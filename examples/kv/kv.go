@@ -136,10 +136,35 @@ func (db *DB) observeRecordTime(ts uint64) {
 	}
 }
 
-// ApplyCommitted applies one committed EPaxos command to the key-value store.
+func (db *DB) newWriteBatch() txnBatch {
+	if db.newBatch != nil {
+		return db.newBatch()
+	}
+	return db.pebble.NewBatch()
+}
+
+// ApplyCommitted applies one committed EPaxOS command to the key-value store.
 func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
-	if cmd.Command.Kind == epaxos.CommandNoop || len(cmd.Command.Payload) == 0 {
+	batch := db.newWriteBatch()
+	defer func() { _ = batch.Close() }()
+	next := db.nextRecordTime()
+	wrote, err := db.stageCommitted(batch, cmd, &next)
+	if err != nil {
+		return err
+	}
+	if !wrote {
 		return nil
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	db.nextTime = next
+	return nil
+}
+
+func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.CommittedCommand, next *uint64) (bool, error) {
+	if cmd.Command.Kind == epaxos.CommandNoop || len(cmd.Command.Payload) == 0 {
+		return false, nil
 	}
 	op := cmd.Command.Payload[0]
 	p := parser{b: cmd.Command.Payload[1:]}
@@ -147,28 +172,38 @@ func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
 	case opPut:
 		key := p.bytes()
 		value := p.bytes()
-		if p.err {
-			return fmt.Errorf("kv: malformed command")
+		if p.err || len(p.b) != 0 {
+			return false, fmt.Errorf("kv: malformed command")
 		}
-		return db.PutVersion(key, value, db.nextRecordTime())
+		ts := *next
+		if err := stagePutVersion(batch, db.cf, key, value, ts); err != nil {
+			return false, err
+		}
+		*next = ts + 1
+		return true, nil
 	case opDelete:
 		key := p.bytes()
 		_ = p.bytes()
-		if p.err {
-			return fmt.Errorf("kv: malformed command")
+		if p.err || len(p.b) != 0 {
+			return false, fmt.Errorf("kv: malformed command")
 		}
-		return db.DeleteVersion(key, db.nextRecordTime())
+		ts := *next
+		if err := stageDeleteVersion(batch, db.cf, key, ts); err != nil {
+			return false, err
+		}
+		*next = ts + 1
+		return true, nil
 	case opTxn:
-		return db.applyTxn(&p)
+		return db.stageTxn(batch, &p, next)
 	default:
-		return fmt.Errorf("kv: unknown op %d", op)
+		return false, fmt.Errorf("kv: unknown op %d", op)
 	}
 }
 
-func (db *DB) applyTxn(p *parser) error {
+func (db *DB) stageTxn(batch txnBatch, p *parser, next *uint64) (bool, error) {
 	count := p.uvarint()
 	if p.err {
-		return fmt.Errorf("kv: malformed command")
+		return false, fmt.Errorf("kv: malformed command")
 	}
 	ops := make([]TxnOp, 0)
 	for i := uint64(0); i < count; i++ {
@@ -176,7 +211,7 @@ func (db *DB) applyTxn(p *parser) error {
 		key := p.bytes()
 		value := p.bytes()
 		if p.err {
-			return fmt.Errorf("kv: malformed command")
+			return false, fmt.Errorf("kv: malformed command")
 		}
 		switch op {
 		case opPut:
@@ -184,26 +219,37 @@ func (db *DB) applyTxn(p *parser) error {
 		case opDelete:
 			ops = append(ops, TxnOp{Delete: true, Key: key})
 		default:
-			return fmt.Errorf("kv: unknown transaction op %d", op)
+			return false, fmt.Errorf("kv: unknown transaction op %d", op)
 		}
 	}
 	if len(p.b) != 0 {
-		return fmt.Errorf("kv: malformed command")
+		return false, fmt.Errorf("kv: malformed command")
 	}
-	ts := db.nextRecordTime()
-	batch := db.newBatch()
-	defer func() { _ = batch.Close() }()
+	if len(ops) == 0 {
+		return false, nil
+	}
+	ts := *next
 	for _, op := range ops {
-		k := EncodeDataKey(nil, db.cf, op.Key, ts)
 		if op.Delete {
-			if err := batch.Set(k, []byte{deleteRecord}, nil); err != nil {
-				return err
+			if err := stageDeleteVersion(batch, db.cf, op.Key, ts); err != nil {
+				return false, err
 			}
 			continue
 		}
-		if err := batch.Set(k, append([]byte{valueRecord}, op.Value...), nil); err != nil {
-			return err
+		if err := stagePutVersion(batch, db.cf, op.Key, op.Value, ts); err != nil {
+			return false, err
 		}
+	}
+	*next = ts + 1
+	return true, nil
+}
+
+// PutVersion writes one version using the example's MyRocks-like data-key format.
+func (db *DB) PutVersion(key, value []byte, ts uint64) error {
+	batch := db.newWriteBatch()
+	defer func() { _ = batch.Close() }()
+	if err := stagePutVersion(batch, db.cf, key, value, ts); err != nil {
+		return err
 	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
@@ -212,25 +258,28 @@ func (db *DB) applyTxn(p *parser) error {
 	return nil
 }
 
-// PutVersion writes one version using the example's MyRocks-like data-key format.
-func (db *DB) PutVersion(key, value []byte, ts uint64) error {
-	k := EncodeDataKey(nil, db.cf, key, ts)
-	v := append([]byte{valueRecord}, value...)
-	if err := db.pebble.Set(k, v, pebble.Sync); err != nil {
+func stagePutVersion(batch txnBatch, cf uint32, key, value []byte, ts uint64) error {
+	k := EncodeDataKey(nil, cf, key, ts)
+	return batch.Set(k, append([]byte{valueRecord}, value...), nil)
+}
+
+// DeleteVersion writes a tombstone version for key.
+func (db *DB) DeleteVersion(key []byte, ts uint64) error {
+	batch := db.newWriteBatch()
+	defer func() { _ = batch.Close() }()
+	if err := stageDeleteVersion(batch, db.cf, key, ts); err != nil {
+		return err
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
 	db.observeRecordTime(ts)
 	return nil
 }
 
-// DeleteVersion writes a tombstone version for key.
-func (db *DB) DeleteVersion(key []byte, ts uint64) error {
-	k := EncodeDataKey(nil, db.cf, key, ts)
-	if err := db.pebble.Set(k, []byte{deleteRecord}, pebble.Sync); err != nil {
-		return err
-	}
-	db.observeRecordTime(ts)
-	return nil
+func stageDeleteVersion(batch txnBatch, cf uint32, key []byte, ts uint64) error {
+	k := EncodeDataKey(nil, cf, key, ts)
+	return batch.Set(k, []byte{deleteRecord}, nil)
 }
 
 // Get returns the newest live value for key.

@@ -21,11 +21,15 @@ import (
 	"gosuda.org/moreconsensus/examples/kv"
 )
 
+type readyApplier interface {
+	ApplyReady(epaxos.Ready) error
+}
+
 type service struct {
 	mu      sync.Mutex
 	id      epaxos.ReplicaID
 	node    *epaxos.RawNode
-	store   *epaxos.MemoryStorage
+	ready   readyApplier
 	db      *kv.DB
 	peers   map[epaxos.ReplicaID]string
 	client  *http.Client
@@ -48,12 +52,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	store := epaxos.NewMemoryStorage()
+	store := db.EPaxosStorage()
 	node, err := epaxos.NewRawNode(epaxos.Config{ID: epaxos.ReplicaID(*idFlag), Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, store: store, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 1024), nextSeq: 1}
+	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 1024), nextSeq: 1}
 	for range 8 {
 		go s.transportWorker()
 	}
@@ -329,13 +333,8 @@ func (s *service) drainLocked() ([]epaxos.Message, error) {
 			return out, nil
 		}
 		rd := s.node.Ready()
-		if err := s.store.ApplyReady(rd); err != nil {
+		if err := s.ready.ApplyReady(rd); err != nil {
 			return nil, err
-		}
-		for _, committed := range rd.Committed {
-			if err := s.db.ApplyCommitted(committed); err != nil {
-				return nil, err
-			}
 		}
 		out = append(out, rd.Messages...)
 		s.node.Advance(rd)

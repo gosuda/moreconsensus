@@ -268,12 +268,12 @@ func newTestService(t *testing.T) *service {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	store := epaxos.NewMemoryStorage()
+	store := db.EPaxosStorage()
 	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: []epaxos.ReplicaID{1}, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &service{id: 1, node: node, store: store, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
+	return &service{id: 1, node: node, ready: db, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
 }
 
 func TestSendPostsOnlyConfiguredRemotePeers(t *testing.T) {
