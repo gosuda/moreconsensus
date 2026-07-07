@@ -353,4 +353,6 @@ var (
 	ErrMessageRejected = errors.New("epaxos: message rejected")
 	// ErrUnknownInstance reports a request for an instance not known locally.
 	ErrUnknownInstance = errors.New("epaxos: unknown instance")
+	// ErrInvalidReady reports an acknowledgement that does not match the outstanding Ready batch.
+	ErrInvalidReady = errors.New("epaxos: invalid ready")
 )

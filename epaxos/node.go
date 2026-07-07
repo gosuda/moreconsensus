@@ -1,6 +1,7 @@
 package epaxos
 
 import (
+	"bytes"
 	"container/heap"
 	"encoding/binary"
 	"fmt"
@@ -363,15 +364,18 @@ func (n *RawNode) Ready() Ready {
 	return rd
 }
 
-// Advance acknowledges that the caller persisted and applied the Ready batch.
-func (n *RawNode) Advance(rd Ready) {
+// Advance acknowledges a prefix of the outstanding Ready batch or returns ErrInvalidReady without mutating node state.
+func (n *RawNode) Advance(rd Ready) error {
 	if !n.awaitAdvance {
-		return
+		if rd.Empty() {
+			return nil
+		}
+		return ErrInvalidReady
+	}
+	if err := n.validateReadyAck(rd); err != nil {
+		return err
 	}
 	ackedCommitted := len(rd.Committed)
-	if ackedCommitted > len(n.pendingReady.Committed) {
-		ackedCommitted = len(n.pendingReady.Committed)
-	}
 	if len(rd.Records) >= len(n.pendingReady.Records) {
 		n.pendingReady.Records = nil
 	} else {
@@ -390,6 +394,101 @@ func (n *RawNode) Advance(rd Ready) {
 	n.pendingReady.MustSync = len(n.pendingReady.Records) > 0
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.awaitAdvance = false
+	return nil
+}
+
+func (n *RawNode) validateReadyAck(rd Ready) error {
+	if len(rd.Records) == 0 && len(rd.Messages) == 0 && len(rd.Committed) == 0 {
+		return ErrInvalidReady
+	}
+	if rd.MustSync != n.pendingReady.MustSync {
+		return ErrInvalidReady
+	}
+	if len(rd.Records) > len(n.pendingReady.Records) || len(rd.Committed) > len(n.pendingReady.Committed) {
+		return ErrInvalidReady
+	}
+	visibleMessages := len(n.pendingReady.Messages)
+	if n.maxReadyMessages > 0 && visibleMessages > n.maxReadyMessages {
+		visibleMessages = n.maxReadyMessages
+	}
+	if len(rd.Messages) > visibleMessages {
+		return ErrInvalidReady
+	}
+	if (len(rd.Messages) > 0 || len(rd.Committed) > 0) && len(rd.Records) != len(n.pendingReady.Records) {
+		return ErrInvalidReady
+	}
+	for i := range rd.Records {
+		if !instanceRecordEqual(rd.Records[i], n.readyRecord(n.pendingReady.Records[i])) {
+			return ErrInvalidReady
+		}
+	}
+	for i := range rd.Messages {
+		if !messageEqual(rd.Messages[i], n.pendingReady.Messages[i].Clone()) {
+			return ErrInvalidReady
+		}
+	}
+	for i := range rd.Committed {
+		if !committedCommandEqual(rd.Committed[i], n.pendingReady.Committed[i].Clone()) {
+			return ErrInvalidReady
+		}
+	}
+	return nil
+}
+
+func instanceRecordEqual(a, b InstanceRecord) bool {
+	return a.Ref == b.Ref &&
+		a.Ballot == b.Ballot &&
+		a.Status == b.Status &&
+		a.Seq == b.Seq &&
+		a.Checksum == b.Checksum &&
+		instanceNumsEqual(a.Deps, b.Deps) &&
+		commandEqual(a.Command, b.Command)
+}
+
+func messageEqual(a, b Message) bool {
+	return a.Type == b.Type &&
+		a.From == b.From &&
+		a.To == b.To &&
+		a.Ref == b.Ref &&
+		a.Ballot == b.Ballot &&
+		a.Seq == b.Seq &&
+		a.Reject == b.Reject &&
+		a.RejectHint == b.RejectHint &&
+		a.RecordStatus == b.RecordStatus &&
+		a.Checksum == b.Checksum &&
+		instanceNumsEqual(a.Deps, b.Deps) &&
+		commandEqual(a.Command, b.Command)
+}
+
+func committedCommandEqual(a, b CommittedCommand) bool {
+	return a.Ref == b.Ref &&
+		a.Seq == b.Seq &&
+		instanceNumsEqual(a.Deps, b.Deps) &&
+		commandEqual(a.Command, b.Command)
+}
+
+func commandEqual(a, b Command) bool {
+	if a.ID != b.ID || a.Kind != b.Kind || !bytes.Equal(a.Payload, b.Payload) || len(a.ConflictKeys) != len(b.ConflictKeys) {
+		return false
+	}
+	for i := range a.ConflictKeys {
+		if !bytes.Equal(a.ConflictKeys[i], b.ConflictKeys[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func instanceNumsEqual(a, b []InstanceNum) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (n *RawNode) enqueueExecutedRecords(committed []CommittedCommand) {

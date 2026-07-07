@@ -181,7 +181,9 @@ func TestRejectPathsAndTimers(t *testing.T) {
 	if err := s.nodes[msg.To].Step(lowAccept); err != nil {
 		t.Fatal(err)
 	}
-	s.nodes[1].Advance(rd)
+	if err := s.nodes[1].Advance(rd); err != nil {
+		t.Fatal(err)
+	}
 	inst := s.nodes[1].instances[ref]
 	s.nodes[1].onTimer(inst, timerPreAccept)
 	s.nodes[1].startAccept(inst, inst.rec.Attributes())

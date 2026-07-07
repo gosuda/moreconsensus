@@ -78,9 +78,11 @@ User commands are emitted to the embedding application through `Ready.Committed`
 
 ## Ready contract
 
-`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` contains user commands that have passed dependency execution and must be applied by the embedding application before they are acknowledged. The embedding application must persist records before sending messages from the same `Ready`. `MustSync` is true when durable records are present.
+`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` contains user commands that have passed dependency execution and must be applied by the embedding application before they are acknowledged. The embedding application must persist every record in a returned `Ready` before sending messages or acknowledging committed commands from that same batch. `MustSync` is true when durable records are present.
 
-`Advance` acknowledges the obligations in the previously returned `Ready`. For user commands, `Advance` queues the corresponding `StatusExecuted` records only after the application has observed `Ready.Committed`; those executed markers appear in a later `Ready.Records` batch and make replay after restart idempotent. Configuration changes and no-op commands do not appear in `Ready.Committed`; their executed records are queued internally when they execute.
+`Advance` returns an error and acknowledges only an exact prefix of the outstanding `Ready`. The acknowledged values must match the records, messages, committed commands, and `MustSync` bit returned by `Ready`; otherwise `Advance` returns `ErrInvalidReady` and leaves the outstanding batch unchanged for retry. A record-only prefix is valid, which lets storage persist part of a batch without marking application commands executed. `Messages` or `Committed` acknowledgements are accepted only after all earlier `Records` from that outstanding batch are acknowledged. When `MaxReadyMessages` caps `Ready.Messages`, records and committed commands still appear in full; after their successful acknowledgement the remaining message tail appears in later `Ready` batches with `MustSync` false.
+
+For user commands, `Advance` queues the corresponding `StatusExecuted` records only after the application has observed and acknowledged `Ready.Committed`; those executed markers appear in a later `Ready.Records` batch and make replay after restart idempotent. Configuration changes and no-op commands do not appear in `Ready.Committed`; their executed records are queued internally when they execute.
 
 ## Checksums and serialization
 

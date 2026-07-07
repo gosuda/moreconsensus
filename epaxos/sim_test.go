@@ -67,7 +67,9 @@ func (s *simCluster) drain() {
 					}
 				}
 			}
-			rn.Advance(rd)
+			if err := rn.Advance(rd); err != nil {
+				s.t.Fatalf("advance %d: %v", id, err)
+			}
 		}
 		if !progress {
 			return
@@ -147,7 +149,9 @@ func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 	if err := s.nodes[m.To].Step(bad); !errors.Is(err, ErrMessageRejected) && !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("bad target err=%v", err)
 	}
-	s.nodes[1].Advance(rd)
+	if err := s.nodes[1].Advance(rd); err != nil {
+		t.Fatal(err)
+	}
 	var decoded Message
 	if err := DecodeMessage([]byte{1, 2, 3}, &decoded); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("malformed decode err=%v", err)
@@ -465,7 +469,9 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	if err := store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
-	rn.Advance(rd)
+	if err := rn.Advance(rd); err != nil {
+		t.Fatal(err)
+	}
 	executedReady := rn.Ready()
 	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
@@ -473,7 +479,9 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	if err := store.ApplyReady(executedReady); err != nil {
 		t.Fatal(err)
 	}
-	rn.Advance(executedReady)
+	if err := rn.Advance(executedReady); err != nil {
+		t.Fatal(err)
+	}
 	if rn.HasReady() {
 		t.Fatal("node still has ready work after executed record")
 	}

@@ -94,7 +94,9 @@ func (s *stressTransportCluster) captureReady(id ReplicaID) {
 		s.apps[id] = append(s.apps[id], c)
 	}
 	s.pending = append(s.pending, rd.Messages...)
-	rn.Advance(rd)
+	if err := rn.Advance(rd); err != nil {
+		s.t.Fatalf("advance %d: %v", id, err)
+	}
 }
 
 func (s *stressTransportCluster) captureRandomReady() bool {

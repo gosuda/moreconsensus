@@ -96,9 +96,10 @@ func TestClusterErrorBranches(t *testing.T) {
 	if _, _, err := cluster.Get(99, []byte("x")); err == nil {
 		t.Fatal("expected unknown replica")
 	}
-	cluster.Stores[1].FailWrites = true
-	if err := cluster.Put([]byte("x"), []byte("y")); err == nil {
-		t.Fatal("expected storage failure")
+	sentinel := errors.New("ready apply failed")
+	cluster.readyAppliers[1] = func(epaxos.Ready) error { return sentinel }
+	if err := cluster.Put([]byte("x"), []byte("y")); !errors.Is(err, sentinel) {
+		t.Fatalf("err=%v", err)
 	}
 	if err := cluster.Close(); err != nil {
 		t.Fatal(err)
@@ -131,15 +132,104 @@ func TestOpenClusterPartialFailureClosesOpenedDBs(t *testing.T) {
 	}
 }
 
+func TestOpenClusterReopensDurableReadyPathWithoutCommandReplay(t *testing.T) {
+	paths := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	cluster, err := OpenCluster(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Put([]byte("durable-key"), []byte("durable-value")); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	executedBefore := make(map[epaxos.ReplicaID][]epaxos.InstanceRef, len(paths))
+	for i := range paths {
+		id := epaxos.ReplicaID(i + 1)
+		executed := cluster.Nodes[id].Status().Executed
+		if len(executed) == 0 {
+			t.Fatalf("replica %d executed refs empty before close", id)
+		}
+		executedBefore[id] = append([]epaxos.InstanceRef(nil), executed...)
+	}
+	if err := cluster.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cluster, err = OpenCluster(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cluster.Close() }()
+	for id, wantRefs := range executedBefore {
+		gotRefs := cluster.Nodes[id].Status().Executed
+		for _, want := range wantRefs {
+			if !hasExecutedRef(gotRefs, want) {
+				t.Fatalf("replica %d executed refs after reopen = %#v, want %s", id, gotRefs, want)
+			}
+		}
+	}
+	restartedCommitted := 0
+	for id, apply := range cluster.readyAppliers {
+		id, apply := id, apply
+		cluster.readyAppliers[id] = func(rd epaxos.Ready) error {
+			restartedCommitted += len(rd.Committed)
+			return apply(rd)
+		}
+	}
+	if err := cluster.Drain(); err != nil {
+		t.Fatal(err)
+	}
+	if restartedCommitted != 0 {
+		t.Fatalf("restarted cluster emitted %d committed commands", restartedCommitted)
+	}
+	for i := range paths {
+		id := epaxos.ReplicaID(i + 1)
+		value, ok, err := cluster.Get(id, []byte("durable-key"))
+		if err != nil || !ok || string(value) != "durable-value" {
+			t.Fatalf("replica %d value=%q ok=%v err=%v", id, value, ok, err)
+		}
+	}
+}
+
 func TestClusterDeletePropagatesDurableStorageFailure(t *testing.T) {
 	cluster, err := OpenCluster([]string{t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = cluster.Close() }()
-	cluster.Stores[1].FailWrites = true
-	if err := cluster.Delete([]byte("x")); err == nil {
-		t.Fatal("expected storage failure")
+	sentinel := errors.New("ready apply failed")
+	cluster.readyAppliers[1] = func(epaxos.Ready) error { return sentinel }
+	if err := cluster.Delete([]byte("x")); !errors.Is(err, sentinel) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestClusterPutReturnsAdvanceValidationErrorAfterDurableApply(t *testing.T) {
+	cluster, err := OpenCluster([]string{t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cluster.Close() }()
+
+	apply := cluster.readyAppliers[1]
+	cluster.readyAppliers[1] = func(rd epaxos.Ready) error {
+		if err := apply(rd); err != nil {
+			return err
+		}
+		if len(rd.Records) == 0 {
+			t.Fatal("ready had no records to corrupt")
+		}
+		rd.Records[0].Seq++
+		return nil
+	}
+
+	err = cluster.Put([]byte("advance-key"), []byte("advance-value"))
+	if !errors.Is(err, epaxos.ErrInvalidReady) {
+		t.Fatalf("put err=%v, want %v", err, epaxos.ErrInvalidReady)
+	}
+	value, ok, err := cluster.Get(1, []byte("advance-key"))
+	if err != nil || !ok || string(value) != "advance-value" {
+		t.Fatalf("value=%q ok=%v err=%v", value, ok, err)
 	}
 }
 
@@ -493,7 +583,9 @@ func TestApplyReadyPersistsExecutedRecordAndKVAcrossReopen(t *testing.T) {
 	if err := db.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
-	node.Advance(rd)
+	if err := node.Advance(rd); err != nil {
+		t.Fatal(err)
+	}
 	executedReady := node.Ready()
 	if len(executedReady.Committed) != 0 {
 		t.Fatalf("post-advance ready committed = %#v, want no replayed command", executedReady.Committed)
@@ -504,7 +596,9 @@ func TestApplyReadyPersistsExecutedRecordAndKVAcrossReopen(t *testing.T) {
 	if err := db.ApplyReady(executedReady); err != nil {
 		t.Fatal(err)
 	}
-	node.Advance(executedReady)
+	if err := node.Advance(executedReady); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -813,6 +907,43 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 		}
 		if got := db.nextRecordTime(); got != 5 {
 			t.Fatalf("next automatic timestamp advanced to %d after invalid record", got)
+		}
+	})
+
+	t.Run("malformed committed command", func(t *testing.T) {
+		db, err := Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		db.nextTime = 6
+		ref := epaxos.InstanceRef{Replica: 1, Instance: 12, Conf: 1}
+		payload := []byte{opTxn, 2}
+		payload = append(payload, opPut)
+		payload = appendKVFields(payload, []byte("txn-ready"), []byte("value"))
+		payload = append(payload, opPut, 9)
+		cmd := epaxos.Command{Payload: payload, ConflictKeys: [][]byte{[]byte("txn-ready")}}
+		rec := checkedKVRecord(epaxos.InstanceRecord{
+			Ref:     ref,
+			Ballot:  epaxos.Ballot{Number: 1, Replica: 1},
+			Status:  epaxos.StatusExecuted,
+			Seq:     1,
+			Deps:    []epaxos.InstanceNum{0},
+			Command: cmd,
+		})
+		err = db.ApplyReady(epaxos.Ready{
+			Records:   []epaxos.InstanceRecord{rec},
+			Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "kv: malformed command") {
+			t.Fatalf("err=%v", err)
+		}
+		assertNoEPaxosRecords(t, db)
+		if value, ok, err := db.Get([]byte("txn-ready")); err != nil || ok {
+			t.Fatalf("malformed command value=%q ok=%v err=%v", value, ok, err)
+		}
+		if got := db.nextRecordTime(); got != 6 {
+			t.Fatalf("next automatic timestamp advanced to %d after malformed command", got)
 		}
 	})
 

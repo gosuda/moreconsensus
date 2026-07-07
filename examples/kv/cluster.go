@@ -10,8 +10,8 @@ import (
 // Cluster is a deterministic in-process distributed KV example.
 type Cluster struct {
 	Nodes          map[epaxos.ReplicaID]*epaxos.RawNode
-	Stores         map[epaxos.ReplicaID]*epaxos.MemoryStorage
 	DBs            map[epaxos.ReplicaID]*DB
+	readyAppliers  map[epaxos.ReplicaID]func(epaxos.Ready) error
 	deliverMessage func(epaxos.Message) error
 	ids            []epaxos.ReplicaID
 	next           uint64
@@ -30,7 +30,13 @@ func openCluster(paths []string, newNode func(epaxos.Config) (*epaxos.RawNode, e
 	for i := range ids {
 		ids[i] = epaxos.ReplicaID(i + 1)
 	}
-	c := &Cluster{Nodes: make(map[epaxos.ReplicaID]*epaxos.RawNode), Stores: make(map[epaxos.ReplicaID]*epaxos.MemoryStorage), DBs: make(map[epaxos.ReplicaID]*DB), ids: ids, next: 1}
+	c := &Cluster{
+		Nodes:         make(map[epaxos.ReplicaID]*epaxos.RawNode),
+		DBs:           make(map[epaxos.ReplicaID]*DB),
+		readyAppliers: make(map[epaxos.ReplicaID]func(epaxos.Ready) error),
+		ids:           ids,
+		next:          1,
+	}
 	c.deliverMessage = c.deliver
 	for i, path := range paths {
 		id := ids[i]
@@ -39,15 +45,14 @@ func openCluster(paths []string, newNode func(epaxos.Config) (*epaxos.RawNode, e
 			_ = c.Close()
 			return nil, err
 		}
-		st := epaxos.NewMemoryStorage()
-		rn, err := newNode(epaxos.Config{ID: id, Voters: ids, Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+		rn, err := newNode(epaxos.Config{ID: id, Voters: ids, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
 		if err != nil {
 			_ = db.Close()
 			_ = c.Close()
 			return nil, err
 		}
 		c.DBs[id] = db
-		c.Stores[id] = st
+		c.readyAppliers[id] = db.ApplyReady
 		c.Nodes[id] = rn
 	}
 	return c, nil
@@ -108,20 +113,17 @@ func (c *Cluster) drainWithLimit(limit int) error {
 			}
 			progress = true
 			rd := rn.Ready()
-			if err := c.Stores[id].ApplyReady(rd); err != nil {
+			if err := c.readyAppliers[id](rd); err != nil {
 				return err
-			}
-			for _, committed := range rd.Committed {
-				if err := c.DBs[id].ApplyCommitted(committed); err != nil {
-					return err
-				}
 			}
 			for _, msg := range rd.Messages {
 				if err := c.deliverMessage(msg); err != nil {
 					return err
 				}
 			}
-			rn.Advance(rd)
+			if err := rn.Advance(rd); err != nil {
+				return err
+			}
 		}
 		if !progress {
 			return nil

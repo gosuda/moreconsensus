@@ -49,10 +49,15 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	}
 	rn.pendingReady = Ready{Records: []InstanceRecord{{}, {}}, Messages: []Message{{}, {}}, Committed: []CommittedCommand{{}, {}}, MustSync: true}
 	rd := rn.Ready()
-	rn.Advance(Ready{Records: rd.Records[:1], Messages: rd.Messages[:1], Committed: rd.Committed[:1]})
-	if len(rn.pendingReady.Records) != 1 || len(rn.pendingReady.Messages) != 1 || len(rn.pendingReady.Committed) != 1 {
-		t.Fatal("partial advance did not retain tails")
+	advanceInvalid(t, rn, Ready{Records: rd.Records[:1], Messages: rd.Messages[:1], Committed: rd.Committed[:1], MustSync: rd.MustSync})
+	if len(rn.pendingReady.Records) != 2 || len(rn.pendingReady.Messages) != 2 || len(rn.pendingReady.Committed) != 2 {
+		t.Fatal("barrier rejection changed pending ready")
 	}
+	advanceOK(t, rn, Ready{Records: rd.Records[:1], MustSync: rd.MustSync})
+	if len(rn.pendingReady.Records) != 1 || len(rn.pendingReady.Messages) != 2 || len(rn.pendingReady.Committed) != 2 {
+		t.Fatal("partial record advance did not retain later work")
+	}
+	advanceOK(t, rn, rn.Ready())
 	if _, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +219,7 @@ func TestMaxReadyMessagesCapsOnlyMessages(t *testing.T) {
 		t.Fatalf("committed commands were capped with messages: %#v", rd.Committed)
 	}
 
-	rn.Advance(rd)
+	advanceOK(t, rn, rd)
 	tail := rn.Ready()
 	if len(tail.Records) != 0 || len(tail.Committed) != 0 {
 		t.Fatalf("advanced records/committed reappeared with message tail: records=%#v committed=%#v", tail.Records, tail.Committed)
@@ -241,7 +246,7 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 	if err := store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
-	rn.Advance(rd)
+	advanceOK(t, rn, rd)
 
 	inst := rn.instances[ref]
 	if inst == nil {
@@ -513,7 +518,7 @@ func TestReadyPersistsExecutedStateForRestart(t *testing.T) {
 	if err := store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
-	rn.Advance(rd)
+	advanceOK(t, rn, rd)
 	executedReady := rn.Ready()
 	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
@@ -521,7 +526,7 @@ func TestReadyPersistsExecutedStateForRestart(t *testing.T) {
 	if err := store.ApplyReady(executedReady); err != nil {
 		t.Fatal(err)
 	}
-	rn.Advance(executedReady)
+	advanceOK(t, rn, executedReady)
 	if rn.HasReady() {
 		t.Fatal("node still has ready work after executed record")
 	}
@@ -596,7 +601,7 @@ func TestPreparePromiseForUnknownInstancePersistsAndRejectsStaleBallots(t *testi
 	if len(rd.Messages) != 1 || rd.Messages[0].Type != MsgPrepareResp || rd.Messages[0].RecordStatus != StatusNone || rd.Messages[0].Ballot != promise.Ballot {
 		t.Fatalf("promise response = %#v", rd.Messages)
 	}
-	rn.Advance(rd)
+	advanceOK(t, rn, rd)
 
 	stale := promise
 	stale.Ballot = Ballot{Number: 1, Replica: 2}
@@ -632,13 +637,13 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 	if len(rd.Committed) != 1 || string(rd.Committed[0].Command.Payload) != "chosen" {
 		t.Fatalf("commit was not applied before accept retry: %#v", rd.Committed)
 	}
-	rn.Advance(rd)
+	advanceOK(t, rn, rd)
 
 	executedReady := rn.Ready()
 	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
 	}
-	rn.Advance(executedReady)
+	advanceOK(t, rn, executedReady)
 
 	retry := Message{
 		Type:    MsgAccept,

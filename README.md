@@ -1,6 +1,6 @@
 # moreconsensus
 
-`moreconsensus` is a Go library for building replicated services with Egalitarian Paxos (EPaxos). The public API follows the shape of etcd raft: applications drive a deterministic `RawNode`, persist `Ready` records, send `Ready` messages, apply committed commands, and then call `Advance`.
+`moreconsensus` is a Go library for building replicated services with Egalitarian Paxos (EPaxos). The public API follows the shape of etcd raft: applications drive a deterministic `RawNode`, persist `Ready` records, send `Ready` messages, apply committed commands, and then call `Advance` with the acknowledged `Ready` prefix.
 
 ## Core features
 

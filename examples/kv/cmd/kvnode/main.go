@@ -501,7 +501,9 @@ func (s *service) drainLocked() ([]epaxos.Message, error) {
 			return nil, err
 		}
 		out = append(out, rd.Messages...)
-		s.node.Advance(rd)
+		if err := s.node.Advance(rd); err != nil {
+			return nil, err
+		}
 	}
 	return nil, fmt.Errorf("ready processing did not quiesce")
 }

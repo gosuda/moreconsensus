@@ -50,7 +50,9 @@ func TestConstructionAndReadyBranches(t *testing.T) {
 	if !rn.Ready().Empty() {
 		t.Fatal("empty ready should be empty")
 	}
-	rn.Advance(Ready{})
+	if err := rn.Advance(Ready{}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := rn.Propose(Command{Kind: CommandConfChange}); err == nil {
 		t.Fatal("expected conf command rejection")
 	}
@@ -64,8 +66,15 @@ func TestConstructionAndReadyBranches(t *testing.T) {
 	if !rn.Ready().Empty() {
 		t.Fatal("ready while awaiting advance should be empty")
 	}
-	rn.Advance(Ready{Records: rd.Records[:1]})
-	rn.Advance(rd)
+	if err := rn.Advance(Ready{Records: rd.Records[:1], MustSync: rd.MustSync}); err != nil {
+		t.Fatal(err)
+	}
+	tail := rn.Ready()
+	if !tail.Empty() {
+		if err := rn.Advance(tail); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestDirectProtocolBranches(t *testing.T) {
