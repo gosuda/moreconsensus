@@ -9,9 +9,12 @@
             [jepsen [checker :as checker]
                     [cli :as cli]
                     [client :as client]
+                    [db :as db]
                     [generator :as gen]
                     [nemesis :as nemesis]
                     [tests :as tests]]
+            [jepsen.control :as control]
+            [jepsen.control.util :as cu]
             [jepsen.checker.timeline :as timeline]
             [knossos.model :as model])
   (:import [java.lang ProcessBuilder$Redirect]))
@@ -45,18 +48,50 @@
 (defn fault-env [suffix]
   (System/getenv (str fault-env-prefix suffix)))
 
+(def destructive-storage-fault "destructive-storage")
+(def supported-faults #{"restart" "transport" "storage" destructive-storage-fault})
+(def enabled-env-values #{"1" "true" "yes"})
+
+(defn env-enabled? [suffix]
+  (contains? enabled-env-values (str/lower-case (or (fault-env suffix) ""))))
+
+(defn parse-env-long [suffix default]
+  (Long/parseLong (or (fault-env suffix) (str default))))
+
 (defn node-port [node]
   (Long/parseLong (last (str/split (str node) #":"))))
+
+(defn node-http-port [cfg node]
+  (if (str/includes? (str node) ":")
+    (node-port node)
+    (:http-port cfg)))
 
 (defn local-node-id [cfg node]
   (- (node-port node) (:base-port cfg)))
 
+(defn indexed-node-ids [nodes]
+  (into {} (map-indexed (fn [idx node] [node (inc idx)]) nodes)))
+
+(defn node-id [cfg node]
+  (or (get (:node-ids cfg) node)
+      (local-node-id cfg node)))
+
+(defn peer-spec [cfg]
+  (str/join "," (map (fn [node]
+                       (str (node-id cfg node) "=" (endpoint cfg node)))
+                     (:nodes cfg))))
+
+(defn http-node [cfg node]
+  (if (or (nil? (:http-port cfg)) (str/includes? (str node) ":"))
+    node
+    (str node ":" (:http-port cfg))))
+
 (defn local-fault-config [opts]
   (let [faults (fault-env "FAULTS")
-        base-port (Long/parseLong (or (fault-env "BASE_PORT") "0"))
+        base-port (parse-env-long "BASE_PORT" 0)
         nodes (:nodes opts)]
-    (case faults
-      "restart"
+    (cond
+      (#{"restart" destructive-storage-fault} faults)
       (let [cfg {:faults faults
                  :bin (fault-env "BIN")
                  :data-dir (fault-env "DATA_DIR")
@@ -67,22 +102,18 @@
         (when (and (every? seq ((juxt :bin :data-dir :peers :pid-dir :nodes) cfg))
                    (pos? (:base-port cfg)))
           cfg))
-      "transport"
+
+      (#{"transport" "storage"} faults)
       (let [cfg {:faults faults
                  :base-port base-port
                  :nodes nodes}]
         (when (and (seq nodes) (pos? base-port))
           cfg))
-      "storage"
-      (let [cfg {:faults faults
-                 :base-port base-port
-                 :nodes nodes}]
-        (when (and (seq nodes) (pos? base-port))
-          cfg))
-      nil)))
+
+      :else nil)))
 
 (defn pid-file [cfg node]
-  (io/file (:pid-dir cfg) (str "node-" (local-node-id cfg node) ".pid")))
+  (io/file (:pid-dir cfg) (str "node-" (node-id cfg node) ".pid")))
 
 (defn read-pid [cfg node]
   (let [file (pid-file cfg node)]
@@ -138,7 +169,7 @@
           (or health last-health))))))
 
 (defn launch-node-process! [cfg node]
-  (let [id (local-node-id cfg node)
+  (let [id (node-id cfg node)
         port (node-port node)
         log-file (io/file (:data-dir cfg) (str "node-" id ".log"))
         data-dir (io/file (:data-dir cfg) (str "node-" id))
@@ -166,6 +197,59 @@
         (if (:healthy health)
           (merge health {:node node :pid new-pid :action :started})
           (merge health {:node node :pid new-pid :action :start-failed}))))))
+
+(defn local-data-dir [cfg node]
+  (io/file (:data-dir cfg) (str "node-" (node-id cfg node))))
+
+(defn local-storage-backup-dir [cfg node]
+  (io/file (:data-dir cfg) (str "node-" (node-id cfg node) ".removed")))
+
+(defn local-rm-rf! [path]
+  (sh "rm" "-rf" (.getPath (io/file path))))
+
+(defn local-move-if-present! [source dest]
+  (when (.exists (io/file source))
+    (local-rm-rf! dest)
+    (sh "mv" (.getPath (io/file source)) (.getPath (io/file dest)))))
+
+(defn remove-local-storage! [cfg node]
+  (let [stop (stop-node! cfg node)
+        data-dir (local-data-dir cfg node)
+        backup-dir (local-storage-backup-dir cfg node)]
+    (local-move-if-present! data-dir backup-dir)
+    (let [start (start-node! cfg node)]
+      {:node node :action :storage-removed :stop stop :start start})))
+
+(defn restore-local-storage! [cfg node]
+  (let [data-dir (local-data-dir cfg node)
+        backup-dir (local-storage-backup-dir cfg node)]
+    (if (.exists backup-dir)
+      (let [stop (stop-node! cfg node)]
+        (local-rm-rf! data-dir)
+        (local-move-if-present! backup-dir data-dir)
+        (let [start (start-node! cfg node)]
+          {:node node :action :storage-restored :stop stop :start start}))
+      {:node node :action :storage-unchanged})))
+
+(defn local-destructive-storage-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this _ op]
+      (try
+        (case (:f op)
+          :remove-storage (assoc op :type :info :value (remove-local-storage! cfg (:value op)))
+          :restore-storage (assoc op :type :info :value (restore-local-storage! cfg (:value op)))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "local destructive storage nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this _]
+      (doseq [node (:nodes cfg)]
+        (try
+          (restore-local-storage! cfg node)
+          (catch Exception e
+            (warn e "local destructive storage nemesis repair failed"))))
+      this)))
 
 (defn local-restart-nemesis [cfg]
   (reify nemesis/Nemesis
@@ -203,18 +287,18 @@
     {:node node :from from :to to :drop drop? :status (:status resp)}))
 
 (defn transport-isolation-requests [cfg node]
-  (let [target (local-node-id cfg node)]
+  (let [target (node-id cfg node)]
     (vec
      (for [peer (:nodes cfg)
            :when (not= peer node)
            controller (:nodes cfg)
-           :let [peer-id (local-node-id cfg peer)]
+           :let [peer-id (node-id cfg peer)]
            [from to] [[target peer-id] [peer-id target]]]
        {:controller controller :from from :to to}))))
 
 (defn set-transport-isolation! [cfg node drop?]
   (mapv (fn [{:keys [controller from to]}]
-          (transport-fault-request! controller from to drop?))
+          (transport-fault-request! (http-node cfg controller) from to drop?))
         (transport-isolation-requests cfg node)))
 
 (defn storage-fault-request! [node fail?]
@@ -258,8 +342,8 @@
     (invoke! [this _ op]
       (try
         (case (:f op)
-          :fail-storage (assoc op :type :info :value (storage-fault-request! (:value op) true))
-          :heal-storage (assoc op :type :info :value (storage-fault-request! (:value op) false))
+          :fail-storage (assoc op :type :info :value (storage-fault-request! (http-node cfg (:value op)) true))
+          :heal-storage (assoc op :type :info :value (storage-fault-request! (http-node cfg (:value op)) false))
           (assoc op :type :info :value :unknown-nemesis-op))
         (catch Exception e
           (warn e "local storage nemesis operation failed")
@@ -267,7 +351,7 @@
     (teardown! [this _]
       (doseq [node (:nodes cfg)]
         (try
-          (storage-fault-request! node false)
+          (storage-fault-request! (http-node cfg node) false)
           (catch Exception e
             (warn e "local storage nemesis repair failed"))))
       this)))
@@ -280,16 +364,188 @@
              {:type :info :f :heal-storage :value node}])
           nodes))
 
+(defn destructive-storage-generator [nodes]
+  (mapcat (fn [node]
+            [(gen/sleep 1)
+             {:type :info :f :remove-storage :value node}
+             (gen/sleep 1)
+             {:type :info :f :restore-storage :value node}])
+          nodes))
+
 (defn local-fault-generator [cfg]
   (case (:faults cfg)
     "transport" (local-transport-generator (:nodes cfg))
     "storage" (local-storage-generator (:nodes cfg))
+    "destructive-storage" (destructive-storage-generator (:nodes cfg))
     (local-restart-generator (:nodes cfg))))
 
 (defn local-fault-nemesis [cfg]
   (case (:faults cfg)
     "transport" (local-transport-nemesis cfg)
     "storage" (local-storage-nemesis cfg)
+    "destructive-storage" (local-destructive-storage-nemesis cfg)
+    (local-restart-nemesis cfg)))
+
+(defn remote-config [opts]
+  (let [nodes (:nodes opts)
+        bin (fault-env "BIN")
+        http-port (parse-env-long "HTTP_PORT" 8080)
+        base {:faults (fault-env "FAULTS")
+              :bin bin
+              :remote-dir (or (fault-env "REMOTE_DIR") "/tmp/moreconsensus-jepsen")
+              :http-port http-port
+              :nodes nodes
+              :node-ids (indexed-node-ids nodes)}]
+    (when (and (env-enabled? "REMOTE") (seq bin) (seq nodes))
+      (assoc base :peers (peer-spec base)))))
+
+(defn fault-enabled-config [cfg]
+  (when (and cfg (contains? supported-faults (:faults cfg)))
+    cfg))
+
+(defn remote-bin-path [cfg]
+  (str (:remote-dir cfg) "/kvnode"))
+
+(defn remote-node-data-dir [cfg node]
+  (str (:remote-dir cfg) "/node-" (node-id cfg node)))
+
+(defn remote-node-backup-dir [cfg node]
+  (str (:remote-dir cfg) "/node-" (node-id cfg node) ".removed"))
+
+(defn remote-pid-file [cfg node]
+  (str (:remote-dir cfg) "/node-" (node-id cfg node) ".pid"))
+
+(defn remote-log-file [cfg node]
+  (str (:remote-dir cfg) "/node-" (node-id cfg node) ".log"))
+
+(defn stop-remote-node! [cfg node]
+  (cu/stop-daemon! (remote-pid-file cfg node))
+  {:node node :action :stopped})
+
+(defn start-remote-node! [cfg node]
+  (let [data-dir (remote-node-data-dir cfg node)
+        result (do
+                 (control/exec :mkdir :-p data-dir)
+                 (cu/start-daemon!
+                  {:logfile (remote-log-file cfg node)
+                   :pidfile (remote-pid-file cfg node)
+                   :chdir (:remote-dir cfg)}
+                  (remote-bin-path cfg)
+                  "-id" (str (node-id cfg node))
+                  "-listen" (str ":" (node-http-port cfg node))
+                  "-data" data-dir
+                  "-peers" (:peers cfg)))
+        health (wait-node-health cfg node)]
+    (merge health {:node node :action result})))
+
+(defn remote-setup-node! [cfg node]
+  (control/exec :mkdir :-p (:remote-dir cfg))
+  (control/upload (:bin cfg) (remote-bin-path cfg))
+  (control/exec :chmod :+x (remote-bin-path cfg))
+  (stop-remote-node! cfg node)
+  (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node))
+  (start-remote-node! cfg node))
+
+(defn remote-teardown-node! [cfg node]
+  (stop-remote-node! cfg node)
+  (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node)))
+
+(defn remote-move-if-present! [source dest]
+  (when (cu/exists? source)
+    (control/exec :rm :-rf dest)
+    (control/exec :mv source dest)))
+
+(defn remove-remote-storage! [cfg node]
+  (let [stop (stop-remote-node! cfg node)
+        data-dir (remote-node-data-dir cfg node)
+        backup-dir (remote-node-backup-dir cfg node)]
+    (remote-move-if-present! data-dir backup-dir)
+    (let [start (start-remote-node! cfg node)]
+      {:node node :action :storage-removed :stop stop :start start})))
+
+(defn restore-remote-storage! [cfg node]
+  (let [data-dir (remote-node-data-dir cfg node)
+        backup-dir (remote-node-backup-dir cfg node)]
+    (if (cu/exists? backup-dir)
+      (let [stop (stop-remote-node! cfg node)]
+        (control/exec :rm :-rf data-dir)
+        (remote-move-if-present! backup-dir data-dir)
+        (let [start (start-remote-node! cfg node)]
+          {:node node :action :storage-restored :stop stop :start start}))
+      {:node node :action :storage-unchanged})))
+
+(defrecord KVNodeDB [cfg]
+  db/DB
+  (setup! [_ test node]
+    (remote-setup-node! (merge cfg (select-keys test [:http-port])) node))
+  (teardown! [_ test node]
+    (when-not (:leave-db-running? test)
+      (remote-teardown-node! (merge cfg (select-keys test [:http-port])) node)))
+
+  db/Kill
+  (kill! [_ test node]
+    (stop-remote-node! (merge cfg (select-keys test [:http-port])) node))
+  (start! [_ test node]
+    (start-remote-node! (merge cfg (select-keys test [:http-port])) node))
+
+  db/LogFiles
+  (log-files [_ _ node]
+    {(remote-log-file cfg node) (str "kvnode-" (node-id cfg node) ".log")}))
+
+(defn kvnode-db [cfg]
+  (->KVNodeDB cfg))
+
+(defn remote-node-op! [test node f]
+  (get (control/on-nodes test [node] (fn [_ seen-node] (f seen-node))) node))
+
+(defn remote-restart-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this test op]
+      (try
+        (case (:f op)
+          :kill-node (assoc op :type :info :value (remote-node-op! test (:value op) #(stop-remote-node! cfg %)))
+          :restart-node (assoc op :type :info :value (remote-node-op! test (:value op) #(start-remote-node! cfg %)))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "remote restart nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this test]
+      (control/on-nodes test (:nodes cfg)
+                        (fn [_ node]
+                          (try
+                            (start-remote-node! cfg node)
+                            (catch Exception e
+                              (warn e "remote restart nemesis repair failed")))))
+      this)))
+
+(defn remote-destructive-storage-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this test op]
+      (try
+        (case (:f op)
+          :remove-storage (assoc op :type :info :value (remote-node-op! test (:value op) #(remove-remote-storage! cfg %)))
+          :restore-storage (assoc op :type :info :value (remote-node-op! test (:value op) #(restore-remote-storage! cfg %)))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "remote destructive storage nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this test]
+      (control/on-nodes test (:nodes cfg)
+                        (fn [_ node]
+                          (try
+                            (restore-remote-storage! cfg node)
+                            (catch Exception e
+                              (warn e "remote destructive storage nemesis repair failed")))))
+      this)))
+
+(defn remote-fault-nemesis [cfg]
+  (case (:faults cfg)
+    "restart" (remote-restart-nemesis cfg)
+    "transport" (local-transport-nemesis cfg)
+    "storage" (local-storage-nemesis cfg)
+    "destructive-storage" (remote-destructive-storage-nemesis cfg)
     (local-restart-nemesis cfg)))
 
 
@@ -527,13 +783,21 @@
                                 :timeline (timeline/html)})})))
 
 (defn moreconsensus-test [opts]
-  (let [fault-cfg (local-fault-config opts)]
+  (let [local-fault-cfg (local-fault-config opts)
+        remote-cfg (remote-config opts)
+        remote-fault-cfg (fault-enabled-config remote-cfg)
+        fault-cfg (or remote-fault-cfg local-fault-cfg)]
     (merge tests/noop-test
            opts
            (workload fault-cfg)
            {:name "moreconsensus-epaxos-kv"}
+           (when remote-cfg
+             {:db (kvnode-db remote-cfg)
+              :http-port (:http-port remote-cfg)})
            (when fault-cfg
-             {:nemesis (local-fault-nemesis fault-cfg)}))))
+             {:nemesis (if remote-fault-cfg
+                         (remote-fault-nemesis fault-cfg)
+                         (local-fault-nemesis fault-cfg))}))))
 
 (defn -main [& args]
   (cli/run! (cli/single-test-cmd {:test-fn moreconsensus-test}) args))

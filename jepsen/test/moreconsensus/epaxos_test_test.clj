@@ -4,6 +4,9 @@
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
+            [jepsen.control :as control]
+            [jepsen.control.util :as cu]
+            [jepsen.db :as db]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as nemesis]
             [moreconsensus.epaxos-test :as epaxos]))
@@ -89,6 +92,34 @@
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
 
+(deftest remote-config-is-opt-in-and-builds-peer-urls-for-bare-nodes
+  (let [nodes ["alpha" "bravo"]
+        env {"REMOTE" "yes"
+             "FAULTS" "restart"
+             "BIN" "/opt/kvnode"
+             "HTTP_PORT" "19090"
+             "REMOTE_DIR" "/srv/kv"}]
+    (testing "remote harness stays disabled unless explicitly requested"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc env "REMOTE" "0"))]
+        (is (nil? (epaxos/remote-config {:nodes nodes})))))
+    (testing "bare hostnames get stable node ids and peer URLs on the configured HTTP port"
+      (with-redefs [epaxos/fault-env (fault-env-from env)]
+        (let [cfg (epaxos/remote-config {:nodes nodes})]
+          (is (= {:faults "restart"
+                  :bin "/opt/kvnode"
+                  :remote-dir "/srv/kv"
+                  :http-port 19090
+                  :nodes nodes
+                  :node-ids {"alpha" 1 "bravo" 2}
+                  :peers "1=http://alpha:19090,2=http://bravo:19090"}
+                 cfg))
+          (is (= "1=http://alpha:19090,2=http://bravo:19090"
+                 (epaxos/peer-spec cfg)))
+          (is (= "alpha:19090"
+                 (epaxos/http-node cfg "alpha")))
+          (is (= "bravo:7777"
+                 (epaxos/http-node cfg "bravo:7777"))))))))
+
 (deftest local-restart-generator-emits-node-restarts-in-order
   (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
         ops (take 9 (epaxos/local-restart-generator nodes))]
@@ -116,6 +147,16 @@
             {:type :info :f :heal-storage :value "127.0.0.1:9101"}
             {:type :info :f :fail-storage :value "127.0.0.1:9102"}
             {:type :info :f :heal-storage :value "127.0.0.1:9102"}]
+           (fault-ops ops)))
+    (is (= 8 (count ops)))))
+
+(deftest local-destructive-storage-generator-emits-remove-and-restore-in-order
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        ops (take 9 (epaxos/destructive-storage-generator nodes))]
+    (is (= [{:type :info :f :remove-storage :value "127.0.0.1:9101"}
+            {:type :info :f :restore-storage :value "127.0.0.1:9101"}
+            {:type :info :f :remove-storage :value "127.0.0.1:9102"}
+            {:type :info :f :restore-storage :value "127.0.0.1:9102"}]
            (fault-ops ops)))
     (is (= 8 (count ops)))))
 
@@ -367,6 +408,261 @@
                   :content-type :json
                   :throw-exceptions false}]]
                @requests))))))
+
+(deftest local-destructive-storage-nemesis-removes-and-restores-selected-storage
+  (let [cfg {:faults "destructive-storage"
+             :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+        calls (atom [])]
+    (with-redefs [epaxos/remove-local-storage! (fn [seen-cfg node]
+                                                (swap! calls conj [:remove seen-cfg node])
+                                                {:node node :action :storage-removed})
+                  epaxos/restore-local-storage! (fn [seen-cfg node]
+                                                 (swap! calls conj [:restore seen-cfg node])
+                                                 {:node node :action :storage-restored})]
+      (let [nemesis (epaxos/local-fault-nemesis cfg)
+            remove-op (nemesis/invoke! nemesis {}
+                                       {:type :invoke
+                                        :f :remove-storage
+                                        :value "127.0.0.1:9101"})
+            restore-op (nemesis/invoke! nemesis {}
+                                        {:type :invoke
+                                         :f :restore-storage
+                                         :value "127.0.0.1:9102"})]
+        (is (= [[:remove cfg "127.0.0.1:9101"]
+                [:restore cfg "127.0.0.1:9102"]]
+               @calls))
+        (is (= {:type :info
+                :f :remove-storage
+                :value {:node "127.0.0.1:9101" :action :storage-removed}}
+               (select-keys remove-op [:type :f :value])))
+        (is (= {:type :info
+                :f :restore-storage
+                :value {:node "127.0.0.1:9102" :action :storage-restored}}
+               (select-keys restore-op [:type :f :value])))))))
+
+(deftest remote-restore-storage-leaves-live-data-when-backup-is-absent
+  (let [cfg {:remote-dir "/srv/kv"
+             :node-ids {"alpha" 1}}
+        calls (atom [])]
+    (with-redefs [cu/exists? (fn [path]
+                               (swap! calls conj [:exists path])
+                               false)
+                  control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 (throw (ex-info "must not remove live data without a backup" {})))
+                  epaxos/stop-remote-node! (fn [_ _]
+                                             (throw (ex-info "must not stop a node without a backup" {})))
+                  epaxos/start-remote-node! (fn [_ _]
+                                              (throw (ex-info "must not restart a node without a backup" {})))]
+      (is (= {:node "alpha" :action :storage-unchanged}
+             (epaxos/restore-remote-storage! cfg "alpha")))
+      (is (= [[:exists "/srv/kv/node-1.removed"]]
+             @calls)))))
+
+(deftest remote-start-node-constructs-command-from-node-id-port-and-peer-spec
+  (let [cfg {:remote-dir "/srv/kv"
+             :http-port 19090
+             :node-ids {"alpha" 1 "bravo" 2}
+             :peers "1=http://alpha:19090,2=http://bravo:19090"}
+        calls (atom [])]
+    (with-redefs [control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 {:exit 0})
+                  cu/start-daemon! (fn [opts cmd & args]
+                                     (swap! calls conj [:start-daemon opts cmd (vec args)])
+                                     :started)
+                  epaxos/wait-node-health (fn [_ node]
+                                            (swap! calls conj [:health node])
+                                            {:status 200 :healthy true})]
+      (is (= {:node "bravo"
+              :action :started
+              :status 200
+              :healthy true}
+             (epaxos/start-remote-node! cfg "bravo")))
+      (is (= [[:exec :mkdir :-p "/srv/kv/node-2"]
+              [:start-daemon {:logfile "/srv/kv/node-2.log"
+                              :pidfile "/srv/kv/node-2.pid"
+                              :chdir "/srv/kv"}
+               "/srv/kv/kvnode"
+               ["-id" "2"
+                "-listen" ":19090"
+                "-data" "/srv/kv/node-2"
+                "-peers" "1=http://alpha:19090,2=http://bravo:19090"]]
+              [:health "bravo"]]
+             @calls)))))
+
+(deftest kvnode-db-setup-uploads-cleans-and-starts-selected-remote-node
+  (let [cfg {:bin "/opt/kvnode"
+             :remote-dir "/srv/kv"
+             :http-port 19090
+             :node-ids {"alpha" 1}
+             :peers "1=http://alpha:19090"}
+        calls (atom [])]
+    (with-redefs [control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 {:exit 0})
+                  control/upload (fn [source dest]
+                                   (swap! calls conj [:upload source dest]))
+                  cu/stop-daemon! (fn [pid-file]
+                                    (swap! calls conj [:stop-daemon pid-file])
+                                    :stopped)
+                  cu/start-daemon! (fn [opts cmd & args]
+                                     (swap! calls conj [:start-daemon opts cmd (vec args)])
+                                     :started)
+                  epaxos/wait-node-health (fn [_ node]
+                                            (swap! calls conj [:health node])
+                                            {:status 200 :healthy true})]
+      (is (= {:node "alpha"
+              :action :started
+              :status 200
+              :healthy true}
+             (db/setup! (epaxos/kvnode-db cfg) {:http-port 19090} "alpha")))
+      (is (= [[:exec :mkdir :-p "/srv/kv"]
+              [:upload "/opt/kvnode" "/srv/kv/kvnode"]
+              [:exec :chmod :+x "/srv/kv/kvnode"]
+              [:stop-daemon "/srv/kv/node-1.pid"]
+              [:exec :rm :-rf "/srv/kv/node-1" "/srv/kv/node-1.removed"]
+              [:exec :mkdir :-p "/srv/kv/node-1"]
+              [:start-daemon {:logfile "/srv/kv/node-1.log"
+                              :pidfile "/srv/kv/node-1.pid"
+                              :chdir "/srv/kv"}
+               "/srv/kv/kvnode"
+               ["-id" "1"
+                "-listen" ":19090"
+                "-data" "/srv/kv/node-1"
+                "-peers" "1=http://alpha:19090"]]
+              [:health "alpha"]]
+             @calls)))))
+
+(deftest remote-restart-nemesis-routes-selected-node-through-control
+  (let [cfg {:faults "restart"
+             :nodes ["alpha" "bravo"]}
+        calls (atom [])]
+    (with-redefs [control/on-nodes (fn [test nodes f]
+                                     (swap! calls conj [:on-nodes (:name test) nodes])
+                                     (into {} (map (fn [node] [node (f test node)]) nodes)))
+                  epaxos/stop-remote-node! (fn [seen-cfg node]
+                                             (swap! calls conj [:stop seen-cfg node])
+                                             {:node node :action :stopped})
+                  epaxos/start-remote-node! (fn [seen-cfg node]
+                                              (swap! calls conj [:start seen-cfg node])
+                                              {:node node :action :started})]
+      (let [nemesis (epaxos/remote-restart-nemesis cfg)
+            kill-op (nemesis/invoke! nemesis {:name "remote-test"}
+                                     {:type :invoke
+                                      :f :kill-node
+                                      :value "bravo"})
+            restart-op (nemesis/invoke! nemesis {:name "remote-test"}
+                                        {:type :invoke
+                                         :f :restart-node
+                                         :value "alpha"})]
+        (is (= [[:on-nodes "remote-test" ["bravo"]]
+                [:stop cfg "bravo"]
+                [:on-nodes "remote-test" ["alpha"]]
+                [:start cfg "alpha"]]
+               @calls))
+        (is (= {:type :info
+                :f :kill-node
+                :value {:node "bravo" :action :stopped}}
+               (select-keys kill-op [:type :f :value])))
+        (is (= {:type :info
+                :f :restart-node
+                :value {:node "alpha" :action :started}}
+               (select-keys restart-op [:type :f :value])))))))
+
+(deftest remote-destructive-storage-nemesis-routes-selected-node-through-control
+  (let [cfg {:faults "destructive-storage"
+             :nodes ["alpha" "bravo"]}
+        calls (atom [])]
+    (with-redefs [control/on-nodes (fn [test nodes f]
+                                     (swap! calls conj [:on-nodes (:name test) nodes])
+                                     (into {} (map (fn [node] [node (f test node)]) nodes)))
+                  epaxos/remove-remote-storage! (fn [seen-cfg node]
+                                                 (swap! calls conj [:remove seen-cfg node])
+                                                 {:node node :action :storage-removed})
+                  epaxos/restore-remote-storage! (fn [seen-cfg node]
+                                                  (swap! calls conj [:restore seen-cfg node])
+                                                  {:node node :action :storage-restored})]
+      (let [nemesis (epaxos/remote-destructive-storage-nemesis cfg)
+            remove-op (nemesis/invoke! nemesis {:name "remote-test"}
+                                       {:type :invoke
+                                        :f :remove-storage
+                                        :value "bravo"})
+            restore-op (nemesis/invoke! nemesis {:name "remote-test"}
+                                        {:type :invoke
+                                         :f :restore-storage
+                                         :value "alpha"})]
+        (is (= [[:on-nodes "remote-test" ["bravo"]]
+                [:remove cfg "bravo"]
+                [:on-nodes "remote-test" ["alpha"]]
+                [:restore cfg "alpha"]]
+               @calls))
+        (is (= {:type :info
+                :f :remove-storage
+                :value {:node "bravo" :action :storage-removed}}
+               (select-keys remove-op [:type :f :value])))
+        (is (= {:type :info
+                :f :restore-storage
+                :value {:node "alpha" :action :storage-restored}}
+               (select-keys restore-op [:type :f :value])))))))
+
+(deftest remote-storage-http-faults-use-configured-port-for-bare-hostnames
+  (let [cfg {:faults "storage"
+             :http-port 19090
+             :nodes ["alpha" "bravo"]}
+        requests (atom [])]
+    (with-redefs [http/post (fn [url opts]
+                              (swap! requests conj [url opts])
+                              {:status 204})]
+      (let [nemesis (epaxos/remote-fault-nemesis cfg)
+            op (nemesis/invoke! nemesis {}
+                                {:type :invoke
+                                 :f :fail-storage
+                                 :value "alpha"})]
+        (is (= {:type :info
+                :f :fail-storage
+                :value {:node "alpha:19090" :fail true :status 204}}
+               (select-keys op [:type :f :value])))
+        (is (= [["http://alpha:19090/faults/storage"
+                 {:body (json/write-str {"fail" true})
+                  :content-type :json
+                  :throw-exceptions false}]]
+               @requests))))))
+
+(deftest moreconsensus-test-prefers-remote-faults-when-local-env-also-matches
+  (let [nodes ["alpha" "bravo"]
+        env {"REMOTE" "true"
+             "FAULTS" "restart"
+             "BIN" "/opt/kvnode"
+             "DATA_DIR" "/tmp/data"
+             "PEERS" "127.0.0.1:9001,127.0.0.1:9002"
+             "PID_DIR" "/tmp/pids"
+             "BASE_PORT" "9000"
+             "HTTP_PORT" "19090"
+             "REMOTE_DIR" "/srv/kv"}
+        calls (atom [])]
+    (with-redefs [epaxos/fault-env (fault-env-from env)
+                  control/on-nodes (fn [test selected-nodes f]
+                                     (swap! calls conj [:on-nodes selected-nodes (:http-port test)])
+                                     (into {} (map (fn [node] [node (f test node)]) selected-nodes)))
+                  epaxos/stop-remote-node! (fn [cfg node]
+                                             (swap! calls conj [:remote-stop (:peers cfg) node])
+                                             {:node node :action :stopped})
+                  epaxos/stop-node! (fn [_ _]
+                                      (throw (ex-info "local restart nemesis should not be selected" {})))]
+      (let [test (epaxos/moreconsensus-test {:nodes nodes})
+            op (nemesis/invoke! (:nemesis test) test
+                                {:type :invoke
+                                 :f :kill-node
+                                 :value "bravo"})]
+        (is (= 19090 (:http-port test)))
+        (is (= [[:on-nodes ["bravo"] 19090]
+                [:remote-stop "1=http://alpha:19090,2=http://bravo:19090" "bravo"]]
+               @calls))
+        (is (= {:type :info
+                :f :kill-node
+                :value {:node "bravo" :action :stopped}}
+               (select-keys op [:type :f :value])))))))
 
 (deftest local-restart-nemesis-surfaces-invoke-errors
   (let [cfg {:nodes ["127.0.0.1:9101"]}]
