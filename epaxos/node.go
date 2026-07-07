@@ -302,7 +302,9 @@ func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
 	return ref, nil
 }
 
-// Step applies one validated transport message to the local node.
+// Step applies one validated transport message to the local node. It copies
+// command bytes before storing them, so callers may reuse decode buffers after
+// Step returns.
 func (n *RawNode) Step(m Message) error {
 	if m.To != n.id {
 		return ErrMessageRejected
@@ -343,7 +345,7 @@ func (n *RawNode) Ready() Ready {
 	rd := Ready{MustSync: n.pendingReady.MustSync}
 	rd.Records = make([]InstanceRecord, len(n.pendingReady.Records))
 	for i := range n.pendingReady.Records {
-		rd.Records[i] = n.pendingReady.Records[i].Clone()
+		rd.Records[i] = n.readyRecord(n.pendingReady.Records[i])
 	}
 	messageCount := len(n.pendingReady.Messages)
 	if n.maxReadyMessages > 0 && messageCount > n.maxReadyMessages {
@@ -405,7 +407,7 @@ func (n *RawNode) Status() StatusSnapshot {
 func (n *RawNode) handlePreAccept(m Message) {
 	attrs := n.computeAttrs(m.Command, m.Ref)
 	attrs = mergeAttrs(attrs, m.Attributes())
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: n.ownedCommand(m.Command)}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: inboundCommand(m.Command)}
 	if old := n.instances[m.Ref]; old != nil {
 		if old.rec.Status >= StatusCommitted {
 			n.sendCommitTo(m.From, old.rec)
@@ -469,7 +471,7 @@ func (n *RawNode) handleAccept(m Message) {
 			return
 		}
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: n.ownedCommand(m.Command)}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command)}
 	rec.Checksum = ChecksumRecord(rec)
 	n.instances[m.Ref] = &instance{rec: rec, phase: phaseAccept}
 	n.indexConflicts(rec)
@@ -503,7 +505,7 @@ func (n *RawNode) handleAcceptResp(m Message) {
 }
 
 func (n *RawNode) handleCommit(m Message) {
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusCommitted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: n.ownedCommand(m.Command)}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusCommitted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command)}
 	rec.Checksum = ChecksumRecord(rec)
 	old := n.instances[m.Ref]
 	if old != nil && old.rec.Status >= StatusCommitted && old.rec.Checksum == rec.Checksum {
@@ -680,7 +682,7 @@ func (n *RawNode) enqueueRecord(rec InstanceRecord) {
 	if rec.Checksum == ([32]byte{}) {
 		rec.Checksum = ChecksumRecord(rec)
 	}
-	n.pendingReady.Records = append(n.pendingReady.Records, rec.Clone())
+	n.pendingReady.Records = append(n.pendingReady.Records, n.readyRecord(rec))
 	n.pendingReady.MustSync = true
 }
 
@@ -696,12 +698,18 @@ func (n *RawNode) enqueueCommitted(c CommittedCommand) {
 	n.pendingReady.Committed = append(n.pendingReady.Committed, c.Clone())
 }
 
-func (n *RawNode) ownedCommand(cmd Command) Command {
+func (n *RawNode) readyRecord(rec InstanceRecord) InstanceRecord {
+	out := rec
+	out.Deps = append([]InstanceNum(nil), rec.Deps...)
 	if n.zeroCopy {
-		return cmd.Borrow()
+		out.Command = rec.Command.Borrow()
+	} else {
+		out.Command = rec.Command.Clone()
 	}
-	return cmd.Clone()
+	return out
 }
+
+func inboundCommand(cmd Command) Command { return cmd.Clone() }
 
 func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 	deps := n.q.deps()

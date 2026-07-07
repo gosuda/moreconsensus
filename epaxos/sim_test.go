@@ -155,7 +155,17 @@ func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 }
 
 func TestCodecChecksumZeroCopy(t *testing.T) {
-	m := Message{Type: MsgCommit, From: 1, To: 2, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload"), ConflictKeys: [][]byte{[]byte("k")}}, RecordStatus: StatusCommitted}
+	m := Message{
+		Type:         MsgCommit,
+		From:         1,
+		To:           2,
+		Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Ballot:       Ballot{Replica: 1},
+		Seq:          1,
+		Deps:         []InstanceNum{0, 0, 0},
+		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), ConflictKeys: [][]byte{[]byte("conflict-key-beta")}},
+		RecordStatus: StatusCommitted,
+	}
 	buf, err := EncodeMessage(make([]byte, 0, 128), m)
 	if err != nil {
 		t.Fatal(err)
@@ -164,8 +174,24 @@ func TestCodecChecksumZeroCopy(t *testing.T) {
 	if err := DecodeMessage(buf, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(out.Command.Payload, []byte("payload")) {
+	if !bytes.Equal(out.Command.Payload, []byte("payload-alpha")) {
 		t.Fatal("payload mismatch")
+	}
+	payloadOffset := bytes.Index(buf, []byte("payload-alpha"))
+	if payloadOffset < 0 {
+		t.Fatal("encoded payload bytes not found")
+	}
+	keyOffset := bytes.Index(buf, []byte("conflict-key-beta"))
+	if keyOffset < 0 {
+		t.Fatal("encoded conflict key bytes not found")
+	}
+	buf[payloadOffset] = 'P'
+	buf[keyOffset] = 'C'
+	if !bytes.Equal(out.Command.Payload, []byte("Payload-alpha")) {
+		t.Fatalf("decoded payload does not alias encoded buffer: %q", out.Command.Payload)
+	}
+	if len(out.Command.ConflictKeys) != 1 || !bytes.Equal(out.Command.ConflictKeys[0], []byte("Conflict-key-beta")) {
+		t.Fatalf("decoded conflict key does not alias encoded buffer: %q", out.Command.ConflictKeys)
 	}
 	buf[len(buf)-1] ^= 0xff
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrChecksumMismatch) {

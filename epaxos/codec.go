@@ -36,7 +36,8 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	return dst, nil
 }
 
-// DecodeMessage decodes a message using zero-copy slices backed by src.
+// DecodeMessage decodes a message. Command payload and conflict-key byte slices
+// alias src; decoded metadata slices such as Deps are allocated.
 func DecodeMessage(src []byte, m *Message) error {
 	m.Reset()
 	if len(src) < len(wireMagic)+32 || string(src[:len(wireMagic)]) != string(wireMagic[:]) {

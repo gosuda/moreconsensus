@@ -109,7 +109,9 @@ type CommandID struct {
 //
 // Payload is opaque to the consensus core. ConflictKeys define the command's
 // commutativity relation: two user commands conflict when any conflict key is
-// byte-identical. Configuration changes conflict with every command.
+// byte-identical. Configuration changes conflict with every command. The core
+// never mutates Payload or ConflictKeys. Propose clones these slices unless
+// Config.ZeroCopyProposals is true.
 type Command struct {
 	ID           CommandID
 	Kind         CommandKind
@@ -140,7 +142,8 @@ func (c Command) Clone() Command {
 	return out
 }
 
-// Borrow returns the command unchanged and documents an ownership transfer.
+// Borrow returns the command unchanged when the caller transfers ownership of
+// its Payload and ConflictKeys slices to the node.
 func (c Command) Borrow() Command { return c }
 
 // ConflictsWith reports whether two commands must be ordered by dependencies.
@@ -204,15 +207,30 @@ func (c ConfState) Index(id ReplicaID) (int, bool) {
 
 // Config configures a RawNode.
 type Config struct {
-	ID                    ReplicaID
-	Voters                []ReplicaID
-	Storage               Storage
-	RetryTicks            uint64
-	RecoveryTicks         uint64
-	TimeOptimization      bool
+	// ID is the local replica id and must be present in Voters.
+	ID ReplicaID
+	// Voters is the complete voting configuration for the initial cluster.
+	Voters []ReplicaID
+	// Storage persists hard state and instance records. A nil Storage selects
+	// an in-memory implementation.
+	Storage Storage
+	// RetryTicks is the logical tick interval for protocol retransmission.
+	RetryTicks uint64
+	// RecoveryTicks is the logical tick interval for recovery attempts.
+	RecoveryTicks uint64
+	// TimeOptimization enables the EPaxos Revisited fast-wait optimization.
+	TimeOptimization bool
+	// TimeOptimizationTicks is the logical fast-wait duration before slow accept.
 	TimeOptimizationTicks uint64
-	ZeroCopyProposals     bool
-	MaxReadyMessages      int
+	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
+	// slices instead of cloning them. When true, the caller transfers ownership
+	// of those slices and must not mutate or reuse them while they remain
+	// observable through Ready or Status.
+	ZeroCopyProposals bool
+	// MaxReadyMessages caps Ready.Messages without capping durable records or
+	// committed application commands. A value less than one leaves messages
+	// uncapped.
+	MaxReadyMessages int
 }
 
 // HardState is the durable node-level state loaded before instances.

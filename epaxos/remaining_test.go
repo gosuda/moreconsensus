@@ -1,6 +1,7 @@
 package epaxos
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -58,18 +59,125 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	if _, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 5}); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("pending conf err=%v", err)
 	}
-	zr, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), ZeroCopyProposals: true})
+	zr, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1)})
 	if err != nil {
 		t.Fatal(err)
-	}
-	cmd := Command{Payload: []byte("owned"), ConflictKeys: [][]byte{[]byte("k")}}
-	if got := zr.ownedCommand(cmd); len(got.Payload) == 0 || &got.Payload[0] != &cmd.Payload[0] {
-		t.Fatal("zero-copy ownership branch copied payload")
 	}
 	inst := &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 9, Conf: 1}, Status: StatusCommitted, Deps: zr.q.deps(), Command: Command{Kind: CommandNoop}}, phase: phaseCommitted}
 	zr.startAccept(inst, inst.rec.Attributes())
 	zr.commit(inst, inst.rec.Attributes())
 	zr.schedule(inst, timerAccept, 0)
+}
+
+func TestProposalOwnershipCopiesCallerSlicesByDefault(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("caller-payload")
+	key := []byte("caller-key")
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, ConflictKeys: [][]byte{key}}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload[0] = 'C'
+	key[0] = 'C'
+
+	rd := rn.Ready()
+	if len(rd.Records) == 0 {
+		t.Fatal("expected proposed record in Ready")
+	}
+	got := rd.Records[0].Command
+	if !bytes.Equal(got.Payload, []byte("caller-payload")) {
+		t.Fatalf("default proposal retained caller payload slice: got %q", got.Payload)
+	}
+	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], []byte("caller-key")) {
+		t.Fatalf("default proposal retained caller conflict key slice: got %q", got.ConflictKeys)
+	}
+}
+
+func TestProposalOwnershipZeroCopyRetainsCallerSlices(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), ZeroCopyProposals: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("caller-payload")
+	key := []byte("caller-key")
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, ConflictKeys: [][]byte{key}}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload[0] = 'C'
+	key[0] = 'C'
+
+	rd := rn.Ready()
+	if len(rd.Records) == 0 {
+		t.Fatal("expected proposed record in Ready")
+	}
+	got := rd.Records[0].Command
+	if !bytes.Equal(got.Payload, []byte("Caller-payload")) {
+		t.Fatalf("zero-copy proposal copied caller payload slice: got %q", got.Payload)
+	}
+	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], []byte("Caller-key")) {
+		t.Fatalf("zero-copy proposal copied caller conflict key slice: got %q", got.ConflictKeys)
+	}
+}
+
+func TestInboundStepCopiesDecodedCommandDespiteZeroCopyProposals(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 2, Voters: makeIDs(3), ZeroCopyProposals: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPayload := []byte("inbound-payload-unique")
+	wantKey := []byte("inbound-conflict-key-unique")
+	msg := Message{
+		Type:    MsgPreAccept,
+		From:    1,
+		To:      2,
+		Ref:     InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Ballot:  Ballot{Replica: 1},
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0},
+		Command: Command{ID: CommandID{Client: 7, Sequence: 11}, Payload: wantPayload, ConflictKeys: [][]byte{wantKey}},
+	}
+	buf, err := EncodeMessage(make([]byte, 0, 128), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inbound Message
+	if err := DecodeMessage(buf, &inbound); err != nil {
+		t.Fatal(err)
+	}
+	if err := rn.Step(inbound); err != nil {
+		t.Fatal(err)
+	}
+
+	payloadOffset := bytes.Index(buf, wantPayload)
+	if payloadOffset < 0 {
+		t.Fatal("encoded payload bytes not found")
+	}
+	for i := range wantPayload {
+		buf[payloadOffset+i] = 'x'
+	}
+	keyOffset := bytes.Index(buf, wantKey)
+	if keyOffset < 0 {
+		t.Fatal("encoded conflict key bytes not found")
+	}
+	for i := range wantKey {
+		buf[keyOffset+i] = 'y'
+	}
+
+	rd := rn.Ready()
+	if len(rd.Records) != 1 {
+		t.Fatalf("ready records = %#v, want one inbound pre-accept record", rd.Records)
+	}
+	got := rd.Records[0].Command
+	if !bytes.Equal(got.Payload, wantPayload) {
+		t.Fatalf("inbound step retained decoded payload buffer: got %q want %q", got.Payload, wantPayload)
+	}
+	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], wantKey) {
+		t.Fatalf("inbound step retained decoded conflict key buffer: got %q want %q", got.ConflictKeys, wantKey)
+	}
 }
 
 func TestMaxReadyMessagesCapsOnlyMessages(t *testing.T) {
