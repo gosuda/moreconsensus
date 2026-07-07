@@ -24,6 +24,8 @@ A command is opaque payload plus explicit conflict keys. Two user commands confl
 
 The EPaxos dependency vector stores, for each voter in sorted configuration order, the latest known conflicting instance from that voter. The sequence number is one greater than the maximum sequence number of the dependencies observed while computing attributes.
 
+The Go implementation stores dependency vectors as per-replica instance-number prefixes for the configuration pinned by the instance. During execution, a dependency value `k` for replica `r` means every locally known instance from replica `r` with instance number `<= k` in the same configuration is considered a dependency, except for the instance being executed. This matches EPaxos dependency-vector semantics while keeping the persisted representation compact.
+
 ## Quorums
 
 The implementation supports cluster sizes 1, 2, 3, 4, 5, 6, and 7 exactly. Slow quorum is majority: `n/2 + 1`. Fast quorum uses the conservative EPaxos formula `n - ((n - 1) / 4)`, yielding this table:
@@ -64,9 +66,11 @@ The implementation includes prepare/recovery message types and a timer-driven re
 
 ## Execution ordering
 
-Committed records are not emitted directly. The node builds a dependency graph over committed but unexecuted instances. Edges point from an instance to each committed dependency in its dependency vector. Strongly connected components are collapsed. A component is executable when all dependencies outside the component are already executed or absent. Commands inside a component are emitted in deterministic `(Seq, ReplicaID, InstanceNum)` order.
+Committed records are not emitted directly. The node builds a dependency graph over committed but unexecuted instances. Edges point from an instance to each locally known committed dependency represented by its dependency vector. Strongly connected components are collapsed. A component is executable when all dependencies outside the component are already executed or absent. Commands inside a component are emitted in deterministic `(Seq, ReplicaID, InstanceNum)` order.
 
 The executor also waits when it knows a conflicting pre-accepted or accepted instance that has not committed yet. This prevents a replica from emitting a command while a known conflicting command is still unresolved.
+
+User commands are emitted to the embedding application through `Ready.Committed`. No-op recovery commands have no application effect. Configuration changes are applied inside the core when their component executes because they update future quorum membership.
 
 ## Configuration changes
 
@@ -74,7 +78,9 @@ The executor also waits when it knows a conflicting pre-accepted or accepted ins
 
 ## Ready contract
 
-`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` are application commands that have passed dependency execution. The embedding application must persist records before sending messages from the same `Ready`. `MustSync` is true when durable records are present. `Advance` tells the node the batch was persisted, sent, and applied according to the application policy.
+`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` contains user commands that have passed dependency execution and must be applied by the embedding application before they are acknowledged. The embedding application must persist records before sending messages from the same `Ready`. `MustSync` is true when durable records are present.
+
+`Advance` acknowledges the obligations in the previously returned `Ready`. For user commands, `Advance` queues the corresponding `StatusExecuted` records only after the application has observed `Ready.Committed`; those executed markers appear in a later `Ready.Records` batch and make replay after restart idempotent. Configuration changes and no-op commands do not appear in `Ready.Committed`; their executed records are queued internally when they execute.
 
 ## Checksums and serialization
 

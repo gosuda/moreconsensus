@@ -13,7 +13,7 @@
 - Deterministic simulation tests for cluster sizes 1 through 7.
 - A Pebble-backed distributed key-value example in its own Go module, including atomic Pebble persistence for EPaxOS records and applied key-value writes.
 - The example HTTP service is built explicitly with `go build -tags kvnode ./cmd/kvnode` from `examples/kv`.
-- Repository verification gates run from `tests/ci.sh` and are wired into GitHub Actions CI.
+- Repository verification gates run from `tests/ci.sh`, including local Jepsen restart, transport-partition, and storage-unavailable profiles, and are wired into GitHub Actions CI.
 
 ## Documentation
 
