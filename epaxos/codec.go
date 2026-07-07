@@ -41,7 +41,7 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 func DecodeMessage(src []byte, m *Message) error {
 	m.Reset()
 	if len(src) < len(wireMagic)+32 || string(src[:len(wireMagic)]) != string(wireMagic[:]) {
-		return ErrInvalidMessage
+		return decodeMessageError(m, ErrInvalidMessage)
 	}
 	p := parser{b: src[len(wireMagic) : len(src)-32]}
 	m.Type = MessageType(p.uvarint())
@@ -52,7 +52,7 @@ func DecodeMessage(src []byte, m *Message) error {
 	m.Seq = p.uvarint()
 	deps := p.uvarint()
 	if deps > 128 {
-		return ErrInvalidMessage
+		return decodeMessageError(m, ErrInvalidMessage)
 	}
 	m.Deps = make([]InstanceNum, int(deps))
 	for i := range m.Deps {
@@ -63,13 +63,18 @@ func DecodeMessage(src []byte, m *Message) error {
 	m.RejectHint = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
 	m.RecordStatus = Status(p.uvarint())
 	if p.err || len(p.b) != 0 {
-		return ErrInvalidMessage
+		return decodeMessageError(m, ErrInvalidMessage)
 	}
 	copy(m.Checksum[:], src[len(src)-32:])
 	if !VerifyMessageChecksum(*m) {
-		return ErrChecksumMismatch
+		return decodeMessageError(m, ErrChecksumMismatch)
 	}
 	return nil
+}
+
+func decodeMessageError(m *Message, err error) error {
+	m.Reset()
+	return err
 }
 
 func appendCommand(dst []byte, c Command) []byte {

@@ -466,8 +466,16 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	rn.Advance(rd)
+	executedReady := rn.Ready()
+	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
+	}
+	if err := store.ApplyReady(executedReady); err != nil {
+		t.Fatal(err)
+	}
+	rn.Advance(executedReady)
 	if rn.HasReady() {
-		t.Fatal("node still has ready work after retry and advance")
+		t.Fatal("node still has ready work after executed record")
 	}
 	persisted, ok := store.Instance(ref)
 	if !ok {

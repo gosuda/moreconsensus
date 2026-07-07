@@ -119,6 +119,58 @@ func TestHandleTxnRejectsMalformedJSONAndInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestHandleTxnAcceptsDuplicateKeysAndAppliesInPayloadOrder(t *testing.T) {
+	s := newTestService(t)
+	seed := httptest.NewRecorder()
+	s.handleKV(seed, httptest.NewRequest(http.MethodPut, "/kv/alpha", bytes.NewReader([]byte("before"))))
+	if seed.Code != http.StatusNoContent {
+		t.Fatalf("seed status=%d body=%q", seed.Code, seed.Body.String())
+	}
+
+	rr := httptest.NewRecorder()
+	body := []byte(`[{"key":"alpha","value":"after"},{"key":"alpha","delete":true},{"key":"alpha","value":"final"}]`)
+	s.handleTxn(rr, httptest.NewRequest(http.MethodPost, "/txn", bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	requireKVValue(t, s, "alpha", "final")
+	scan, err := s.db.Scan(kv.ScanOptions{Prefix: []byte("alpha")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 || string(scan[0].Value) != "final" || scan[0].Time != 2 {
+		t.Fatalf("scan=%#v", scan)
+	}
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	if !hasExecutedRef(s.node.Status().Executed, ref) {
+		t.Fatalf("executed refs=%v, want %s", s.node.Status().Executed, ref)
+	}
+}
+
+func TestHandleTxnAcceptsDuplicateKeysWithFinalDelete(t *testing.T) {
+	s := newTestService(t)
+	seed := httptest.NewRecorder()
+	s.handleKV(seed, httptest.NewRequest(http.MethodPut, "/kv/alpha", bytes.NewReader([]byte("before"))))
+	if seed.Code != http.StatusNoContent {
+		t.Fatalf("seed status=%d body=%q", seed.Code, seed.Body.String())
+	}
+
+	rr := httptest.NewRecorder()
+	body := []byte(`[{"key":"alpha","value":"after"},{"key":"alpha","delete":true}]`)
+	s.handleTxn(rr, httptest.NewRequest(http.MethodPost, "/txn", bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	requireKVMissing(t, s, "alpha")
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	if !hasExecutedRef(s.node.Status().Executed, ref) {
+		t.Fatalf("executed refs=%v, want %s", s.node.Status().Executed, ref)
+	}
+}
+
+
 func TestHandleKVRepeatedPutWaitsForNewAppliedRef(t *testing.T) {
 	s := newTestService(t)
 	for i := 1; i <= 2; i++ {
@@ -203,6 +255,22 @@ func TestHandleScanRejectsBadQueryAndMethod(t *testing.T) {
 	}
 }
 
+func TestHandleScanRejectsNegativeLimit(t *testing.T) {
+	s := newTestService(t)
+	body := []byte(`[{"key":"scan-a","value":"one"},{"key":"scan-b","value":"two"}]`)
+	seed := httptest.NewRecorder()
+	s.handleTxn(seed, httptest.NewRequest(http.MethodPost, "/txn", bytes.NewReader(body)))
+	if seed.Code != http.StatusNoContent {
+		t.Fatalf("seed status=%d body=%q", seed.Code, seed.Body.String())
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleScan(rr, httptest.NewRequest(http.MethodGet, "/scan?prefix=scan-&limit=-1", nil))
+	if rr.Code != http.StatusBadRequest || rr.Body.String() != "bad limit\n" {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleKVRejectsBadKeysAndMethods(t *testing.T) {
 	s := newTestService(t)
 
@@ -231,6 +299,142 @@ func TestHandleMessageRejectsMalformedTransportPayload(t *testing.T) {
 	s.handleMessage(rr, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader([]byte("not an epaxos message"))))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleTransportFaultSetsListsAndClearsDroppedLinks(t *testing.T) {
+	s := newTestService(t)
+
+	setFirst := httptest.NewRecorder()
+	s.handleTransportFault(setFirst, httptest.NewRequest(http.MethodPost, "/faults/transport", bytes.NewReader([]byte(`{"from":2,"to":1,"drop":true}`))))
+	if setFirst.Code != http.StatusNoContent {
+		t.Fatalf("set first status=%d body=%q", setFirst.Code, setFirst.Body.String())
+	}
+	setSecond := httptest.NewRecorder()
+	s.handleTransportFault(setSecond, httptest.NewRequest(http.MethodPost, "/faults/transport", bytes.NewReader([]byte(`{"from":1,"to":3,"drop":true}`))))
+	if setSecond.Code != http.StatusNoContent {
+		t.Fatalf("set second status=%d body=%q", setSecond.Code, setSecond.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	s.handleTransportFault(list, httptest.NewRequest(http.MethodGet, "/faults/transport", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%q", list.Code, list.Body.String())
+	}
+	requireTransportDrops(t, list.Body.Bytes(), []transportFaultRequest{
+		{From: 1, To: 3, Drop: true},
+		{From: 2, To: 1, Drop: true},
+	})
+
+	clearOne := httptest.NewRecorder()
+	s.handleTransportFault(clearOne, httptest.NewRequest(http.MethodPost, "/faults/transport", bytes.NewReader([]byte(`{"from":1,"to":3,"drop":false}`))))
+	if clearOne.Code != http.StatusNoContent {
+		t.Fatalf("clear one status=%d body=%q", clearOne.Code, clearOne.Body.String())
+	}
+	listAfterClearOne := httptest.NewRecorder()
+	s.handleTransportFault(listAfterClearOne, httptest.NewRequest(http.MethodGet, "/faults/transport", nil))
+	requireTransportDrops(t, listAfterClearOne.Body.Bytes(), []transportFaultRequest{{From: 2, To: 1, Drop: true}})
+
+	clearAll := httptest.NewRecorder()
+	s.handleTransportFault(clearAll, httptest.NewRequest(http.MethodDelete, "/faults/transport", nil))
+	if clearAll.Code != http.StatusNoContent {
+		t.Fatalf("clear all status=%d body=%q", clearAll.Code, clearAll.Body.String())
+	}
+	listAfterClearAll := httptest.NewRecorder()
+	s.handleTransportFault(listAfterClearAll, httptest.NewRequest(http.MethodGet, "/faults/transport", nil))
+	requireTransportDrops(t, listAfterClearAll.Body.Bytes(), nil)
+}
+
+func TestHandleTransportFaultRejectsMalformedRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		body   []byte
+		want   int
+	}{
+		{name: "wrong method", method: http.MethodPut, want: http.StatusMethodNotAllowed},
+		{name: "malformed json", method: http.MethodPost, body: []byte(`{"from":`), want: http.StatusBadRequest},
+		{name: "zero source", method: http.MethodPost, body: []byte(`{"from":0,"to":1,"drop":true}`), want: http.StatusBadRequest},
+		{name: "zero destination", method: http.MethodPost, body: []byte(`{"from":1,"to":0,"drop":true}`), want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleTransportFault(rr, httptest.NewRequest(tc.method, "/faults/transport", bytes.NewReader(tc.body)))
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			list := httptest.NewRecorder()
+			s.handleTransportFault(list, httptest.NewRequest(http.MethodGet, "/faults/transport", nil))
+			requireTransportDrops(t, list.Body.Bytes(), nil)
+		})
+	}
+}
+
+func TestSendDropsConfiguredOutgoingTransportLinkWithoutPostingOrQueueing(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	posts := 0
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		posts++
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.setTransportDrop(1, 2, true)
+
+	msg := epaxos.Message{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}}
+	s.send([]epaxos.Message{msg})
+
+	if posts != 0 {
+		t.Fatalf("posts=%d", posts)
+	}
+	if len(s.sendq) != 0 {
+		t.Fatalf("queued messages=%d", len(s.sendq))
+	}
+}
+
+func TestHandleMessageDropsConfiguredInboundTransportLinkBeforeSteppingNode(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
+	s.setTransportDrop(2, 1, true)
+	msg := epaxos.Message{
+		Type:    epaxos.MsgPreAccept,
+		From:    2,
+		To:      1,
+		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:  epaxos.Ballot{Replica: 2},
+		Seq:     1,
+		Deps:    []epaxos.InstanceNum{0, 0},
+		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, ConflictKeys: [][]byte{[]byte("blocked")}},
+	}
+	buf, err := epaxos.EncodeMessage(nil, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleMessage(rr, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(buf)))
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	status := s.node.Status()
+	if len(status.Instances) != 0 || len(status.Executed) != 0 {
+		t.Fatalf("node status after dropped message: instances=%v executed=%v", status.Instances, status.Executed)
+	}
+}
+
+func requireTransportDrops(t *testing.T, body []byte, want []transportFaultRequest) {
+	t.Helper()
+	var got []transportFaultRequest
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("drops=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("drops=%v, want %v", got, want)
+		}
 	}
 }
 
@@ -274,6 +478,25 @@ func newTestService(t *testing.T) *service {
 		t.Fatal(err)
 	}
 	return &service{id: 1, node: node, ready: db, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
+}
+
+func newTestClusterService(t *testing.T, voters []epaxos.ReplicaID) *service {
+	t.Helper()
+	db, err := kv.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store := db.EPaxosStorage()
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peers := make(map[epaxos.ReplicaID]string, len(voters))
+	for _, voter := range voters {
+		peers[voter] = "http://127.0.0.1"
+	}
+	return &service{id: 1, node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
 }
 
 func TestSendPostsOnlyConfiguredRemotePeers(t *testing.T) {

@@ -35,7 +35,7 @@
                  (select-keys op [:type :process :f :value]))))
        vec))
 
-(deftest local-fault-config-requires-restart-fault
+(deftest local-fault-config-requires-enabled-local-fault
   (let [base-env {"BIN" "/tmp/kvnode"
                   "DATA_DIR" "/tmp/data"
                   "PEERS" "127.0.0.1:9001,127.0.0.1:9002"
@@ -56,10 +56,25 @@
              "PID_DIR" "/var/run/moreconsensus"
              "BASE_PORT" "9100"}]
     (with-redefs [epaxos/fault-env (fault-env-from env)]
-      (is (= {:bin "/opt/moreconsensus/kvnode"
+      (is (= {:faults "restart"
+              :bin "/opt/moreconsensus/kvnode"
               :data-dir "/var/lib/moreconsensus"
               :peers "127.0.0.1:9101,127.0.0.1:9102"
               :pid-dir "/var/run/moreconsensus"
+              :base-port 9100
+              :nodes nodes}
+             (epaxos/local-fault-config {:nodes nodes}))))))
+
+(deftest local-fault-config-uses-provided-transport-env
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        env {"FAULTS" "transport"
+             "BIN" "/opt/moreconsensus/kvnode"
+             "DATA_DIR" "/var/lib/moreconsensus"
+             "PEERS" "127.0.0.1:9101,127.0.0.1:9102"
+             "PID_DIR" "/var/run/moreconsensus"
+             "BASE_PORT" "9100"}]
+    (with-redefs [epaxos/fault-env (fault-env-from env)]
+      (is (= {:faults "transport"
               :base-port 9100
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
@@ -74,27 +89,53 @@
            (fault-ops ops)))
     (is (= 8 (count ops)))))
 
+(deftest local-transport-generator-emits-isolate-and-heal-in-order
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        ops (take 9 (epaxos/local-transport-generator nodes))]
+    (is (= [{:type :info :f :isolate-node :value "127.0.0.1:9101"}
+            {:type :info :f :heal-node :value "127.0.0.1:9101"}
+            {:type :info :f :isolate-node :value "127.0.0.1:9102"}
+            {:type :info :f :heal-node :value "127.0.0.1:9102"}]
+           (fault-ops ops)))
+    (is (= 8 (count ops)))))
+
 (deftest workload-routes-client-and-nemesis-generators
-  (let [fault-cfg {:nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
-        client-generator (:generator (epaxos/workload fault-cfg))
-        nemesis-generator (:generator (epaxos/workload fault-cfg))
-        [client-op] (generated-ops-for client-generator 0 1)
-        nemesis-faults (fault-ops (generated-ops-for nemesis-generator :nemesis 4))]
-    (is (= :invoke (:type client-op)))
-    (is (= 0 (:process client-op)))
-    (is (contains? client-operation-fs (:f client-op)))
-    (is (= [{:type :info
-             :process :nemesis
-             :f :kill-node
-             :value "127.0.0.1:9101"}
-            {:type :info
-             :process :nemesis
-             :f :restart-node
-             :value "127.0.0.1:9101"}]
-           nemesis-faults))))
+  (testing "restart faults keep the node restart nemesis operations"
+    (let [fault-cfg {:faults "restart"
+                     :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+          generator (:generator (epaxos/workload fault-cfg))
+          [client-op] (generated-ops-for generator 0 1)
+          nemesis-faults (fault-ops (take 5 (epaxos/local-fault-generator fault-cfg)))]
+      (is (= :invoke (:type client-op)))
+      (is (= 0 (:process client-op)))
+      (is (contains? client-operation-fs (:f client-op)))
+      (is (= [{:type :info
+               :f :kill-node
+               :value "127.0.0.1:9101"}
+              {:type :info
+               :f :restart-node
+               :value "127.0.0.1:9101"}]
+             nemesis-faults))))
+  (testing "transport faults select the isolate and heal nemesis operations"
+    (let [fault-cfg {:faults "transport"
+                     :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+          generator (:generator (epaxos/workload fault-cfg))
+          [client-op] (generated-ops-for generator 0 1)
+          nemesis-faults (fault-ops (take 5 (epaxos/local-fault-generator fault-cfg)))]
+      (is (= :invoke (:type client-op)))
+      (is (= 0 (:process client-op)))
+      (is (contains? client-operation-fs (:f client-op)))
+      (is (= [{:type :info
+               :f :isolate-node
+               :value "127.0.0.1:9101"}
+              {:type :info
+               :f :heal-node
+               :value "127.0.0.1:9101"}]
+             nemesis-faults)))))
 
 (deftest local-restart-nemesis-stops-and-starts-selected-node
-  (let [cfg {:nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+  (let [cfg {:faults "restart"
+             :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
         calls (atom [])]
     (with-redefs [epaxos/stop-node! (fn [seen-cfg node]
                                       (swap! calls conj [:stop seen-cfg node])
@@ -102,7 +143,7 @@
                   epaxos/start-node! (fn [seen-cfg node]
                                        (swap! calls conj [:start seen-cfg node])
                                        {:node node :action :started})]
-      (let [nemesis (epaxos/local-restart-nemesis cfg)
+      (let [nemesis (epaxos/local-fault-nemesis cfg)
             kill-op (nemesis/invoke! nemesis {}
                                      {:type :invoke
                                       :f :kill-node
@@ -122,6 +163,47 @@
                 :f :restart-node
                 :value {:node "127.0.0.1:9102" :action :started}}
                (select-keys restart-op [:type :f :value])))))))
+
+(deftest local-transport-nemesis-issues-control-requests-for-source-and-destination-pairs
+  (let [cfg {:faults "transport"
+             :base-port 9100
+             :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+        calls (atom [])]
+    (with-redefs [epaxos/transport-fault-request! (fn [node from to drop?]
+                                                   (swap! calls conj [node from to drop?])
+                                                   {:node node :from from :to to :drop drop? :status 204})]
+      (let [nemesis (epaxos/local-fault-nemesis cfg)
+            isolate-op (nemesis/invoke! nemesis {}
+                                        {:type :invoke
+                                         :f :isolate-node
+                                         :value "127.0.0.1:9101"})
+            heal-op (nemesis/invoke! nemesis {}
+                                     {:type :invoke
+                                      :f :heal-node
+                                      :value "127.0.0.1:9101"})]
+        (is (= [["127.0.0.1:9101" 1 2 true]
+                ["127.0.0.1:9101" 2 1 true]
+                ["127.0.0.1:9102" 1 2 true]
+                ["127.0.0.1:9102" 2 1 true]
+                ["127.0.0.1:9101" 1 2 false]
+                ["127.0.0.1:9101" 2 1 false]
+                ["127.0.0.1:9102" 1 2 false]
+                ["127.0.0.1:9102" 2 1 false]]
+               @calls))
+        (is (= {:type :info
+                :f :isolate-node
+                :value [{:node "127.0.0.1:9101" :from 1 :to 2 :drop true :status 204}
+                        {:node "127.0.0.1:9101" :from 2 :to 1 :drop true :status 204}
+                        {:node "127.0.0.1:9102" :from 1 :to 2 :drop true :status 204}
+                        {:node "127.0.0.1:9102" :from 2 :to 1 :drop true :status 204}]}
+               (select-keys isolate-op [:type :f :value])))
+        (is (= {:type :info
+                :f :heal-node
+                :value [{:node "127.0.0.1:9101" :from 1 :to 2 :drop false :status 204}
+                        {:node "127.0.0.1:9101" :from 2 :to 1 :drop false :status 204}
+                        {:node "127.0.0.1:9102" :from 1 :to 2 :drop false :status 204}
+                        {:node "127.0.0.1:9102" :from 2 :to 1 :drop false :status 204}]}
+               (select-keys heal-op [:type :f :value])))))))
 
 (deftest local-restart-nemesis-surfaces-invoke-errors
   (let [cfg {:nodes ["127.0.0.1:9101"]}]
@@ -175,6 +257,23 @@
                                 epaxos/txn-key-groups))]
              (epaxos/scan-values "http://node"))))))
 
+(deftest mutation-result-classifies-submitted-mutations
+  (testing "successful mutation responses complete the operation"
+    (is (= {:type :ok :f :write :value 6}
+           (select-keys (epaxos/mutation-result {:type :invoke :f :write :value 6}
+                                                {:status 204})
+                        [:type :f :value]))))
+  (testing "server-side mutation responses are indeterminate and preserve the status"
+    (is (= {:type :info :f :write :value 3 :error 503}
+           (select-keys (epaxos/mutation-result {:type :invoke :f :write :value 3}
+                                                {:status 503})
+                        [:type :f :value :error]))))
+  (testing "client-side mutation responses are definite failures and preserve the status"
+    (is (= {:type :fail :f :write :value 4 :error 400}
+           (select-keys (epaxos/mutation-result {:type :invoke :f :write :value 4}
+                                                {:status 400})
+                        [:type :f :value :error])))))
+
 (deftest normalize-register-op-treats-delete-as-register-clear
   (testing "successful deletes become nil writes for the knossos register model"
     (is (= {:type :ok :f :write :value nil}
@@ -197,6 +296,17 @@
                    {:type :ok :process 0 :f :delete}
                    {:type :invoke :process 0 :f :read}
                    {:type :ok :process 0 :f :read :value nil}]
+          result (check-register-history history)]
+      (is (= true (:valid? result))))))
+
+(deftest register-linearizable-checker-accepts-observed-info-write
+  (testing "an indeterminate write may be linearized when a later read observes its value"
+    (let [history [{:type :invoke :process 0 :f :write :value 6}
+                   {:type :ok :process 0 :f :write :value 6}
+                   {:type :invoke :process 1 :f :write :value 3}
+                   {:type :info :process 1 :f :write :value 3 :error 503}
+                   {:type :invoke :process 2 :f :read}
+                   {:type :ok :process 2 :f :read :value 3}]
           result (check-register-history history)]
       (is (= true (:valid? result))))))
 

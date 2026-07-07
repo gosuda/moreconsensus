@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,15 +27,28 @@ type readyApplier interface {
 }
 
 type service struct {
-	mu      sync.Mutex
-	id      epaxos.ReplicaID
-	node    *epaxos.RawNode
-	ready   readyApplier
-	db      *kv.DB
-	peers   map[epaxos.ReplicaID]string
-	client  *http.Client
-	sendq   chan epaxos.Message
-	nextSeq uint64
+	mu             sync.Mutex
+	faultMu        sync.RWMutex
+	id             epaxos.ReplicaID
+	node           *epaxos.RawNode
+	ready          readyApplier
+	db             *kv.DB
+	peers          map[epaxos.ReplicaID]string
+	client         *http.Client
+	sendq          chan epaxos.Message
+	nextSeq        uint64
+	transportDrops map[transportLink]struct{}
+}
+
+type transportLink struct {
+	from epaxos.ReplicaID
+	to   epaxos.ReplicaID
+}
+
+type transportFaultRequest struct {
+	From epaxos.ReplicaID `json:"from"`
+	To   epaxos.ReplicaID `json:"to"`
+	Drop bool             `json:"drop"`
 }
 
 func main() {
@@ -57,7 +71,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 1024), nextSeq: 1}
+	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 1024), nextSeq: 1, transportDrops: make(map[transportLink]struct{})}
 	for range 8 {
 		go s.transportWorker()
 	}
@@ -66,6 +80,7 @@ func main() {
 	mux.HandleFunc("/txn", s.handleTxn)
 	mux.HandleFunc("/scan", s.handleScan)
 	mux.HandleFunc("/epaxos/message", s.handleMessage)
+	mux.HandleFunc("/faults/transport", s.handleTransportFault)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	log.Printf("kvnode %d listening on %s", s.id, *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
@@ -192,6 +207,10 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if n < 0 {
+			http.Error(w, "bad limit", http.StatusBadRequest)
+			return
+		}
 		limit = n
 	}
 	reverse := false
@@ -237,6 +256,77 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+func (s *service) handleTransportFault(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		drops := s.transportDropSnapshot()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(drops)
+	case http.MethodPost:
+		var req transportFaultRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.From == 0 || req.To == 0 {
+			http.Error(w, "bad transport link", http.StatusBadRequest)
+			return
+		}
+		s.setTransportDrop(req.From, req.To, req.Drop)
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		s.clearTransportDrops()
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *service) setTransportDrop(from, to epaxos.ReplicaID, drop bool) {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	if s.transportDrops == nil {
+		s.transportDrops = make(map[transportLink]struct{})
+	}
+	link := transportLink{from: from, to: to}
+	if drop {
+		s.transportDrops[link] = struct{}{}
+		return
+	}
+	delete(s.transportDrops, link)
+}
+
+func (s *service) clearTransportDrops() {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	for link := range s.transportDrops {
+		delete(s.transportDrops, link)
+	}
+}
+
+func (s *service) transportDropSnapshot() []transportFaultRequest {
+	s.faultMu.RLock()
+	defer s.faultMu.RUnlock()
+	out := make([]transportFaultRequest, 0, len(s.transportDrops))
+	for link := range s.transportDrops {
+		out = append(out, transportFaultRequest{From: link.from, To: link.to, Drop: true})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].From != out[j].From {
+			return out[i].From < out[j].From
+		}
+		return out[i].To < out[j].To
+	})
+	return out
+}
+
+func (s *service) transportDropped(from, to epaxos.ReplicaID) bool {
+	s.faultMu.RLock()
+	defer s.faultMu.RUnlock()
+	_, ok := s.transportDrops[transportLink{from: from, to: to}]
+	return ok
+}
+
 func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -246,6 +336,10 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 	var msg epaxos.Message
 	if err := epaxos.DecodeMessage(body, &msg); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if s.transportDropped(msg.From, s.id) {
+		http.Error(w, "transport link dropped", http.StatusConflict)
 		return
 	}
 	s.mu.Lock()
@@ -360,6 +454,9 @@ func (s *service) send(messages []epaxos.Message) {
 func (s *service) postMessage(msg epaxos.Message) bool {
 	base := s.peers[msg.To]
 	if base == "" {
+		return true
+	}
+	if s.transportDropped(s.id, msg.To) {
 		return true
 	}
 	buf, err := epaxos.EncodeMessage(nil, msg)

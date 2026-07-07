@@ -16,7 +16,7 @@ if ! "$JAVA_BIN" -version >/dev/null 2>&1; then
   fi
 fi
 
-for cfg in tla/EPaxos.cfg tla/EPaxosKVConflict.cfg; do
+for cfg in tla/EPaxos.cfg tla/EPaxosKVConflict.cfg tla/EPaxosThreeReplica.cfg; do
   "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config "$cfg" tla/EPaxos.tla
   rm -rf states
 done

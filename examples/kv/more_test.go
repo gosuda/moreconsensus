@@ -494,6 +494,17 @@ func TestApplyReadyPersistsExecutedRecordAndKVAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	node.Advance(rd)
+	executedReady := node.Ready()
+	if len(executedReady.Committed) != 0 {
+		t.Fatalf("post-advance ready committed = %#v, want no replayed command", executedReady.Committed)
+	}
+	if len(executedReady.Records) != 1 || executedReady.Records[0].Ref != ref || executedReady.Records[0].Status != epaxos.StatusExecuted {
+		t.Fatalf("post-advance ready records = %#v, want one executed record for %s", executedReady.Records, ref)
+	}
+	if err := db.ApplyReady(executedReady); err != nil {
+		t.Fatal(err)
+	}
+	node.Advance(executedReady)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

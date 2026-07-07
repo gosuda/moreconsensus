@@ -507,19 +507,24 @@ func TestReadyPersistsExecutedStateForRestart(t *testing.T) {
 	if len(rd.Committed) != 1 || rd.Committed[0].Ref != ref || string(rd.Committed[0].Command.Payload) != "value" {
 		t.Fatalf("executed command not emitted in ready: %#v", rd.Committed)
 	}
-	var sawExecuted bool
-	for _, rec := range rd.Records {
-		if rec.Ref == ref && rec.Status == StatusExecuted {
-			sawExecuted = true
-		}
-	}
-	if !sawExecuted {
-		t.Fatalf("ready did not persist executed status for %s: %#v", ref, rd.Records)
+	if readyHasStatus(rd, ref, StatusExecuted) {
+		t.Fatalf("first ready persisted executed status before advance for %s: %#v", ref, rd.Records)
 	}
 	if err := store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
 	rn.Advance(rd)
+	executedReady := rn.Ready()
+	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
+	}
+	if err := store.ApplyReady(executedReady); err != nil {
+		t.Fatal(err)
+	}
+	rn.Advance(executedReady)
+	if rn.HasReady() {
+		t.Fatal("node still has ready work after executed record")
+	}
 	persisted, ok := store.Instance(ref)
 	if !ok {
 		t.Fatalf("stored record %s not found", ref)
@@ -628,6 +633,12 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 		t.Fatalf("commit was not applied before accept retry: %#v", rd.Committed)
 	}
 	rn.Advance(rd)
+
+	executedReady := rn.Ready()
+	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
+	}
+	rn.Advance(executedReady)
 
 	retry := Message{
 		Type:    MsgAccept,

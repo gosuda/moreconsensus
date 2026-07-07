@@ -137,6 +137,47 @@ func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
 	}
 }
 
+func TestCommandForTxnDeduplicatesConflictKeysAndKeepsPayloadOps(t *testing.T) {
+	cmd := CommandForTxn(7, 12, []TxnOp{
+		{Key: []byte("alpha"), Value: []byte("one")},
+		{Key: []byte("beta"), Value: []byte("two")},
+		{Delete: true, Key: []byte("alpha")},
+		{Key: []byte("alpha"), Value: []byte("three")},
+	})
+	if len(cmd.ConflictKeys) != 2 ||
+		string(cmd.ConflictKeys[0]) != "alpha" ||
+		string(cmd.ConflictKeys[1]) != "beta" {
+		t.Fatalf("conflict keys=%q", cmd.ConflictKeys)
+	}
+	wantPayload := []byte{
+		opTxn, 4,
+		opPut, 5, 'a', 'l', 'p', 'h', 'a', 3, 'o', 'n', 'e',
+		opPut, 4, 'b', 'e', 't', 'a', 3, 't', 'w', 'o',
+		opDelete, 5, 'a', 'l', 'p', 'h', 'a', 0,
+		opPut, 5, 'a', 'l', 'p', 'h', 'a', 5, 't', 'h', 'r', 'e', 'e',
+	}
+	if !bytes.Equal(cmd.Payload, wantPayload) {
+		t.Fatalf("payload=%v, want %v", cmd.Payload, wantPayload)
+	}
+
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: cmd}); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := db.Get([]byte("alpha"))
+	if err != nil || !ok || string(value) != "three" {
+		t.Fatalf("alpha value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.Get([]byte("beta"))
+	if err != nil || !ok || string(value) != "two" {
+		t.Fatalf("beta value=%q ok=%v err=%v", value, ok, err)
+	}
+}
+
 func TestDeleteCommandRejectsMalformedPayload(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {

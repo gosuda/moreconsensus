@@ -52,16 +52,28 @@
   (- (node-port node) (:base-port cfg)))
 
 (defn local-fault-config [opts]
-  (when (= "restart" (fault-env "FAULTS"))
-    (let [cfg {:bin (fault-env "BIN")
-               :data-dir (fault-env "DATA_DIR")
-               :peers (fault-env "PEERS")
-               :pid-dir (fault-env "PID_DIR")
-               :base-port (Long/parseLong (or (fault-env "BASE_PORT") "0"))
-               :nodes (:nodes opts)}]
-      (when (and (every? seq ((juxt :bin :data-dir :peers :pid-dir :nodes) cfg))
-                 (pos? (:base-port cfg)))
-        cfg))))
+  (let [faults (fault-env "FAULTS")
+        base-port (Long/parseLong (or (fault-env "BASE_PORT") "0"))
+        nodes (:nodes opts)]
+    (case faults
+      "restart"
+      (let [cfg {:faults faults
+                 :bin (fault-env "BIN")
+                 :data-dir (fault-env "DATA_DIR")
+                 :peers (fault-env "PEERS")
+                 :pid-dir (fault-env "PID_DIR")
+                 :base-port base-port
+                 :nodes nodes}]
+        (when (and (every? seq ((juxt :bin :data-dir :peers :pid-dir :nodes) cfg))
+                   (pos? (:base-port cfg)))
+          cfg))
+      "transport"
+      (let [cfg {:faults faults
+                 :base-port base-port
+                 :nodes nodes}]
+        (when (and (seq nodes) (pos? base-port))
+          cfg))
+      nil)))
 
 (defn pid-file [cfg node]
   (io/file (:pid-dir cfg) (str "node-" (local-node-id cfg node) ".pid")))
@@ -146,9 +158,79 @@
              {:type :info :f :restart-node :value node}])
           nodes))
 
+(defn transport-fault-request! [node from to drop?]
+  (let [resp (http/post (str (endpoint {} node) "/faults/transport")
+                        {:body (json/write-str {"from" from "to" to "drop" drop?})
+                         :content-type :json
+                         :throw-exceptions false})]
+    {:node node :from from :to to :drop drop? :status (:status resp)}))
+
+(defn transport-isolation-requests [cfg node]
+  (let [target (local-node-id cfg node)]
+    (vec
+     (for [peer (:nodes cfg)
+           :when (not= peer node)
+           controller (:nodes cfg)
+           :let [peer-id (local-node-id cfg peer)]
+           [from to] [[target peer-id] [peer-id target]]]
+       {:controller controller :from from :to to}))))
+
+(defn set-transport-isolation! [cfg node drop?]
+  (mapv (fn [{:keys [controller from to]}]
+          (transport-fault-request! controller from to drop?))
+        (transport-isolation-requests cfg node)))
+
+(defn local-transport-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this _ op]
+      (try
+        (case (:f op)
+          :isolate-node (assoc op :type :info :value (set-transport-isolation! cfg (:value op) true))
+          :heal-node (assoc op :type :info :value (set-transport-isolation! cfg (:value op) false))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "local transport nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this _]
+      (doseq [node (:nodes cfg)]
+        (try
+          (set-transport-isolation! cfg node false)
+          (catch Exception e
+            (warn e "local transport nemesis repair failed"))))
+      this)))
+
+(defn local-transport-generator [nodes]
+  (mapcat (fn [node]
+            [(gen/sleep 1)
+             {:type :info :f :isolate-node :value node}
+             (gen/sleep 1)
+             {:type :info :f :heal-node :value node}])
+          nodes))
+
+(defn local-fault-generator [cfg]
+  (case (:faults cfg)
+    "transport" (local-transport-generator (:nodes cfg))
+    (local-restart-generator (:nodes cfg))))
+
+(defn local-fault-nemesis [cfg]
+  (case (:faults cfg)
+    "transport" (local-transport-nemesis cfg)
+    (local-restart-nemesis cfg)))
+
 
 (defn ok-status? [status]
   (contains? #{200 201 202 204} status))
+
+(defn indeterminate-status? [status]
+  (and (integer? status) (<= 500 status)))
+
+(defn mutation-result [op resp]
+  (let [status (:status resp)]
+    (cond
+      (ok-status? status) (assoc op :type :ok)
+      (indeterminate-status? status) (assoc op :type :info :error status)
+      :else (assoc op :type :fail :error status))))
 
 (defn txn-group-for [n]
   (nth txn-group-ids (mod n (count txn-group-ids))))
@@ -229,9 +311,7 @@
           (let [resp (http/put (str base "/kv/" k)
                                {:body (pr-str (:value op))
                                 :throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :read
           (let [resp (http/get (str base "/kv/" k)
                                {:throw-exceptions false})]
@@ -242,42 +322,32 @@
           :delete
           (let [resp (http/delete (str base "/kv/" k)
                                   {:throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :txn-write
           (let [{:keys [group value]} (:value op)
                 resp (http/post (str base "/txn")
                                 {:body (txn-body group value)
                                  :content-type :json
                                  :throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :txn-delete
           (let [{:keys [group]} (:value op)
                 resp (http/post (str base "/txn")
                                 {:body (txn-delete-body group)
                                  :content-type :json
                                  :throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :scan-write
           (let [{:keys [key value]} (:value op)
                 resp (http/put (str base "/kv/" key)
                                {:body (pr-str value)
                                 :throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :scan-delete
           (let [{:keys [key]} (:value op)
                 resp (http/delete (str base "/kv/" key)
                                   {:throw-exceptions false})]
-            (if (ok-status? (:status resp))
-              (assoc op :type :ok)
-              (assoc op :type :fail :error (:status resp))))
+            (mutation-result op resp))
           :scan-forward
           (let [[status rows] (advanced-scan base false)]
             (if (= :ok status)
@@ -375,7 +445,7 @@
    (let [client-gen (client-workload-generator)]
      {:client (->KVClient nil)
       :generator (if fault-cfg
-                   (gen/clients client-gen (local-restart-generator (:nodes fault-cfg)))
+                   (gen/clients client-gen (local-fault-generator fault-cfg))
                    (gen/clients client-gen))
      :checker (checker/compose {:linearizable (register-linearizable-checker)
                                 :scan-shape (advanced-scan-checker)
@@ -389,7 +459,7 @@
            (workload fault-cfg)
            {:name "moreconsensus-epaxos-kv"}
            (when fault-cfg
-             {:nemesis (local-restart-nemesis fault-cfg)}))))
+             {:nemesis (local-fault-nemesis fault-cfg)}))))
 
 (defn -main [& args]
   (cli/run! (cli/single-test-cmd {:test-fn moreconsensus-test}) args))

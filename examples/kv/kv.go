@@ -369,7 +369,16 @@ func CommandForTxn(client, seq uint64, ops []TxnOp) epaxos.Command {
 	payload := appendKVTxn(ops)
 	keys := make([][]byte, 0, len(ops))
 	for _, op := range ops {
-		keys = append(keys, append([]byte(nil), op.Key...))
+		duplicate := false
+		for _, key := range keys {
+			if bytes.Equal(key, op.Key) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			keys = append(keys, append([]byte(nil), op.Key...))
+		}
 	}
 	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: keys}
 }

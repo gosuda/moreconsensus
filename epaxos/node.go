@@ -368,6 +368,10 @@ func (n *RawNode) Advance(rd Ready) {
 	if !n.awaitAdvance {
 		return
 	}
+	ackedCommitted := len(rd.Committed)
+	if ackedCommitted > len(n.pendingReady.Committed) {
+		ackedCommitted = len(n.pendingReady.Committed)
+	}
 	if len(rd.Records) >= len(n.pendingReady.Records) {
 		n.pendingReady.Records = nil
 	} else {
@@ -384,7 +388,18 @@ func (n *RawNode) Advance(rd Ready) {
 		n.pendingReady.Committed = n.pendingReady.Committed[len(rd.Committed):]
 	}
 	n.pendingReady.MustSync = len(n.pendingReady.Records) > 0
+	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.awaitAdvance = false
+}
+
+func (n *RawNode) enqueueExecutedRecords(committed []CommittedCommand) {
+	for _, c := range committed {
+		inst := n.instances[c.Ref]
+		if inst == nil || inst.rec.Status != StatusExecuted {
+			continue
+		}
+		n.enqueueRecord(inst.rec)
+	}
 }
 
 // Status returns a copy-only diagnostic snapshot of node state.
@@ -422,7 +437,7 @@ func (n *RawNode) handlePreAccept(m Message) {
 	n.instances[m.Ref] = &instance{rec: rec, phase: phasePreAccept}
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
-	resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), RecordStatus: rec.Status}
+	resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
 	n.enqueueMessage(resp)
 }
 
@@ -476,7 +491,7 @@ func (n *RawNode) handleAccept(m Message) {
 	n.instances[m.Ref] = &instance{rec: rec, phase: phaseAccept}
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
-	resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), RecordStatus: rec.Status}
+	resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
 	n.enqueueMessage(resp)
 }
 
@@ -537,8 +552,8 @@ func (n *RawNode) handlePrepare(m Message) {
 	}
 	resp.Ballot = inst.rec.Ballot
 	resp.Seq = inst.rec.Seq
-	resp.Deps = append([]InstanceNum(nil), inst.rec.Deps...)
-	resp.Command = inst.rec.Command.Clone()
+	resp.Deps = inst.rec.Deps
+	resp.Command = inst.rec.Command.Borrow()
 	resp.RecordStatus = inst.rec.Status
 	n.enqueueMessage(resp)
 }
@@ -663,7 +678,7 @@ func (n *RawNode) broadcast(t MessageType, rec InstanceRecord) {
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: t, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: rec.Command.Clone(), RecordStatus: rec.Status}
+		m := Message{Type: t, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command.Borrow(), RecordStatus: rec.Status}
 		n.enqueueMessage(m)
 	}
 }
@@ -674,7 +689,7 @@ func (n *RawNode) sendReject(t MessageType, to ReplicaID, ref InstanceRef, hint 
 }
 
 func (n *RawNode) sendCommitTo(to ReplicaID, rec InstanceRecord) {
-	m := Message{Type: MsgCommit, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: rec.Command.Clone(), RecordStatus: rec.Status}
+	m := Message{Type: MsgCommit, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command.Borrow(), RecordStatus: rec.Status}
 	n.enqueueMessage(m)
 }
 
@@ -837,12 +852,14 @@ func (n *RawNode) tryExecute() {
 					n.executed[ref] = struct{}{}
 					inst.rec.Status = StatusExecuted
 					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					n.enqueueRecord(inst.rec)
-					if inst.rec.Command.Kind == CommandConfChange {
-						n.applyConfChange(inst.rec.Command)
-					}
-					if inst.rec.Command.Kind != CommandNoop {
+					switch inst.rec.Command.Kind {
+					case CommandUser:
 						n.enqueueCommitted(CommittedCommand{Ref: ref, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), Command: inst.rec.Command.Clone()})
+					case CommandConfChange:
+						n.applyConfChange(inst.rec.Command)
+						n.enqueueRecord(inst.rec)
+					default:
+						n.enqueueRecord(inst.rec)
 					}
 					progress = true
 				}
@@ -976,8 +993,15 @@ func (n *RawNode) dependencyRefs(ref InstanceRef) []InstanceRef {
 		if dep == 0 || i >= len(conf.Voters) {
 			continue
 		}
-		out = append(out, InstanceRef{Replica: conf.Voters[i], Instance: dep, Conf: ref.Conf})
+		replica := conf.Voters[i]
+		for other := range n.instances {
+			if other == ref || other.Conf != ref.Conf || other.Replica != replica || other.Instance > dep {
+				continue
+			}
+			out = append(out, other)
+		}
 	}
+	sortRefs(out)
 	return out
 }
 
