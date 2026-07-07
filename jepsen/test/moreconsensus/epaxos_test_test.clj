@@ -4,7 +4,138 @@
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
+            [jepsen.generator :as gen]
+            [jepsen.nemesis :as nemesis]
             [moreconsensus.epaxos-test :as epaxos]))
+
+(defn fault-env-from [values]
+  (fn [suffix]
+    (get values suffix)))
+
+(def client-operation-fs
+  #{:read :write :delete
+    :scan-write :scan-delete :scan-forward :scan-reverse
+    :txn-write :txn-delete :txn-read})
+
+(defn generated-ops-for [generator process n]
+  (let [test {:concurrency 1}
+        ctx (gen/context test)]
+    (loop [generator (gen/on #{process} generator)
+           ops []]
+      (if (= n (count ops))
+        ops
+        (if-let [[op generator'] (gen/op generator test ctx)]
+          (recur generator' (conj ops op))
+          ops)))))
+
+(defn fault-ops [ops]
+  (->> ops
+       (keep (fn [op]
+               (when (:f op)
+                 (select-keys op [:type :process :f :value]))))
+       vec))
+
+(deftest local-fault-config-requires-restart-fault
+  (let [base-env {"BIN" "/tmp/kvnode"
+                  "DATA_DIR" "/tmp/data"
+                  "PEERS" "127.0.0.1:9001,127.0.0.1:9002"
+                  "PID_DIR" "/tmp/pids"
+                  "BASE_PORT" "9000"}
+        nodes ["127.0.0.1:9001" "127.0.0.1:9002"]]
+    (doseq [faults [nil "" "crash" "Restart" " restart "]]
+      (testing (str "fault selector " (pr-str faults))
+        (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env "FAULTS" faults))]
+          (is (nil? (epaxos/local-fault-config {:nodes nodes}))))))))
+
+(deftest local-fault-config-uses-provided-restart-env
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        env {"FAULTS" "restart"
+             "BIN" "/opt/moreconsensus/kvnode"
+             "DATA_DIR" "/var/lib/moreconsensus"
+             "PEERS" "127.0.0.1:9101,127.0.0.1:9102"
+             "PID_DIR" "/var/run/moreconsensus"
+             "BASE_PORT" "9100"}]
+    (with-redefs [epaxos/fault-env (fault-env-from env)]
+      (is (= {:bin "/opt/moreconsensus/kvnode"
+              :data-dir "/var/lib/moreconsensus"
+              :peers "127.0.0.1:9101,127.0.0.1:9102"
+              :pid-dir "/var/run/moreconsensus"
+              :base-port 9100
+              :nodes nodes}
+             (epaxos/local-fault-config {:nodes nodes}))))))
+
+(deftest local-restart-generator-emits-node-restarts-in-order
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        ops (take 9 (epaxos/local-restart-generator nodes))]
+    (is (= [{:type :info :f :kill-node :value "127.0.0.1:9101"}
+            {:type :info :f :restart-node :value "127.0.0.1:9101"}
+            {:type :info :f :kill-node :value "127.0.0.1:9102"}
+            {:type :info :f :restart-node :value "127.0.0.1:9102"}]
+           (fault-ops ops)))
+    (is (= 8 (count ops)))))
+
+(deftest workload-routes-client-and-nemesis-generators
+  (let [fault-cfg {:nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+        client-generator (:generator (epaxos/workload fault-cfg))
+        nemesis-generator (:generator (epaxos/workload fault-cfg))
+        [client-op] (generated-ops-for client-generator 0 1)
+        nemesis-faults (fault-ops (generated-ops-for nemesis-generator :nemesis 4))]
+    (is (= :invoke (:type client-op)))
+    (is (= 0 (:process client-op)))
+    (is (contains? client-operation-fs (:f client-op)))
+    (is (= [{:type :info
+             :process :nemesis
+             :f :kill-node
+             :value "127.0.0.1:9101"}
+            {:type :info
+             :process :nemesis
+             :f :restart-node
+             :value "127.0.0.1:9101"}]
+           nemesis-faults))))
+
+(deftest local-restart-nemesis-stops-and-starts-selected-node
+  (let [cfg {:nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+        calls (atom [])]
+    (with-redefs [epaxos/stop-node! (fn [seen-cfg node]
+                                      (swap! calls conj [:stop seen-cfg node])
+                                      {:node node :action :stopped})
+                  epaxos/start-node! (fn [seen-cfg node]
+                                       (swap! calls conj [:start seen-cfg node])
+                                       {:node node :action :started})]
+      (let [nemesis (epaxos/local-restart-nemesis cfg)
+            kill-op (nemesis/invoke! nemesis {}
+                                     {:type :invoke
+                                      :f :kill-node
+                                      :value "127.0.0.1:9101"})
+            restart-op (nemesis/invoke! nemesis {}
+                                        {:type :invoke
+                                         :f :restart-node
+                                         :value "127.0.0.1:9102"})]
+        (is (= [[:stop cfg "127.0.0.1:9101"]
+                [:start cfg "127.0.0.1:9102"]]
+               @calls))
+        (is (= {:type :info
+                :f :kill-node
+                :value {:node "127.0.0.1:9101" :action :stopped}}
+               (select-keys kill-op [:type :f :value])))
+        (is (= {:type :info
+                :f :restart-node
+                :value {:node "127.0.0.1:9102" :action :started}}
+               (select-keys restart-op [:type :f :value])))))))
+
+(deftest local-restart-nemesis-surfaces-invoke-errors
+  (let [cfg {:nodes ["127.0.0.1:9101"]}]
+    (with-redefs [epaxos/stop-node! (fn [_ _]
+                                      (throw (ex-info "cannot stop selected node" {})))]
+      (let [nemesis (epaxos/local-restart-nemesis cfg)
+            op (nemesis/invoke! nemesis {}
+                                {:type :invoke
+                                 :f :kill-node
+                                 :value "127.0.0.1:9101"})]
+        (is (= {:type :info
+                :f :kill-node
+                :value {:error "cannot stop selected node"}}
+               (select-keys op [:type :f :value])))))))
 
 (deftest txn-body-encodes-selected-group-as-json
   (testing "writes one EDN value to every key in the chosen transaction group"

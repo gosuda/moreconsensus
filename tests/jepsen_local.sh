@@ -7,9 +7,15 @@ cd "$ROOT"
 BASE_PORT="${JEPSEN_BASE_PORT:-19080}"
 BIN="${TMPDIR:-/tmp}/moreconsensus-kvnode-$$"
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/moreconsensus-jepsen.XXXXXX")"
+PID_DIR="$DATA_DIR/pids"
 PIDS=""
 
 cleanup() {
+  for pid_file in "$PID_DIR"/*.pid; do
+    if [[ -f "$pid_file" ]]; then
+      kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
+    fi
+  done
   for pid in $PIDS; do
     kill "$pid" >/dev/null 2>&1 || true
   done
@@ -21,6 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 (cd examples/kv && go build -tags kvnode -o "$BIN" ./cmd/kvnode)
+mkdir -p "$PID_DIR"
 
 peer_arg=""
 node_arg=""
@@ -37,10 +44,17 @@ for id in 1 2 3; do
   node_arg="${node_arg}127.0.0.1:${port}"
 done
 
-for id in 1 2 3; do
-  port=$((BASE_PORT + id))
+start_node() {
+  local id="$1"
+  local port=$((BASE_PORT + id))
   "$BIN" -id "$id" -listen ":${port}" -data "$DATA_DIR/node-${id}" -peers "$peer_arg" >"$DATA_DIR/node-${id}.log" 2>&1 &
-  PIDS="$PIDS $!"
+  local pid="$!"
+  echo "$pid" >"$PID_DIR/node-${id}.pid"
+  PIDS="$PIDS $pid"
+}
+
+for id in 1 2 3; do
+  start_node "$id"
 done
 
 for id in 1 2 3; do
@@ -60,6 +74,12 @@ for id in 1 2 3; do
 done
 
 export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} -Djava.net.preferIPv4Stack=true"
+export MORECONSENSUS_KVNODE_BIN="$BIN"
+export MORECONSENSUS_KVNODE_DATA_DIR="$DATA_DIR"
+export MORECONSENSUS_KVNODE_PEERS="$peer_arg"
+export MORECONSENSUS_KVNODE_PID_DIR="$PID_DIR"
+export MORECONSENSUS_KVNODE_BASE_PORT="$BASE_PORT"
+export MORECONSENSUS_KVNODE_FAULTS="${JEPSEN_LOCAL_FAULTS:-restart}"
 (
   cd jepsen
   lein run test --no-ssh --nodes "$node_arg" --time-limit 5 --concurrency 3

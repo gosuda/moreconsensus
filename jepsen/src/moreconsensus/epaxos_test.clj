@@ -2,15 +2,19 @@
   (:require [clj-http.client :as http]
             [clojure.edn :as edn]
             [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [checker :as checker]
                     [cli :as cli]
                     [client :as client]
                     [generator :as gen]
+                    [nemesis :as nemesis]
                     [tests :as tests]]
             [jepsen.checker.timeline :as timeline]
-            [knossos.model :as model]))
+            [knossos.model :as model])
+  (:import [java.lang ProcessBuilder$Redirect]))
 
 (defn endpoint [test node]
   (let [node (str/replace (str node) #"/$" "")]
@@ -35,6 +39,112 @@
 (def scan-keys ["scan-a" "scan-b" "scan-c" "scan-d"])
 (def scan-limit 3)
 (def scan-barrier (str/join "," scan-keys))
+
+(def fault-env-prefix "MORECONSENSUS_KVNODE_")
+
+(defn fault-env [suffix]
+  (System/getenv (str fault-env-prefix suffix)))
+
+(defn node-port [node]
+  (Long/parseLong (last (str/split (str node) #":"))))
+
+(defn local-node-id [cfg node]
+  (- (node-port node) (:base-port cfg)))
+
+(defn local-fault-config [opts]
+  (when (= "restart" (fault-env "FAULTS"))
+    (let [cfg {:bin (fault-env "BIN")
+               :data-dir (fault-env "DATA_DIR")
+               :peers (fault-env "PEERS")
+               :pid-dir (fault-env "PID_DIR")
+               :base-port (Long/parseLong (or (fault-env "BASE_PORT") "0"))
+               :nodes (:nodes opts)}]
+      (when (and (every? seq ((juxt :bin :data-dir :peers :pid-dir :nodes) cfg))
+                 (pos? (:base-port cfg)))
+        cfg))))
+
+(defn pid-file [cfg node]
+  (io/file (:pid-dir cfg) (str "node-" (local-node-id cfg node) ".pid")))
+
+(defn read-pid [cfg node]
+  (let [file (pid-file cfg node)]
+    (when (.exists file)
+      (str/trim (slurp file)))))
+
+(defn pid-alive? [pid]
+  (and (seq pid) (zero? (:exit (sh "kill" "-0" pid)))))
+
+(defn remove-pid! [cfg node]
+  (io/delete-file (pid-file cfg node) true))
+
+(defn write-pid! [cfg node pid]
+  (let [file (pid-file cfg node)]
+    (.mkdirs (.getParentFile file))
+    (spit file (str pid))))
+
+(defn stop-node! [cfg node]
+  (let [pid (read-pid cfg node)]
+    (if (pid-alive? pid)
+      (do
+        (sh "kill" "-TERM" pid)
+        (dotimes [_ 20]
+          (when (pid-alive? pid)
+            (Thread/sleep 50)))
+        (when (pid-alive? pid)
+          (sh "kill" "-KILL" pid))
+        (remove-pid! cfg node)
+        {:node node :pid pid :action :killed})
+      {:node node :action :already-down})))
+
+(defn start-node! [cfg node]
+  (let [pid (read-pid cfg node)]
+    (if (pid-alive? pid)
+      {:node node :pid pid :action :already-running}
+      (let [id (local-node-id cfg node)
+            port (node-port node)
+            log-file (io/file (:data-dir cfg) (str "node-" id ".log"))
+            data-dir (io/file (:data-dir cfg) (str "node-" id))
+            pb (ProcessBuilder.
+                (into-array String [(:bin cfg)
+                                    "-id" (str id)
+                                    "-listen" (str ":" port)
+                                    "-data" (.getPath data-dir)
+                                    "-peers" (:peers cfg)]))]
+        (.mkdirs data-dir)
+        (.redirectOutput pb (ProcessBuilder$Redirect/appendTo log-file))
+        (.redirectError pb (ProcessBuilder$Redirect/appendTo log-file))
+        (let [process (.start pb)
+              new-pid (str (.pid process))]
+          (write-pid! cfg node new-pid)
+          {:node node :pid new-pid :action :started})))))
+
+(defn local-restart-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this _ op]
+      (try
+        (case (:f op)
+          :kill-node (assoc op :type :info :value (stop-node! cfg (:value op)))
+          :restart-node (assoc op :type :info :value (start-node! cfg (:value op)))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "local restart nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this _]
+      (doseq [node (:nodes cfg)]
+        (try
+          (start-node! cfg node)
+          (catch Exception e
+            (warn e "local restart nemesis repair failed"))))
+      this)))
+
+(defn local-restart-generator [nodes]
+  (mapcat (fn [node]
+            [(gen/sleep 1)
+             {:type :info :f :kill-node :value node}
+             (gen/sleep 1)
+             {:type :info :f :restart-node :value node}])
+          nodes))
 
 
 (defn ok-status? [status]
@@ -246,30 +356,40 @@
          :bad-count (count bad)
          :bad (take 5 bad)}))))
 
-(defn workload []
-  {:client (->KVClient nil)
-   :generator (gen/clients
-               (gen/limit 90
-                          (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
-                                    (gen/repeat {:type :invoke :f :read :value nil})
-                                    (gen/repeat {:type :invoke :f :delete :value nil})
-                                    (map (fn [x] {:type :invoke :f :scan-write :value {:key (scan-key-for x) :value x}}) (range))
-                                    (map (fn [x] {:type :invoke :f :scan-delete :value {:key (scan-key-for x)}}) (range))
-                                    (gen/repeat {:type :invoke :f :scan-forward :value nil})
-                                    (gen/repeat {:type :invoke :f :scan-reverse :value nil})
-                                    (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
-                                    (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
-                                    (gen/repeat {:type :invoke :f :txn-read :value nil})])))
-   :checker (checker/compose {:linearizable (register-linearizable-checker)
-                              :scan-shape (advanced-scan-checker)
-                              :txn-atomic (txn-atomic-checker)
-                              :timeline (timeline/html)})})
+(defn client-workload-generator []
+  (gen/limit 90
+             (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
+                       (gen/repeat {:type :invoke :f :read :value nil})
+                       (gen/repeat {:type :invoke :f :delete :value nil})
+                       (map (fn [x] {:type :invoke :f :scan-write :value {:key (scan-key-for x) :value x}}) (range))
+                       (map (fn [x] {:type :invoke :f :scan-delete :value {:key (scan-key-for x)}}) (range))
+                       (gen/repeat {:type :invoke :f :scan-forward :value nil})
+                       (gen/repeat {:type :invoke :f :scan-reverse :value nil})
+                       (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
+                       (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
+                       (gen/repeat {:type :invoke :f :txn-read :value nil})])))
+
+(defn workload
+  ([] (workload nil))
+  ([fault-cfg]
+   (let [client-gen (client-workload-generator)]
+     {:client (->KVClient nil)
+      :generator (if fault-cfg
+                   (gen/clients client-gen (local-restart-generator (:nodes fault-cfg)))
+                   (gen/clients client-gen))
+     :checker (checker/compose {:linearizable (register-linearizable-checker)
+                                :scan-shape (advanced-scan-checker)
+                                :txn-atomic (txn-atomic-checker)
+                                :timeline (timeline/html)})})))
 
 (defn moreconsensus-test [opts]
-  (merge tests/noop-test
-         opts
-         (workload)
-         {:name "moreconsensus-epaxos-kv"}))
+  (let [fault-cfg (local-fault-config opts)]
+    (merge tests/noop-test
+           opts
+           (workload fault-cfg)
+           {:name "moreconsensus-epaxos-kv"}
+           (when fault-cfg
+             {:nemesis (local-restart-nemesis fault-cfg)}))))
 
 (defn -main [& args]
   (cli/run! (cli/single-test-cmd {:test-fn moreconsensus-test}) args))
