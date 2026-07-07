@@ -268,10 +268,13 @@ func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 	return n.propose(cmd)
 }
 
-// ProposeConfChange proposes a membership change encoded as a consensus command.
+// ProposeConfChange proposes a validated membership change encoded as a consensus command.
 func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
 	if n.pendingConf {
 		return InstanceRef{}, fmt.Errorf("%w: configuration change already pending", ErrMessageRejected)
+	}
+	if _, err := n.confChangeQuorum(cc); err != nil {
+		return InstanceRef{}, err
 	}
 	var payload [9]byte
 	payload[0] = byte(cc.Type)
@@ -282,6 +285,38 @@ func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
 		n.pendingConf = true
 	}
 	return ref, err
+}
+
+func (n *RawNode) confChangeQuorum(cc ConfChange) (quorum, error) {
+	voters := append([]ReplicaID(nil), n.q.conf.Voters...)
+	switch cc.Type {
+	case ConfChangeAddVoter:
+		if cc.Replica == 0 {
+			return quorum{}, fmt.Errorf("%w: configuration change replica zero", ErrInvalidConfig)
+		}
+		if _, ok := n.q.depIndex(cc.Replica); ok {
+			return quorum{}, fmt.Errorf("%w: voter already exists", ErrInvalidConfig)
+		}
+		voters = append(voters, cc.Replica)
+	case ConfChangeRemoveVoter:
+		if _, ok := n.q.depIndex(cc.Replica); !ok {
+			return quorum{}, fmt.Errorf("%w: voter not found", ErrInvalidConfig)
+		}
+		filtered := voters[:0]
+		for _, id := range voters {
+			if id != cc.Replica {
+				filtered = append(filtered, id)
+			}
+		}
+		voters = filtered
+	default:
+		return quorum{}, fmt.Errorf("%w: unknown configuration change", ErrInvalidConfig)
+	}
+	q, err := newQuorum(voters)
+	if err != nil {
+		return quorum{}, err
+	}
+	return q, nil
 }
 
 func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
@@ -1110,27 +1145,7 @@ func (n *RawNode) applyConfChange(cmd Command) {
 		return
 	}
 	cc := ConfChange{Type: ConfChangeType(cmd.Payload[0]), Replica: ReplicaID(binary.LittleEndian.Uint64(cmd.Payload[1:]))}
-	voters := append([]ReplicaID(nil), n.q.conf.Voters...)
-	switch cc.Type {
-	case ConfChangeAddVoter:
-		if cc.Replica == 0 {
-			return
-		}
-		if _, ok := n.q.depIndex(cc.Replica); !ok {
-			voters = append(voters, cc.Replica)
-		}
-	case ConfChangeRemoveVoter:
-		filtered := voters[:0]
-		for _, id := range voters {
-			if id != cc.Replica {
-				filtered = append(filtered, id)
-			}
-		}
-		voters = filtered
-	default:
-		return
-	}
-	q, err := newQuorum(voters)
+	q, err := n.confChangeQuorum(cc)
 	if err != nil {
 		return
 	}

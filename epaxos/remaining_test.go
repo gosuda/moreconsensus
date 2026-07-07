@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -17,6 +18,13 @@ func confChangeCommand(cc ConfChange) Command {
 	payload[0] = byte(cc.Type)
 	binary.LittleEndian.PutUint64(payload[1:], uint64(cc.Replica))
 	return Command{Kind: CommandConfChange, Payload: payload[:], ConflictKeys: [][]byte{[]byte("\xffconf")}}
+}
+
+func assertConfState(t *testing.T, got, want ConfState) {
+	t.Helper()
+	if got.ID != want.ID || !slices.Equal(got.Voters, want.Voters) {
+		t.Fatalf("config=%#v, want %#v", got, want)
+	}
 }
 
 func TestRemainingValidationAndEncodingBranches(t *testing.T) {
@@ -72,6 +80,90 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	zr.startAccept(inst, inst.rec.Attributes())
 	zr.commit(inst, inst.rec.Attributes())
 	zr.schedule(inst, timerAccept, 0)
+}
+
+func TestProposeConfChangeValidatesMembershipChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		voters []ReplicaID
+		change ConfChange
+	}{
+		{
+			name:   "add zero",
+			voters: makeIDs(3),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 0},
+		},
+		{
+			name:   "add existing voter",
+			voters: makeIDs(3),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 2},
+		},
+		{
+			name:   "add beyond seven voters",
+			voters: makeIDs(7),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 8},
+		},
+		{
+			name:   "remove absent voter",
+			voters: makeIDs(3),
+			change: ConfChange{Type: ConfChangeRemoveVoter, Replica: 4},
+		},
+		{
+			name:   "remove only voter",
+			voters: makeIDs(1),
+			change: ConfChange{Type: ConfChangeRemoveVoter, Replica: 1},
+		},
+		{
+			name:   "unknown type",
+			voters: makeIDs(3),
+			change: ConfChange{Type: ConfChangeType(99), Replica: 2},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rn, err := NewRawNode(Config{ID: 1, Voters: tt.voters})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := rn.Status().Conf
+
+			if _, err := rn.ProposeConfChange(tt.change); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("ProposeConfChange(%#v) err=%v, want ErrInvalidConfig", tt.change, err)
+			}
+			if rn.pendingConf {
+				t.Fatalf("ProposeConfChange(%#v) left pendingConf set", tt.change)
+			}
+			assertConfState(t, rn.Status().Conf, before)
+			if rn.HasReady() {
+				t.Fatalf("ProposeConfChange(%#v) produced ready work despite rejection: %#v", tt.change, rn.Ready())
+			}
+		})
+	}
+}
+
+func TestValidProposeConfChangeSetsPending(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := rn.Status().Conf
+
+	ref, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rn.pendingConf {
+		t.Fatal("valid ProposeConfChange did not set pendingConf")
+	}
+	assertConfState(t, rn.Status().Conf, before)
+	if !rn.HasReady() {
+		t.Fatal("valid ProposeConfChange produced no ready work")
+	}
+	rd := rn.Ready()
+	if len(rd.Records) == 0 || rd.Records[0].Ref != ref || rd.Records[0].Command.Kind != CommandConfChange {
+		t.Fatalf("valid ProposeConfChange ready records = %#v, want config change record for %s", rd.Records, ref)
+	}
 }
 
 func TestProposalOwnershipCopiesCallerSlicesByDefault(t *testing.T) {
@@ -604,6 +696,68 @@ func TestFinalExecutionBranches(t *testing.T) {
 	conf.applyConfChange(Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeRemoveVoter), 1, 0, 0, 0, 0, 0, 0, 0}})
 	if conf.Status().Conf.Contains(0) {
 		t.Fatal("invalid configuration applied")
+	}
+}
+
+func TestApplyConfChangeRejectsInvalidCommittedPayloads(t *testing.T) {
+	tests := []struct {
+		name   string
+		voters []ReplicaID
+		cmd    Command
+	}{
+		{
+			name:   "malformed payload",
+			voters: makeIDs(3),
+			cmd:    Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter), 4}},
+		},
+		{
+			name:   "add zero",
+			voters: makeIDs(3),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 0}),
+		},
+		{
+			name:   "add existing voter",
+			voters: makeIDs(3),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+		},
+		{
+			name:   "add beyond seven voters",
+			voters: makeIDs(7),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 8}),
+		},
+		{
+			name:   "remove absent voter",
+			voters: makeIDs(3),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 4}),
+		},
+		{
+			name:   "remove only voter",
+			voters: makeIDs(1),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 1}),
+		},
+		{
+			name:   "unknown type",
+			voters: makeIDs(3),
+			cmd:    confChangeCommand(ConfChange{Type: ConfChangeType(99), Replica: 2}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rn, err := NewRawNode(Config{ID: 1, Voters: tt.voters})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := rn.Status().Conf
+			rn.pendingConf = true
+
+			rn.applyConfChange(tt.cmd)
+
+			if rn.pendingConf {
+				t.Fatalf("applyConfChange(%#v) left pendingConf set", tt.cmd)
+			}
+			assertConfState(t, rn.Status().Conf, before)
+		})
 	}
 }
 

@@ -74,7 +74,7 @@ User commands are emitted to the embedding application through `Ready.Committed`
 
 ## Configuration changes
 
-`ProposeConfChange` encodes a membership operation as a configuration command. Only one configuration change may be pending. The command conflicts with every non-noop command. When the command executes, future instances use the new sorted voter set and an incremented configuration id. Existing instances remain pinned to their original configuration id.
+`ProposeConfChange` validates that a membership operation changes the current voter set and keeps the size within the supported one-to-seven-replica range, then encodes it as a configuration command. Only one configuration change may be pending. The command conflicts with every non-noop command. When the command executes, future instances use the new sorted voter set and an incremented configuration id. Existing instances remain pinned to their original configuration id.
 
 ## Ready contract
 
