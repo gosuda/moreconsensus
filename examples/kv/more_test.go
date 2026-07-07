@@ -2,6 +2,7 @@ package kv
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -69,6 +70,19 @@ func TestKVErrorAndPrefixBranches(t *testing.T) {
 	}
 	if !IsNotFound(pebble.ErrNotFound) || IsNotFound(errors.New("x")) {
 		t.Fatal("not-found helper failed")
+	}
+}
+
+func TestParserUvarintAlreadyErroredReturnsZero(t *testing.T) {
+	p := parser{b: []byte{1, 'x'}, err: true}
+	if got := p.uvarint(); got != 0 {
+		t.Fatalf("uvarint=%d", got)
+	}
+	if !p.err {
+		t.Fatal("parser error state cleared")
+	}
+	if len(p.b) != 2 || p.b[0] != 1 || p.b[1] != 'x' {
+		t.Fatalf("parser consumed input %x", p.b)
 	}
 }
 
@@ -203,4 +217,226 @@ func TestDrainReturnsDeliveryFailure(t *testing.T) {
 	if err := cluster.drainWithLimit(1); !errors.Is(err, sentinel) {
 		t.Fatalf("drain err=%v", err)
 	}
+}
+
+func TestCommandForTxnAppliesPutsThenDeleteAndPut(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	first := epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 10, Conf: 1},
+		Command: CommandForTxn(7, 1, []TxnOp{{Key: []byte("alpha"), Value: []byte("one")}, {Key: []byte("beta"), Value: []byte("two")}}),
+	}
+	if err := db.ApplyCommitted(first); err != nil {
+		t.Fatal(err)
+	}
+	scan, err := db.Scan(ScanOptions{Start: []byte("a"), End: []byte("z")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTime := (uint64(1) << 56) | 10
+	if len(scan) != 2 ||
+		string(scan[0].Key) != "alpha" || string(scan[0].Value) != "one" || scan[0].Time != wantTime ||
+		string(scan[1].Key) != "beta" || string(scan[1].Value) != "two" || scan[1].Time != wantTime {
+		t.Fatalf("first transaction scan %#v", scan)
+	}
+
+	second := epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 11, Conf: 1},
+		Command: CommandForTxn(7, 2, []TxnOp{{Delete: true, Key: []byte("alpha")}, {Key: []byte("gamma"), Value: []byte("three")}}),
+	}
+	if err := db.ApplyCommitted(second); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := db.Get([]byte("alpha")); err != nil || ok {
+		t.Fatalf("deleted key ok=%v err=%v", ok, err)
+	}
+	v, ok, err := db.Get([]byte("beta"))
+	if err != nil || !ok || string(v) != "two" {
+		t.Fatalf("beta value=%q ok=%v err=%v", v, ok, err)
+	}
+	v, ok, err = db.Get([]byte("gamma"))
+	if err != nil || !ok || string(v) != "three" {
+		t.Fatalf("gamma value=%q ok=%v err=%v", v, ok, err)
+	}
+}
+
+func TestTxnPayloadRejectsMalformedInputsAndKeepsBatchAtomic(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		wantErr string
+	}{
+		{name: "bad count varint", payload: []byte{opTxn, 0xff}, wantErr: "kv: malformed command"},
+		{name: "missing transaction operation", payload: []byte{opTxn, 1}, wantErr: "kv: malformed command"},
+		{name: "unknown transaction operation", payload: []byte{opTxn, 1, 99, 0, 0}, wantErr: "kv: unknown transaction op 99"},
+		{name: "extra byte after operations", payload: []byte{opTxn, 0, 0}, wantErr: "kv: malformed command"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			err = db.ApplyCommitted(epaxos.CommittedCommand{
+				Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+				Command: epaxos.Command{Payload: tt.payload},
+			})
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("err=%v want %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("unknown operation leaves earlier write unapplied", func(t *testing.T) {
+		db, err := Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		payload := []byte{opTxn, 2, opPut}
+		payload = appendKVFields(payload, []byte("alpha"), []byte("one"))
+		payload = append(payload, 99)
+		payload = appendKVFields(payload, []byte("beta"), nil)
+		err = db.ApplyCommitted(epaxos.CommittedCommand{
+			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+			Command: epaxos.Command{Payload: payload},
+		})
+		if err == nil || !strings.Contains(err.Error(), "unknown transaction op") {
+			t.Fatalf("err=%v", err)
+		}
+		if _, ok, err := db.Get([]byte("alpha")); err != nil || ok {
+			t.Fatalf("partial write ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+func TestTxnBatchSetReturnsIndexErrorForPutAndDelete(t *testing.T) {
+	tests := []struct {
+		name string
+		op   TxnOp
+	}{
+		{name: "put", op: TxnOp{Key: []byte("alpha"), Value: []byte("one")}},
+		{name: "delete", op: TxnOp{Delete: true, Key: []byte("alpha")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+
+			setErr := errors.New("batch set failed")
+			db.newBatch = func() txnBatch {
+				return txnBatchWithSetErr{err: setErr}
+			}
+
+			err = db.ApplyCommitted(epaxos.CommittedCommand{
+				Ref:     epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1},
+				Command: CommandForTxn(7, 3, []TxnOp{tt.op}),
+			})
+			if !errors.Is(err, setErr) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+type txnBatchWithSetErr struct {
+	err error
+}
+
+func (b txnBatchWithSetErr) Set(_, _ []byte, _ *pebble.WriteOptions) error {
+	return b.err
+}
+
+func (txnBatchWithSetErr) Commit(*pebble.WriteOptions) error {
+	return nil
+}
+
+func (txnBatchWithSetErr) Close() error {
+	return nil
+}
+
+func TestPutVersionSameTimestampKeepsLaterValue(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PutVersion([]byte("collision"), []byte("first"), 44); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("collision"), []byte("second"), 44); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := db.Get([]byte("collision"))
+	if err != nil || !ok || string(v) != "second" {
+		t.Fatalf("value=%q ok=%v err=%v", v, ok, err)
+	}
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("collision")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 || string(scan[0].Value) != "second" {
+		t.Fatalf("scan %#v", scan)
+	}
+}
+
+func TestPebbleDBPersistsVersionWriteAcrossReopen(t *testing.T) {
+	path := t.TempDir()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("durable"), []byte("kept"), 88); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	v, ok, err := db.Get([]byte("durable"))
+	if err != nil || !ok || string(v) != "kept" {
+		t.Fatalf("value=%q ok=%v err=%v", v, ok, err)
+	}
+}
+
+func TestReverseScanUsesNewestVersionForRepeatedKey(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PutVersion([]byte("scan-b"), []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("scan-b"), []byte("new"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("scan-c"), []byte("later"), 3); err != nil {
+		t.Fatal(err)
+	}
+	scan, err := db.Scan(ScanOptions{Reverse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range scan {
+		if string(kv.Key) == "scan-b" {
+			if string(kv.Value) != "new" {
+				t.Fatalf("reverse scan returned repeated key value %q in %#v", kv.Value, scan)
+			}
+			return
+		}
+	}
+	t.Fatalf("reverse scan missed repeated key in %#v", scan)
 }

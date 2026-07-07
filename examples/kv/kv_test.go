@@ -2,8 +2,11 @@ package kv
 
 import (
 	"bytes"
+	"encoding/binary"
+	"strings"
 	"testing"
 
+	"github.com/cockroachdb/pebble"
 	"gosuda.org/moreconsensus/epaxos"
 )
 
@@ -59,4 +62,106 @@ func TestPutGetScanAndApplyCommitted(t *testing.T) {
 	if err != nil || ok {
 		t.Fatalf("deleted ok=%v err=%v", ok, err)
 	}
+}
+
+func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PutVersion([]byte("gone"), []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	cmd := epaxos.CommittedCommand{
+		Ref: epaxos.InstanceRef{Replica: 1, Instance: 9, Conf: 1},
+		Command: CommandForTxn(7, 11, []TxnOp{
+			{Key: []byte("alpha"), Value: []byte("one")},
+			{Delete: true, Key: []byte("gone")},
+		}),
+	}
+	if err := db.ApplyCommitted(cmd); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := db.Get([]byte("alpha"))
+	if err != nil || !ok || string(value) != "one" {
+		t.Fatalf("alpha value=%q ok=%v err=%v", value, ok, err)
+	}
+	if _, ok, err := db.Get([]byte("gone")); err != nil || ok {
+		t.Fatalf("gone ok=%v err=%v", ok, err)
+	}
+}
+
+func TestDeleteCommandRejectsMalformedPayload(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	err = db.ApplyCommitted(epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Command: epaxos.Command{Payload: []byte{opDelete, 1, 'k'}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "malformed command") {
+		t.Fatalf("err=%v, want malformed command", err)
+	}
+}
+
+func TestTransactionRejectsMalformedPayloads(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	cases := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{name: "bad count", payload: []byte{opTxn, 0xff}, want: "malformed command"},
+		{name: "missing op", payload: []byte{opTxn, 1}, want: "malformed command"},
+		{name: "truncated fields", payload: appendTxnPayload(1, opPut, []byte{9}), want: "malformed command"},
+		{name: "unknown op", payload: appendTxnPayload(1, 99, appendKVFields(nil, []byte("k"), []byte("v"))), want: "unknown transaction op 99"},
+		{name: "trailing bytes", payload: []byte{opTxn, 0, 1}, want: "malformed command"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: epaxos.Command{Payload: tc.payload}})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestScanIgnoresMalformedInternalRecordsAndKeepsNewestUserVersion(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PutVersion([]byte("stable"), []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("stable"), []byte("new"), 2); err != nil {
+		t.Fatal(err)
+	}
+	badKey := append(EncodeUserPrefix(nil, 1, []byte("stable-bad-record-without-separator")), make([]byte, 8)...)
+	if err := db.pebble.Set(badKey, []byte{valueRecord, 'x'}, pebble.Sync); err != nil {
+		t.Fatal(err)
+	}
+	scan, err := db.Scan(ScanOptions{Start: []byte("stable"), End: []byte("stablez")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 || string(scan[0].Key) != "stable" || string(scan[0].Value) != "new" || scan[0].Time != 2 {
+		t.Fatalf("scan=%#v", scan)
+	}
+}
+
+func appendTxnPayload(count uint64, op byte, rest []byte) []byte {
+	out := []byte{opTxn}
+	out = binary.AppendUvarint(out, count)
+	out = append(out, op)
+	return append(out, rest...)
 }

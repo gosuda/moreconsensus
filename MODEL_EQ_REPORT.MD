@@ -23,6 +23,8 @@ This report maps the current TLA+ specification to the current Go implementation
 | Not represented in current TLA safety model | `epaxos/codec.go:40` Go decoder | Wire-decoder input tolerance is implementation validation rather than modeled state. |
 | Not represented in current TLA safety model | `epaxos/storage.go:9` Go storage interface | Storage virtualization is an implementation boundary used by deterministic tests rather than modeled state. |
 | Not represented in current TLA safety model | `epaxos/quorum.go:15` Go quorum calculation | Quorum arithmetic for cluster sizes one through seven is verified by Go tests; the current TLA constants enumerate voters directly. |
+| Not represented in current TLA safety model | `examples/kv/kv.go:102` Go transaction batch apply | Example KV transactions are opaque EPaxos commands at the model boundary; atomic multi-key apply is verified by Go tests rather than by the current TLA state. |
+| Not represented in current TLA safety model | `examples/kv/kv.go:169` Go scan implementation | Advanced scan ordering, reverse ordering, timestamp collision behavior, and Pebble durability are example storage semantics verified by Go tests rather than by the current TLA state. |
 
 ## Current verification evidence
 
@@ -31,6 +33,8 @@ This report maps the current TLA+ specification to the current Go implementation
 - Observed `go test ./...` from `examples/kv` passing.
 - Observed `go test -coverprofile=coverage.out ./...` from `examples/kv` plus `go tool cover -func=coverage.out` reporting 100.0% statement coverage for the example module.
 - Observed `go test -tags kvnode ./cmd/kvnode` from `examples/kv` passing for the tagged HTTP service package.
+- Observed `go test ./...` coverage including cluster destruction and restart via `TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand`, equal-sequence execution ordering via `TestExecutionEqualSeqTieBreaksByRef`, and inactive dependency filtering via `TestExecutionComponentsSkipInactiveDependencyRefs`.
+- Observed `go test ./...` coverage in `examples/kv` including transaction atomicity, malformed transaction rejection, transaction batch error propagation, timestamp collision overwrite behavior, Pebble close/open durability, and reverse scans returning the newest version for repeated keys.
 - Observed TLC passing with `/opt/homebrew/opt/openjdk/bin/java -cp /tmp/tla2tools.jar tlc2.TLC -config tla/EPaxos.cfg tla/EPaxos.tla`, generating 11162 states, 2002 distinct states, and no invariant violation.
 - Observed `lein test` from `jepsen` passing namespace and dependency loading, and observed `tests/ci.sh` running a local three-node Jepsen workload against deployed `kvnode` processes with `lein run test --no-ssh --nodes 127.0.0.1:19081,127.0.0.1:19082,127.0.0.1:19083 --time-limit 5 --concurrency 3` reporting `:valid? true` after successful writes and reads.
 - Observed repository text audit with no disallowed external-project name, scaffolding marker, or wall-clock API matches.
@@ -38,5 +42,5 @@ This report maps the current TLA+ specification to the current Go implementation
 ## Open equivalence risks
 
 - The TLA+ model is finite-bounded for TLC, so it demonstrates correspondence for the configured state space rather than unbounded proof.
-- Checksum, wire-decoder tolerance, storage virtualization, quorum arithmetic, and recovery response collection are verified by implementation tests but outside the current TLA safety state.
-- The local Jepsen run uses in-process loopback deployment without SSH-managed OS faults; external deployment validation can exercise a broader environment.
+- Checksum, wire-decoder tolerance, storage virtualization, quorum arithmetic, recovery response collection, and example KV storage semantics are verified by implementation tests but outside the current TLA safety state.
+- The local Jepsen run uses in-process loopback deployment without SSH-managed OS faults, and its workload currently covers register-style successful writes and reads rather than application-level transaction internals.

@@ -177,6 +177,70 @@ func TestRestartFromMemoryStorage(t *testing.T) {
 	}
 }
 
+func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T) {
+	ids := makeIDs(3)
+	s := newSimCluster(t, len(ids), false)
+	first := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("first"), ConflictKeys: [][]byte{[]byte("shared")}}
+	second := Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("second"), ConflictKeys: [][]byte{[]byte("shared")}}
+	if _, err := s.nodes[1].Propose(first); err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	if got := len(s.apps[1]); got != 1 {
+		t.Fatalf("node 1 applied %d commands before restart", got)
+	}
+	firstRef := s.apps[1][0].Ref
+	for id := range s.nodes {
+		if got := len(s.apps[id]); got != 1 {
+			t.Fatalf("node %d applied %d commands before restart", id, got)
+		}
+		if s.apps[id][0].Ref != firstRef {
+			t.Fatalf("node %d first ref = %s, want %s", id, s.apps[id][0].Ref, firstRef)
+		}
+	}
+
+	s.nodes = make(map[ReplicaID]*RawNode, len(ids))
+	for _, id := range ids {
+		rn, err := NewRawNode(Config{ID: id, Voters: ids, Storage: s.stores[id], RetryTicks: 2, RecoveryTicks: 5})
+		if err != nil {
+			t.Fatalf("restart node %d: %v", id, err)
+		}
+		s.nodes[id] = rn
+	}
+	s.apps = make(map[ReplicaID][]CommittedCommand, len(ids))
+
+	if _, err := s.nodes[2].Propose(second); err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	for id, rn := range s.nodes {
+		applied := s.apps[id]
+		if len(applied) != 1 {
+			t.Fatalf("node %d applied %d commands after restart: %#v", id, len(applied), applied)
+		}
+		gotCmd := applied[0].Command
+		if gotCmd.ID != second.ID ||
+			!bytes.Equal(gotCmd.Payload, second.Payload) ||
+			len(gotCmd.ConflictKeys) != 1 ||
+			!bytes.Equal(gotCmd.ConflictKeys[0], second.ConflictKeys[0]) {
+			t.Fatalf("node %d applied command = %#v, want %#v", id, gotCmd, second)
+		}
+		if applied[0].Ref == firstRef {
+			t.Fatalf("node %d re-applied first ref %s", id, firstRef)
+		}
+		var hasFirst bool
+		for _, ref := range rn.Status().Executed {
+			if ref == firstRef {
+				hasFirst = true
+				break
+			}
+		}
+		if !hasFirst {
+			t.Fatalf("node %d executed refs lost first ref %s: %#v", id, firstRef, rn.Status().Executed)
+		}
+	}
+}
+
 func TestLogicalTicksRecoveryAndStorageFailure(t *testing.T) {
 	s := newSimCluster(t, 3, true)
 	s.drop[[2]ReplicaID{1, 2}] = true
@@ -236,6 +300,68 @@ func TestQuorumTables(t *testing.T) {
 	}
 	if _, err := SlowQuorum(8); err == nil {
 		t.Fatal("expected invalid size")
+	}
+}
+
+func TestExecutionEqualSeqTieBreaksByRef(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
+	b := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	c := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	rn.instances[a] = &instance{rec: InstanceRecord{Ref: a, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{1, 0, 0}, Command: Command{Payload: []byte("a")}}}
+	rn.instances[b] = &instance{rec: InstanceRecord{Ref: b, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("b")}}}
+	rn.instances[c] = &instance{rec: InstanceRecord{Ref: c, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 0, 1}, Command: Command{Payload: []byte("c")}}}
+
+	comps := rn.executionComponents()
+	if len(comps) != 1 || len(comps[0]) != 3 {
+		t.Fatalf("equal-seq cycle components = %#v", comps)
+	}
+	if refs := append([]InstanceRef(nil), comps[0]...); len(refs) == 3 && refs[0] == b && refs[1] == c && refs[2] == a {
+		t.Fatalf("test setup no longer exercises execution sort: %#v", refs)
+	}
+
+	rn.tryExecute()
+	rd := rn.Ready()
+	want := []InstanceRef{b, c, a}
+	if got := refs(rd.Committed); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("equal-seq execution order = %v, want %v", got, want)
+	}
+	for i, cmd := range rd.Committed {
+		if cmd.Seq != 7 {
+			t.Fatalf("committed[%d] seq = %d, want 7", i, cmd.Seq)
+		}
+	}
+}
+
+func TestExecutionComponentsSkipInactiveDependencyRefs(t *testing.T) {
+	tests := []struct {
+		name string
+		dep  *instance
+	}{
+		{name: "missing"},
+		{name: "not-yet-chosen", dep: &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Status: StatusAccepted, Seq: 1}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			x := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+			y := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+			rn.instances[x] = &instance{rec: InstanceRecord{Ref: x, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("x")}}}
+			if tt.dep != nil {
+				rn.instances[y] = tt.dep
+			}
+
+			comps := rn.executionComponents()
+			if len(comps) != 1 || len(comps[0]) != 1 || comps[0][0] != x {
+				t.Fatalf("component with inactive dependency = %#v, want only %s", comps, x)
+			}
+		})
 	}
 }
 

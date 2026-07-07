@@ -17,13 +17,21 @@ const (
 	deleteRecord byte = 2
 	opPut        byte = 1
 	opDelete     byte = 2
+	opTxn        byte = 3
 )
 
 // DB stores EPaxos-applied commands in a Pebble database.
 type DB struct {
-	pebble  *pebble.DB
-	cf      uint32
-	newIter func(*pebble.IterOptions) (*pebble.Iterator, error)
+	pebble   *pebble.DB
+	cf       uint32
+	newIter  func(*pebble.IterOptions) (*pebble.Iterator, error)
+	newBatch func() txnBatch
+}
+
+type txnBatch interface {
+	Set(key, value []byte, opts *pebble.WriteOptions) error
+	Commit(opts *pebble.WriteOptions) error
+	Close() error
 }
 
 // KV is one key-value pair returned by scans.
@@ -31,6 +39,13 @@ type KV struct {
 	Key   []byte
 	Value []byte
 	Time  uint64
+}
+
+// TxnOp is one write or delete inside an example key-value transaction.
+type TxnOp struct {
+	Delete bool
+	Key    []byte
+	Value  []byte
 }
 
 // ScanOptions controls range scans.
@@ -44,11 +59,11 @@ type ScanOptions struct {
 
 // Open opens a Pebble-backed example database.
 func Open(path string) (*DB, error) {
-	db, err := pebble.Open(path, &pebble.Options{})
+	pebbleDB, err := pebble.Open(path, &pebble.Options{})
 	if err != nil {
 		return nil, err
 	}
-	return &DB{pebble: db, cf: 1, newIter: db.NewIter}, nil
+	return &DB{pebble: pebbleDB, cf: 1, newIter: pebbleDB.NewIter, newBatch: func() txnBatch { return pebbleDB.NewBatch() }}, nil
 }
 
 // Close closes the underlying Pebble database.
@@ -61,20 +76,61 @@ func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
 	}
 	op := cmd.Command.Payload[0]
 	p := parser{b: cmd.Command.Payload[1:]}
-	key := p.bytes()
-	value := p.bytes()
-	if p.err {
-		return fmt.Errorf("kv: malformed command")
-	}
 	ts := (uint64(cmd.Ref.Replica) << 56) | uint64(cmd.Ref.Instance)
 	switch op {
 	case opPut:
+		key := p.bytes()
+		value := p.bytes()
+		if p.err {
+			return fmt.Errorf("kv: malformed command")
+		}
 		return db.PutVersion(key, value, ts)
 	case opDelete:
+		key := p.bytes()
+		_ = p.bytes()
+		if p.err {
+			return fmt.Errorf("kv: malformed command")
+		}
 		return db.DeleteVersion(key, ts)
+	case opTxn:
+		return db.applyTxn(&p, ts)
 	default:
 		return fmt.Errorf("kv: unknown op %d", op)
 	}
+}
+
+func (db *DB) applyTxn(p *parser, ts uint64) error {
+	count := p.uvarint()
+	if p.err {
+		return fmt.Errorf("kv: malformed command")
+	}
+	batch := db.newBatch()
+	defer func() { _ = batch.Close() }()
+	for i := uint64(0); i < count; i++ {
+		op := p.byte()
+		key := p.bytes()
+		value := p.bytes()
+		if p.err {
+			return fmt.Errorf("kv: malformed command")
+		}
+		k := EncodeDataKey(nil, db.cf, key, ts)
+		switch op {
+		case opPut:
+			if err := batch.Set(k, append([]byte{valueRecord}, value...), nil); err != nil {
+				return err
+			}
+		case opDelete:
+			if err := batch.Set(k, []byte{deleteRecord}, nil); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("kv: unknown transaction op %d", op)
+		}
+	}
+	if len(p.b) != 0 {
+		return fmt.Errorf("kv: malformed command")
+	}
+	return batch.Commit(pebble.Sync)
 }
 
 // PutVersion writes one version using the example's MyRocks-like record format.
@@ -133,31 +189,31 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 	if limit <= 0 {
 		limit = int(^uint(0) >> 1)
 	}
-	valid := false
-	if opt.Reverse {
-		valid = iter.Last()
-	} else {
-		valid = iter.First()
-	}
-	for valid && len(out) < limit {
+	for valid := iter.First(); valid; valid = iter.Next() {
 		uk, ts, ok := DecodeDataKey(iter.Key(), db.cf)
-		if ok {
-			id := string(uk)
-			if _, exists := seen[id]; !exists {
-				seen[id] = struct{}{}
-				v := iter.Value()
-				if len(v) > 0 && v[0] == valueRecord {
-					out = append(out, KV{Key: append([]byte(nil), uk...), Value: append([]byte(nil), v[1:]...), Time: ts})
-				}
-			}
+		if !ok {
+			continue
 		}
-		if opt.Reverse {
-			valid = iter.Prev()
-		} else {
-			valid = iter.Next()
+		id := string(uk)
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		v := iter.Value()
+		if len(v) > 0 && v[0] == valueRecord {
+			out = append(out, KV{Key: append([]byte(nil), uk...), Value: append([]byte(nil), v[1:]...), Time: ts})
 		}
 	}
-	return out, iter.Error()
+	scanErr := iter.Error()
+	if opt.Reverse {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, scanErr
 }
 
 // CommandForPut encodes a deterministic EPaxos command for a key update.
@@ -170,6 +226,16 @@ func CommandForPut(client, seq uint64, key, value []byte) epaxos.Command {
 func CommandForDelete(client, seq uint64, key []byte) epaxos.Command {
 	payload := appendKVCommand(opDelete, key, nil)
 	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: [][]byte{append([]byte(nil), key...)}}
+}
+
+// CommandForTxn encodes an atomic multi-key transaction command.
+func CommandForTxn(client, seq uint64, ops []TxnOp) epaxos.Command {
+	payload := appendKVTxn(ops)
+	keys := make([][]byte, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, append([]byte(nil), op.Key...))
+	}
+	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: keys}
 }
 
 // EncodeDataKey appends a MyRocks-like data key to dst.
@@ -213,6 +279,28 @@ func appendKVCommand(op byte, key, value []byte) []byte {
 	return out
 }
 
+func appendKVTxn(ops []TxnOp) []byte {
+	out := []byte{opTxn}
+	out = binary.AppendUvarint(out, uint64(len(ops)))
+	for _, op := range ops {
+		if op.Delete {
+			out = append(out, opDelete)
+			out = appendKVFields(out, op.Key, nil)
+			continue
+		}
+		out = append(out, opPut)
+		out = appendKVFields(out, op.Key, op.Value)
+	}
+	return out
+}
+
+func appendKVFields(out, key, value []byte) []byte {
+	out = binary.AppendUvarint(out, uint64(len(key)))
+	out = append(out, key...)
+	out = binary.AppendUvarint(out, uint64(len(value)))
+	return append(out, value...)
+}
+
 func prefixLimit(prefix []byte) []byte {
 	out := append([]byte(nil), prefix...)
 	for i := len(out) - 1; i >= 0; i-- {
@@ -227,6 +315,29 @@ func prefixLimit(prefix []byte) []byte {
 type parser struct {
 	b   []byte
 	err bool
+}
+
+func (p *parser) uvarint() uint64 {
+	if p.err {
+		return 0
+	}
+	n, used := binary.Uvarint(p.b)
+	if used <= 0 {
+		p.err = true
+		return 0
+	}
+	p.b = p.b[used:]
+	return n
+}
+
+func (p *parser) byte() byte {
+	if p.err || len(p.b) == 0 {
+		p.err = true
+		return 0
+	}
+	out := p.b[0]
+	p.b = p.b[1:]
+	return out
 }
 
 func (p *parser) bytes() []byte {
