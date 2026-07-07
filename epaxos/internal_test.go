@@ -1,0 +1,221 @@
+package epaxos
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+)
+
+func TestValueHelpersAndStrings(t *testing.T) {
+	for typ := MsgPreAccept; typ <= MsgPrepareResp; typ++ {
+		if typ.String() == "unknown" {
+			t.Fatalf("message type %d unknown", typ)
+		}
+	}
+	if MessageType(99).String() != "unknown" {
+		t.Fatal("unknown message type string")
+	}
+	for st := StatusNone; st <= StatusExecuted; st++ {
+		if st.String() == "unknown" {
+			t.Fatalf("status %d unknown", st)
+		}
+	}
+	if Status(99).String() != "unknown" {
+		t.Fatal("unknown status string")
+	}
+	if !((InstanceRef{}).IsZero()) || (InstanceRef{Replica: 1}).IsZero() {
+		t.Fatal("zero ref detection failed")
+	}
+	if (InstanceRef{Replica: 1, Instance: 2, Conf: 3}).String() != "1.2@3" {
+		t.Fatal("ref string failed")
+	}
+	if !(Ballot{Epoch: 1}).Less(Ballot{Epoch: 2}) || !(Ballot{Epoch: 2, Number: 1}).Less(Ballot{Epoch: 2, Number: 2}) || !(Ballot{Epoch: 2, Number: 2, Replica: 1}).Less(Ballot{Epoch: 2, Number: 2, Replica: 2}) {
+		t.Fatal("ballot less failed")
+	}
+	if (Ballot{Number: 7}).Next(3) != (Ballot{Number: 8, Replica: 3}) {
+		t.Fatal("ballot next failed")
+	}
+	userA := Command{Payload: []byte("a"), ConflictKeys: [][]byte{[]byte("x")}}
+	userB := Command{Payload: []byte("b"), ConflictKeys: [][]byte{[]byte("x")}}
+	userC := Command{Payload: []byte("c"), ConflictKeys: [][]byte{[]byte("y")}}
+	if !userA.ConflictsWith(userB) || userA.ConflictsWith(userC) {
+		t.Fatal("user conflict failed")
+	}
+	if userA.ConflictsWith(Command{Kind: CommandNoop}) {
+		t.Fatal("noop conflict failed")
+	}
+	if !userA.ConflictsWith(Command{Kind: CommandConfChange}) {
+		t.Fatal("conf change conflict failed")
+	}
+	borrowed := userA.Borrow()
+	if !bytes.Equal(borrowed.Payload, userA.Payload) {
+		t.Fatal("borrow changed command")
+	}
+	rd := Ready{Records: []InstanceRecord{{}}, Messages: []Message{{Deps: []InstanceNum{1}}}, Committed: []CommittedCommand{{}}, MustSync: true}
+	rd.Release()
+	if !rd.Empty() || rd.MustSync {
+		t.Fatal("ready release failed")
+	}
+	if (Attributes{Seq: 1, Deps: []InstanceNum{1}}).Equal(Attributes{Seq: 2, Deps: []InstanceNum{1}}) {
+		t.Fatal("attributes equality sequence failed")
+	}
+	if (Attributes{Seq: 1, Deps: []InstanceNum{1}}).Equal(Attributes{Seq: 1, Deps: []InstanceNum{1, 2}}) {
+		t.Fatal("attributes equality length failed")
+	}
+}
+
+func TestConfigValidationAndMessageValidation(t *testing.T) {
+	invalids := []Config{
+		{ID: 1, Voters: nil},
+		{ID: 1, Voters: []ReplicaID{1, 1}},
+		{ID: 1, Voters: []ReplicaID{0}},
+		{ID: 9, Voters: []ReplicaID{1, 2, 3}},
+		{ID: 1, Voters: []ReplicaID{1, 2, 3, 4, 5, 6, 7, 8}},
+	}
+	for _, cfg := range invalids {
+		if _, err := NewRawNode(cfg); err == nil {
+			t.Fatalf("expected invalid config %#v", cfg)
+		}
+	}
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []InstanceNum{0, 0, 0}}
+	bad := base
+	bad.Type = 99
+	if err := rn.Step(bad); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("bad type err=%v", err)
+	}
+	bad = base
+	bad.From = 9
+	if err := rn.Step(bad); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("unknown sender err=%v", err)
+	}
+	bad = base
+	bad.Deps = nil
+	if err := rn.Step(bad); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("bad deps err=%v", err)
+	}
+	bad = base
+	bad.Checksum = [32]byte{1}
+	if err := rn.Step(bad); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("bad checksum err=%v", err)
+	}
+	bad = base
+	bad.To = 2
+	if err := rn.Step(bad); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("wrong target err=%v", err)
+	}
+}
+
+func TestStorageEdgeCases(t *testing.T) {
+	st := NewMemoryStorage()
+	st.Configs = []ConfState{{ID: 2, Voters: makeIDs(3)}}
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rn.Status().Conf.ID != 2 {
+		t.Fatal("loaded config history was ignored")
+	}
+	rec := InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0}, Command: Command{Payload: []byte("x")}}
+	rec.Checksum = ChecksumRecord(rec)
+	st.Records[rec.Ref] = rec
+	got, ok := st.Instance(rec.Ref)
+	if !ok || !VerifyRecordChecksum(got) {
+		t.Fatal("instance lookup failed")
+	}
+	got.Command.Payload[0] = 'y'
+	again, _ := st.Instance(rec.Ref)
+	if string(again.Command.Payload) != "x" {
+		t.Fatal("instance lookup did not clone")
+	}
+	st.Records[rec.Ref] = InstanceRecord{Ref: rec.Ref, Checksum: [32]byte{1}}
+	if err := st.LoadInstances(func(InstanceRecord) error { return nil }); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("checksum mismatch err=%v", err)
+	}
+	st.Records[rec.Ref] = rec
+	sentinel := errors.New("sentinel")
+	if err := st.LoadInstances(func(InstanceRecord) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("callback err=%v", err)
+	}
+	nilMap := &MemoryStorage{}
+	if err := nilMap.ApplyReady(Ready{Records: []InstanceRecord{rec}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareRecoveryPath(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := s.nodes[1].instances[ref]
+	s.nodes[1].startPrepare(inst)
+	s.drain()
+	if len(s.apps[1]) != 1 {
+		t.Fatalf("prepare path did not commit locally: %d", len(s.apps[1]))
+	}
+}
+
+func TestRejectPathsAndTimers(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := s.nodes[1].Ready()
+	if len(rd.Messages) == 0 {
+		t.Fatal("expected preaccept messages")
+	}
+	msg := rd.Messages[0]
+	if err := s.nodes[msg.To].Step(msg); err != nil {
+		t.Fatal(err)
+	}
+	remote := s.nodes[msg.To].instances[ref]
+	remote.rec.Ballot = Ballot{Number: 9, Replica: msg.To}
+	lowAccept := Message{Type: MsgAccept, From: 1, To: msg.To, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}}}
+	lowAccept.Checksum = ChecksumMessage(lowAccept)
+	if err := s.nodes[msg.To].Step(lowAccept); err != nil {
+		t.Fatal(err)
+	}
+	s.nodes[1].Advance(rd)
+	inst := s.nodes[1].instances[ref]
+	s.nodes[1].onTimer(inst, timerPreAccept)
+	s.nodes[1].startAccept(inst, inst.rec.Attributes())
+	s.nodes[1].onTimer(inst, timerAccept)
+	s.nodes[1].startPrepare(inst)
+	s.nodes[1].onTimer(inst, timerPrepare)
+	s.nodes[1].onTimer(inst, timerFastWait)
+}
+
+func TestCodecMalformedBranches(t *testing.T) {
+	var out Message
+	if err := DecodeMessage([]byte{'M', 'E', 'P', '1', 0xff}, &out); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("bad varint err=%v", err)
+	}
+	m := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: make([]InstanceNum, 129)}
+	buf, err := EncodeMessage(nil, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("too many deps err=%v", err)
+	}
+	m.Deps = []InstanceNum{0}
+	m.Command.ConflictKeys = make([][]byte, 129)
+	buf, err = EncodeMessage(nil, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("too many keys err=%v", err)
+	}
+	truncated := append([]byte(nil), wireMagic[:]...)
+	truncated = append(truncated, make([]byte, 32)...)
+	if err := DecodeMessage(truncated, &out); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("truncated err=%v", err)
+	}
+}
