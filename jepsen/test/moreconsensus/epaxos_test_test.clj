@@ -12,6 +12,13 @@
                    (get epaxos/txn-keys-by-group :tx-b))
              rows)))))
 
+(deftest txn-delete-body-encodes-selected-group-as-json
+  (testing "deletes every key in the chosen transaction group"
+    (let [rows (json/read-str (epaxos/txn-delete-body :tx-b) :key-fn keyword)]
+      (is (= (mapv (fn [k] {:key k :delete true})
+                   (get epaxos/txn-keys-by-group :tx-b))
+             rows)))))
+
 (deftest scan-values-returns-grouped-vectors-with-full-key-barrier
   (testing "reads all transaction keys and reports values grouped by independent transaction group"
     (let [flat-values (zipmap epaxos/txn-keys (range))]
@@ -23,7 +30,17 @@
         (is (= [:ok (into {} (map (fn [{:keys [group keys]}]
                                     [group (mapv flat-values keys)])
                                   epaxos/txn-key-groups))]
-               (epaxos/scan-values "http://node")))))))
+               (epaxos/scan-values "http://node"))))))
+  (testing "missing transaction keys are reported as fully deleted grouped reads"
+    (with-redefs [epaxos/scan-map (fn [_ prefix barrier]
+                                    (if (and (= "tx-" prefix)
+                                             (= epaxos/txn-scan-barrier barrier))
+                                      [:ok {}]
+                                      [:fail {:prefix prefix :barrier barrier}]))]
+      (is (= [:ok (into {} (map (fn [{:keys [group keys]}]
+                                  [group (mapv (constantly nil) keys)])
+                                epaxos/txn-key-groups))]
+             (epaxos/scan-values "http://node"))))))
 
 (defn check-txn-history [history]
   (checker/check (epaxos/txn-atomic-checker) nil history nil))
@@ -34,6 +51,14 @@
                                       :f :txn-read
                                       :value {:tx-a [1 1]
                                               :tx-b [2 2 2]
+                                              :tx-c [nil nil]}}])]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))))
+  (testing "fully deleted transaction groups are atomic reads"
+    (let [result (check-txn-history [{:type :ok
+                                      :f :txn-read
+                                      :value {:tx-a [nil nil]
+                                              :tx-b [nil nil nil]
                                               :tx-c [nil nil]}}])]
       (is (= {:valid? true :checked 1 :bad-count 0}
              (select-keys result [:valid? :checked :bad-count])))))
@@ -48,4 +73,16 @@
       (is (= {:valid? false :checked 1 :bad-count 1}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= {:tx-a [1 2] :tx-c [nil 3]}
+             (:bad-groups bad-op)))))
+  (testing "mixed delete and write visibility inside a group is invalid"
+    (let [read-op {:type :ok
+                   :f :txn-read
+                   :value {:tx-a [4 4]
+                           :tx-b [nil 5 nil]
+                           :tx-c [6 6]}}
+          result (check-txn-history [read-op])
+          bad-op (first (:bad result))]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= {:tx-b [nil 5 nil]}
              (:bad-groups bad-op))))))

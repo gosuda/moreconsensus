@@ -44,6 +44,12 @@
     (json/write-str
      (mapv (fn [k] {"key" k "value" (pr-str value)}) keys))))
 
+(defn txn-delete-body [group]
+  (let [keys (or (get txn-keys-by-group group)
+                 (throw (ex-info "unknown transaction group" {:group group})))]
+    (json/write-str
+     (mapv (fn [k] {"key" k "delete" true}) keys))))
+
 (defn parse-rows [body]
   (json/read-str body :key-fn keyword))
 
@@ -108,6 +114,15 @@
             (if (ok-status? (:status resp))
               (assoc op :type :ok)
               (assoc op :type :fail :error (:status resp))))
+          :txn-delete
+          (let [{:keys [group]} (:value op)
+                resp (http/post (str base "/txn")
+                                {:body (txn-delete-body group)
+                                 :content-type :json
+                                 :throw-exceptions false})]
+            (if (ok-status? (:status resp))
+              (assoc op :type :ok)
+              (assoc op :type :fail :error (:status resp))))
           :txn-read
           (let [[status values] (scan-values base)]
             (if (= :ok status)
@@ -153,6 +168,7 @@
                           (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
                                     (gen/repeat {:type :invoke :f :read :value nil})
                                     (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
+                                    (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
                                     (gen/repeat {:type :invoke :f :txn-read :value nil})])))
    :checker (checker/compose {:linearizable (register-linearizable-checker)
                               :txn-atomic (txn-atomic-checker)
