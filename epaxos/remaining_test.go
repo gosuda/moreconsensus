@@ -312,6 +312,115 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 	}
 }
 
+func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
+	store := NewMemoryStorage()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(5), Storage: store, RetryTicks: 10, TimeOptimization: true, TimeOptimizationTicks: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("late-fast-value"), ConflictKeys: [][]byte{[]byte("late-fast-key")}}
+	ref, err := rn.Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := rn.Ready()
+	if len(rd.Messages) != 4 {
+		t.Fatalf("initial preaccept messages = %#v", rd.Messages)
+	}
+	if err := store.ApplyReady(rd); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, rd)
+
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatalf("missing local instance %s", ref)
+	}
+	stepMatchingPreAcceptResp := func(from ReplicaID) {
+		t.Helper()
+		resp := Message{
+			Type:         MsgPreAcceptResp,
+			From:         from,
+			To:           1,
+			Ref:          ref,
+			Ballot:       inst.rec.Ballot,
+			Seq:          inst.rec.Seq,
+			Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
+			RecordStatus: StatusPreAccepted,
+		}
+		if err := rn.Step(resp); err != nil {
+			t.Fatalf("step matching preaccept response from %d: %v", from, err)
+		}
+	}
+
+	for _, from := range []ReplicaID{2, 3} {
+		stepMatchingPreAcceptResp(from)
+	}
+	if got, slow, fast := len(inst.preOK), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
+		t.Fatalf("preaccept votes = %d, want slow quorum %d below fast quorum %d", got, slow, fast)
+	}
+	if inst.phase != phasePreAccept {
+		t.Fatalf("phase after slow quorum preaccept responses = %d, want preaccept", inst.phase)
+	}
+	if rn.HasReady() {
+		t.Fatalf("slow quorum response produced ready work before fast-wait deadline: %#v", rn.Ready())
+	}
+
+	for tick := uint64(1); tick < 3; tick++ {
+		rn.Tick()
+		if inst.phase != phasePreAccept {
+			t.Fatalf("phase after tick %d = %d, want preaccept before fast-wait deadline", tick, inst.phase)
+		}
+		if rn.HasReady() {
+			t.Fatalf("ready work appeared after tick %d before fast-wait deadline: %#v", tick, rn.Ready())
+		}
+	}
+
+	stepMatchingPreAcceptResp(4)
+	if got, fast := len(inst.preOK), rn.q.fastQuorum(); got != fast {
+		t.Fatalf("preaccept votes after late response = %d, want fast quorum %d", got, fast)
+	}
+	if inst.phase != phaseCommitted {
+		t.Fatalf("phase after late fast-quorum response = %d, want committed", inst.phase)
+	}
+	if inst.rec.Status != StatusExecuted {
+		t.Fatalf("instance status after dependency-ready commit = %s, want executed", inst.rec.Status)
+	}
+
+	rd = rn.Ready()
+	if len(rd.Records) != 1 || rd.Records[0].Ref != ref || rd.Records[0].Status != StatusCommitted {
+		t.Fatalf("late fast-quorum ready records = %#v, want committed record for %s", rd.Records, ref)
+	}
+	if len(rd.Messages) != 4 {
+		t.Fatalf("late fast-quorum commit messages = %#v", rd.Messages)
+	}
+	seen := make(map[ReplicaID]bool, 4)
+	for _, msg := range rd.Messages {
+		if msg.Type == MsgAccept {
+			t.Fatalf("late fast-quorum response emitted accept message: %#v", msg)
+		}
+		if msg.Type != MsgCommit || msg.From != 1 || msg.Ref != ref || msg.RecordStatus != StatusCommitted {
+			t.Fatalf("late fast-quorum message = %#v, want commit for %s from replica 1", msg, ref)
+		}
+		seen[msg.To] = true
+	}
+	for _, to := range []ReplicaID{2, 3, 4, 5} {
+		if !seen[to] {
+			t.Fatalf("missing commit message to replica %d in %#v", to, rd.Messages)
+		}
+	}
+	if len(rd.Committed) != 1 {
+		t.Fatalf("late fast-quorum committed commands = %#v, want one command", rd.Committed)
+	}
+	committed := requireCommittedForRef(t, rd, ref)
+	if committed.Command.Kind != CommandUser || committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+		t.Fatalf("committed command = %#v, want user command %#v", committed.Command, cmd)
+	}
+	if len(committed.Command.ConflictKeys) != 1 || !bytes.Equal(committed.Command.ConflictKeys[0], cmd.ConflictKeys[0]) {
+		t.Fatalf("committed conflict keys = %#v, want %#v", committed.Command.ConflictKeys, cmd.ConflictKeys)
+	}
+}
+
 func TestRemainingResponseBranches(t *testing.T) {
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
 	if err != nil {
