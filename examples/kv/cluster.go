@@ -9,15 +9,20 @@ import (
 
 // Cluster is a deterministic in-process distributed KV example.
 type Cluster struct {
-	Nodes  map[epaxos.ReplicaID]*epaxos.RawNode
-	Stores map[epaxos.ReplicaID]*epaxos.MemoryStorage
-	DBs    map[epaxos.ReplicaID]*DB
-	ids    []epaxos.ReplicaID
-	next   uint64
+	Nodes          map[epaxos.ReplicaID]*epaxos.RawNode
+	Stores         map[epaxos.ReplicaID]*epaxos.MemoryStorage
+	DBs            map[epaxos.ReplicaID]*DB
+	deliverMessage func(epaxos.Message) error
+	ids            []epaxos.ReplicaID
+	next           uint64
 }
 
 // OpenCluster opens one Pebble DB per path and wires EPaxos nodes together.
 func OpenCluster(paths []string) (*Cluster, error) {
+	return openCluster(paths, epaxos.NewRawNode)
+}
+
+func openCluster(paths []string, newNode func(epaxos.Config) (*epaxos.RawNode, error)) (*Cluster, error) {
 	if len(paths) == 0 || len(paths) > 7 {
 		return nil, fmt.Errorf("kv: cluster size must be 1..7")
 	}
@@ -26,6 +31,7 @@ func OpenCluster(paths []string) (*Cluster, error) {
 		ids[i] = epaxos.ReplicaID(i + 1)
 	}
 	c := &Cluster{Nodes: make(map[epaxos.ReplicaID]*epaxos.RawNode), Stores: make(map[epaxos.ReplicaID]*epaxos.MemoryStorage), DBs: make(map[epaxos.ReplicaID]*DB), ids: ids, next: 1}
+	c.deliverMessage = c.deliver
 	for i, path := range paths {
 		id := ids[i]
 		db, err := Open(path)
@@ -34,7 +40,7 @@ func OpenCluster(paths []string) (*Cluster, error) {
 			return nil, err
 		}
 		st := epaxos.NewMemoryStorage()
-		rn, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: ids, Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+		rn, err := newNode(epaxos.Config{ID: id, Voters: ids, Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
 		if err != nil {
 			_ = db.Close()
 			_ = c.Close()
@@ -60,18 +66,18 @@ func (c *Cluster) Close() error {
 func (c *Cluster) Put(key, value []byte) error {
 	seq := c.next
 	c.next++
-	_, err := c.Nodes[c.ids[0]].Propose(CommandForPut(1, seq, key, value))
-	if err != nil {
-		return err
-	}
-	return c.Drain()
+	return c.proposeAndDrain(CommandForPut(1, seq, key, value))
 }
 
 // Delete proposes and applies a replicated delete through the first replica.
 func (c *Cluster) Delete(key []byte) error {
 	seq := c.next
 	c.next++
-	_, err := c.Nodes[c.ids[0]].Propose(CommandForDelete(1, seq, key))
+	return c.proposeAndDrain(CommandForDelete(1, seq, key))
+}
+
+func (c *Cluster) proposeAndDrain(cmd epaxos.Command) error {
+	_, err := c.Nodes[c.ids[0]].Propose(cmd)
 	if err != nil {
 		return err
 	}
@@ -89,7 +95,11 @@ func (c *Cluster) Get(id epaxos.ReplicaID, key []byte) ([]byte, bool, error) {
 
 // Drain runs deterministic transport until no node has ready work.
 func (c *Cluster) Drain() error {
-	for round := 0; round < 1000; round++ {
+	return c.drainWithLimit(1000)
+}
+
+func (c *Cluster) drainWithLimit(limit int) error {
+	for round := 0; round < limit; round++ {
 		progress := false
 		for _, id := range c.ids {
 			rn := c.Nodes[id]
@@ -107,11 +117,7 @@ func (c *Cluster) Drain() error {
 				}
 			}
 			for _, msg := range rd.Messages {
-				to := c.Nodes[msg.To]
-				if to == nil {
-					continue
-				}
-				if err := to.Step(msg); err != nil && !errors.Is(err, epaxos.ErrMessageRejected) {
+				if err := c.deliverMessage(msg); err != nil {
 					return err
 				}
 			}
@@ -122,4 +128,15 @@ func (c *Cluster) Drain() error {
 		}
 	}
 	return fmt.Errorf("kv: cluster did not quiesce")
+}
+
+func (c *Cluster) deliver(msg epaxos.Message) error {
+	to := c.Nodes[msg.To]
+	if to == nil {
+		return nil
+	}
+	if err := to.Step(msg); err != nil && !errors.Is(err, epaxos.ErrMessageRejected) {
+		return err
+	}
+	return nil
 }

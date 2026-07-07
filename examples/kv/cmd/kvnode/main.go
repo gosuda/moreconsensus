@@ -220,6 +220,9 @@ func (s *service) send(messages []epaxos.Message) {
 		if msg.To == s.id || s.peers[msg.To] == "" {
 			continue
 		}
+		if s.postMessage(msg) {
+			continue
+		}
 		select {
 		case s.sendq <- msg:
 		default:
@@ -227,21 +230,29 @@ func (s *service) send(messages []epaxos.Message) {
 	}
 }
 
+func (s *service) postMessage(msg epaxos.Message) bool {
+	base := s.peers[msg.To]
+	if base == "" {
+		return true
+	}
+	buf, err := epaxos.EncodeMessage(nil, msg)
+	if err != nil {
+		return false
+	}
+	resp, err := s.client.Post(base+"/epaxos/message", "application/octet-stream", bytes.NewReader(buf))
+	if err != nil {
+		return false
+	}
+	if resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	return resp.StatusCode < http.StatusInternalServerError
+}
+
 func (s *service) transportWorker() {
 	for msg := range s.sendq {
-		base := s.peers[msg.To]
-		if base == "" {
-			continue
-		}
-		buf, err := epaxos.EncodeMessage(nil, msg)
-		if err != nil {
-			continue
-		}
-		resp, err := s.client.Post(base+"/epaxos/message", "application/octet-stream", bytes.NewReader(buf))
-		if err == nil && resp.Body != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-		}
+		_ = s.postMessage(msg)
 	}
 }
 

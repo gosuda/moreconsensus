@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verification:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+
+      - name: Install Leiningen
+        run: |
+          curl -fsSL -o /tmp/lein https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          chmod +x /tmp/lein
+          echo /tmp >> "$GITHUB_PATH"
+
+      - name: Run repository verification gates
+        run: tests/ci.sh

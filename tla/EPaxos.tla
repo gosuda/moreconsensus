@@ -1,11 +1,13 @@
 ---- MODULE EPaxos ----
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS Replicas, InstanceNums, SeqNums, TickLimit, Commands, Conflicts, None, PreAccepted, Accepted, Committed, Executed
+CONSTANTS Replicas, InstanceNums, SeqNums, BallotNums, TickLimit, Commands, None, PreAccepted, Accepted, Committed, Executed
 
 VARIABLES status, ballot, seq, deps, command, messages, executed, tick
 
 Instances == Replicas \X InstanceNums
+Conflicts == Commands \X Commands
+
 
 KnownConflicts(i, c) ==
     {j \in Instances : j # i /\ command[j] # None /\ <<c, command[j]>> \in Conflicts}
@@ -14,7 +16,7 @@ SafeDeps(i, c, d) == KnownConflicts(i, c) \subseteq d
 
 TypeOK ==
     /\ status \in [Instances -> {None, PreAccepted, Accepted, Committed, Executed}]
-    /\ ballot \in [Instances -> Nat]
+    /\ ballot \in [Instances -> BallotNums \cup {0}]
     /\ seq \in [Instances -> SeqNums \cup {0}]
     /\ deps \in [Instances -> SUBSET Instances]
     /\ command \in [Instances -> Commands \cup {None}]
@@ -61,6 +63,7 @@ Commit(i) ==
 
 Prepare(i) ==
     /\ status[i] \in {PreAccepted, Accepted}
+    /\ ballot[i] + 1 \in BallotNums
     /\ ballot' = [ballot EXCEPT ![i] = ballot[i] + 1]
     /\ messages' = messages \cup {[type |-> "prepare", from |-> i[1], to |-> r, inst |-> i] : r \in Replicas \ {i[1]}}
     /\ UNCHANGED <<status, seq, deps, command, executed, tick>>

@@ -1,6 +1,7 @@
 (ns moreconsensus.epaxos-test
   (:require [clj-http.client :as http]
             [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [checker :as checker]
                     [cli :as cli]
@@ -11,7 +12,12 @@
             [knossos.model :as model]))
 
 (defn endpoint [test node]
-  (str "http://" node ":" (or (:http-port test) 8080)))
+  (let [node (str/replace (str node) #"/$" "")]
+    (cond
+      (str/starts-with? node "http://") node
+      (str/starts-with? node "https://") node
+      (str/includes? node ":") (str "http://" node)
+      :else (str "http://" node ":" (or (:http-port test) 8080)))))
 
 (defrecord KVClient [node]
   client/Client
@@ -45,8 +51,10 @@
 
 (defn workload []
   {:client (->KVClient nil)
-   :generator (gen/mix [(gen/map (fn [x] {:type :invoke :f :write :value x}) (range))
-                        (gen/repeat {:type :invoke :f :read :value nil})])
+   :generator (gen/clients
+               (gen/limit 60
+                          (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
+                                    (gen/repeat {:type :invoke :f :read :value nil})])))
    :checker (checker/compose {:linearizable (checker/linearizable {:model (model/register)})
                               :timeline (timeline/html)})})
 

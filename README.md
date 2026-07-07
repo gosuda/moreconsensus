@@ -13,6 +13,7 @@
 - Deterministic simulation tests for cluster sizes 1 through 7.
 - A Pebble-backed distributed key-value example in its own Go module.
 - The example HTTP service is built explicitly with `go build -tags kvnode ./cmd/kvnode` from `examples/kv`.
+- Repository verification gates run from `tests/ci.sh` and are wired into GitHub Actions CI.
 
 ## Documentation
 
@@ -21,6 +22,7 @@
 - [tla/EPaxos.tla](tla/EPaxos.tla) contains the executable-style formal model.
 - [examples/kv](examples/kv) contains the Pebble/MyRocks-style key-value example.
 - [jepsen](jepsen) contains the Jepsen workload harness for external validation.
+- [tests](tests) contains the repository verification scripts used by CI.
 
 ## Module layout
 

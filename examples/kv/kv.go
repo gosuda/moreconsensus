@@ -21,8 +21,9 @@ const (
 
 // DB stores EPaxos-applied commands in a Pebble database.
 type DB struct {
-	pebble *pebble.DB
-	cf     uint32
+	pebble  *pebble.DB
+	cf      uint32
+	newIter func(*pebble.IterOptions) (*pebble.Iterator, error)
 }
 
 // KV is one key-value pair returned by scans.
@@ -47,7 +48,7 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{pebble: db, cf: 1}, nil
+	return &DB{pebble: db, cf: 1, newIter: db.NewIter}, nil
 }
 
 // Close closes the underlying Pebble database.
@@ -93,7 +94,7 @@ func (db *DB) DeleteVersion(key []byte, ts uint64) error {
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	prefix := EncodeUserPrefix(nil, db.cf, key)
 	upper := prefixLimit(prefix)
-	iter, err := db.pebble.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
+	iter, err := db.newIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,7 +122,7 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 	if len(upperUser) == 0 {
 		upper = prefixLimit(EncodeUserPrefix(nil, db.cf, nil))
 	}
-	iter, err := db.pebble.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := db.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, err
 	}

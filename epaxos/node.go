@@ -163,7 +163,11 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		if !VerifyRecordChecksum(rec) {
 			return ErrChecksumMismatch
 		}
-		n.instances[rec.Ref] = &instance{rec: rec.Clone(), phase: phaseFromStatus(rec.Status)}
+		phase := phaseFromStatus(rec.Status)
+		if rec.Ref.Replica == n.id && rec.Status < StatusCommitted && rec.Status != StatusNone && rec.Ballot.Number > 0 {
+			phase = phasePrepare
+		}
+		n.instances[rec.Ref] = &instance{rec: rec.Clone(), phase: phase}
 		if rec.Ref.Replica == n.id && rec.Ref.Instance >= n.nextInstance {
 			n.nextInstance = rec.Ref.Instance + 1
 		}

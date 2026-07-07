@@ -24,6 +24,12 @@ profile.cov
 go.work.sum
 AGENTS.md
 
+# Generated validation artifacts
+states/
+jepsen/target/
+jepsen/.lein-failures
+jepsen/store/
+
 # env file
 .env
 
