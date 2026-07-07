@@ -79,6 +79,16 @@
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
 
+(deftest local-fault-config-uses-provided-storage-env
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        env {"FAULTS" "storage"
+             "BASE_PORT" "9100"}]
+    (with-redefs [epaxos/fault-env (fault-env-from env)]
+      (is (= {:faults "storage"
+              :base-port 9100
+              :nodes nodes}
+             (epaxos/local-fault-config {:nodes nodes}))))))
+
 (deftest local-restart-generator-emits-node-restarts-in-order
   (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
         ops (take 9 (epaxos/local-restart-generator nodes))]
@@ -96,6 +106,16 @@
             {:type :info :f :heal-node :value "127.0.0.1:9101"}
             {:type :info :f :isolate-node :value "127.0.0.1:9102"}
             {:type :info :f :heal-node :value "127.0.0.1:9102"}]
+           (fault-ops ops)))
+    (is (= 8 (count ops)))))
+
+(deftest local-storage-generator-emits-fail-and-heal-in-order
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        ops (take 9 (epaxos/local-storage-generator nodes))]
+    (is (= [{:type :info :f :fail-storage :value "127.0.0.1:9101"}
+            {:type :info :f :heal-storage :value "127.0.0.1:9101"}
+            {:type :info :f :fail-storage :value "127.0.0.1:9102"}
+            {:type :info :f :heal-storage :value "127.0.0.1:9102"}]
            (fault-ops ops)))
     (is (= 8 (count ops)))))
 
@@ -132,6 +152,23 @@
                :f :heal-node
                :value "127.0.0.1:9101"}]
              nemesis-faults)))))
+
+(deftest workload-routes-storage-faults-to-storage-generator
+  (let [fault-cfg {:faults "storage"
+                   :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
+        generator (:generator (epaxos/workload fault-cfg))
+        [client-op] (generated-ops-for generator 0 1)
+        nemesis-faults (fault-ops (take 5 (epaxos/local-fault-generator fault-cfg)))]
+    (is (= :invoke (:type client-op)))
+    (is (= 0 (:process client-op)))
+    (is (contains? client-operation-fs (:f client-op)))
+    (is (= [{:type :info
+             :f :fail-storage
+             :value "127.0.0.1:9101"}
+            {:type :info
+             :f :heal-storage
+             :value "127.0.0.1:9101"}]
+           nemesis-faults))))
 
 (deftest local-restart-nemesis-stops-and-starts-selected-node
   (let [cfg {:faults "restart"
@@ -204,6 +241,52 @@
                         {:node "127.0.0.1:9102" :from 1 :to 2 :drop false :status 204}
                         {:node "127.0.0.1:9102" :from 2 :to 1 :drop false :status 204}]}
                (select-keys heal-op [:type :f :value])))))))
+
+
+(deftest local-storage-nemesis-posts-selected-faults-and-heals-teardown
+  (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
+        cfg {:faults "storage"
+             :base-port 9100
+             :nodes nodes}
+        requests (atom [])]
+    (with-redefs [http/post (fn [url opts]
+                              (swap! requests conj [url opts])
+                              {:status 204})]
+      (let [nemesis (epaxos/local-fault-nemesis cfg)
+            fail-op (nemesis/invoke! nemesis {}
+                                     {:type :invoke
+                                      :f :fail-storage
+                                      :value "127.0.0.1:9101"})
+            heal-op (nemesis/invoke! nemesis {}
+                                     {:type :invoke
+                                      :f :heal-storage
+                                      :value "127.0.0.1:9101"})]
+        (nemesis/teardown! nemesis {:nodes ["127.0.0.1:9999"]})
+        (is (= {:type :info
+                :f :fail-storage
+                :value {:node "127.0.0.1:9101" :fail true :status 204}}
+               (select-keys fail-op [:type :f :value])))
+        (is (= {:type :info
+                :f :heal-storage
+                :value {:node "127.0.0.1:9101" :fail false :status 204}}
+               (select-keys heal-op [:type :f :value])))
+        (is (= [["http://127.0.0.1:9101/faults/storage"
+                 {:body (json/write-str {"fail" true})
+                  :content-type :json
+                  :throw-exceptions false}]
+                ["http://127.0.0.1:9101/faults/storage"
+                 {:body (json/write-str {"fail" false})
+                  :content-type :json
+                  :throw-exceptions false}]
+                ["http://127.0.0.1:9101/faults/storage"
+                 {:body (json/write-str {"fail" false})
+                  :content-type :json
+                  :throw-exceptions false}]
+                ["http://127.0.0.1:9102/faults/storage"
+                 {:body (json/write-str {"fail" false})
+                  :content-type :json
+                  :throw-exceptions false}]]
+               @requests))))))
 
 (deftest local-restart-nemesis-surfaces-invoke-errors
   (let [cfg {:nodes ["127.0.0.1:9101"]}]

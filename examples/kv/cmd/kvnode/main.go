@@ -38,6 +38,7 @@ type service struct {
 	sendq          chan epaxos.Message
 	nextSeq        uint64
 	transportDrops map[transportLink]struct{}
+	storageFailed  bool
 }
 
 type transportLink struct {
@@ -49,6 +50,10 @@ type transportFaultRequest struct {
 	From epaxos.ReplicaID `json:"from"`
 	To   epaxos.ReplicaID `json:"to"`
 	Drop bool             `json:"drop"`
+}
+
+type storageFaultRequest struct {
+	Fail bool `json:"fail"`
 }
 
 func main() {
@@ -81,6 +86,7 @@ func main() {
 	mux.HandleFunc("/scan", s.handleScan)
 	mux.HandleFunc("/epaxos/message", s.handleMessage)
 	mux.HandleFunc("/faults/transport", s.handleTransportFault)
+	mux.HandleFunc("/faults/storage", s.handleStorageFault)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	log.Printf("kvnode %d listening on %s", s.id, *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
@@ -117,6 +123,10 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	key := []byte(keyText)
 	switch r.Method {
 	case http.MethodGet:
+		if s.storageFaultActive() {
+			http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+			return
+		}
 		if err := s.waitForKeys(r.Context(), key); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -132,6 +142,10 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write(value)
 	case http.MethodPut:
+		if s.storageFaultActive() {
+			http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -143,6 +157,10 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodDelete:
+		if s.storageFaultActive() {
+			http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+			return
+		}
 		if err := s.proposeAndWait(r.Context(), kv.CommandForDelete(uint64(s.id), s.next(), key)); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -180,6 +198,10 @@ func (s *service) handleTxn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ops = append(ops, kv.TxnOp{Delete: op.Delete, Key: []byte(op.Key), Value: []byte(op.Value)})
+	}
+	if s.storageFaultActive() {
+		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+		return
 	}
 	if err := s.proposeAndWait(r.Context(), kv.CommandForTxn(uint64(s.id), s.next(), ops)); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -221,6 +243,10 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reverse = v
+	}
+	if s.storageFaultActive() {
+		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+		return
 	}
 	if raw := q.Get("barrier"); raw != "" {
 		parts := strings.Split(raw, ",")
@@ -280,6 +306,39 @@ func (s *service) handleTransportFault(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *service) handleStorageFault(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(storageFaultRequest{Fail: s.storageFaultActive()})
+	case http.MethodPost:
+		var req storageFaultRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.setStorageFault(req.Fail)
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		s.setStorageFault(false)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *service) setStorageFault(failed bool) {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	s.storageFailed = failed
+}
+
+func (s *service) storageFaultActive() bool {
+	s.faultMu.RLock()
+	defer s.faultMu.RUnlock()
+	return s.storageFailed
 }
 
 func (s *service) setTransportDrop(from, to epaxos.ReplicaID, drop bool) {
@@ -342,12 +401,20 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "transport link dropped", http.StatusConflict)
 		return
 	}
+	if s.storageFaultActive() {
+		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+		return
+	}
 	s.mu.Lock()
 	err = s.node.Step(msg)
 	out, drainErr := s.drainLocked()
 	s.mu.Unlock()
-	if err != nil || drainErr != nil {
-		http.Error(w, errorsJoin(err, drainErr).Error(), http.StatusBadRequest)
+	if drainErr != nil {
+		http.Error(w, errorsJoin(err, drainErr).Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	s.send(out)
@@ -377,6 +444,9 @@ func (s *service) waitForKeys(ctx context.Context, keys ...[]byte) error {
 }
 
 func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error {
+	if s.storageFaultActive() {
+		return fmt.Errorf("storage fault active")
+	}
 	s.mu.Lock()
 	ref, err := s.node.Propose(cmd)
 	out, drainErr := s.drainLocked()

@@ -170,7 +170,6 @@ func TestHandleTxnAcceptsDuplicateKeysWithFinalDelete(t *testing.T) {
 	}
 }
 
-
 func TestHandleKVRepeatedPutWaitsForNewAppliedRef(t *testing.T) {
 	s := newTestService(t)
 	for i := 1; i <= 2; i++ {
@@ -302,6 +301,122 @@ func TestHandleMessageRejectsMalformedTransportPayload(t *testing.T) {
 	}
 }
 
+func TestHandleStorageFaultSetsListsAndClearsFailure(t *testing.T) {
+	s := newTestService(t)
+
+	requireStorageFault(t, s, false)
+
+	set := httptest.NewRecorder()
+	s.handleStorageFault(set, httptest.NewRequest(http.MethodPost, "/faults/storage", bytes.NewReader([]byte(`{"fail":true}`))))
+	if set.Code != http.StatusNoContent {
+		t.Fatalf("set status=%d body=%q", set.Code, set.Body.String())
+	}
+	requireStorageFault(t, s, true)
+
+	clearByPost := httptest.NewRecorder()
+	s.handleStorageFault(clearByPost, httptest.NewRequest(http.MethodPost, "/faults/storage", bytes.NewReader([]byte(`{"fail":false}`))))
+	if clearByPost.Code != http.StatusNoContent {
+		t.Fatalf("clear post status=%d body=%q", clearByPost.Code, clearByPost.Body.String())
+	}
+	requireStorageFault(t, s, false)
+
+	setAgain := httptest.NewRecorder()
+	s.handleStorageFault(setAgain, httptest.NewRequest(http.MethodPost, "/faults/storage", bytes.NewReader([]byte(`{"fail":true}`))))
+	if setAgain.Code != http.StatusNoContent {
+		t.Fatalf("set again status=%d body=%q", setAgain.Code, setAgain.Body.String())
+	}
+
+	clearByDelete := httptest.NewRecorder()
+	s.handleStorageFault(clearByDelete, httptest.NewRequest(http.MethodDelete, "/faults/storage", nil))
+	if clearByDelete.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%q", clearByDelete.Code, clearByDelete.Body.String())
+	}
+	requireStorageFault(t, s, false)
+}
+
+func TestHandleStorageFaultRejectsMalformedRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		body   []byte
+		want   int
+	}{
+		{name: "wrong method", method: http.MethodPut, want: http.StatusMethodNotAllowed},
+		{name: "malformed json", method: http.MethodPost, body: []byte(`{"fail":`), want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			s.setStorageFault(true)
+			rr := httptest.NewRecorder()
+			s.handleStorageFault(rr, httptest.NewRequest(tc.method, "/faults/storage", bytes.NewReader(tc.body)))
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			requireStorageFault(t, s, true)
+		})
+	}
+}
+
+func TestStorageFaultRejectsClientRequestsBeforeConsensusProgress(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   []byte
+		handle func(*service, http.ResponseWriter, *http.Request)
+	}{
+		{name: "put", method: http.MethodPut, target: "/kv/alpha", body: []byte("one"), handle: (*service).handleKV},
+		{name: "delete", method: http.MethodDelete, target: "/kv/alpha", handle: (*service).handleKV},
+		{name: "get", method: http.MethodGet, target: "/kv/alpha", handle: (*service).handleKV},
+		{name: "txn", method: http.MethodPost, target: "/txn", body: []byte(`[{"key":"alpha","value":"one"}]`), handle: (*service).handleTxn},
+		{name: "scan barrier", method: http.MethodGet, target: "/scan?barrier=alpha", handle: (*service).handleScan},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			set := httptest.NewRecorder()
+			s.handleStorageFault(set, httptest.NewRequest(http.MethodPost, "/faults/storage", bytes.NewReader([]byte(`{"fail":true}`))))
+			if set.Code != http.StatusNoContent {
+				t.Fatalf("set fault status=%d body=%q", set.Code, set.Body.String())
+			}
+
+			rr := httptest.NewRecorder()
+			tc.handle(s, rr, httptest.NewRequest(tc.method, tc.target, bytes.NewReader(tc.body)))
+			if rr.Code != http.StatusServiceUnavailable || rr.Body.String() != "storage fault active\n" {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestStorageFaultRejectsInboundMessageBeforeSteppingNode(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
+	s.setStorageFault(true)
+	msg := epaxos.Message{
+		Type:    epaxos.MsgPreAccept,
+		From:    2,
+		To:      1,
+		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:  epaxos.Ballot{Replica: 2},
+		Seq:     1,
+		Deps:    []epaxos.InstanceNum{0, 0},
+		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, ConflictKeys: [][]byte{[]byte("blocked")}},
+	}
+	buf, err := epaxos.EncodeMessage(nil, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleMessage(rr, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(buf)))
+	if rr.Code != http.StatusServiceUnavailable || rr.Body.String() != "storage fault active\n" {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	requireNoConsensusProgress(t, s)
+}
+
 func TestHandleTransportFaultSetsListsAndClearsDroppedLinks(t *testing.T) {
 	s := newTestService(t)
 
@@ -419,6 +534,30 @@ func TestHandleMessageDropsConfiguredInboundTransportLinkBeforeSteppingNode(t *t
 	status := s.node.Status()
 	if len(status.Instances) != 0 || len(status.Executed) != 0 {
 		t.Fatalf("node status after dropped message: instances=%v executed=%v", status.Instances, status.Executed)
+	}
+}
+
+func requireStorageFault(t *testing.T, s *service, want bool) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	s.handleStorageFault(rr, httptest.NewRequest(http.MethodGet, "/faults/storage", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	var got storageFaultRequest
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Fail != want {
+		t.Fatalf("storage fault active=%t, want %t", got.Fail, want)
+	}
+}
+
+func requireNoConsensusProgress(t *testing.T, s *service) {
+	t.Helper()
+	status := s.node.Status()
+	if len(status.Instances) != 0 || len(status.Executed) != 0 {
+		t.Fatalf("node status after storage fault: instances=%v executed=%v", status.Instances, status.Executed)
 	}
 }
 

@@ -73,6 +73,12 @@
                  :nodes nodes}]
         (when (and (seq nodes) (pos? base-port))
           cfg))
+      "storage"
+      (let [cfg {:faults faults
+                 :base-port base-port
+                 :nodes nodes}]
+        (when (and (seq nodes) (pos? base-port))
+          cfg))
       nil)))
 
 (defn pid-file [cfg node]
@@ -180,6 +186,13 @@
           (transport-fault-request! controller from to drop?))
         (transport-isolation-requests cfg node)))
 
+(defn storage-fault-request! [node fail?]
+  (let [resp (http/post (str (endpoint {} node) "/faults/storage")
+                        {:body (json/write-str {"fail" fail?})
+                         :content-type :json
+                         :throw-exceptions false})]
+    {:node node :fail fail? :status (:status resp)}))
+
 (defn local-transport-nemesis [cfg]
   (reify nemesis/Nemesis
     (setup! [this _] this)
@@ -208,14 +221,44 @@
              {:type :info :f :heal-node :value node}])
           nodes))
 
+(defn local-storage-nemesis [cfg]
+  (reify nemesis/Nemesis
+    (setup! [this _] this)
+    (invoke! [this _ op]
+      (try
+        (case (:f op)
+          :fail-storage (assoc op :type :info :value (storage-fault-request! (:value op) true))
+          :heal-storage (assoc op :type :info :value (storage-fault-request! (:value op) false))
+          (assoc op :type :info :value :unknown-nemesis-op))
+        (catch Exception e
+          (warn e "local storage nemesis operation failed")
+          (assoc op :type :info :value {:error (.getMessage e)}))))
+    (teardown! [this _]
+      (doseq [node (:nodes cfg)]
+        (try
+          (storage-fault-request! node false)
+          (catch Exception e
+            (warn e "local storage nemesis repair failed"))))
+      this)))
+
+(defn local-storage-generator [nodes]
+  (mapcat (fn [node]
+            [(gen/sleep 1)
+             {:type :info :f :fail-storage :value node}
+             (gen/sleep 1)
+             {:type :info :f :heal-storage :value node}])
+          nodes))
+
 (defn local-fault-generator [cfg]
   (case (:faults cfg)
     "transport" (local-transport-generator (:nodes cfg))
+    "storage" (local-storage-generator (:nodes cfg))
     (local-restart-generator (:nodes cfg))))
 
 (defn local-fault-nemesis [cfg]
   (case (:faults cfg)
     "transport" (local-transport-nemesis cfg)
+    "storage" (local-storage-nemesis cfg)
     (local-restart-nemesis cfg)))
 
 
