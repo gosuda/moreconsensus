@@ -114,27 +114,58 @@
         {:node node :pid pid :action :killed})
       {:node node :action :already-down})))
 
+(def health-attempts 20)
+(def health-pause-ms 50)
+
+(defn node-health [cfg node]
+  (try
+    (let [resp (http/get (str (endpoint cfg node) "/health")
+                         {:throw-exceptions false})]
+      {:node node :status (:status resp) :healthy (= 200 (:status resp))})
+    (catch Exception e
+      {:node node :healthy false :error (.getMessage e)})))
+
+(defn wait-node-health [cfg node]
+  (loop [attempt 1
+         last-health nil]
+    (let [health (assoc (node-health cfg node) :attempt attempt)]
+      (if (:healthy health)
+        health
+        (if (< attempt health-attempts)
+          (do
+            (Thread/sleep health-pause-ms)
+            (recur (inc attempt) health))
+          (or health last-health))))))
+
+(defn launch-node-process! [cfg node]
+  (let [id (local-node-id cfg node)
+        port (node-port node)
+        log-file (io/file (:data-dir cfg) (str "node-" id ".log"))
+        data-dir (io/file (:data-dir cfg) (str "node-" id))
+        pb (ProcessBuilder.
+            (into-array String [(:bin cfg)
+                                "-id" (str id)
+                                "-listen" (str ":" port)
+                                "-data" (.getPath data-dir)
+                                "-peers" (:peers cfg)]))]
+    (.mkdirs data-dir)
+    (.redirectOutput pb (ProcessBuilder$Redirect/appendTo log-file))
+    (.redirectError pb (ProcessBuilder$Redirect/appendTo log-file))
+    (str (.pid (.start pb)))))
+
 (defn start-node! [cfg node]
   (let [pid (read-pid cfg node)]
     (if (pid-alive? pid)
-      {:node node :pid pid :action :already-running}
-      (let [id (local-node-id cfg node)
-            port (node-port node)
-            log-file (io/file (:data-dir cfg) (str "node-" id ".log"))
-            data-dir (io/file (:data-dir cfg) (str "node-" id))
-            pb (ProcessBuilder.
-                (into-array String [(:bin cfg)
-                                    "-id" (str id)
-                                    "-listen" (str ":" port)
-                                    "-data" (.getPath data-dir)
-                                    "-peers" (:peers cfg)]))]
-        (.mkdirs data-dir)
-        (.redirectOutput pb (ProcessBuilder$Redirect/appendTo log-file))
-        (.redirectError pb (ProcessBuilder$Redirect/appendTo log-file))
-        (let [process (.start pb)
-              new-pid (str (.pid process))]
-          (write-pid! cfg node new-pid)
-          {:node node :pid new-pid :action :started})))))
+      (let [health (wait-node-health cfg node)]
+        (if (:healthy health)
+          (merge health {:node node :pid pid :action :already-running})
+          (merge health {:node node :pid pid :action :start-failed})))
+      (let [new-pid (launch-node-process! cfg node)
+            health (wait-node-health cfg node)]
+        (write-pid! cfg node new-pid)
+        (if (:healthy health)
+          (merge health {:node node :pid new-pid :action :started})
+          (merge health {:node node :pid new-pid :action :start-failed}))))))
 
 (defn local-restart-nemesis [cfg]
   (reify nemesis/Nemesis

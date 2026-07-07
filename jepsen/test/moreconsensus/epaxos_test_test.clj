@@ -170,6 +170,86 @@
              :value "127.0.0.1:9101"}]
            nemesis-faults))))
 
+(deftest start-node-reports-healthy-launch
+  (let [cfg {:base-port 9100
+             :data-dir "/var/lib/moreconsensus"
+             :peers "127.0.0.1:9101,127.0.0.1:9102"
+             :pid-dir "/var/run/moreconsensus"}
+        node "127.0.0.1:9101"
+        calls (atom [])]
+    (with-redefs [epaxos/read-pid (fn [seen-cfg seen-node]
+                                    (swap! calls conj [:read seen-cfg seen-node])
+                                    nil)
+                  epaxos/pid-alive? (fn [seen-pid]
+                                      (swap! calls conj [:alive seen-pid])
+                                      false)
+                  epaxos/launch-node-process! (fn [seen-cfg seen-node]
+                                                (swap! calls conj [:launch seen-cfg seen-node])
+                                                "4242")
+                  epaxos/wait-node-health (fn [seen-cfg seen-node]
+                                            (swap! calls conj [:health seen-cfg seen-node])
+                                            {:node seen-node
+                                             :status 200
+                                             :healthy true
+                                             :attempt 1})
+                  epaxos/write-pid! (fn [seen-cfg seen-node seen-pid]
+                                      (swap! calls conj [:write seen-cfg seen-node seen-pid]))]
+      (is (= {:node node
+              :pid "4242"
+              :action :started
+              :status 200
+              :healthy true
+              :attempt 1}
+             (epaxos/start-node! cfg node)))
+      (is (= [[:read cfg node]
+              [:alive nil]
+              [:launch cfg node]
+              [:health cfg node]
+              [:write cfg node "4242"]]
+             @calls)))))
+
+(deftest local-restart-nemesis-reports-unhealthy-restart
+  (let [cfg {:faults "restart"
+             :nodes ["127.0.0.1:9101"]}
+        node "127.0.0.1:9101"
+        health-calls (atom [])
+        launches (atom [])
+        writes (atom [])]
+    (with-redefs [epaxos/read-pid (fn [_ _] nil)
+                  epaxos/pid-alive? (constantly false)
+                  epaxos/launch-node-process! (fn [seen-cfg seen-node]
+                                                (swap! launches conj [seen-cfg seen-node])
+                                                "5151")
+                  epaxos/health-attempts 3
+                  epaxos/health-pause-ms 0
+                  epaxos/node-health (fn [seen-cfg seen-node]
+                                       (swap! health-calls conj [seen-cfg seen-node])
+                                       {:node seen-node
+                                        :status 503
+                                        :healthy false})
+                  epaxos/write-pid! (fn [seen-cfg seen-node seen-pid]
+                                      (swap! writes conj [seen-cfg seen-node seen-pid]))]
+      (let [nemesis (epaxos/local-fault-nemesis cfg)
+            restart-op (nemesis/invoke! nemesis {}
+                                        {:type :invoke
+                                         :f :restart-node
+                                         :value node})]
+        (is (= [[cfg node]]
+               @launches))
+        (is (= [[cfg node] [cfg node] [cfg node]]
+               @health-calls))
+        (is (= [[cfg node "5151"]]
+               @writes))
+        (is (= {:type :info
+                :f :restart-node
+                :value {:node node
+                        :pid "5151"
+                        :action :start-failed
+                        :status 503
+                        :healthy false
+                        :attempt 3}}
+               (select-keys restart-op [:type :f :value])))))))
+
 (deftest local-restart-nemesis-stops-and-starts-selected-node
   (let [cfg {:faults "restart"
              :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
