@@ -19,7 +19,7 @@
 
 - [EPAXOS.MD](EPAXOS.MD) describes the implemented algorithm in detail.
 - [MODEL_EQ_REPORT.MD](MODEL_EQ_REPORT.MD) describes the current TLA+ model correspondence and implementation verification scope.
-- [tla/EPaxos.tla](tla/EPaxos.tla), [tla/ReadyAdvance.tla](tla/ReadyAdvance.tla), and [tla/Quorum.tla](tla/Quorum.tla) contain the finite executable formal models checked by CI.
+- [tla/EPaxos.tla](tla/EPaxos.tla), [tla/EPaxosResponses.tla](tla/EPaxosResponses.tla), [tla/ReadyAdvance.tla](tla/ReadyAdvance.tla), and [tla/Quorum.tla](tla/Quorum.tla) contain the finite executable formal models checked by CI.
 - [examples/kv](examples/kv) contains the Pebble/MyRocks-style key-value example.
 - [jepsen](jepsen) contains the Jepsen workload harness for external validation.
 - [tests](tests) contains the repository verification scripts used by CI.
