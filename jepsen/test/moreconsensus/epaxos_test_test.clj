@@ -969,12 +969,29 @@
       (is (= {:tx-b [nil 5 nil]}
              (:bad-groups bad-op))))))
 
+(deftest txn-atomic-checker-rejects-missing-and-wrong-sized-groups
+  (testing "every transaction read must contain exactly the configured groups with one value per key"
+    (let [missing-group {:type :ok
+                         :f :txn-read
+                         :value {:tx-a [1 1]
+                                 :tx-c [3 3]}}
+          wrong-lengths {:type :ok
+                         :f :txn-read
+                         :value {:tx-a [7]
+                                 :tx-b [8 8]
+                                 :tx-c [9 9 9]}}
+          result (check-txn-history [missing-group wrong-lengths])]
+      (is (= {:valid? false :checked 2 :bad-count 2}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [(:value missing-group) (:value wrong-lengths)]
+             (mapv :value (:bad result)))))))
+
 
 (defn check-advanced-scan-history [history]
   (checker/check (epaxos/advanced-scan-checker) nil history nil))
 
 (defn scan-row [key value]
-  {:key key :value (pr-str value)})
+  {:key key :value (pr-str value) :time 0})
 
 (deftest advanced-scan-sends-scan-query-params
   (testing "forward scans send the prefix, string limit, and barrier without a reverse flag"
@@ -1008,7 +1025,7 @@
                @requests))))))
 
 (deftest advanced-scan-checker-accepts-sorted-scan-shapes
-  (testing "ok scans are checked for key shape, not returned values"
+  (testing "ok scans are checked for key order and EDN row values"
     (let [history [{:type :ok
                     :f :scan-forward
                     :value [(scan-row "scan-a" :stale)
@@ -1054,6 +1071,55 @@
               {:f :scan-forward :bad-scan :order}
               {:f :scan-reverse :bad-scan :order}]
              (mapv #(select-keys % [:f :bad-scan]) bad))))))
+
+(deftest advanced-scan-checker-rejects-malformed-scan-rows
+  (testing "scan rows must be maps with string keys and EDN-encoded string values"
+    (let [non-map-row {:type :ok
+                       :f :scan-forward
+                       :value ["not-a-row"]}
+          missing-value {:type :ok
+                         :f :scan-forward
+                         :value [{:key "scan-a"}]}
+          non-string-key {:type :ok
+                          :f :scan-forward
+                          :value [{:key :scan-a :value (pr-str 1) :time 0}]}
+          non-string-value {:type :ok
+                            :f :scan-forward
+                            :value [{:key "scan-a" :value 1 :time 0}]}
+          non-edn-value {:type :ok
+                         :f :scan-forward
+                         :value [{:key "scan-a" :value "{:unterminated" :time 0}]}
+          result (check-advanced-scan-history [non-map-row
+                                               missing-value
+                                               non-string-key
+                                               non-string-value
+                                               non-edn-value])]
+      (is (= {:valid? false :checked 5 :bad-count 5}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [(:value non-map-row)
+              (:value missing-value)
+              (:value non-string-key)
+              (:value non-string-value)
+              (:value non-edn-value)]
+             (mapv :value (:bad result)))))))
+
+(deftest advanced-scan-checker-rejects-duplicate-scan-keys
+  (testing "scan results must not repeat a key even when they satisfy prefix, order, and limit"
+    (let [forward-duplicate {:type :ok
+                             :f :scan-forward
+                             :value [(scan-row "scan-a" 1)
+                                     (scan-row "scan-a" 2)
+                                     (scan-row "scan-b" 3)]}
+          reverse-duplicate {:type :ok
+                             :f :scan-reverse
+                             :value [(scan-row "scan-c" 3)
+                                     (scan-row "scan-c" 2)
+                                     (scan-row "scan-b" 1)]}
+          result (check-advanced-scan-history [forward-duplicate reverse-duplicate])]
+      (is (= {:valid? false :checked 2 :bad-count 2}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [:scan-forward :scan-reverse]
+             (mapv :f (:bad result)))))))
 
 (deftest advanced-scan-checker-ignores-non-scan-and-failed-scans
   (testing "only ok forward and reverse scan operations are checked"

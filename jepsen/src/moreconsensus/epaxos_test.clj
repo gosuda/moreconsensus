@@ -581,10 +581,37 @@
 (defn parse-rows [body]
   (json/read-str body :key-fn keyword))
 
+(defn decode-row-value [row]
+  (try
+    [:ok (edn/read-string (:value row))]
+    (catch Exception e
+      [:fail (.getMessage e)])))
+
+(defn scan-row-error [row]
+  (cond
+    (not (map? row)) :row
+    (not (string? (:key row))) :key
+    (not (string? (:value row))) :value
+    (not (integer? (:time row))) :time
+    (neg? (:time row)) :time
+    :else (let [[status _] (decode-row-value row)]
+            (when-not (= :ok status)
+              :value))))
+
+(defn scan-rows-error [rows]
+  (cond
+    (not (vector? rows)) :rows
+    :else (or (some scan-row-error rows)
+              (when (not= (count rows) (count (distinct (map :key rows))))
+                :duplicate-key))))
+
 (defn row-values [rows]
-  (into {} (map (fn [row]
-                  [(:key row) (edn/read-string (:value row))])
-                rows)))
+  (if-let [reason (scan-rows-error rows)]
+    (throw (ex-info "bad scan rows" {:reason reason :rows rows}))
+    (into {} (map (fn [row]
+                    (let [[_ value] (decode-row-value row)]
+                      [(:key row) value]))
+                  rows))))
 
 (defn scan-rows [base params]
   (try
@@ -593,7 +620,10 @@
                          {:query-params query-params
                           :throw-exceptions false})]
       (if (= 200 (:status resp))
-        [:ok (parse-rows (:body resp))]
+        (try
+          [:ok (parse-rows (:body resp))]
+          (catch Exception e
+            [:ok {:reason :body :error (.getMessage e)}]))
         [:fail (:status resp)]))
     (catch Exception e
       [:fail (.getMessage e)])))
@@ -604,7 +634,9 @@
    (let [[status rows] (scan-rows base {"prefix" prefix
                                         "barrier" barrier})]
      (if (= :ok status)
-       [:ok (row-values rows)]
+       (if-let [reason (scan-rows-error rows)]
+         [:malformed {:reason reason :rows rows}]
+         [:ok (row-values rows)])
        [:fail rows]))))
 
 (defn advanced-scan [base reverse?]
@@ -618,11 +650,12 @@
 
 (defn scan-values [base]
   (let [[status values] (scan-map base "tx-" txn-scan-barrier)]
-    (if (= :ok status)
-      [:ok (into {} (map (fn [{:keys [group keys]}]
-                           [group (mapv #(get values %) keys)])
-                         txn-key-groups))]
-      [:fail values])))
+    (cond
+      (= :ok status) [:ok (into {} (map (fn [{:keys [group keys]}]
+                                          [group (mapv #(get values %) keys)])
+                                        txn-key-groups))]
+      (= :malformed status) [:ok {:malformed values}]
+      :else [:fail values])))
 
 
 (defrecord KVClient [node]
@@ -709,21 +742,42 @@
       (check [_ test history opts]
         (checker/check linear test (mapv normalize-register-op (filterv #(contains? register-ops (:f %)) history)) opts)))))
 
+(defn txn-group-shape-errors [groups]
+  (if-not (map? groups)
+    {:groups :shape}
+    (let [expected (set txn-group-ids)
+          extras (vec (remove expected (keys groups)))]
+      (cond-> (into {} (keep (fn [{:keys [group keys]}]
+                               (let [values (get groups group ::missing)]
+                                 (cond
+                                   (= ::missing values) [group :missing]
+                                   (not (vector? values)) [group :shape]
+                                   (not= (count keys) (count values)) [group {:want (count keys) :got (count values)}])))
+                             txn-key-groups))
+        (seq extras) (assoc :extra extras)))))
+
 (defn inconsistent-txn-groups [groups]
-  (into {} (keep (fn [[group values]]
-                   (when-not (apply = values)
-                     [group values]))
-                 groups)))
+  (into {} (keep (fn [{:keys [group]}]
+                   (let [values (get groups group)]
+                     (when (and (vector? values) (not (apply = values)))
+                       [group values])))
+                 txn-key-groups)))
+
+(defn bad-txn-op [op]
+  (let [shape-errors (txn-group-shape-errors (:value op))
+        bad-groups (if (seq shape-errors)
+                     {}
+                     (inconsistent-txn-groups (:value op)))]
+    (when (or (seq shape-errors) (seq bad-groups))
+      (cond-> op
+        (seq shape-errors) (assoc :bad-shape shape-errors)
+        (seq bad-groups) (assoc :bad-groups bad-groups)))))
 
 (defn txn-atomic-checker []
   (reify checker/Checker
     (check [_ _ history _]
       (let [reads (filter #(and (= :ok (:type %)) (= :txn-read (:f %))) history)
-            bad (vec (keep (fn [op]
-                             (let [groups (inconsistent-txn-groups (:value op))]
-                               (when (seq groups)
-                                 (assoc op :bad-groups groups))))
-                           reads))]
+            bad (vec (keep bad-txn-op reads))]
         {:valid? (empty? bad)
          :checked (count reads)
          :bad-count (count bad)
@@ -737,8 +791,10 @@
 
 (defn bad-scan-op [op]
   (let [rows (:value op)
-        keys (mapv :key rows)]
+        row-error (scan-rows-error rows)
+        keys (if (vector? rows) (mapv :key rows) [])]
     (cond
+      row-error (assoc op :bad-scan row-error)
       (> (count rows) scan-limit) (assoc op :bad-scan :limit)
       (some #(not (str/starts-with? % scan-prefix)) keys) (assoc op :bad-scan :prefix)
       (and (= :scan-forward (:f op)) (not (ordered-ascending? keys))) (assoc op :bad-scan :order)
