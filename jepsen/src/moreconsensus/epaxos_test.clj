@@ -20,7 +20,7 @@
       (str/includes? node ":") (str "http://" node)
       :else (str "http://" node ":" (or (:http-port test) 8080)))))
 
-(def register-ops #{:read :write})
+(def register-ops #{:read :write :delete})
 
 (def txn-key-groups
   [{:group :tx-a :keys ["tx-a0" "tx-a1"]}
@@ -102,8 +102,15 @@
           :read
           (let [resp (http/get (str base "/kv/" k)
                                {:throw-exceptions false})]
-            (if (= 200 (:status resp))
-              (assoc op :type :ok :value (edn/read-string (:body resp)))
+            (cond
+              (= 200 (:status resp)) (assoc op :type :ok :value (edn/read-string (:body resp)))
+              (= 404 (:status resp)) (assoc op :type :ok :value nil)
+              :else (assoc op :type :fail :error (:status resp))))
+          :delete
+          (let [resp (http/delete (str base "/kv/" k)
+                                  {:throw-exceptions false})]
+            (if (ok-status? (:status resp))
+              (assoc op :type :ok)
               (assoc op :type :fail :error (:status resp))))
           :txn-write
           (let [{:keys [group value]} (:value op)
@@ -135,11 +142,16 @@
   (teardown! [this test])
   (close! [this test]))
 
+(defn normalize-register-op [op]
+  (if (= :delete (:f op))
+    (assoc op :f :write :value nil)
+    op))
+
 (defn register-linearizable-checker []
   (let [linear (checker/linearizable {:model (model/register)})]
     (reify checker/Checker
       (check [_ test history opts]
-        (checker/check linear test (filterv #(contains? register-ops (:f %)) history) opts)))))
+        (checker/check linear test (mapv normalize-register-op (filterv #(contains? register-ops (:f %)) history)) opts)))))
 
 (defn inconsistent-txn-groups [groups]
   (into {} (keep (fn [[group values]]
@@ -167,6 +179,7 @@
                (gen/limit 90
                           (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
                                     (gen/repeat {:type :invoke :f :read :value nil})
+                                    (gen/repeat {:type :invoke :f :delete :value nil})
                                     (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
                                     (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
                                     (gen/repeat {:type :invoke :f :txn-read :value nil})])))
