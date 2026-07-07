@@ -22,6 +22,98 @@ func TestRecordFormatOrdersNewestFirst(t *testing.T) {
 	}
 }
 
+func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
+	embeddedKey := []byte("a\x00x")
+	cases := []struct {
+		name  string
+		write func(*DB) error
+	}{
+		{
+			name: "put version",
+			write: func(db *DB) error {
+				return db.PutVersion(embeddedKey, []byte("embedded"), 2)
+			},
+		},
+		{
+			name: "delete version",
+			write: func(db *DB) error {
+				return db.DeleteVersion(embeddedKey, 2)
+			},
+		},
+		{
+			name: "committed put",
+			write: func(db *DB) error {
+				return db.ApplyCommitted(epaxos.CommittedCommand{
+					Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+					Command: CommandForPut(1, 2, embeddedKey, []byte("embedded")),
+				})
+			},
+		},
+		{
+			name: "committed delete",
+			write: func(db *DB) error {
+				return db.ApplyCommitted(epaxos.CommittedCommand{
+					Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+					Command: CommandForDelete(1, 2, embeddedKey),
+				})
+			},
+		},
+		{
+			name: "transaction put",
+			write: func(db *DB) error {
+				return db.ApplyCommitted(epaxos.CommittedCommand{
+					Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+					Command: CommandForTxn(1, 2, []TxnOp{
+						{Key: []byte("a"), Value: []byte("txn-overwrite")},
+						{Key: embeddedKey, Value: []byte("embedded")},
+					}),
+				})
+			},
+		},
+		{
+			name: "transaction delete",
+			write: func(db *DB) error {
+				return db.ApplyCommitted(epaxos.CommittedCommand{
+					Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+					Command: CommandForTxn(1, 2, []TxnOp{
+						{Key: []byte("a"), Value: []byte("txn-overwrite")},
+						{Delete: true, Key: embeddedKey},
+					}),
+				})
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+
+			if err := db.PutVersion([]byte("a"), []byte("short"), 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.write(db); err == nil {
+				t.Fatalf("embedded-separator key %q was accepted", embeddedKey)
+			}
+
+			value, ok, err := db.Get([]byte("a"))
+			if err != nil || !ok || string(value) != "short" {
+				t.Fatalf("short key value=%q ok=%v err=%v", value, ok, err)
+			}
+			scan, err := db.Scan(ScanOptions{Start: []byte("a"), End: []byte("b")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(scan) != 1 || string(scan[0].Key) != "a" || string(scan[0].Value) != "short" || scan[0].Time != 1 {
+				t.Fatalf("scan=%#v", scan)
+			}
+		})
+	}
+}
+
 func TestPutGetScanAndApplyCommitted(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {

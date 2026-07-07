@@ -20,6 +20,16 @@ const (
 	opTxn        byte = 3
 )
 
+var errInvalidKey = errors.New("kv: key must be non-empty and must not contain separator byte")
+
+// ValidateKey rejects user keys that cannot be encoded unambiguously.
+func ValidateKey(key []byte) error {
+	if len(key) == 0 || bytes.IndexByte(key, 0) >= 0 {
+		return errInvalidKey
+	}
+	return nil
+}
+
 // DB stores EPaxos-applied commands in a Pebble database.
 type DB struct {
 	pebble   *pebble.DB
@@ -175,6 +185,9 @@ func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.CommittedCommand, next *
 		if p.err || len(p.b) != 0 {
 			return false, fmt.Errorf("kv: malformed command")
 		}
+		if err := ValidateKey(key); err != nil {
+			return false, err
+		}
 		ts := *next
 		if err := stagePutVersion(batch, db.cf, key, value, ts); err != nil {
 			return false, err
@@ -186,6 +199,9 @@ func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.CommittedCommand, next *
 		_ = p.bytes()
 		if p.err || len(p.b) != 0 {
 			return false, fmt.Errorf("kv: malformed command")
+		}
+		if err := ValidateKey(key); err != nil {
+			return false, err
 		}
 		ts := *next
 		if err := stageDeleteVersion(batch, db.cf, key, ts); err != nil {
@@ -215,8 +231,14 @@ func (db *DB) stageTxn(batch txnBatch, p *parser, next *uint64) (bool, error) {
 		}
 		switch op {
 		case opPut:
+			if err := ValidateKey(key); err != nil {
+				return false, err
+			}
 			ops = append(ops, TxnOp{Key: key, Value: value})
 		case opDelete:
+			if err := ValidateKey(key); err != nil {
+				return false, err
+			}
 			ops = append(ops, TxnOp{Delete: true, Key: key})
 		default:
 			return false, fmt.Errorf("kv: unknown transaction op %d", op)
@@ -246,6 +268,9 @@ func (db *DB) stageTxn(batch txnBatch, p *parser, next *uint64) (bool, error) {
 
 // PutVersion writes one version using the example's MyRocks-like data-key format.
 func (db *DB) PutVersion(key, value []byte, ts uint64) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	batch := db.newWriteBatch()
 	defer func() { _ = batch.Close() }()
 	if err := stagePutVersion(batch, db.cf, key, value, ts); err != nil {
@@ -259,12 +284,18 @@ func (db *DB) PutVersion(key, value []byte, ts uint64) error {
 }
 
 func stagePutVersion(batch txnBatch, cf uint32, key, value []byte, ts uint64) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	k := EncodeDataKey(nil, cf, key, ts)
 	return batch.Set(k, append([]byte{valueRecord}, value...), nil)
 }
 
 // DeleteVersion writes a tombstone version for key.
 func (db *DB) DeleteVersion(key []byte, ts uint64) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	batch := db.newWriteBatch()
 	defer func() { _ = batch.Close() }()
 	if err := stageDeleteVersion(batch, db.cf, key, ts); err != nil {
@@ -278,12 +309,18 @@ func (db *DB) DeleteVersion(key []byte, ts uint64) error {
 }
 
 func stageDeleteVersion(batch txnBatch, cf uint32, key []byte, ts uint64) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	k := EncodeDataKey(nil, cf, key, ts)
 	return batch.Set(k, []byte{deleteRecord}, nil)
 }
 
 // Get returns the newest live value for key.
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, false, err
+	}
 	prefix := EncodeUserPrefix(nil, db.cf, key)
 	upper := prefixLimit(prefix)
 	iter, err := db.newIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})

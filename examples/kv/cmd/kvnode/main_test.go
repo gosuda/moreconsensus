@@ -102,6 +102,7 @@ func TestHandleTxnRejectsMalformedJSONAndInvalidRequests(t *testing.T) {
 		{name: "malformed json", method: http.MethodPost, body: []byte(`{"key"`), want: http.StatusBadRequest},
 		{name: "empty transaction", method: http.MethodPost, body: []byte(`[]`), want: http.StatusBadRequest},
 		{name: "empty key", method: http.MethodPost, body: []byte(`[{"key":"","value":"x"}]`), want: http.StatusBadRequest},
+		{name: "embedded separator key", method: http.MethodPost, body: []byte(`[{"key":"alpha\u0000beta","value":"x"}]`), want: http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -271,24 +272,29 @@ func TestHandleScanRejectsNegativeLimit(t *testing.T) {
 }
 
 func TestHandleKVRejectsBadKeysAndMethods(t *testing.T) {
-	s := newTestService(t)
-
-	badKey := httptest.NewRecorder()
-	s.handleKV(badKey, httptest.NewRequest(http.MethodGet, "/kv/", nil))
-	if badKey.Code != http.StatusBadRequest {
-		t.Fatalf("bad-key status=%d body=%q", badKey.Code, badKey.Body.String())
+	tests := []struct {
+		name    string
+		request *http.Request
+		want    int
+	}{
+		{name: "empty key", request: httptest.NewRequest(http.MethodGet, "/kv/", nil), want: http.StatusBadRequest},
+		{name: "bad escape", request: &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/kv/%zz"}, Body: http.NoBody}, want: http.StatusBadRequest},
+		{name: "embedded separator key", request: &http.Request{Method: http.MethodPut, URL: &url.URL{Path: "/kv/alpha%00beta"}, Body: http.NoBody}, want: http.StatusBadRequest},
+		{name: "wrong method", request: httptest.NewRequest(http.MethodPost, "/kv/alpha", nil), want: http.StatusMethodNotAllowed},
 	}
-
-	badEscape := httptest.NewRecorder()
-	s.handleKV(badEscape, &http.Request{Method: http.MethodGet, URL: &url.URL{Path: "/kv/%zz"}, Body: http.NoBody})
-	if badEscape.Code != http.StatusBadRequest {
-		t.Fatalf("bad-escape status=%d body=%q", badEscape.Code, badEscape.Body.String())
-	}
-
-	method := httptest.NewRecorder()
-	s.handleKV(method, httptest.NewRequest(http.MethodPost, "/kv/alpha", nil))
-	if method.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("method status=%d body=%q", method.Code, method.Body.String())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleKV(rr, tc.request)
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			status := s.node.Status()
+			if rr.Code == http.StatusBadRequest && (len(status.Instances) != 0 || len(status.Executed) != 0) {
+				t.Fatalf("node status after rejected request: instances=%v executed=%v", status.Instances, status.Executed)
+			}
+		})
 	}
 }
 

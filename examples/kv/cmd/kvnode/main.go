@@ -116,11 +116,15 @@ func parsePeers(raw string) (map[epaxos.ReplicaID]string, []epaxos.ReplicaID, er
 
 func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	keyText, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/kv/"))
-	if err != nil || keyText == "" {
+	if err != nil {
 		http.Error(w, "bad key", http.StatusBadRequest)
 		return
 	}
 	key := []byte(keyText)
+	if err := kv.ValidateKey(key); err != nil {
+		http.Error(w, "bad key", http.StatusBadRequest)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if s.storageFaultActive() {
@@ -193,11 +197,12 @@ func (s *service) handleTxn(w http.ResponseWriter, r *http.Request) {
 	}
 	ops := make([]kv.TxnOp, 0, len(request))
 	for _, op := range request {
-		if op.Key == "" {
+		key := []byte(op.Key)
+		if err := kv.ValidateKey(key); err != nil {
 			http.Error(w, "bad key", http.StatusBadRequest)
 			return
 		}
-		ops = append(ops, kv.TxnOp{Delete: op.Delete, Key: []byte(op.Key), Value: []byte(op.Value)})
+		ops = append(ops, kv.TxnOp{Delete: op.Delete, Key: key, Value: []byte(op.Value)})
 	}
 	if s.storageFaultActive() {
 		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
