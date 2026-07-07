@@ -21,5 +21,10 @@ for cfg in tla/EPaxos.cfg tla/EPaxosKVConflict.cfg tla/EPaxosThreeReplica.cfg; d
   rm -rf states
 done
 
+for cfg in tla/ReadyAdvance.cfg tla/ReadyAdvanceCapped.cfg; do
+  "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config "$cfg" tla/ReadyAdvance.tla
+  rm -rf states
+done
+
 "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config tla/Quorum.cfg tla/Quorum.tla
 rm -rf states

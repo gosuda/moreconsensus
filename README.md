@@ -26,7 +26,7 @@
 
 ## Operational validation
 
-- `JEPSEN_LOCAL_FAULTS=destructive-storage bash tests/jepsen_local.sh` runs the loopback KV cluster while each process is stopped, its Pebble directory is moved aside, an empty directory is started, and the original directory is restored.
+- `JEPSEN_LOCAL_FAULTS=destructive-storage bash tests/jepsen_local.sh` runs the loopback KV cluster while each selected process is stopped, its Pebble directory is moved aside, and the original directory is restored before the process rejoins.
 - `JEPSEN_NODES=n1,n2,n3 bash tests/jepsen_remote.sh` builds `kvnode`, uploads it to each SSH-managed host, starts one node per host, and runs the destructive-storage profile by default. `JEPSEN_REMOTE_FAULTS=restart|transport|storage|destructive-storage`, `JEPSEN_REMOTE_DURATION`, `JEPSEN_REMOTE_CONCURRENCY`, `MORECONSENSUS_KVNODE_HTTP_PORT`, and `MORECONSENSUS_KVNODE_REMOTE_DIR` tune that run.
 
 ## Module layout

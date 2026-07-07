@@ -1,6 +1,7 @@
 (ns moreconsensus.epaxos-test-test
   (:require [clj-http.client :as http]
             [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
@@ -409,16 +410,87 @@
                   :throw-exceptions false}]]
                @requests))))))
 
+(deftest remove-local-storage-stops-node-and-moves-data-aside
+  (let [root (doto (java.io.File/createTempFile "epaxos-storage" "local")
+               (.delete)
+               (.mkdirs))
+        cfg {:data-dir (.getPath root)
+             :base-port 9100}
+        node "127.0.0.1:9101"
+        data-dir (epaxos/local-data-dir cfg node)
+        backup-dir (epaxos/local-storage-backup-dir cfg node)
+        calls (atom [])]
+    (try
+      (.mkdirs data-dir)
+      (spit (io/file data-dir "state.edn") "{:committed 7}")
+      (with-redefs [epaxos/stop-node! (fn [seen-cfg seen-node]
+                                        (swap! calls conj [:stop seen-cfg seen-node])
+                                        {:node seen-node :action :stopped})
+                    epaxos/start-node! (fn [_ _]
+                                         (throw (ex-info "storage removal must keep the node stopped" {})))]
+        (is (= {:node node
+                :action :storage-removed
+                :stop {:node node :action :stopped}}
+               (epaxos/remove-local-storage! cfg node)))
+        (is (= [[:stop cfg node]]
+               @calls))
+        (is (false? (.exists data-dir)))
+        (is (= "{:committed 7}"
+               (slurp (io/file backup-dir "state.edn")))))
+      (finally
+        (epaxos/local-rm-rf! root)))))
+
+(deftest restore-local-storage-restores-backup-before-restart
+  (let [root (doto (java.io.File/createTempFile "epaxos-storage" "restore")
+               (.delete)
+               (.mkdirs))
+        cfg {:data-dir (.getPath root)
+             :base-port 9100}
+        node "127.0.0.1:9101"
+        data-dir (epaxos/local-data-dir cfg node)
+        backup-dir (epaxos/local-storage-backup-dir cfg node)
+        calls (atom [])]
+    (try
+      (.mkdirs data-dir)
+      (spit (io/file data-dir "stale.edn") "{:stale true}")
+      (.mkdirs backup-dir)
+      (spit (io/file backup-dir "state.edn") "{:committed 9}")
+      (with-redefs [epaxos/stop-node! (fn [seen-cfg seen-node]
+                                        (swap! calls conj [:stop seen-cfg seen-node])
+                                        {:node seen-node :action :stopped})
+                    epaxos/start-node! (fn [seen-cfg seen-node]
+                                         (swap! calls conj [:start seen-cfg seen-node])
+                                         {:node seen-node :action :started})]
+        (is (= {:node node
+                :action :storage-restored
+                :stop {:node node :action :stopped}
+                :start {:node node :action :started}}
+               (epaxos/restore-local-storage! cfg node)))
+        (is (= [[:stop cfg node]
+                [:start cfg node]]
+               @calls))
+        (is (false? (.exists backup-dir)))
+        (is (false? (.exists (io/file data-dir "stale.edn"))))
+        (is (= "{:committed 9}"
+               (slurp (io/file data-dir "state.edn")))))
+      (finally
+        (epaxos/local-rm-rf! root)))))
+
 (deftest local-destructive-storage-nemesis-removes-and-restores-selected-storage
   (let [cfg {:faults "destructive-storage"
              :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
         calls (atom [])]
     (with-redefs [epaxos/remove-local-storage! (fn [seen-cfg node]
                                                 (swap! calls conj [:remove seen-cfg node])
-                                                {:node node :action :storage-removed})
+                                                {:node node
+                                                 :action :storage-removed
+                                                 :stop {:node node :action :stopped}})
                   epaxos/restore-local-storage! (fn [seen-cfg node]
                                                  (swap! calls conj [:restore seen-cfg node])
-                                                 {:node node :action :storage-restored})]
+                                                 {:node node
+                                                  :action :storage-restored
+                                                  :stop {:node node :action :stopped}
+                                                  :start {:node node :action :started}})]
       (let [nemesis (epaxos/local-fault-nemesis cfg)
             remove-op (nemesis/invoke! nemesis {}
                                        {:type :invoke
@@ -433,12 +505,76 @@
                @calls))
         (is (= {:type :info
                 :f :remove-storage
-                :value {:node "127.0.0.1:9101" :action :storage-removed}}
+                :value {:node "127.0.0.1:9101"
+                        :action :storage-removed
+                        :stop {:node "127.0.0.1:9101" :action :stopped}}}
                (select-keys remove-op [:type :f :value])))
         (is (= {:type :info
                 :f :restore-storage
-                :value {:node "127.0.0.1:9102" :action :storage-restored}}
+                :value {:node "127.0.0.1:9102"
+                        :action :storage-restored
+                        :stop {:node "127.0.0.1:9102" :action :stopped}
+                        :start {:node "127.0.0.1:9102" :action :started}}}
                (select-keys restore-op [:type :f :value])))))))
+
+(deftest remove-remote-storage-stops-node-and-moves-data-aside
+  (let [cfg {:remote-dir "/srv/kv"
+             :node-ids {"alpha" 1}}
+        data-dir "/srv/kv/node-1"
+        backup-dir "/srv/kv/node-1.removed"
+        calls (atom [])]
+    (with-redefs [cu/exists? (fn [path]
+                               (swap! calls conj [:exists path])
+                               (= data-dir path))
+                  control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 {:exit 0})
+                  epaxos/stop-remote-node! (fn [seen-cfg node]
+                                             (swap! calls conj [:stop seen-cfg node])
+                                             {:node node :action :stopped})
+                  epaxos/start-remote-node! (fn [_ _]
+                                              (throw (ex-info "storage removal must keep the remote node stopped" {})))]
+      (is (= {:node "alpha"
+              :action :storage-removed
+              :stop {:node "alpha" :action :stopped}}
+             (epaxos/remove-remote-storage! cfg "alpha")))
+      (is (= [[:stop cfg "alpha"]
+              [:exists data-dir]
+              [:exec :rm :-rf backup-dir]
+              [:exec :mv data-dir backup-dir]]
+             @calls)))))
+
+(deftest restore-remote-storage-restores-backup-before-restart
+  (let [cfg {:remote-dir "/srv/kv"
+             :node-ids {"alpha" 1}}
+        data-dir "/srv/kv/node-1"
+        backup-dir "/srv/kv/node-1.removed"
+        calls (atom [])]
+    (with-redefs [cu/exists? (fn [path]
+                               (swap! calls conj [:exists path])
+                               (= backup-dir path))
+                  control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 {:exit 0})
+                  epaxos/stop-remote-node! (fn [seen-cfg node]
+                                             (swap! calls conj [:stop seen-cfg node])
+                                             {:node node :action :stopped})
+                  epaxos/start-remote-node! (fn [seen-cfg node]
+                                              (swap! calls conj [:start seen-cfg node])
+                                              {:node node :action :started})]
+      (is (= {:node "alpha"
+              :action :storage-restored
+              :stop {:node "alpha" :action :stopped}
+              :start {:node "alpha" :action :started}}
+             (epaxos/restore-remote-storage! cfg "alpha")))
+      (is (= [[:stop cfg "alpha"]
+              [:exec :mv backup-dir data-dir]
+              [:start cfg "alpha"]]
+             (filterv (fn [call]
+                        (or (#{:stop :start} (first call))
+                            (= [:exec :mv backup-dir data-dir] call)))
+                      @calls)))
+      (is (some #{[:exec :rm :-rf data-dir]} @calls)))))
 
 (deftest remote-restore-storage-leaves-live-data-when-backup-is-absent
   (let [cfg {:remote-dir "/srv/kv"
@@ -579,10 +715,15 @@
                                      (into {} (map (fn [node] [node (f test node)]) nodes)))
                   epaxos/remove-remote-storage! (fn [seen-cfg node]
                                                  (swap! calls conj [:remove seen-cfg node])
-                                                 {:node node :action :storage-removed})
+                                                 {:node node
+                                                  :action :storage-removed
+                                                  :stop {:node node :action :stopped}})
                   epaxos/restore-remote-storage! (fn [seen-cfg node]
                                                   (swap! calls conj [:restore seen-cfg node])
-                                                  {:node node :action :storage-restored})]
+                                                  {:node node
+                                                   :action :storage-restored
+                                                   :stop {:node node :action :stopped}
+                                                   :start {:node node :action :started}})]
       (let [nemesis (epaxos/remote-destructive-storage-nemesis cfg)
             remove-op (nemesis/invoke! nemesis {:name "remote-test"}
                                        {:type :invoke
@@ -599,11 +740,16 @@
                @calls))
         (is (= {:type :info
                 :f :remove-storage
-                :value {:node "bravo" :action :storage-removed}}
+                :value {:node "bravo"
+                        :action :storage-removed
+                        :stop {:node "bravo" :action :stopped}}}
                (select-keys remove-op [:type :f :value])))
         (is (= {:type :info
                 :f :restore-storage
-                :value {:node "alpha" :action :storage-restored}}
+                :value {:node "alpha"
+                        :action :storage-restored
+                        :stop {:node "alpha" :action :stopped}
+                        :start {:node "alpha" :action :started}}}
                (select-keys restore-op [:type :f :value])))))))
 
 (deftest remote-storage-http-faults-use-configured-port-for-bare-hostnames

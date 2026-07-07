@@ -217,8 +217,7 @@
         data-dir (local-data-dir cfg node)
         backup-dir (local-storage-backup-dir cfg node)]
     (local-move-if-present! data-dir backup-dir)
-    (let [start (start-node! cfg node)]
-      {:node node :action :storage-removed :stop stop :start start})))
+    {:node node :action :storage-removed :stop stop}))
 
 (defn restore-local-storage! [cfg node]
   (let [data-dir (local-data-dir cfg node)
@@ -460,8 +459,7 @@
         data-dir (remote-node-data-dir cfg node)
         backup-dir (remote-node-backup-dir cfg node)]
     (remote-move-if-present! data-dir backup-dir)
-    (let [start (start-remote-node! cfg node)]
-      {:node node :action :storage-removed :stop stop :start start})))
+    {:node node :action :storage-removed :stop stop}))
 
 (defn restore-remote-storage! [cfg node]
   (let [data-dir (remote-node-data-dir cfg node)
