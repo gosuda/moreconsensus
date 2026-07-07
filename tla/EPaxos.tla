@@ -1,12 +1,15 @@
 ---- MODULE EPaxos ----
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS Replicas, InstanceNums, SeqNums, BallotNums, TickLimit, Commands, None, PreAccepted, Accepted, Committed, Executed
+CONSTANTS Replicas, InstanceNums, SeqNums, BallotNums, TickLimit, Commands, ConflictKeyACommands, ConflictKeyBCommands, None, PreAccepted, Accepted, Committed, Executed
 
 VARIABLES status, ballot, seq, deps, command, messages, executed, tick
 
 Instances == Replicas \X InstanceNums
-Conflicts == Commands \X Commands
+Conflicts ==
+    (ConflictKeyACommands \X ConflictKeyACommands) \cup
+    (ConflictKeyBCommands \X ConflictKeyBCommands)
+
 
 
 KnownConflicts(i, c) ==
@@ -20,6 +23,8 @@ TypeOK ==
     /\ seq \in [Instances -> SeqNums \cup {0}]
     /\ deps \in [Instances -> SUBSET Instances]
     /\ command \in [Instances -> Commands \cup {None}]
+    /\ ConflictKeyACommands \subseteq Commands
+    /\ ConflictKeyBCommands \subseteq Commands
     /\ messages \in SUBSET [type : {"preaccept", "preaccept_resp", "accept", "accept_resp", "commit", "prepare", "prepare_resp"}, from : Replicas, to : Replicas, inst : Instances]
     /\ executed \in SUBSET Instances
     /\ tick \in 0..TickLimit
