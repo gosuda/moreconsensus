@@ -20,3 +20,6 @@ for cfg in tla/EPaxos.cfg tla/EPaxosKVConflict.cfg; do
   "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config "$cfg" tla/EPaxos.tla
   rm -rf states
 done
+
+"$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config tla/Quorum.cfg tla/Quorum.tla
+rm -rf states
