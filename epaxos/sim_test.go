@@ -365,6 +365,143 @@ func TestExecutionComponentsSkipInactiveDependencyRefs(t *testing.T) {
 	}
 }
 
+func TestRemoveVoterConfChangeAllowsLaterProgress(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	if _, err := s.nodes[1].ProposeConfChange(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}); err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	for _, id := range []ReplicaID{1, 2, 3} {
+		conf := s.nodes[id].Status().Conf
+		if conf.ID != 2 || conf.Contains(3) || !conf.Contains(1) || !conf.Contains(2) {
+			t.Fatalf("node %d config after voter removal = %#v", id, conf)
+		}
+	}
+
+	cmd := Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("after-removal"), ConflictKeys: [][]byte{[]byte("after-removal")}}
+	ref, err := s.nodes[1].Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Conf != 2 {
+		t.Fatalf("proposal used config %d, want 2", ref.Conf)
+	}
+	s.drain()
+	for _, id := range []ReplicaID{1, 2} {
+		if !committedPayload(s.apps[id], ref, cmd.Payload) {
+			t.Fatalf("node %d did not apply command %s after voter removal: %#v", id, ref, s.apps[id])
+		}
+	}
+	if committedPayload(s.apps[3], ref, cmd.Payload) {
+		t.Fatalf("removed voter applied command %s: %#v", ref, s.apps[3])
+	}
+}
+
+func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
+	store := NewMemoryStorage()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("durable"), ConflictKeys: [][]byte{[]byte("durable")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := rn.Ready()
+	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+		t.Fatalf("ready for %s = %#v", ref, rd)
+	}
+
+	store.FailWrites = true
+	if err := store.ApplyReady(rd); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("write error = %v", err)
+	}
+	if _, ok := store.Instance(ref); ok {
+		t.Fatalf("record %s was stored after rejected write", ref)
+	}
+	if rn.HasReady() {
+		t.Fatal("node exposed new work before the current ready was advanced")
+	}
+
+	store.FailWrites = false
+	if err := store.ApplyReady(rd); err != nil {
+		t.Fatal(err)
+	}
+	rn.Advance(rd)
+	if rn.HasReady() {
+		t.Fatal("node still has ready work after retry and advance")
+	}
+	persisted, ok := store.Instance(ref)
+	if !ok {
+		t.Fatalf("record %s not stored after retry", ref)
+	}
+	if persisted.Status != StatusExecuted {
+		t.Fatalf("stored status = %s, want executed", persisted.Status)
+	}
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := restarted.Status()
+	if len(status.Executed) != 1 || status.Executed[0] != ref {
+		t.Fatalf("restart executed refs = %#v, want %s", status.Executed, ref)
+	}
+	if restarted.HasReady() {
+		t.Fatal("restart re-emitted durable command")
+	}
+}
+
+func TestFiveNodePartitionHealConverges(t *testing.T) {
+	s := newSimCluster(t, 5, true)
+	majority := []ReplicaID{1, 2, 3}
+	minority := []ReplicaID{4, 5}
+	for _, a := range majority {
+		for _, b := range minority {
+			s.drop[[2]ReplicaID{a, b}] = true
+			s.drop[[2]ReplicaID{b, a}] = true
+		}
+	}
+
+	cmd := Command{ID: CommandID{Client: 9, Sequence: 1}, Payload: []byte("majority"), ConflictKeys: [][]byte{[]byte("majority")}}
+	ref, err := s.nodes[1].Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(2)
+	for _, id := range majority {
+		if !committedPayload(s.apps[id], ref, cmd.Payload) {
+			t.Fatalf("majority node %d did not apply %s while minority was isolated: %#v", id, ref, s.apps[id])
+		}
+	}
+	for _, id := range minority {
+		if committedPayload(s.apps[id], ref, cmd.Payload) {
+			t.Fatalf("minority node %d applied %s before heal: %#v", id, ref, s.apps[id])
+		}
+	}
+
+	s.drop = map[[2]ReplicaID]bool{}
+	s.tickAll(6)
+	want := refs(s.apps[1])
+	for id := range s.nodes {
+		if got := refs(s.apps[id]); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("node %d refs = %v, want %v", id, got, want)
+		}
+		if !committedPayload(s.apps[id], ref, cmd.Payload) {
+			t.Fatalf("node %d did not converge on %s: %#v", id, ref, s.apps[id])
+		}
+	}
+}
+
+func committedPayload(app []CommittedCommand, ref InstanceRef, payload []byte) bool {
+	for _, c := range app {
+		if c.Ref == ref && bytes.Equal(c.Command.Payload, payload) {
+			return true
+		}
+	}
+	return false
+}
+
 func refs(cmds []CommittedCommand) []InstanceRef {
 	out := make([]InstanceRef, len(cmds))
 	for i := range cmds {

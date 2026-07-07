@@ -1,6 +1,6 @@
-# Model Equivalence Report
+# Model Correspondence and Scope Report
 
-This report maps the current TLA+ specification to the current Go implementation. Line numbers are regenerated from the working tree that contains this file.
+This report maps the current finite TLA+ safety model to the current Go implementation and names implementation areas that are verified outside the model.
 
 ## Mapping
 
@@ -33,13 +33,13 @@ This report maps the current TLA+ specification to the current Go implementation
 - Observed `go test ./...` from `examples/kv` passing.
 - Observed `go test -coverprofile=coverage.out ./...` from `examples/kv` plus `go tool cover -func=coverage.out` reporting 100.0% statement coverage for the example module.
 - Observed `go test -tags kvnode ./cmd/kvnode` from `examples/kv` passing for the tagged HTTP service package.
-- Observed `go test ./...` coverage including cluster destruction and restart via `TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand`, equal-sequence execution ordering via `TestExecutionEqualSeqTieBreaksByRef`, and inactive dependency filtering via `TestExecutionComponentsSkipInactiveDependencyRefs`.
-- Observed `go test ./...` coverage in `examples/kv` including transaction atomicity, malformed transaction rejection, transaction batch error propagation, timestamp collision overwrite behavior, Pebble close/open durability, and reverse scans returning the newest version for repeated keys.
+- Observed `go test ./...` coverage including cluster destruction and restart via `TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand`, remove-voter progress via `TestRemoveVoterConfChangeAllowsLaterProgress`, storage write retry via `TestWriteErrorKeepsReadyForRetry`, partition heal convergence via `TestFiveNodePartitionHealConverges`, equal-sequence execution ordering via `TestExecutionEqualSeqTieBreaksByRef`, and inactive dependency filtering via `TestExecutionComponentsSkipInactiveDependencyRefs`.
+- Observed `go test ./...` coverage in `examples/kv` including transaction atomicity, malformed transaction rejection, transaction batch error propagation, transaction commit error propagation, timestamp collision overwrite behavior, ApplyCommitted close/open durability, delete-tombstone scan suppression, Pebble close/open durability, and reverse scans returning the newest version for repeated keys.
 - Observed TLC passing with `/opt/homebrew/opt/openjdk/bin/java -cp /tmp/tla2tools.jar tlc2.TLC -config tla/EPaxos.cfg tla/EPaxos.tla`, generating 11162 states, 2002 distinct states, and no invariant violation.
 - Observed `lein test` from `jepsen` passing namespace and dependency loading, and observed `tests/ci.sh` running a local three-node Jepsen workload against deployed `kvnode` processes with `lein run test --no-ssh --nodes 127.0.0.1:19081,127.0.0.1:19082,127.0.0.1:19083 --time-limit 5 --concurrency 3` reporting `:valid? true` after successful writes and reads.
 - Observed repository text audit with no disallowed external-project name, scaffolding marker, or wall-clock API matches.
 
-## Open equivalence risks
+## Open correspondence risks
 
 - The TLA+ model is finite-bounded for TLC, so it demonstrates correspondence for the configured state space rather than unbounded proof.
 - Checksum, wire-decoder tolerance, storage virtualization, quorum arithmetic, recovery response collection, and example KV storage semantics are verified by implementation tests but outside the current TLA safety state.

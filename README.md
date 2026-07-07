@@ -18,7 +18,7 @@
 ## Documentation
 
 - [EPAXOS.MD](EPAXOS.MD) describes the implemented algorithm in detail.
-- [MODEL_EQ_REPORT.MD](MODEL_EQ_REPORT.MD) maps the TLA+ model to the Go implementation.
+- [MODEL_EQ_REPORT.MD](MODEL_EQ_REPORT.MD) describes the current TLA+ model correspondence and implementation verification scope.
 - [tla/EPaxos.tla](tla/EPaxos.tla) contains the executable-style formal model.
 - [examples/kv](examples/kv) contains the Pebble/MyRocks-style key-value example.
 - [jepsen](jepsen) contains the Jepsen workload harness for external validation.

@@ -347,6 +347,27 @@ func TestTxnBatchSetReturnsIndexErrorForPutAndDelete(t *testing.T) {
 	}
 }
 
+func TestTxnBatchCommitErrorIsReturned(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	commitErr := errors.New("batch commit failed")
+	db.newBatch = func() txnBatch {
+		return txnBatchWithCommitErr{err: commitErr}
+	}
+
+	err = db.ApplyCommitted(epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1},
+		Command: CommandForTxn(7, 4, []TxnOp{{Key: []byte("alpha"), Value: []byte("one")}}),
+	})
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 type txnBatchWithSetErr struct {
 	err error
 }
@@ -360,6 +381,22 @@ func (txnBatchWithSetErr) Commit(*pebble.WriteOptions) error {
 }
 
 func (txnBatchWithSetErr) Close() error {
+	return nil
+}
+
+type txnBatchWithCommitErr struct {
+	err error
+}
+
+func (txnBatchWithCommitErr) Set(_, _ []byte, _ *pebble.WriteOptions) error {
+	return nil
+}
+
+func (b txnBatchWithCommitErr) Commit(*pebble.WriteOptions) error {
+	return b.err
+}
+
+func (txnBatchWithCommitErr) Close() error {
 	return nil
 }
 
@@ -408,6 +445,103 @@ func TestPebbleDBPersistsVersionWriteAcrossReopen(t *testing.T) {
 	v, ok, err := db.Get([]byte("durable"))
 	if err != nil || !ok || string(v) != "kept" {
 		t.Fatalf("value=%q ok=%v err=%v", v, ok, err)
+	}
+}
+
+func TestScanOmitsOlderValueHiddenByNewerDelete(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PutVersion([]byte("scan-alive"), []byte("kept"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("scan-gone"), []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteVersion([]byte("scan-gone"), 2); err != nil {
+		t.Fatal(err)
+	}
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("scan-")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 || string(scan[0].Key) != "scan-alive" || string(scan[0].Value) != "kept" || scan[0].Time != 1 {
+		t.Fatalf("scan %#v", scan)
+	}
+}
+
+func TestApplyCommittedChangesPersistAcrossReopen(t *testing.T) {
+	path := t.TempDir()
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := []epaxos.CommittedCommand{
+		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: CommandForPut(7, 1, []byte("applied-put"), []byte("one"))},
+		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Command: CommandForPut(7, 2, []byte("applied-deleted"), []byte("before"))},
+		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1}, Command: CommandForDelete(7, 3, []byte("applied-deleted"))},
+		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1}, Command: CommandForPut(7, 4, []byte("txn-deleted"), []byte("before"))},
+		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 5, Conf: 1}, Command: CommandForTxn(7, 5, []TxnOp{
+			{Key: []byte("txn-put"), Value: []byte("two")},
+			{Delete: true, Key: []byte("txn-deleted")},
+		})},
+	}
+	for _, cmd := range commands {
+		if err := db.ApplyCommitted(cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	value, ok, err := db.Get([]byte("applied-put"))
+	if err != nil || !ok || string(value) != "one" {
+		t.Fatalf("applied-put value=%q ok=%v err=%v", value, ok, err)
+	}
+	if _, ok, err := db.Get([]byte("applied-deleted")); err != nil || ok {
+		t.Fatalf("applied-deleted ok=%v err=%v", ok, err)
+	}
+	value, ok, err = db.Get([]byte("txn-put"))
+	if err != nil || !ok || string(value) != "two" {
+		t.Fatalf("txn-put value=%q ok=%v err=%v", value, ok, err)
+	}
+	if _, ok, err := db.Get([]byte("txn-deleted")); err != nil || ok {
+		t.Fatalf("txn-deleted ok=%v err=%v", ok, err)
+	}
+}
+
+func TestApplyCommittedSameRefSameKeyKeepsLaterValue(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 44, Conf: 1}
+	if err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: ref, Command: CommandForPut(7, 1, []byte("same-ref"), []byte("first"))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: ref, Command: CommandForPut(7, 2, []byte("same-ref"), []byte("second"))}); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := db.Get([]byte("same-ref"))
+	if err != nil || !ok || string(value) != "second" {
+		t.Fatalf("value=%q ok=%v err=%v", value, ok, err)
+	}
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("same-ref")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTime := (uint64(1) << 56) | 44
+	if len(scan) != 1 || string(scan[0].Value) != "second" || scan[0].Time != wantTime {
+		t.Fatalf("scan %#v", scan)
 	}
 }
 
