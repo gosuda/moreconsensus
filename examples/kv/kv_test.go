@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 
@@ -109,6 +110,74 @@ func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
 			}
 			if len(scan) != 1 || string(scan[0].Key) != "a" || string(scan[0].Value) != "short" || scan[0].Time != 1 {
 				t.Fatalf("scan=%#v", scan)
+			}
+		})
+	}
+}
+
+func TestStageVersionHelpersRejectInvalidKeysBeforeBatchMutation(t *testing.T) {
+	invalidKeys := []struct {
+		name string
+		key  []byte
+	}{
+		{name: "empty", key: nil},
+		{name: "embedded separator", key: []byte("a\x00x")},
+	}
+	helpers := []struct {
+		name  string
+		stage func(txnBatch, []byte) error
+	}{
+		{
+			name: "put",
+			stage: func(batch txnBatch, key []byte) error {
+				return stagePutVersion(batch, 1, key, []byte("value"), 7)
+			},
+		},
+		{
+			name: "delete",
+			stage: func(batch txnBatch, key []byte) error {
+				return stageDeleteVersion(batch, 1, key, 7)
+			},
+		},
+	}
+
+	for _, invalid := range invalidKeys {
+		for _, helper := range helpers {
+			t.Run(invalid.name+" "+helper.name, func(t *testing.T) {
+				batch := &recordingTxnBatch{}
+				err := helper.stage(batch, invalid.key)
+				if !errors.Is(err, errInvalidKey) {
+					t.Fatalf("err=%v, want invalid key", err)
+				}
+				if batch.sets != 0 {
+					t.Fatalf("invalid key reached batch Set %d time(s)", batch.sets)
+				}
+			})
+		}
+	}
+}
+
+func TestGetRejectsInvalidKeys(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, tc := range []struct {
+		name string
+		key  []byte
+	}{
+		{name: "empty", key: nil},
+		{name: "embedded separator", key: []byte("a\x00x")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, ok, err := db.Get(tc.key)
+			if !errors.Is(err, errInvalidKey) {
+				t.Fatalf("err=%v, want invalid key", err)
+			}
+			if ok || value != nil {
+				t.Fatalf("invalid get returned value=%q ok=%v", value, ok)
 			}
 		})
 	}
@@ -342,4 +411,21 @@ func appendTxnPayload(count uint64, op byte, rest []byte) []byte {
 	out = binary.AppendUvarint(out, count)
 	out = append(out, op)
 	return append(out, rest...)
+}
+
+type recordingTxnBatch struct {
+	sets int
+}
+
+func (b *recordingTxnBatch) Set(_, _ []byte, _ *pebble.WriteOptions) error {
+	b.sets++
+	return errors.New("recording batch Set should not be called for invalid keys")
+}
+
+func (*recordingTxnBatch) Commit(*pebble.WriteOptions) error {
+	return nil
+}
+
+func (*recordingTxnBatch) Close() error {
+	return nil
 }
