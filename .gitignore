@@ -29,6 +29,7 @@ states/
 jepsen/target/
 jepsen/.lein-failures
 jepsen/store/
+kvnode-data/
 
 # env file
 .env

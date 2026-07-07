@@ -345,8 +345,12 @@ func (n *RawNode) Ready() Ready {
 	for i := range n.pendingReady.Records {
 		rd.Records[i] = n.pendingReady.Records[i].Clone()
 	}
-	rd.Messages = make([]Message, len(n.pendingReady.Messages))
-	for i := range n.pendingReady.Messages {
+	messageCount := len(n.pendingReady.Messages)
+	if n.maxReadyMessages > 0 && messageCount > n.maxReadyMessages {
+		messageCount = n.maxReadyMessages
+	}
+	rd.Messages = make([]Message, messageCount)
+	for i := range rd.Messages {
 		rd.Messages[i] = n.pendingReady.Messages[i].Clone()
 	}
 	rd.Committed = make([]CommittedCommand, len(n.pendingReady.Committed))

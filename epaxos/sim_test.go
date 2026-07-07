@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"testing"
 )
 
@@ -31,10 +32,20 @@ func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 	return s
 }
 
+func (s *simCluster) ids() []ReplicaID {
+	ids := make([]ReplicaID, 0, len(s.nodes))
+	for id := range s.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
 func (s *simCluster) drain() {
 	for round := 0; round < 1000; round++ {
 		progress := false
-		for id, rn := range s.nodes {
+		for _, id := range s.ids() {
+			rn := s.nodes[id]
 			if !rn.HasReady() {
 				continue
 			}
@@ -67,8 +78,8 @@ func (s *simCluster) drain() {
 
 func (s *simCluster) tickAll(n int) {
 	for i := 0; i < n; i++ {
-		for _, rn := range s.nodes {
-			rn.Tick()
+		for _, id := range s.ids() {
+			s.nodes[id].Tick()
 		}
 		s.drain()
 	}
@@ -83,7 +94,7 @@ func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.drain()
-			for id := range s.nodes {
+			for _, id := range s.ids() {
 				if got := len(s.apps[id]); got != 1 {
 					t.Fatalf("node %d applied %d commands", id, got)
 				}
@@ -105,7 +116,7 @@ func TestConflictingConcurrentCommandsConverge(t *testing.T) {
 	}
 	s.drain()
 	want := refs(s.apps[1])
-	for id := range s.nodes {
+	for _, id := range s.ids() {
 		if got := refs(s.apps[id]); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Fatalf("node %d order %v want %v", id, got, want)
 		}
@@ -190,7 +201,7 @@ func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T)
 		t.Fatalf("node 1 applied %d commands before restart", got)
 	}
 	firstRef := s.apps[1][0].Ref
-	for id := range s.nodes {
+	for _, id := range s.ids() {
 		if got := len(s.apps[id]); got != 1 {
 			t.Fatalf("node %d applied %d commands before restart", id, got)
 		}
@@ -213,7 +224,8 @@ func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T)
 		t.Fatal(err)
 	}
 	s.drain()
-	for id, rn := range s.nodes {
+	for _, id := range s.ids() {
+		rn := s.nodes[id]
 		applied := s.apps[id]
 		if len(applied) != 1 {
 			t.Fatalf("node %d applied %d commands after restart: %#v", id, len(applied), applied)
@@ -483,7 +495,7 @@ func TestFiveNodePartitionHealConverges(t *testing.T) {
 	s.drop = map[[2]ReplicaID]bool{}
 	s.tickAll(6)
 	want := refs(s.apps[1])
-	for id := range s.nodes {
+	for _, id := range s.ids() {
 		if got := refs(s.apps[id]); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Fatalf("node %d refs = %v, want %v", id, got, want)
 		}

@@ -67,6 +67,7 @@ type ScanOptions struct {
 	Reverse bool
 }
 
+// Open opens a Pebble-backed key-value store and resumes automatic version timestamps from existing records.
 func Open(path string) (*DB, error) {
 	return open(path, nil)
 }

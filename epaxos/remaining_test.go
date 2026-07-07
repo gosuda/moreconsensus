@@ -72,6 +72,133 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	zr.schedule(inst, timerAccept, 0)
 }
 
+func TestMaxReadyMessagesCapsOnlyMessages(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), MaxReadyMessages: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	second := InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	rn.pendingReady = Ready{
+		Records: []InstanceRecord{
+			{Ref: first, Command: Command{Payload: []byte("record-1")}},
+			{Ref: second, Command: Command{Payload: []byte("record-2")}},
+		},
+		Messages: []Message{
+			{Type: MsgPreAccept, From: 1, To: 2, Ref: first, Deps: []InstanceNum{0, 0, 0}},
+			{Type: MsgPreAccept, From: 1, To: 3, Ref: second, Deps: []InstanceNum{0, 0, 0}},
+		},
+		Committed: []CommittedCommand{
+			{Ref: first, Command: Command{Payload: []byte("commit-1")}},
+			{Ref: second, Command: Command{Payload: []byte("commit-2")}},
+		},
+		MustSync: true,
+	}
+
+	rd := rn.Ready()
+	if len(rd.Messages) != 1 || rd.Messages[0].To != 2 {
+		t.Fatalf("first ready messages = %#v, want only the first capped message", rd.Messages)
+	}
+	if len(rd.Records) != 2 || rd.Records[0].Ref != first || rd.Records[1].Ref != second {
+		t.Fatalf("records were capped with messages: %#v", rd.Records)
+	}
+	if len(rd.Committed) != 2 || rd.Committed[0].Ref != first || rd.Committed[1].Ref != second {
+		t.Fatalf("committed commands were capped with messages: %#v", rd.Committed)
+	}
+
+	rn.Advance(rd)
+	tail := rn.Ready()
+	if len(tail.Records) != 0 || len(tail.Committed) != 0 {
+		t.Fatalf("advanced records/committed reappeared with message tail: records=%#v committed=%#v", tail.Records, tail.Committed)
+	}
+	if len(tail.Messages) != 1 || tail.Messages[0].To != 3 || tail.Messages[0].Ref != second {
+		t.Fatalf("message tail ready = %#v, want the unsent second message", tail.Messages)
+	}
+}
+
+func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
+	store := NewMemoryStorage()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(5), Storage: store, RetryTicks: 10, TimeOptimization: true, TimeOptimizationTicks: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("key")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := rn.Ready()
+	if len(rd.Messages) != 4 {
+		t.Fatalf("initial preaccept messages = %#v", rd.Messages)
+	}
+	if err := store.ApplyReady(rd); err != nil {
+		t.Fatal(err)
+	}
+	rn.Advance(rd)
+
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatalf("missing local instance %s", ref)
+	}
+	for _, from := range []ReplicaID{2, 3} {
+		resp := Message{
+			Type:         MsgPreAcceptResp,
+			From:         from,
+			To:           1,
+			Ref:          ref,
+			Ballot:       inst.rec.Ballot,
+			Seq:          inst.rec.Seq,
+			Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
+			RecordStatus: StatusPreAccepted,
+		}
+		if err := rn.Step(resp); err != nil {
+			t.Fatalf("step preaccept response from %d: %v", from, err)
+		}
+	}
+	if got, slow, fast := len(inst.preOK), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
+		t.Fatalf("preaccept votes = %d, want slow quorum %d below fast quorum %d", got, slow, fast)
+	}
+	if inst.phase != phasePreAccept {
+		t.Fatalf("phase after slow quorum preaccept responses = %d, want preaccept", inst.phase)
+	}
+	if rn.HasReady() {
+		t.Fatalf("slow quorum response produced ready work before fast-wait deadline: %#v", rn.Ready())
+	}
+
+	for tick := uint64(1); tick < 3; tick++ {
+		rn.Tick()
+		if inst.phase != phasePreAccept {
+			t.Fatalf("phase after tick %d = %d, want preaccept before fast-wait deadline", tick, inst.phase)
+		}
+		if rn.HasReady() {
+			t.Fatalf("ready work appeared after tick %d before fast-wait deadline: %#v", tick, rn.Ready())
+		}
+	}
+
+	rn.Tick()
+	if inst.phase != phaseAccept {
+		t.Fatalf("phase at fast-wait deadline = %d, want accept", inst.phase)
+	}
+	rd = rn.Ready()
+	if len(rd.Records) != 1 || rd.Records[0].Ref != ref || rd.Records[0].Status != StatusAccepted {
+		t.Fatalf("fast-wait ready records = %#v, want accepted record for %s", rd.Records, ref)
+	}
+	if len(rd.Messages) != 4 {
+		t.Fatalf("fast-wait accept messages = %#v", rd.Messages)
+	}
+	seen := make(map[ReplicaID]bool, 4)
+	for _, msg := range rd.Messages {
+		if msg.Type != MsgAccept || msg.From != 1 || msg.Ref != ref {
+			t.Fatalf("fast-wait message = %#v, want accept for %s from replica 1", msg, ref)
+		}
+		seen[msg.To] = true
+	}
+	for _, to := range []ReplicaID{2, 3, 4, 5} {
+		if !seen[to] {
+			t.Fatalf("missing accept message to replica %d in %#v", to, rd.Messages)
+		}
+	}
+}
+
 func TestRemainingResponseBranches(t *testing.T) {
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
 	if err != nil {
