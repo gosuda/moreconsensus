@@ -8,7 +8,7 @@
 - Deterministic logical ticks for all timing behavior.
 - Caller-owned transport and storage virtualization.
 - Pool-aware message and command helpers.
-- Zero-copy command payload/key decode and explicit proposal ownership options.
+- Zero-copy command payload/key decode, reusable decode metadata buffers, and explicit proposal ownership options.
 - BLAKE3 checksums through `github.com/zeebo/blake3` as the only intentional main-module runtime dependency.
 - Deterministic simulation tests for cluster sizes 1 through 7.
 - A Pebble-backed distributed key-value example in its own Go module, including atomic Pebble persistence for EPaxOS records and applied key-value writes.

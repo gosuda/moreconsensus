@@ -2,7 +2,6 @@ package epaxos
 
 import (
 	"encoding/binary"
-	"hash"
 	"sync"
 
 	"github.com/zeebo/blake3"
@@ -10,28 +9,32 @@ import (
 
 var checksumPool = sync.Pool{New: func() any { return blake3.New() }}
 
-func getHash() hash.Hash {
-	h := checksumPool.Get().(hash.Hash)
+func getHash() *blake3.Hasher {
+	h := checksumPool.Get().(*blake3.Hasher)
 	h.Reset()
 	return h
 }
 
-func putHash(h hash.Hash) { checksumPool.Put(h) }
+func putHash(h *blake3.Hasher) { checksumPool.Put(h) }
 
-func writeByte(h hash.Hash, v byte) { _, _ = h.Write([]byte{v}) }
+func writeByte(h *blake3.Hasher, v byte) {
+	var b [1]byte
+	b[0] = v
+	_, _ = h.Write(b[:])
+}
 
-func writeUint64(h hash.Hash, v uint64) {
+func writeUint64(h *blake3.Hasher, v uint64) {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
 	_, _ = h.Write(b[:])
 }
 
-func writeBytes(h hash.Hash, b []byte) {
+func writeBytes(h *blake3.Hasher, b []byte) {
 	writeUint64(h, uint64(len(b)))
 	_, _ = h.Write(b)
 }
 
-func writeCommand(h hash.Hash, c Command) {
+func writeCommand(h *blake3.Hasher, c Command) {
 	writeUint64(h, c.ID.Client)
 	writeUint64(h, c.ID.Sequence)
 	writeByte(h, byte(c.Kind))
@@ -42,19 +45,19 @@ func writeCommand(h hash.Hash, c Command) {
 	}
 }
 
-func writeRef(h hash.Hash, r InstanceRef) {
+func writeRef(h *blake3.Hasher, r InstanceRef) {
 	writeUint64(h, uint64(r.Replica))
 	writeUint64(h, uint64(r.Instance))
 	writeUint64(h, uint64(r.Conf))
 }
 
-func writeBallot(h hash.Hash, b Ballot) {
+func writeBallot(h *blake3.Hasher, b Ballot) {
 	writeUint64(h, b.Epoch)
 	writeUint64(h, b.Number)
 	writeUint64(h, uint64(b.Replica))
 }
 
-func sumHash(h hash.Hash) [32]byte {
+func sumHash(h *blake3.Hasher) [32]byte {
 	var out [32]byte
 	s := h.Sum(out[:0])
 	copy(out[:], s)

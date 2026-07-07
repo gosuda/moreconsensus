@@ -1,6 +1,7 @@
 package epaxos
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"reflect"
@@ -140,6 +141,261 @@ func FuzzDecodeMessage(f *testing.F) {
 	})
 }
 
+func TestDecodeMessageWithNilScratchMatchesDecodeMessage(t *testing.T) {
+	valid := mustEncodeMessageSeed(decodeScratchTestMessage())
+	corruptChecksum := append([]byte(nil), valid...)
+	corruptChecksum[len(corruptChecksum)-1] ^= 0x80
+	truncated := append([]byte(nil), valid[:len(valid)-1]...)
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "valid message", data: valid},
+		{name: "checksum mismatch", data: corruptChecksum},
+		{name: "truncated message", data: truncated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var want Message
+			wantErr := DecodeMessage(tc.data, &want)
+			var got Message
+			gotErr := DecodeMessageWithScratch(tc.data, &got, nil)
+			if (wantErr == nil) != (gotErr == nil) || wantErr != nil && !errors.Is(gotErr, wantErr) {
+				t.Fatalf("DecodeMessageWithScratch error = %v, want %v", gotErr, wantErr)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("nil scratch decode mismatch\nDecodeMessage:            %#v\nDecodeMessageWithScratch: %#v", want, got)
+			}
+		})
+	}
+}
+
+func TestDecodeMessageWithScratchUsesPresizedMetadataWithoutAllocation(t *testing.T) {
+	input := decodeScratchTestMessage()
+	encoded := mustEncodeMessageSeed(input)
+	scratch := DecodeScratch{
+		Deps:         make([]InstanceNum, 0, len(input.Deps)),
+		ConflictKeys: make([][]byte, 0, len(input.Command.ConflictKeys)),
+	}
+	var out Message
+
+	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	assertDecodedScratchMessage(t, out, input)
+	if len(out.Deps) == 0 || len(scratch.Deps) == 0 || &out.Deps[0] != &scratch.Deps[0] {
+		t.Fatalf("decoded deps did not use scratch storage: deps=%#v scratch=%#v", out.Deps, scratch.Deps)
+	}
+	if len(out.Command.ConflictKeys) == 0 || len(scratch.ConflictKeys) == 0 || &out.Command.ConflictKeys[0] != &scratch.ConflictKeys[0] {
+		t.Fatalf("decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.ConflictKeys, scratch.ConflictKeys)
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("DecodeMessageWithScratch allocations with pre-sized scratch = %v, want 0", allocs)
+	}
+}
+
+func TestDecodeMessageWithScratchGrowsUndersizedMetadataStorage(t *testing.T) {
+	input := decodeScratchTestMessage()
+	encoded := mustEncodeMessageSeed(input)
+	oldDeps := []InstanceNum{99}
+	oldKey := []byte("stale-key-reference")
+	scratch := DecodeScratch{
+		Deps:         oldDeps[:0],
+		ConflictKeys: [][]byte{oldKey},
+	}
+	oldDepSlots := scratch.Deps[:cap(scratch.Deps)]
+	oldKeySlots := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
+	var out Message
+
+	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+
+	assertDecodedScratchMessage(t, out, input)
+	if cap(scratch.Deps) < len(input.Deps) {
+		t.Fatalf("scratch deps capacity = %d, want at least decoded deps %d", cap(scratch.Deps), len(input.Deps))
+	}
+	if cap(scratch.ConflictKeys) < len(input.Command.ConflictKeys) {
+		t.Fatalf("scratch conflict key capacity = %d, want at least decoded keys %d", cap(scratch.ConflictKeys), len(input.Command.ConflictKeys))
+	}
+	if len(out.Deps) == 0 || len(scratch.Deps) == 0 || &out.Deps[0] != &scratch.Deps[0] {
+		t.Fatalf("grown decoded deps did not use scratch storage: deps=%#v scratch=%#v", out.Deps, scratch.Deps)
+	}
+	if len(out.Command.ConflictKeys) == 0 || len(scratch.ConflictKeys) == 0 || &out.Command.ConflictKeys[0] != &scratch.ConflictKeys[0] {
+		t.Fatalf("grown decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.ConflictKeys, scratch.ConflictKeys)
+	}
+	if &scratch.Deps[0] == &oldDepSlots[0] {
+		t.Fatalf("undersized deps scratch reused old storage with capacity %d for %d decoded deps", cap(oldDepSlots), len(input.Deps))
+	}
+	if &scratch.ConflictKeys[0] == &oldKeySlots[0] {
+		t.Fatalf("undersized conflict-key scratch reused old storage with capacity %d for %d decoded keys", cap(oldKeySlots), len(input.Command.ConflictKeys))
+	}
+	if oldKeySlots[0] != nil {
+		t.Fatalf("scratch growth retained stale conflict key bytes: %q", oldKeySlots[0])
+	}
+}
+
+func TestDecodeScratchResetClearsConflictKeyRefsAndKeepsCapacity(t *testing.T) {
+	input := decodeScratchTestMessage()
+	encoded := mustEncodeMessageSeed(input)
+	scratch := DecodeScratch{}
+	var out Message
+
+	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	depsCap := cap(scratch.Deps)
+	keysCap := cap(scratch.ConflictKeys)
+	retainedKeySlots := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
+	if len(retainedKeySlots) != len(input.Command.ConflictKeys) {
+		t.Fatalf("scratch conflict-key slots = %d, want %d before reset", len(retainedKeySlots), len(input.Command.ConflictKeys))
+	}
+
+	scratch.Reset()
+
+	if len(scratch.Deps) != 0 || cap(scratch.Deps) != depsCap {
+		t.Fatalf("reset deps len/cap = %d/%d, want 0/%d", len(scratch.Deps), cap(scratch.Deps), depsCap)
+	}
+	if len(scratch.ConflictKeys) != 0 || cap(scratch.ConflictKeys) != keysCap {
+		t.Fatalf("reset conflict keys len/cap = %d/%d, want 0/%d", len(scratch.ConflictKeys), cap(scratch.ConflictKeys), keysCap)
+	}
+	for i, key := range retainedKeySlots {
+		if key != nil {
+			t.Fatalf("reset retained conflict key slot %d: %q", i, key)
+		}
+	}
+}
+
+func TestDecodeMessageWithScratchAliasesInputPayloadAndKeyBytes(t *testing.T) {
+	input := decodeScratchTestMessage()
+	encoded := mustEncodeMessageSeed(input)
+	scratch := DecodeScratch{
+		Deps:         make([]InstanceNum, 0, len(input.Deps)),
+		ConflictKeys: make([][]byte, 0, len(input.Command.ConflictKeys)),
+	}
+	var out Message
+	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+
+	payloadOffset := bytes.Index(encoded, input.Command.Payload)
+	if payloadOffset < 0 {
+		t.Fatal("encoded payload bytes not found")
+	}
+	keyOffset := bytes.Index(encoded, input.Command.ConflictKeys[0])
+	if keyOffset < 0 {
+		t.Fatal("encoded conflict key bytes not found")
+	}
+
+	encoded[payloadOffset] = 'S'
+	encoded[keyOffset] = 'S'
+	if !bytes.Equal(out.Command.Payload, []byte("Scratch-payload")) {
+		t.Fatalf("decoded payload does not alias input buffer: %q", out.Command.Payload)
+	}
+	if len(out.Command.ConflictKeys) != len(input.Command.ConflictKeys) || !bytes.Equal(out.Command.ConflictKeys[0], []byte("Scratch-key-a")) {
+		t.Fatalf("decoded conflict key does not alias input buffer: %q", out.Command.ConflictKeys)
+	}
+}
+
+func TestDecodeMessageWithScratchReuseClearsInactiveConflictKeys(t *testing.T) {
+	first := decodeScratchTestMessage([]byte("scratch-key-a"), []byte("scratch-key-b"))
+	second := decodeScratchTestMessage([]byte("scratch-key-c"))
+	firstEncoded := mustEncodeMessageSeed(first)
+	secondEncoded := mustEncodeMessageSeed(second)
+	scratch := DecodeScratch{
+		Deps:         make([]InstanceNum, 0, len(first.Deps)),
+		ConflictKeys: make([][]byte, 0, len(first.Command.ConflictKeys)),
+	}
+	var out Message
+	if err := DecodeMessageWithScratch(firstEncoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	if len(scratch.ConflictKeys) != 2 {
+		t.Fatalf("first decode conflict keys = %d, want 2", len(scratch.ConflictKeys))
+	}
+	if err := DecodeMessageWithScratch(secondEncoded, &out, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	assertDecodedScratchMessage(t, out, second)
+	if len(out.Command.ConflictKeys) != 1 {
+		t.Fatalf("second decode conflict keys = %d, want 1", len(out.Command.ConflictKeys))
+	}
+	retained := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
+	for i := len(out.Command.ConflictKeys); i < len(retained); i++ {
+		if retained[i] != nil {
+			t.Fatalf("scratch retained inactive conflict key %d: %q", i, retained[i])
+		}
+	}
+}
+
+func TestDecodeMessageWithScratchClearsDestinationOnMalformedInput(t *testing.T) {
+	base := decodeScratchTestMessage()
+	valid := mustEncodeMessageSeed(base)
+	corruptChecksum := append([]byte(nil), valid...)
+	corruptChecksum[len(corruptChecksum)-1] ^= 0x80
+
+	invalidAfterCommand := append([]byte(nil), wireMagic[:]...)
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.Type))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.From))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.To))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.Ref.Replica))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.Ref.Instance))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.Ref.Conf))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, base.Ballot.Epoch)
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, base.Ballot.Number)
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(base.Ballot.Replica))
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, base.Seq)
+	invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(len(base.Deps)))
+	for _, dep := range base.Deps {
+		invalidAfterCommand = binary.AppendUvarint(invalidAfterCommand, uint64(dep))
+	}
+	invalidAfterCommand = appendCommand(invalidAfterCommand, base.Command)
+	invalidAfterCommand = append(invalidAfterCommand, make([]byte, 32)...)
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want error
+	}{
+		{name: "checksum corrupted after complete decode", data: corruptChecksum, want: ErrChecksumMismatch},
+		{name: "invalid after parsed payload and keys", data: invalidAfterCommand, want: ErrInvalidMessage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := DecodeScratch{
+				Deps:         make([]InstanceNum, 0, len(base.Deps)),
+				ConflictKeys: make([][]byte, 0, len(base.Command.ConflictKeys)),
+			}
+			out := Message{
+				Type:   MsgAccept,
+				From:   9,
+				To:     8,
+				Ref:    InstanceRef{Replica: 7, Instance: 6, Conf: 5},
+				Ballot: Ballot{Epoch: 4, Number: 3, Replica: 2},
+				Seq:    1,
+				Deps:   []InstanceNum{99},
+				Command: Command{
+					ID:           CommandID{Client: 7, Sequence: 8},
+					Payload:      []byte("previous-payload"),
+					ConflictKeys: [][]byte{[]byte("previous-key")},
+				},
+			}
+			if err := DecodeMessageWithScratch(tc.data, &out, &scratch); !errors.Is(err, tc.want) {
+				t.Fatalf("DecodeMessageWithScratch error = %v, want %v", err, tc.want)
+			}
+			assertMessageCleared(t, &out)
+			if len(scratch.Deps) != 0 || len(scratch.ConflictKeys) != 0 {
+				t.Fatalf("scratch exposed decoded metadata after error: %#v", scratch)
+			}
+		})
+	}
+}
+
 func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 	base := Message{
 		Type:   MsgCommit,
@@ -189,13 +445,13 @@ func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := Message{
-				Type:    MsgAccept,
-				From:    9,
-				To:      8,
-				Ref:     InstanceRef{Replica: 7, Instance: 6, Conf: 5},
-				Ballot:  Ballot{Epoch: 4, Number: 3, Replica: 2},
-				Seq:     1,
-				Deps:    []InstanceNum{99},
+				Type:   MsgAccept,
+				From:   9,
+				To:     8,
+				Ref:    InstanceRef{Replica: 7, Instance: 6, Conf: 5},
+				Ballot: Ballot{Epoch: 4, Number: 3, Replica: 2},
+				Seq:    1,
+				Deps:   []InstanceNum{99},
 				Command: Command{
 					ID:           CommandID{Client: 7, Sequence: 8},
 					Payload:      []byte("previous-payload"),
@@ -207,6 +463,36 @@ func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 			}
 			assertMessageCleared(t, &out)
 		})
+	}
+}
+
+func decodeScratchTestMessage(keys ...[]byte) Message {
+	if len(keys) == 0 {
+		keys = [][]byte{[]byte("scratch-key-a"), []byte("scratch-key-b")}
+	}
+	return Message{
+		Type:   MsgCommit,
+		From:   1,
+		To:     2,
+		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
+		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
+		Seq:    11,
+		Deps:   []InstanceNum{4, 5, 6},
+		Command: Command{
+			ID:           CommandID{Client: 9, Sequence: 10},
+			Payload:      []byte("scratch-payload"),
+			ConflictKeys: keys,
+		},
+		RejectHint:   Ballot{Epoch: 3, Number: 4, Replica: 2},
+		RecordStatus: StatusCommitted,
+	}
+}
+
+func assertDecodedScratchMessage(t *testing.T, got Message, want Message) {
+	t.Helper()
+	want.Checksum = ChecksumMessage(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded message mismatch\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
 

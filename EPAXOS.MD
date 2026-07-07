@@ -90,4 +90,8 @@ For user commands, `Advance` queues the corresponding `StatusExecuted` records o
 
 ## Allocation and ownership
 
-The public API provides both safe-copy and zero-copy ownership paths. By default, proposals are copied into the node. When `Config.ZeroCopyProposals` is true, the caller transfers ownership of proposal payload and conflict-key slices and must not mutate or reuse them while they remain observable through `Ready` or `Status`. `DecodeMessage` returns command payload and conflict-key byte slices backed by the input buffer while allocating decoded metadata slices such as dependencies. `Step` copies inbound command bytes before storing them, so callers may reuse decode buffers after `Step` returns. `GetMessage`, `PutMessage`, `GetCommand`, and `PutCommand` expose sync.Pool-aware helpers for transport integrations.
+The public API provides both safe-copy and zero-copy ownership paths. By default, proposals are copied into the node. When `Config.ZeroCopyProposals` is true, the caller transfers ownership of proposal payload and conflict-key slices and must not mutate or reuse them while they remain observable through `Ready` or `Status`.
+
+`DecodeMessage` returns command payload and conflict-key byte slices backed by the input buffer while allocating decoded metadata slices such as dependencies. `DecodeMessageWithScratch` accepts `DecodeScratch` for transports that want to reuse dependency and conflict-key slice-header storage; decoded metadata aliases the scratch until the scratch is reused or reset, while payload and key bytes still alias the input buffer. Decode errors reset the destination message; when a scratch is supplied, the active scratch metadata is cleared while its capacity is retained.
+
+`Step` copies inbound command bytes before storing them, so callers may reuse decode buffers after `Step` returns. `GetMessage`, `PutMessage`, `GetCommand`, and `PutCommand` expose sync.Pool-aware helpers for transport integrations.

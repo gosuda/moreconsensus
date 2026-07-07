@@ -1,8 +1,54 @@
 package epaxos
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
 var wireMagic = [...]byte{'M', 'E', 'P', '1'}
+
+// DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
+//
+// The decoded message's Deps and ConflictKeys slice header alias these buffers
+// until the scratch is reused. Command payload and conflict-key bytes still
+// alias the input buffer.
+type DecodeScratch struct {
+	Deps         []InstanceNum
+	ConflictKeys [][]byte
+}
+
+// Reset clears references retained by the scratch while keeping buffer capacity.
+func (s *DecodeScratch) Reset() {
+	for i := range s.ConflictKeys {
+		s.ConflictKeys[i] = nil
+	}
+	s.Deps = s.Deps[:0]
+	s.ConflictKeys = s.ConflictKeys[:0]
+}
+
+func (s *DecodeScratch) deps(n int) []InstanceNum {
+	if cap(s.Deps) < n {
+		s.Deps = make([]InstanceNum, n)
+	} else {
+		s.Deps = s.Deps[:n]
+	}
+	return s.Deps
+}
+
+func (s *DecodeScratch) conflictKeys(n int) [][]byte {
+	if cap(s.ConflictKeys) < n {
+		for i := range s.ConflictKeys {
+			s.ConflictKeys[i] = nil
+		}
+		s.ConflictKeys = make([][]byte, n)
+	} else {
+		for i := n; i < len(s.ConflictKeys); i++ {
+			s.ConflictKeys[i] = nil
+		}
+		s.ConflictKeys = s.ConflictKeys[:n]
+	}
+	return s.ConflictKeys
+}
 
 // EncodeMessage appends the canonical wire representation of m to dst.
 func EncodeMessage(dst []byte, m Message) ([]byte, error) {
@@ -39,11 +85,24 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 // DecodeMessage decodes a message. Command payload and conflict-key byte slices
 // alias src; decoded metadata slices such as Deps are allocated.
 func DecodeMessage(src []byte, m *Message) error {
+	return decodeMessage(src, m, nil)
+}
+
+// DecodeMessageWithScratch decodes a message using scratch-owned metadata buffers.
+//
+// A nil scratch behaves like DecodeMessage. With a non-nil scratch, the decoded
+// Deps and ConflictKeys slice header are valid until the scratch is reused.
+// Command payload and conflict-key bytes alias src.
+func DecodeMessageWithScratch(src []byte, m *Message, scratch *DecodeScratch) error {
+	return decodeMessage(src, m, scratch)
+}
+
+func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	m.Reset()
-	if len(src) < len(wireMagic)+32 || string(src[:len(wireMagic)]) != string(wireMagic[:]) {
-		return decodeMessageError(m, ErrInvalidMessage)
+	if len(src) < len(wireMagic)+32 || !bytes.Equal(src[:len(wireMagic)], wireMagic[:]) {
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
-	p := parser{b: src[len(wireMagic) : len(src)-32]}
+	p := parser{b: src[len(wireMagic) : len(src)-32], scratch: scratch}
 	m.Type = MessageType(p.uvarint())
 	m.From = ReplicaID(p.uvarint())
 	m.To = ReplicaID(p.uvarint())
@@ -52,9 +111,13 @@ func DecodeMessage(src []byte, m *Message) error {
 	m.Seq = p.uvarint()
 	deps := p.uvarint()
 	if deps > 128 {
-		return decodeMessageError(m, ErrInvalidMessage)
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
-	m.Deps = make([]InstanceNum, int(deps))
+	if scratch != nil {
+		m.Deps = scratch.deps(int(deps))
+	} else {
+		m.Deps = make([]InstanceNum, int(deps))
+	}
 	for i := range m.Deps {
 		m.Deps[i] = InstanceNum(p.uvarint())
 	}
@@ -63,17 +126,20 @@ func DecodeMessage(src []byte, m *Message) error {
 	m.RejectHint = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
 	m.RecordStatus = Status(p.uvarint())
 	if p.err || len(p.b) != 0 {
-		return decodeMessageError(m, ErrInvalidMessage)
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
 	copy(m.Checksum[:], src[len(src)-32:])
 	if !VerifyMessageChecksum(*m) {
-		return decodeMessageError(m, ErrChecksumMismatch)
+		return decodeMessageError(m, scratch, ErrChecksumMismatch)
 	}
 	return nil
 }
 
-func decodeMessageError(m *Message, err error) error {
+func decodeMessageError(m *Message, scratch *DecodeScratch, err error) error {
 	m.Reset()
+	if scratch != nil {
+		scratch.Reset()
+	}
 	return err
 }
 
@@ -92,8 +158,9 @@ func appendCommand(dst []byte, c Command) []byte {
 }
 
 type parser struct {
-	b   []byte
-	err bool
+	b       []byte
+	err     bool
+	scratch *DecodeScratch
 }
 
 func (p *parser) uvarint() uint64 {
@@ -138,7 +205,11 @@ func (p *parser) command() Command {
 		p.err = true
 		return c
 	}
-	c.ConflictKeys = make([][]byte, int(keys))
+	if p.scratch != nil {
+		c.ConflictKeys = p.scratch.conflictKeys(int(keys))
+	} else {
+		c.ConflictKeys = make([][]byte, int(keys))
+	}
 	for i := range c.ConflictKeys {
 		c.ConflictKeys[i] = p.bytes()
 	}
