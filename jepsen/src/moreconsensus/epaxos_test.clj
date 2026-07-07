@@ -21,15 +21,28 @@
       :else (str "http://" node ":" (or (:http-port test) 8080)))))
 
 (def register-ops #{:read :write})
-(def txn-keys ["tx0" "tx1"])
+
+(def txn-key-groups
+  [{:group :tx-a :keys ["tx-a0" "tx-a1"]}
+   {:group :tx-b :keys ["tx-b0" "tx-b1" "tx-b2"]}
+   {:group :tx-c :keys ["tx-c0" "tx-c1"]}])
+
+(def txn-group-ids (mapv :group txn-key-groups))
+(def txn-keys (vec (mapcat :keys txn-key-groups)))
+(def txn-keys-by-group (into {} (map (juxt :group :keys)) txn-key-groups))
+(def txn-scan-barrier (str/join "," txn-keys))
 
 (defn ok-status? [status]
   (contains? #{200 201 202 204} status))
 
-(defn txn-body [value]
-  (let [v (str value)]
-    (str "[{\"key\":\"tx0\",\"value\":\"" v "\"},"
-         "{\"key\":\"tx1\",\"value\":\"" v "\"}]")))
+(defn txn-group-for [n]
+  (nth txn-group-ids (mod n (count txn-group-ids))))
+
+(defn txn-body [group value]
+  (let [keys (or (get txn-keys-by-group group)
+                 (throw (ex-info "unknown transaction group" {:group group})))]
+    (json/write-str
+     (mapv (fn [k] {"key" k "value" (pr-str value)}) keys))))
 
 (defn parse-rows [body]
   (json/read-str body :key-fn keyword))
@@ -55,9 +68,11 @@
        [:fail (.getMessage e)]))))
 
 (defn scan-values [base]
-  (let [[status values] (scan-map base "tx" "tx0,tx1")]
+  (let [[status values] (scan-map base "tx-" txn-scan-barrier)]
     (if (= :ok status)
-      [:ok (mapv #(get values %) txn-keys)]
+      [:ok (into {} (map (fn [{:keys [group keys]}]
+                           [group (mapv #(get values %) keys)])
+                         txn-key-groups))]
       [:fail values])))
 
 
@@ -85,8 +100,9 @@
               (assoc op :type :ok :value (edn/read-string (:body resp)))
               (assoc op :type :fail :error (:status resp))))
           :txn-write
-          (let [resp (http/post (str base "/txn")
-                                {:body (txn-body (:value op))
+          (let [{:keys [group value]} (:value op)
+                resp (http/post (str base "/txn")
+                                {:body (txn-body group value)
                                  :content-type :json
                                  :throw-exceptions false})]
             (if (ok-status? (:status resp))
@@ -110,11 +126,21 @@
       (check [_ test history opts]
         (checker/check linear test (filterv #(contains? register-ops (:f %)) history) opts)))))
 
+(defn inconsistent-txn-groups [groups]
+  (into {} (keep (fn [[group values]]
+                   (when-not (apply = values)
+                     [group values]))
+                 groups)))
+
 (defn txn-atomic-checker []
   (reify checker/Checker
     (check [_ _ history _]
       (let [reads (filter #(and (= :ok (:type %)) (= :txn-read (:f %))) history)
-            bad (vec (remove #(apply = (:value %)) reads))]
+            bad (vec (keep (fn [op]
+                             (let [groups (inconsistent-txn-groups (:value op))]
+                               (when (seq groups)
+                                 (assoc op :bad-groups groups))))
+                           reads))]
         {:valid? (empty? bad)
          :checked (count reads)
          :bad-count (count bad)
@@ -126,7 +152,7 @@
                (gen/limit 90
                           (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
                                     (gen/repeat {:type :invoke :f :read :value nil})
-                                    (map (fn [x] {:type :invoke :f :txn-write :value x}) (range))
+                                    (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
                                     (gen/repeat {:type :invoke :f :txn-read :value nil})])))
    :checker (checker/compose {:linearizable (register-linearizable-checker)
                               :txn-atomic (txn-atomic-checker)
