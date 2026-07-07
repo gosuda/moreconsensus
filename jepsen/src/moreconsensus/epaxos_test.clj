@@ -31,12 +31,20 @@
 (def txn-keys (vec (mapcat :keys txn-key-groups)))
 (def txn-keys-by-group (into {} (map (juxt :group :keys)) txn-key-groups))
 (def txn-scan-barrier (str/join "," txn-keys))
+(def scan-prefix "scan-")
+(def scan-keys ["scan-a" "scan-b" "scan-c" "scan-d"])
+(def scan-limit 3)
+(def scan-barrier (str/join "," scan-keys))
+
 
 (defn ok-status? [status]
   (contains? #{200 201 202 204} status))
 
 (defn txn-group-for [n]
   (nth txn-group-ids (mod n (count txn-group-ids))))
+
+(defn scan-key-for [n]
+  (nth scan-keys (mod n (count scan-keys))))
 
 (defn txn-body [group value]
   (let [keys (or (get txn-keys-by-group group)
@@ -58,20 +66,35 @@
                   [(:key row) (edn/read-string (:value row))])
                 rows)))
 
+(defn scan-rows [base params]
+  (try
+    (let [query-params (into {} (remove (comp nil? val)) params)
+          resp (http/get (str base "/scan")
+                         {:query-params query-params
+                          :throw-exceptions false})]
+      (if (= 200 (:status resp))
+        [:ok (parse-rows (:body resp))]
+        [:fail (:status resp)]))
+    (catch Exception e
+      [:fail (.getMessage e)])))
+
 (defn scan-map
   ([base prefix] (scan-map base prefix nil))
   ([base prefix barrier]
-   (try
-     (let [params (cond-> {"prefix" prefix}
-                    barrier (assoc "barrier" barrier))
-           resp (http/get (str base "/scan")
-                          {:query-params params
-                           :throw-exceptions false})]
-       (if (= 200 (:status resp))
-         [:ok (row-values (parse-rows (:body resp)))]
-         [:fail (:status resp)]))
-     (catch Exception e
-       [:fail (.getMessage e)]))))
+   (let [[status rows] (scan-rows base {"prefix" prefix
+                                        "barrier" barrier})]
+     (if (= :ok status)
+       [:ok (row-values rows)]
+       [:fail rows]))))
+
+(defn advanced-scan [base reverse?]
+  (let [[status rows] (scan-rows base {"prefix" scan-prefix
+                                       "limit" (str scan-limit)
+                                       "reverse" (when reverse? "true")
+                                       "barrier" scan-barrier})]
+    (if (= :ok status)
+      [:ok rows]
+      [:fail rows])))
 
 (defn scan-values [base]
   (let [[status values] (scan-map base "tx-" txn-scan-barrier)]
@@ -130,6 +153,31 @@
             (if (ok-status? (:status resp))
               (assoc op :type :ok)
               (assoc op :type :fail :error (:status resp))))
+          :scan-write
+          (let [{:keys [key value]} (:value op)
+                resp (http/put (str base "/kv/" key)
+                               {:body (pr-str value)
+                                :throw-exceptions false})]
+            (if (ok-status? (:status resp))
+              (assoc op :type :ok)
+              (assoc op :type :fail :error (:status resp))))
+          :scan-delete
+          (let [{:keys [key]} (:value op)
+                resp (http/delete (str base "/kv/" key)
+                                  {:throw-exceptions false})]
+            (if (ok-status? (:status resp))
+              (assoc op :type :ok)
+              (assoc op :type :fail :error (:status resp))))
+          :scan-forward
+          (let [[status rows] (advanced-scan base false)]
+            (if (= :ok status)
+              (assoc op :type :ok :value rows)
+              (assoc op :type :fail :error rows)))
+          :scan-reverse
+          (let [[status rows] (advanced-scan base true)]
+            (if (= :ok status)
+              (assoc op :type :ok :value rows)
+              (assoc op :type :fail :error rows)))
           :txn-read
           (let [[status values] (scan-values base)]
             (if (= :ok status)
@@ -173,6 +221,31 @@
          :bad-count (count bad)
          :bad (take 5 bad)}))))
 
+(defn ordered-ascending? [xs]
+  (every? (fn [[a b]] (not (pos? (compare a b)))) (partition 2 1 xs)))
+
+(defn ordered-descending? [xs]
+  (every? (fn [[a b]] (not (neg? (compare a b)))) (partition 2 1 xs)))
+
+(defn bad-scan-op [op]
+  (let [rows (:value op)
+        keys (mapv :key rows)]
+    (cond
+      (> (count rows) scan-limit) (assoc op :bad-scan :limit)
+      (some #(not (str/starts-with? % scan-prefix)) keys) (assoc op :bad-scan :prefix)
+      (and (= :scan-forward (:f op)) (not (ordered-ascending? keys))) (assoc op :bad-scan :order)
+      (and (= :scan-reverse (:f op)) (not (ordered-descending? keys))) (assoc op :bad-scan :order))))
+
+(defn advanced-scan-checker []
+  (reify checker/Checker
+    (check [_ _ history _]
+      (let [reads (filter #(and (= :ok (:type %)) (contains? #{:scan-forward :scan-reverse} (:f %))) history)
+            bad (vec (keep bad-scan-op reads))]
+        {:valid? (empty? bad)
+         :checked (count reads)
+         :bad-count (count bad)
+         :bad (take 5 bad)}))))
+
 (defn workload []
   {:client (->KVClient nil)
    :generator (gen/clients
@@ -180,10 +253,15 @@
                           (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
                                     (gen/repeat {:type :invoke :f :read :value nil})
                                     (gen/repeat {:type :invoke :f :delete :value nil})
+                                    (map (fn [x] {:type :invoke :f :scan-write :value {:key (scan-key-for x) :value x}}) (range))
+                                    (map (fn [x] {:type :invoke :f :scan-delete :value {:key (scan-key-for x)}}) (range))
+                                    (gen/repeat {:type :invoke :f :scan-forward :value nil})
+                                    (gen/repeat {:type :invoke :f :scan-reverse :value nil})
                                     (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
                                     (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
                                     (gen/repeat {:type :invoke :f :txn-read :value nil})])))
    :checker (checker/compose {:linearizable (register-linearizable-checker)
+                              :scan-shape (advanced-scan-checker)
                               :txn-atomic (txn-atomic-checker)
                               :timeline (timeline/html)})})
 

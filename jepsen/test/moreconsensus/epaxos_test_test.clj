@@ -122,3 +122,106 @@
              (select-keys result [:valid? :checked :bad-count])))
       (is (= {:tx-b [nil 5 nil]}
              (:bad-groups bad-op))))))
+
+
+(defn check-advanced-scan-history [history]
+  (checker/check (epaxos/advanced-scan-checker) nil history nil))
+
+(defn scan-row [key value]
+  {:key key :value (pr-str value)})
+
+(deftest advanced-scan-sends-scan-query-params
+  (testing "forward scans send the prefix, string limit, and barrier without a reverse flag"
+    (let [requests (atom [])
+          rows [(scan-row "scan-a" :old)]]
+      (with-redefs [http/get (fn [url opts]
+                               (swap! requests conj [url opts])
+                               {:status 200 :body (json/write-str rows)})]
+        (is (= [:ok rows]
+               (epaxos/advanced-scan "http://node" false)))
+        (is (= [["http://node/scan"
+                 {:query-params {"prefix" epaxos/scan-prefix
+                                 "limit" (str epaxos/scan-limit)
+                                 "barrier" epaxos/scan-barrier}
+                  :throw-exceptions false}]]
+               @requests)))))
+  (testing "reverse scans send the same scan shape params plus reverse true"
+    (let [requests (atom [])
+          rows [(scan-row "scan-c" :old)]]
+      (with-redefs [http/get (fn [url opts]
+                               (swap! requests conj [url opts])
+                               {:status 200 :body (json/write-str rows)})]
+        (is (= [:ok rows]
+               (epaxos/advanced-scan "http://node" true)))
+        (is (= [["http://node/scan"
+                 {:query-params {"prefix" epaxos/scan-prefix
+                                 "limit" (str epaxos/scan-limit)
+                                 "reverse" "true"
+                                 "barrier" epaxos/scan-barrier}
+                  :throw-exceptions false}]]
+               @requests))))))
+
+(deftest advanced-scan-checker-accepts-sorted-scan-shapes
+  (testing "ok scans are checked for key shape, not returned values"
+    (let [history [{:type :ok
+                    :f :scan-forward
+                    :value [(scan-row "scan-a" :stale)
+                            (scan-row "scan-b" :newer)
+                            (scan-row "scan-c" :older)]}
+                   {:type :ok
+                    :f :scan-reverse
+                    :value [(scan-row "scan-d" 4)
+                            (scan-row "scan-c" 1)
+                            (scan-row "scan-a" 9)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 2 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
+
+(deftest advanced-scan-checker-rejects-bad-scan-shapes
+  (testing "scan failures identify whether the limit, prefix, or direction order was broken"
+    (let [over-limit {:type :ok
+                      :f :scan-forward
+                      :value (mapv #(scan-row (str "scan-" %) %)
+                                   (range (inc epaxos/scan-limit)))}
+          bad-prefix {:type :ok
+                      :f :scan-forward
+                      :value [(scan-row "scan-a" 1)
+                              (scan-row "other-a" 2)]}
+          forward-order {:type :ok
+                         :f :scan-forward
+                         :value [(scan-row "scan-b" 2)
+                                 (scan-row "scan-a" 1)]}
+          reverse-order {:type :ok
+                         :f :scan-reverse
+                         :value [(scan-row "scan-a" 1)
+                                 (scan-row "scan-b" 2)]}
+          result (check-advanced-scan-history [over-limit
+                                               bad-prefix
+                                               forward-order
+                                               reverse-order])
+          bad (vec (:bad result))]
+      (is (= {:valid? false :checked 4 :bad-count 4}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [{:f :scan-forward :bad-scan :limit}
+              {:f :scan-forward :bad-scan :prefix}
+              {:f :scan-forward :bad-scan :order}
+              {:f :scan-reverse :bad-scan :order}]
+             (mapv #(select-keys % [:f :bad-scan]) bad))))))
+
+(deftest advanced-scan-checker-ignores-non-scan-and-failed-scans
+  (testing "only ok forward and reverse scan operations are checked"
+    (let [history [{:type :ok
+                    :f :read
+                    :value [(scan-row "other-a" 1)]}
+                   {:type :fail
+                    :f :scan-forward
+                    :value [(scan-row "other-a" 1)]}
+                   {:type :info
+                    :f :scan-reverse
+                    :value [(scan-row "scan-a" 1)
+                            (scan-row "scan-b" 2)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 0 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
