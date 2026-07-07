@@ -1,4 +1,3 @@
-// Package epaxos implements a deterministic, library-embedded EPaxos core.
 package epaxos
 
 import (

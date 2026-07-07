@@ -8,6 +8,12 @@ import (
 	"testing"
 )
 
+var (
+	allocationChecksumSink [32]byte
+	allocationBytesSink    []byte
+	allocationRefSink      InstanceRef
+)
+
 func TestPoolClearsOwnedReferencesAndReusesWarmObjects(t *testing.T) {
 	payload := []byte("payload-bytes")
 	deps := []InstanceNum{1, 2, 3}
@@ -109,6 +115,129 @@ func TestReadyReleaseClearsHeadersAndBackingArraysWithoutAllocation(t *testing.T
 	})
 	if allocs != 0 {
 		t.Fatalf("Ready.Release allocations = %v, want 0", allocs)
+	}
+}
+
+func TestEncodeMessageWithPresizedDestinationHasNoAllocation(t *testing.T) {
+	msg := allocationTestMessage()
+	encoded, err := EncodeMessage(nil, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, 0, len(encoded))
+	backing := dst[:cap(dst)]
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		out, err := EncodeMessage(dst[:0], msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) != len(encoded) {
+			t.Fatalf("encoded length = %d, want %d", len(out), len(encoded))
+		}
+		if len(out) == 0 || &out[0] != &backing[0] {
+			t.Fatal("EncodeMessage did not append into caller-owned destination")
+		}
+		allocationBytesSink = out
+	})
+	if allocs != 0 {
+		t.Fatalf("EncodeMessage allocations with pre-sized destination = %v, want 0", allocs)
+	}
+}
+
+func TestChecksumRecordAndMessageReuseWarmHasherWithoutAllocation(t *testing.T) {
+	msg := allocationTestMessage()
+	rec := allocationTestRecord(msg)
+
+	tests := []struct {
+		name string
+		run  func()
+	}{
+		{
+			name: "record checksum reuses warm hasher",
+			run: func() {
+				allocationChecksumSink = ChecksumRecord(rec)
+			},
+		},
+		{
+			name: "message checksum reuses warm hasher",
+			run: func() {
+				allocationChecksumSink = ChecksumMessage(msg)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run()
+			allocs := testing.AllocsPerRun(1000, tt.run)
+			if allocs != 0 {
+				t.Fatalf("%s allocations = %v, want 0", tt.name, allocs)
+			}
+		})
+	}
+}
+
+func TestProposeZeroCopyPayloadKeyCommandUsesLowerAllocationBudgetThanSafeCopyCommand(t *testing.T) {
+	safeCopyAllocs := proposePayloadKeyCommandAllocs(t, false)
+	zeroCopyAllocs := proposePayloadKeyCommandAllocs(t, true)
+	if zeroCopyAllocs >= safeCopyAllocs {
+		t.Fatalf("zero-copy Propose allocations = %v, want less than safe-copy allocations %v", zeroCopyAllocs, safeCopyAllocs)
+	}
+	if safeCopyAllocs > 54 {
+		t.Fatalf("safe-copy Propose allocations = %v, want <= 54", safeCopyAllocs)
+	}
+	if zeroCopyAllocs > 48 {
+		t.Fatalf("zero-copy Propose allocations = %v, want <= 48", zeroCopyAllocs)
+	}
+}
+
+func proposePayloadKeyCommandAllocs(t *testing.T, zeroCopy bool) float64 {
+	t.Helper()
+	payload := []byte("proposal-allocation-payload")
+	key := []byte("proposal-allocation-key")
+	cmd := Command{ID: CommandID{Client: 31, Sequence: 41}, Payload: payload, ConflictKeys: [][]byte{key}}
+	voters := []ReplicaID{1, 2, 3}
+
+	return testing.AllocsPerRun(1000, func() {
+		rn, err := NewRawNode(Config{ID: 1, Voters: voters, ZeroCopyProposals: zeroCopy})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, err := rn.Propose(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocationRefSink = ref
+	})
+}
+
+func allocationTestMessage() Message {
+	return Message{
+		Type:   MsgCommit,
+		From:   1,
+		To:     2,
+		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
+		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
+		Seq:    11,
+		Deps:   []InstanceNum{4, 5, 6},
+		Command: Command{
+			ID:           CommandID{Client: 9, Sequence: 10},
+			Payload:      []byte("allocation-payload"),
+			ConflictKeys: [][]byte{[]byte("allocation-key-a"), []byte("allocation-key-b")},
+		},
+		RejectHint:   Ballot{Epoch: 3, Number: 4, Replica: 2},
+		RecordStatus: StatusCommitted,
+	}
+}
+
+func allocationTestRecord(m Message) InstanceRecord {
+	return InstanceRecord{
+		Ref:     m.Ref,
+		Ballot:  m.Ballot,
+		Status:  StatusCommitted,
+		Seq:     m.Seq,
+		Deps:    m.Deps,
+		Command: m.Command,
 	}
 }
 
