@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -58,6 +59,8 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/kv/", s.handleKV)
+	mux.HandleFunc("/txn", s.handleTxn)
+	mux.HandleFunc("/scan", s.handleScan)
 	mux.HandleFunc("/epaxos/message", s.handleMessage)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	log.Printf("kvnode %d listening on %s", s.id, *listen)
@@ -95,6 +98,10 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	key := []byte(keyText)
 	switch r.Method {
 	case http.MethodGet:
+		if err := s.waitForKeys(r.Context(), key); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		value, ok, err := s.db.Get(key)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -111,13 +118,13 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := s.proposeAndWait(r.Context(), kv.CommandForPut(uint64(s.id), s.next(), key, body), key, body); err != nil {
+		if err := s.proposeAndWait(r.Context(), kv.CommandForPut(uint64(s.id), s.next(), key, body)); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodDelete:
-		if err := s.proposeAndWait(r.Context(), kv.CommandForDelete(uint64(s.id), s.next(), key), key, nil); err != nil {
+		if err := s.proposeAndWait(r.Context(), kv.CommandForDelete(uint64(s.id), s.next(), key)); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -125,6 +132,105 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+type txnRequestOp struct {
+	Delete bool   `json:"delete"`
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+}
+
+func (s *service) handleTxn(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request []txnRequestOp
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(request) == 0 {
+		http.Error(w, "empty transaction", http.StatusBadRequest)
+		return
+	}
+	ops := make([]kv.TxnOp, 0, len(request))
+	for _, op := range request {
+		if op.Key == "" {
+			http.Error(w, "bad key", http.StatusBadRequest)
+			return
+		}
+		ops = append(ops, kv.TxnOp{Delete: op.Delete, Key: []byte(op.Key), Value: []byte(op.Value)})
+	}
+	if err := s.proposeAndWait(r.Context(), kv.CommandForTxn(uint64(s.id), s.next(), ops)); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type scanResponseKV struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Time  uint64 `json:"time"`
+}
+
+func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	limit := 0
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	reverse := false
+	if raw := q.Get("reverse"); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reverse = v
+	}
+	if raw := q.Get("barrier"); raw != "" {
+		parts := strings.Split(raw, ",")
+		keys := make([][]byte, 0, len(parts))
+		for _, part := range parts {
+			if part == "" {
+				http.Error(w, "bad barrier key", http.StatusBadRequest)
+				return
+			}
+			keys = append(keys, []byte(part))
+		}
+		if err := s.waitForKeys(r.Context(), keys...); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+	}
+	rows, err := s.db.Scan(kv.ScanOptions{
+		Start:   []byte(q.Get("start")),
+		End:     []byte(q.Get("end")),
+		Prefix:  []byte(q.Get("prefix")),
+		Limit:   limit,
+		Reverse: reverse,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]scanResponseKV, len(rows))
+	for i, row := range rows {
+		out[i] = scanResponseKV{Key: string(row.Key), Value: string(row.Value), Time: row.Time}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
@@ -158,25 +264,34 @@ func (s *service) next() uint64 {
 	return seq
 }
 
-func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command, key, value []byte) error {
+func (s *service) waitForKeys(ctx context.Context, keys ...[]byte) error {
+	conflicts := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		conflicts = append(conflicts, append([]byte(nil), key...))
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return s.proposeAndWait(ctx, epaxos.Command{ID: epaxos.CommandID{Client: uint64(s.id), Sequence: s.next()}, ConflictKeys: conflicts})
+}
+
+func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error {
 	s.mu.Lock()
-	_, err := s.node.Propose(cmd)
+	ref, err := s.node.Propose(cmd)
 	out, drainErr := s.drainLocked()
+	done := err == nil && drainErr == nil && s.executedLocked(ref)
 	s.mu.Unlock()
 	if err != nil || drainErr != nil {
 		return errorsJoin(err, drainErr)
 	}
 	s.send(out)
+	if done {
+		return nil
+	}
 	for range 512 {
-		current, ok, err := s.db.Get(key)
-		if err == nil {
-			if value == nil && !ok {
-				return nil
-			}
-			if value != nil && ok && bytes.Equal(current, value) {
-				return nil
-			}
-		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -185,13 +300,26 @@ func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command, key, v
 		s.mu.Lock()
 		s.node.Tick()
 		out, drainErr := s.drainLocked()
+		done := s.executedLocked(ref)
 		s.mu.Unlock()
 		if drainErr != nil {
 			return drainErr
 		}
 		s.send(out)
+		if done {
+			return nil
+		}
 	}
 	return fmt.Errorf("proposal was not applied after logical tick budget")
+}
+
+func (s *service) executedLocked(ref epaxos.InstanceRef) bool {
+	for _, got := range s.node.Status().Executed {
+		if got == ref {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *service) drainLocked() ([]epaxos.Message, error) {

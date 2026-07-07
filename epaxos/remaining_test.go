@@ -111,6 +111,47 @@ func TestRemainingResponseBranches(t *testing.T) {
 	}
 }
 
+func TestConflictIndexIncludesKnownInstancesFromEveryReplica(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("shared-key")
+	priors := []InstanceRecord{
+		{
+			Ref:     InstanceRef{Replica: 2, Instance: 5, Conf: 1},
+			Status:  StatusCommitted,
+			Seq:     7,
+			Deps:    rn.q.deps(),
+			Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("prior-r2"), ConflictKeys: [][]byte{key}},
+		},
+		{
+			Ref:     InstanceRef{Replica: 3, Instance: 3, Conf: 1},
+			Status:  StatusCommitted,
+			Seq:     4,
+			Deps:    rn.q.deps(),
+			Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("prior-r3"), ConflictKeys: [][]byte{key}},
+		},
+	}
+	for _, rec := range priors {
+		rec = checkedRecord(rec)
+		rn.instances[rec.Ref] = &instance{rec: rec, phase: phaseCommitted}
+		rn.indexConflicts(rec)
+	}
+
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("next"), ConflictKeys: [][]byte{key}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatalf("missing proposed instance %s", ref)
+	}
+	if inst.rec.Seq != 8 || len(inst.rec.Deps) != 3 || inst.rec.Deps[0] != 0 || inst.rec.Deps[1] != 5 || inst.rec.Deps[2] != 3 {
+		t.Fatalf("proposed attrs seq=%d deps=%v, want seq=8 deps=[0 5 3]", inst.rec.Seq, inst.rec.Deps)
+	}
+}
+
 func TestRemainingDependencyAndStorageBranches(t *testing.T) {
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
 	if err != nil {

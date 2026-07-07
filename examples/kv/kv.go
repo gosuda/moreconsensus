@@ -24,8 +24,18 @@ const (
 type DB struct {
 	pebble   *pebble.DB
 	cf       uint32
-	newIter  func(*pebble.IterOptions) (*pebble.Iterator, error)
+	nextTime uint64
+	newIter  func(*pebble.IterOptions) (kvIterator, error)
 	newBatch func() txnBatch
+}
+
+type kvIterator interface {
+	First() bool
+	Next() bool
+	Key() []byte
+	Value() []byte
+	Error() error
+	Close() error
 }
 
 type txnBatch interface {
@@ -57,17 +67,73 @@ type ScanOptions struct {
 	Reverse bool
 }
 
-// Open opens a Pebble-backed example database.
 func Open(path string) (*DB, error) {
+	return open(path, nil)
+}
+
+func open(path string, newIterFor func(*pebble.DB) func(*pebble.IterOptions) (kvIterator, error)) (*DB, error) {
 	pebbleDB, err := pebble.Open(path, &pebble.Options{})
 	if err != nil {
 		return nil, err
 	}
-	return &DB{pebble: pebbleDB, cf: 1, newIter: pebbleDB.NewIter, newBatch: func() txnBatch { return pebbleDB.NewBatch() }}, nil
+	if newIterFor == nil {
+		newIterFor = func(db *pebble.DB) func(*pebble.IterOptions) (kvIterator, error) {
+			return func(opts *pebble.IterOptions) (kvIterator, error) {
+				return db.NewIter(opts)
+			}
+		}
+	}
+	db := &DB{
+		pebble:   pebbleDB,
+		cf:       1,
+		nextTime: 1,
+		newIter:  newIterFor(pebbleDB),
+		newBatch: func() txnBatch { return pebbleDB.NewBatch() },
+	}
+	next, err := db.loadNextTime()
+	if err != nil {
+		_ = pebbleDB.Close()
+		return nil, err
+	}
+	db.nextTime = next
+	return db, nil
 }
 
 // Close closes the underlying Pebble database.
 func (db *DB) Close() error { return db.pebble.Close() }
+
+func (db *DB) loadNextTime() (uint64, error) {
+	lower := EncodeUserPrefix(nil, db.cf, nil)
+	iter, err := db.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: prefixLimit(lower)})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = iter.Close() }()
+	var max uint64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		_, ts, ok := DecodeDataKey(iter.Key(), db.cf)
+		if ok && ts > max {
+			max = ts
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, err
+	}
+	return max + 1, nil
+}
+
+func (db *DB) nextRecordTime() uint64 {
+	if db.nextTime == 0 {
+		db.nextTime = 1
+	}
+	return db.nextTime
+}
+
+func (db *DB) observeRecordTime(ts uint64) {
+	if ts >= db.nextTime {
+		db.nextTime = ts + 1
+	}
+}
 
 // ApplyCommitted applies one committed EPaxos command to the key-value store.
 func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
@@ -76,7 +142,6 @@ func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
 	}
 	op := cmd.Command.Payload[0]
 	p := parser{b: cmd.Command.Payload[1:]}
-	ts := (uint64(cmd.Ref.Replica) << 56) | uint64(cmd.Ref.Instance)
 	switch op {
 	case opPut:
 		key := p.bytes()
@@ -84,28 +149,27 @@ func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
 		if p.err {
 			return fmt.Errorf("kv: malformed command")
 		}
-		return db.PutVersion(key, value, ts)
+		return db.PutVersion(key, value, db.nextRecordTime())
 	case opDelete:
 		key := p.bytes()
 		_ = p.bytes()
 		if p.err {
 			return fmt.Errorf("kv: malformed command")
 		}
-		return db.DeleteVersion(key, ts)
+		return db.DeleteVersion(key, db.nextRecordTime())
 	case opTxn:
-		return db.applyTxn(&p, ts)
+		return db.applyTxn(&p)
 	default:
 		return fmt.Errorf("kv: unknown op %d", op)
 	}
 }
 
-func (db *DB) applyTxn(p *parser, ts uint64) error {
+func (db *DB) applyTxn(p *parser) error {
 	count := p.uvarint()
 	if p.err {
 		return fmt.Errorf("kv: malformed command")
 	}
-	batch := db.newBatch()
-	defer func() { _ = batch.Close() }()
+	ops := make([]TxnOp, 0)
 	for i := uint64(0); i < count; i++ {
 		op := p.byte()
 		key := p.bytes()
@@ -113,16 +177,11 @@ func (db *DB) applyTxn(p *parser, ts uint64) error {
 		if p.err {
 			return fmt.Errorf("kv: malformed command")
 		}
-		k := EncodeDataKey(nil, db.cf, key, ts)
 		switch op {
 		case opPut:
-			if err := batch.Set(k, append([]byte{valueRecord}, value...), nil); err != nil {
-				return err
-			}
+			ops = append(ops, TxnOp{Key: key, Value: value})
 		case opDelete:
-			if err := batch.Set(k, []byte{deleteRecord}, nil); err != nil {
-				return err
-			}
+			ops = append(ops, TxnOp{Delete: true, Key: key})
 		default:
 			return fmt.Errorf("kv: unknown transaction op %d", op)
 		}
@@ -130,20 +189,47 @@ func (db *DB) applyTxn(p *parser, ts uint64) error {
 	if len(p.b) != 0 {
 		return fmt.Errorf("kv: malformed command")
 	}
-	return batch.Commit(pebble.Sync)
+	ts := db.nextRecordTime()
+	batch := db.newBatch()
+	defer func() { _ = batch.Close() }()
+	for _, op := range ops {
+		k := EncodeDataKey(nil, db.cf, op.Key, ts)
+		if op.Delete {
+			if err := batch.Set(k, []byte{deleteRecord}, nil); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := batch.Set(k, append([]byte{valueRecord}, op.Value...), nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	db.observeRecordTime(ts)
+	return nil
 }
 
-// PutVersion writes one version using the example's MyRocks-like record format.
+// PutVersion writes one version using the example's MyRocks-like data-key format.
 func (db *DB) PutVersion(key, value []byte, ts uint64) error {
 	k := EncodeDataKey(nil, db.cf, key, ts)
 	v := append([]byte{valueRecord}, value...)
-	return db.pebble.Set(k, v, pebble.Sync)
+	if err := db.pebble.Set(k, v, pebble.Sync); err != nil {
+		return err
+	}
+	db.observeRecordTime(ts)
+	return nil
 }
 
 // DeleteVersion writes a tombstone version for key.
 func (db *DB) DeleteVersion(key []byte, ts uint64) error {
 	k := EncodeDataKey(nil, db.cf, key, ts)
-	return db.pebble.Set(k, []byte{deleteRecord}, pebble.Sync)
+	if err := db.pebble.Set(k, []byte{deleteRecord}, pebble.Sync); err != nil {
+		return err
+	}
+	db.observeRecordTime(ts)
+	return nil
 }
 
 // Get returns the newest live value for key.

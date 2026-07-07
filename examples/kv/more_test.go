@@ -142,6 +142,109 @@ func TestClusterDeletePropagatesDurableStorageFailure(t *testing.T) {
 	}
 }
 
+func TestOpenLoadIteratorFactoryErrorClosesPebbleDB(t *testing.T) {
+	path := t.TempDir()
+	sentinel := errors.New("load iterator")
+
+	_, err := open(path, func(*pebble.DB) func(*pebble.IterOptions) (kvIterator, error) {
+		return func(*pebble.IterOptions) (kvIterator, error) {
+			return nil, sentinel
+		}
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err=%v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("database remained locked after load iterator failure: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenLoadIteratorTerminalErrorClosesPebbleDB(t *testing.T) {
+	path := t.TempDir()
+	sentinel := errors.New("load scan")
+	iter := &terminalErrorIterator{err: sentinel}
+
+	_, err := open(path, func(*pebble.DB) func(*pebble.IterOptions) (kvIterator, error) {
+		return func(*pebble.IterOptions) (kvIterator, error) {
+			return iter, nil
+		}
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err=%v", err)
+	}
+	if !iter.closed {
+		t.Fatal("load iterator was not closed")
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("database remained locked after load scan failure: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNextRecordTimeStartsZeroValuedDBAtOne(t *testing.T) {
+	db := &DB{}
+	if got := db.nextRecordTime(); got != 1 {
+		t.Fatalf("first timestamp=%d, want 1", got)
+	}
+	if got := db.nextRecordTime(); got != 1 {
+		t.Fatalf("pending timestamp advanced to %d before a successful write", got)
+	}
+}
+
+func TestVersionWriteErrorsDoNotAdvanceNextAutomaticTimestamp(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(*DB) error
+	}{
+		{
+			name: "put",
+			write: func(db *DB) error {
+				return db.PutVersion([]byte("closed-put"), []byte("value"), 99)
+			},
+		},
+		{
+			name: "delete",
+			write: func(db *DB) error {
+				return db.DeleteVersion([]byte("closed-delete"), 99)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := t.TempDir()
+			db, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			pebbleDB, err := pebble.Open(path, &pebble.Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = pebbleDB.Close() }()
+			db = &DB{pebble: pebbleDB, cf: 1, nextTime: 7}
+
+			if err := tt.write(db); !errors.Is(err, pebble.ErrReadOnly) {
+				t.Fatalf("err=%v, want read-only write failure", err)
+			}
+			if got := db.nextRecordTime(); got != 7 {
+				t.Fatalf("next automatic timestamp advanced to %d after failed explicit write", got)
+			}
+		})
+	}
+}
+
 func TestIteratorFactoryErrorsPropagate(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
@@ -149,7 +252,7 @@ func TestIteratorFactoryErrorsPropagate(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	sentinel := errors.New("iterator")
-	db.newIter = func(*pebble.IterOptions) (*pebble.Iterator, error) {
+	db.newIter = func(*pebble.IterOptions) (kvIterator, error) {
 		return nil, sentinel
 	}
 	if _, _, err := db.Get([]byte("x")); !errors.Is(err, sentinel) {
@@ -237,7 +340,7 @@ func TestCommandForTxnAppliesPutsThenDeleteAndPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTime := (uint64(1) << 56) | 10
+	wantTime := uint64(1)
 	if len(scan) != 2 ||
 		string(scan[0].Key) != "alpha" || string(scan[0].Value) != "one" || scan[0].Time != wantTime ||
 		string(scan[1].Key) != "beta" || string(scan[1].Value) != "two" || scan[1].Time != wantTime {
@@ -366,6 +469,36 @@ func TestTxnBatchCommitErrorIsReturned(t *testing.T) {
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+type terminalErrorIterator struct {
+	err    error
+	closed bool
+}
+
+func (i *terminalErrorIterator) First() bool {
+	return false
+}
+
+func (i *terminalErrorIterator) Next() bool {
+	return false
+}
+
+func (i *terminalErrorIterator) Key() []byte {
+	return nil
+}
+
+func (i *terminalErrorIterator) Value() []byte {
+	return nil
+}
+
+func (i *terminalErrorIterator) Error() error {
+	return i.err
+}
+
+func (i *terminalErrorIterator) Close() error {
+	i.closed = true
+	return nil
 }
 
 type txnBatchWithSetErr struct {
@@ -539,7 +672,7 @@ func TestApplyCommittedSameRefSameKeyKeepsLaterValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTime := (uint64(1) << 56) | 44
+	wantTime := uint64(2)
 	if len(scan) != 1 || string(scan[0].Value) != "second" || scan[0].Time != wantTime {
 		t.Fatalf("scan %#v", scan)
 	}

@@ -64,6 +64,44 @@ func TestPutGetScanAndApplyCommitted(t *testing.T) {
 	}
 }
 
+func TestApplyCommittedUsesApplyOrderInsteadOfInstanceRefOrder(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	first := epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 99, Conf: 1},
+		Command: CommandForPut(2, 99, []byte("shared"), []byte("first-applied")),
+	}
+	second := epaxos.CommittedCommand{
+		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Command: CommandForPut(1, 1, []byte("shared"), []byte("second-applied")),
+	}
+	if err := db.ApplyCommitted(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyCommitted(second); err != nil {
+		t.Fatal(err)
+	}
+
+	value, ok, err := db.Get([]byte("shared"))
+	if err != nil || !ok || string(value) != "second-applied" {
+		t.Fatalf("get value=%q ok=%v err=%v", value, ok, err)
+	}
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("shared")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 ||
+		string(scan[0].Key) != "shared" ||
+		string(scan[0].Value) != "second-applied" ||
+		scan[0].Time != 2 {
+		t.Fatalf("scan=%#v", scan)
+	}
+}
+
 func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
@@ -89,6 +127,13 @@ func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
 	}
 	if _, ok, err := db.Get([]byte("gone")); err != nil || ok {
 		t.Fatalf("gone ok=%v err=%v", ok, err)
+	}
+	alpha, err := db.Scan(ScanOptions{Prefix: []byte("alpha")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alpha) != 1 || string(alpha[0].Value) != "one" || alpha[0].Time != 2 {
+		t.Fatalf("alpha scan=%#v", alpha)
 	}
 }
 

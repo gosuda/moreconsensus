@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -64,6 +65,144 @@ func TestHandleKVAppliesPutGetAndDeleteThroughConsensus(t *testing.T) {
 	}
 }
 
+func TestHandleTxnAppliesMultiplePutsAndDeleteThroughConsensus(t *testing.T) {
+	s := newTestService(t)
+
+	seed := httptest.NewRecorder()
+	s.handleKV(seed, httptest.NewRequest(http.MethodPut, "/kv/gone", bytes.NewReader([]byte("old"))))
+	if seed.Code != http.StatusNoContent {
+		t.Fatalf("seed status=%d body=%q", seed.Code, seed.Body.String())
+	}
+
+	body := []byte(`[{"key":"alpha","value":"one"},{"key":"beta","value":"two"},{"key":"gone","delete":true}]`)
+	rr := httptest.NewRecorder()
+	s.handleTxn(rr, httptest.NewRequest(http.MethodPost, "/txn", bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("txn status=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	requireKVValue(t, s, "alpha", "one")
+	requireKVValue(t, s, "beta", "two")
+	requireKVMissing(t, s, "gone")
+
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	if !hasExecutedRef(s.node.Status().Executed, ref) {
+		t.Fatalf("executed refs=%v, want %s", s.node.Status().Executed, ref)
+	}
+}
+
+func TestHandleTxnRejectsMalformedJSONAndInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		body   []byte
+		want   int
+	}{
+		{name: "wrong method", method: http.MethodGet, want: http.StatusMethodNotAllowed},
+		{name: "malformed json", method: http.MethodPost, body: []byte(`{"key"`), want: http.StatusBadRequest},
+		{name: "empty transaction", method: http.MethodPost, body: []byte(`[]`), want: http.StatusBadRequest},
+		{name: "empty key", method: http.MethodPost, body: []byte(`[{"key":"","value":"x"}]`), want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleTxn(rr, httptest.NewRequest(tc.method, "/txn", bytes.NewReader(tc.body)))
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			status := s.node.Status()
+			if len(status.Instances) != 0 || len(status.Executed) != 0 {
+				t.Fatalf("node status after rejected request: instances=%v executed=%v", status.Instances, status.Executed)
+			}
+		})
+	}
+}
+
+func TestHandleKVRepeatedPutWaitsForNewAppliedRef(t *testing.T) {
+	s := newTestService(t)
+	for i := 1; i <= 2; i++ {
+		rr := httptest.NewRecorder()
+		s.handleKV(rr, httptest.NewRequest(http.MethodPut, "/kv/repeat", bytes.NewReader([]byte("same"))))
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("put %d status=%d body=%q", i, rr.Code, rr.Body.String())
+		}
+	}
+
+	scan, err := s.db.Scan(kv.ScanOptions{Prefix: []byte("repeat")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 1 || string(scan[0].Value) != "same" {
+		t.Fatalf("scan=%v", scan)
+	}
+	wantTime := uint64(2)
+	if scan[0].Time != wantTime {
+		t.Fatalf("applied version=%d, want %d", scan[0].Time, wantTime)
+	}
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	if !hasExecutedRef(s.node.Status().Executed, ref) {
+		t.Fatalf("executed refs=%v, want %s", s.node.Status().Executed, ref)
+	}
+}
+
+func TestHandleScanReturnsPrefixRows(t *testing.T) {
+	s := newTestService(t)
+
+	body := []byte(`[{"key":"tx-a","value":"one"},{"key":"tx-b","value":"two"},{"key":"other","value":"three"}]`)
+	rr := httptest.NewRecorder()
+	s.handleTxn(rr, httptest.NewRequest(http.MethodPost, "/txn", bytes.NewReader(body)))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("txn status=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	scan := httptest.NewRecorder()
+	s.handleScan(scan, httptest.NewRequest(http.MethodGet, "/scan?prefix=tx", nil))
+	if scan.Code != http.StatusOK {
+		t.Fatalf("scan status=%d body=%q", scan.Code, scan.Body.String())
+	}
+	var rows []scanResponseKV
+	if err := json.Unmarshal(scan.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	wantVersion := uint64(1)
+	want := []scanResponseKV{
+		{Key: "tx-a", Value: "one", Time: wantVersion},
+		{Key: "tx-b", Value: "two", Time: wantVersion},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%v, want %v", rows, want)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Fatalf("rows=%v, want %v", rows, want)
+		}
+	}
+}
+
+func TestHandleScanRejectsBadQueryAndMethod(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		want   int
+	}{
+		{name: "wrong method", method: http.MethodPost, target: "/scan", want: http.StatusMethodNotAllowed},
+		{name: "bad limit", method: http.MethodGet, target: "/scan?limit=many", want: http.StatusBadRequest},
+		{name: "bad reverse", method: http.MethodGet, target: "/scan?reverse=sideways", want: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleScan(rr, httptest.NewRequest(tc.method, tc.target, nil))
+			if rr.Code != tc.want {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestHandleKVRejectsBadKeysAndMethods(t *testing.T) {
 	s := newTestService(t)
 
@@ -93,6 +232,33 @@ func TestHandleMessageRejectsMalformedTransportPayload(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
 	}
+}
+
+func requireKVValue(t *testing.T, s *service, key, want string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	s.handleKV(rr, httptest.NewRequest(http.MethodGet, "/kv/"+key, nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != want {
+		t.Fatalf("get %q status=%d body=%q", key, rr.Code, rr.Body.String())
+	}
+}
+
+func requireKVMissing(t *testing.T, s *service, key string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	s.handleKV(rr, httptest.NewRequest(http.MethodGet, "/kv/"+key, nil))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("get %q status=%d body=%q", key, rr.Code, rr.Body.String())
+	}
+}
+
+func hasExecutedRef(refs []epaxos.InstanceRef, want epaxos.InstanceRef) bool {
+	for _, ref := range refs {
+		if ref == want {
+			return true
+		}
+	}
+	return false
 }
 
 func newTestService(t *testing.T) *service {

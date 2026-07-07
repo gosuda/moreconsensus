@@ -86,7 +86,7 @@ type RawNode struct {
 	tick         uint64
 	nextInstance InstanceNum
 	instances    map[InstanceRef]*instance
-	conflicts    map[string]InstanceRef
+	conflicts    map[string]map[ReplicaID]InstanceRef
 	executed     map[InstanceRef]struct{}
 	pendingConf  bool
 	timers       timerHeap
@@ -127,7 +127,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		maxReadyMessages:      cfg.MaxReadyMessages,
 		nextInstance:          1,
 		instances:             make(map[InstanceRef]*instance),
-		conflicts:             make(map[string]InstanceRef),
+		conflicts:             make(map[string]map[ReplicaID]InstanceRef),
 		executed:              make(map[InstanceRef]struct{}),
 		confHistory:           make(map[ConfID]ConfState),
 	}
@@ -720,7 +720,10 @@ func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 		return Attributes{Seq: seq, Deps: deps}
 	}
 	for _, key := range cmd.ConflictKeys {
-		if ref, ok := n.conflicts[string(key)]; ok && ref != exclude {
+		for _, ref := range n.conflicts[string(key)] {
+			if ref == exclude {
+				continue
+			}
 			if idx, ok := n.q.depIndex(ref.Replica); ok && ref.Instance > deps[idx] {
 				deps[idx] = ref.Instance
 				if inst := n.instances[ref]; inst != nil && inst.rec.Seq >= seq {
@@ -740,9 +743,13 @@ func (n *RawNode) indexConflicts(rec InstanceRecord) {
 		return
 	}
 	for _, key := range rec.Command.ConflictKeys {
-		old, ok := n.conflicts[string(key)]
-		if !ok || lessRef(old, rec.Ref) {
-			n.conflicts[string(key)] = rec.Ref
+		byReplica := n.conflicts[string(key)]
+		if byReplica == nil {
+			byReplica = make(map[ReplicaID]InstanceRef)
+			n.conflicts[string(key)] = byReplica
+		}
+		if old, ok := byReplica[rec.Ref.Replica]; !ok || lessRef(old, rec.Ref) {
+			byReplica[rec.Ref.Replica] = rec.Ref
 		}
 	}
 }
