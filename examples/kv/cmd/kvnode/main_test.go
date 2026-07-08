@@ -242,6 +242,8 @@ func TestHandleScanRejectsBadQueryAndMethod(t *testing.T) {
 		{name: "wrong method", method: http.MethodPost, target: "/scan", want: http.StatusMethodNotAllowed},
 		{name: "bad limit", method: http.MethodGet, target: "/scan?limit=many", want: http.StatusBadRequest},
 		{name: "bad reverse", method: http.MethodGet, target: "/scan?reverse=sideways", want: http.StatusBadRequest},
+		{name: "empty barrier part", method: http.MethodGet, target: "/scan?barrier=alpha,,beta", want: http.StatusBadRequest},
+		{name: "embedded separator barrier key", method: http.MethodGet, target: "/scan?barrier=alpha%00beta", want: http.StatusBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -250,6 +252,12 @@ func TestHandleScanRejectsBadQueryAndMethod(t *testing.T) {
 			s.handleScan(rr, httptest.NewRequest(tc.method, tc.target, nil))
 			if rr.Code != tc.want {
 				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			if tc.want == http.StatusBadRequest {
+				status := s.node.Status()
+				if len(status.Instances) != 0 || len(status.Executed) != 0 {
+					t.Fatalf("node status after rejected request: instances=%v executed=%v", status.Instances, status.Executed)
+				}
 			}
 		})
 	}

@@ -257,11 +257,12 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(raw, ",")
 		keys := make([][]byte, 0, len(parts))
 		for _, part := range parts {
-			if part == "" {
+			key := []byte(part)
+			if err := kv.ValidateKey(key); err != nil {
 				http.Error(w, "bad barrier key", http.StatusBadRequest)
 				return
 			}
-			keys = append(keys, []byte(part))
+			keys = append(keys, key)
 		}
 		if err := s.waitForKeys(r.Context(), keys...); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
