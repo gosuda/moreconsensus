@@ -31,5 +31,15 @@ for cfg in tla/EPaxosResponses.cfg tla/EPaxosResponsesFive.cfg; do
   rm -rf states
 done
 
+for cfg in tla/KVTimestampStaleness.cfg; do
+  "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config "$cfg" tla/KVTimestampStaleness.tla
+  rm -rf states
+done
+
+for cfg in tla/KVOmissionRecovery.cfg; do
+  "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config "$cfg" tla/KVOmissionRecovery.tla
+  rm -rf states
+done
+
 "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC -config tla/Quorum.cfg tla/Quorum.tla
 rm -rf states

@@ -12,6 +12,7 @@
 - BLAKE3 checksums through `github.com/zeebo/blake3` as the only intentional main-module runtime dependency.
 - Deterministic simulation tests for cluster sizes 1 through 7.
 - A Pebble-backed distributed key-value example in its own Go module, including atomic Pebble persistence for EPaxOS records and applied key-value writes.
+- The key-value example exposes deterministic timestamp bounds, bounded staleness, and exact staleness reads over explicit record timestamps.
 - The example HTTP service is built explicitly with `go build -tags kvnode ./cmd/kvnode` from `examples/kv`.
 - Repository verification gates run from `tests/ci.sh`, including local Jepsen restart, transport-partition, storage-unavailable, and destructive-storage profiles, and are wired into GitHub Actions CI. SSH-managed multi-host Jepsen profiles are available as opt-in operational gates.
 
@@ -19,7 +20,7 @@
 
 - [EPAXOS.MD](EPAXOS.MD) describes the implemented algorithm in detail.
 - [MODEL_EQ_REPORT.MD](MODEL_EQ_REPORT.MD) describes the current TLA+ model correspondence and implementation verification scope.
-- [tla/EPaxos.tla](tla/EPaxos.tla), [tla/EPaxosResponses.tla](tla/EPaxosResponses.tla), [tla/ReadyAdvance.tla](tla/ReadyAdvance.tla), and [tla/Quorum.tla](tla/Quorum.tla) contain the finite executable formal models checked by CI.
+- [tla/EPaxos.tla](tla/EPaxos.tla), [tla/EPaxosResponses.tla](tla/EPaxosResponses.tla), [tla/ReadyAdvance.tla](tla/ReadyAdvance.tla), [tla/Quorum.tla](tla/Quorum.tla), [tla/KVTimestampStaleness.tla](tla/KVTimestampStaleness.tla), and [tla/KVOmissionRecovery.tla](tla/KVOmissionRecovery.tla) contain the finite executable formal models checked by CI.
 - [examples/kv](examples/kv) contains the Pebble/MyRocks-style key-value example.
 - [jepsen](jepsen) contains the Jepsen workload harness for external validation.
 - [tests](tests) contains the repository verification scripts used by CI.

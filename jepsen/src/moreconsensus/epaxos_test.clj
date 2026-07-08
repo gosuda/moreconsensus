@@ -42,6 +42,7 @@
 (def scan-keys ["scan-a" "scan-b" "scan-c" "scan-d"])
 (def scan-limit 3)
 (def scan-barrier (str/join "," scan-keys))
+(def stale-scan-ops #{:scan-at :scan-bounded-staleness :scan-exact-staleness})
 
 (def fault-env-prefix "MORECONSENSUS_KVNODE_")
 
@@ -648,6 +649,57 @@
       [:ok rows]
       [:fail rows])))
 
+(defn remember-scan-times! [state rows]
+  (when (and state (vector? rows))
+    (let [times (keep (fn [row]
+                        (let [t (:time row)]
+                          (when (integer? t) t)))
+                      rows)]
+      (when (seq times)
+        (swap! state into times)))))
+
+(defn learned-stale-scan-query [state f]
+  (let [times (seq (sort (distinct (or (some-> state deref) []))))]
+    (when-not times
+      (throw (ex-info "no observed scan row time" {:f f})))
+    (let [first-ts (first times)
+          latest-ts (last times)]
+      (case f
+        :scan-at {:at latest-ts}
+        :scan-bounded-staleness {:reference-time latest-ts
+                                 :max-staleness (- latest-ts first-ts)}
+        :scan-exact-staleness {:reference-time latest-ts
+                               :exact-staleness (- latest-ts first-ts)}))))
+
+(defn stale-scan-query [state f value]
+  (assoc (if (seq value)
+           value
+           (learned-stale-scan-query state f))
+         :prefix scan-prefix))
+
+(defn stale-scan-query-params [f query]
+  (case f
+    :scan-at {"prefix" (:prefix query)
+              "at" (str (:at query))}
+    :scan-bounded-staleness {"prefix" (:prefix query)
+                             "reference-time" (str (:reference-time query))
+                             "max-staleness" (str (:max-staleness query))}
+    :scan-exact-staleness {"prefix" (:prefix query)
+                           "reference-time" (str (:reference-time query))
+                           "exact-staleness" (str (:exact-staleness query))}))
+
+(defn stale-scan [base f observed-times value]
+  (try
+    (let [query (stale-scan-query observed-times f value)
+          [status rows] (scan-rows base (stale-scan-query-params f query))]
+      (if (= :ok status)
+        (do
+          (remember-scan-times! observed-times rows)
+          [:ok {:query query :rows rows}])
+        [:fail rows]))
+    (catch Exception e
+      [:fail (.getMessage e)])))
+
 (defn scan-values [base]
   (let [[status values] (scan-map base "tx-" txn-scan-barrier)]
     (cond
@@ -660,12 +712,13 @@
 
 (defrecord KVClient [node]
   client/Client
-  (open! [this test node] (assoc this :node node))
+  (open! [this test node] (assoc this :node node :observed-scan-times (atom [])))
   (setup! [this test]
     (info "using EPaxos KV endpoint" (endpoint test node)))
   (invoke! [this test op]
     (let [base (endpoint test node)
-          k "k0"]
+          k "k0"
+          observed-times (:observed-scan-times this)]
       (try
         (case (:f op)
           :write
@@ -712,13 +765,32 @@
           :scan-forward
           (let [[status rows] (advanced-scan base false)]
             (if (= :ok status)
-              (assoc op :type :ok :value rows)
+              (do
+                (remember-scan-times! observed-times rows)
+                (assoc op :type :ok :value rows))
               (assoc op :type :fail :error rows)))
           :scan-reverse
           (let [[status rows] (advanced-scan base true)]
             (if (= :ok status)
-              (assoc op :type :ok :value rows)
+              (do
+                (remember-scan-times! observed-times rows)
+                (assoc op :type :ok :value rows))
               (assoc op :type :fail :error rows)))
+          :scan-at
+          (let [[status value] (stale-scan base :scan-at observed-times (:value op))]
+            (if (= :ok status)
+              (assoc op :type :ok :value value)
+              (assoc op :type :fail :error value)))
+          :scan-bounded-staleness
+          (let [[status value] (stale-scan base :scan-bounded-staleness observed-times (:value op))]
+            (if (= :ok status)
+              (assoc op :type :ok :value value)
+              (assoc op :type :fail :error value)))
+          :scan-exact-staleness
+          (let [[status value] (stale-scan base :scan-exact-staleness observed-times (:value op))]
+            (if (= :ok status)
+              (assoc op :type :ok :value value)
+              (assoc op :type :fail :error value)))
           :txn-read
           (let [[status values] (scan-values base)]
             (if (= :ok status)
@@ -853,18 +925,95 @@
          :bad-count (count bad)
          :bad (take 5 bad)}))))
 
+(defn nonnegative-int? [x]
+  (and (integer? x) (not (neg? x))))
+
+(defn stale-scan-query-error [f query]
+  (cond
+    (not (map? query)) :query
+    (not= scan-prefix (:prefix query)) :query
+    (= :scan-at f) (when-not (nonnegative-int? (:at query)) :query)
+    (= :scan-bounded-staleness f) (when-not (and (nonnegative-int? (:reference-time query))
+                                                 (nonnegative-int? (:max-staleness query)))
+                                    :query)
+    (= :scan-exact-staleness f) (when-not (and (nonnegative-int? (:reference-time query))
+                                               (nonnegative-int? (:exact-staleness query)))
+                                  :query)
+    :else :query))
+
+(defn stale-scan-time-bound-error [f query rows]
+  (case f
+    :scan-at
+    (when (some #(> (:time %) (:at query)) rows)
+      :time)
+    :scan-bounded-staleness
+    (let [reference (:reference-time query)
+          lower (max 0 (- reference (:max-staleness query)))]
+      (when (some (fn [row]
+                    (let [t (:time row)]
+                      (or (< t lower) (> t reference))))
+                  rows)
+        :time))
+    :scan-exact-staleness
+    (let [reference (:reference-time query)
+          staleness (:exact-staleness query)]
+      (if (> staleness reference)
+        (when (seq rows)
+          :exact-staleness)
+        (let [target (- reference staleness)]
+          (when (some #(not= target (:time %)) rows)
+            :exact-staleness))))))
+
+(defn bad-stale-scan-op [op]
+  (let [value (:value op)
+        query (:query value)
+        rows (:rows value)
+        row-error (scan-rows-error rows)
+        keys (if (vector? rows) (mapv :key rows) [])]
+    (cond
+      (not (map? value)) (assoc op :bad-stale-scan :value)
+      (stale-scan-query-error (:f op) query) (assoc op :bad-stale-scan :query)
+      row-error (assoc op :bad-stale-scan row-error)
+      (some #(not (str/starts-with? % scan-prefix)) keys) (assoc op :bad-stale-scan :prefix)
+      :else (when-let [reason (stale-scan-time-bound-error (:f op) query rows)]
+              (assoc op :bad-stale-scan reason)))))
+
+(defn stale-scan-checker []
+  (reify checker/Checker
+    (check [_ _ history _]
+      (let [reads (filter #(and (= :ok (:type %)) (contains? stale-scan-ops (:f %))) history)
+            bad (vec (keep bad-stale-scan-op reads))]
+        {:valid? (empty? bad)
+         :checked (count reads)
+         :bad-count (count bad)
+         :bad (take 5 bad)}))))
+
+(defn stale-scan-bootstrap-generator []
+  (concat
+   (map-indexed (fn [idx key]
+                  {:type :invoke
+                   :f :scan-write
+                   :value {:key key :value [:stale-seed idx]}})
+                scan-keys)
+   [{:type :invoke :f :scan-forward :value nil}
+    {:type :invoke :f :scan-at :value nil}
+    {:type :invoke :f :scan-bounded-staleness :value nil}
+    {:type :invoke :f :scan-exact-staleness :value nil}]))
+
 (defn client-workload-generator []
-  (gen/limit 90
-             (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
-                       (gen/repeat {:type :invoke :f :read :value nil})
-                       (gen/repeat {:type :invoke :f :delete :value nil})
-                       (map (fn [x] {:type :invoke :f :scan-write :value {:key (scan-key-for x) :value x}}) (range))
-                       (map (fn [x] {:type :invoke :f :scan-delete :value {:key (scan-key-for x)}}) (range))
-                       (gen/repeat {:type :invoke :f :scan-forward :value nil})
-                       (gen/repeat {:type :invoke :f :scan-reverse :value nil})
-                       (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
-                       (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
-                       (gen/repeat {:type :invoke :f :txn-read :value nil})])))
+  (gen/phases
+   (stale-scan-bootstrap-generator)
+   (gen/limit 90
+              (gen/mix [(map (fn [x] {:type :invoke :f :write :value x}) (range))
+                        (gen/repeat {:type :invoke :f :read :value nil})
+                        (gen/repeat {:type :invoke :f :delete :value nil})
+                        (map (fn [x] {:type :invoke :f :scan-write :value {:key (scan-key-for x) :value x}}) (range))
+                        (map (fn [x] {:type :invoke :f :scan-delete :value {:key (scan-key-for x)}}) (range))
+                        (gen/repeat {:type :invoke :f :scan-forward :value nil})
+                        (gen/repeat {:type :invoke :f :scan-reverse :value nil})
+                        (map (fn [x] {:type :invoke :f :txn-write :value {:group (txn-group-for x) :value x}}) (range))
+                        (map (fn [x] {:type :invoke :f :txn-delete :value {:group (txn-group-for x)}}) (range))
+                        (gen/repeat {:type :invoke :f :txn-read :value nil})]))))
 
 (defn workload
   ([] (workload nil))
@@ -876,6 +1025,7 @@
                    (gen/clients client-gen))
      :checker (checker/compose {:linearizable (register-linearizable-checker)
                                 :scan-shape (advanced-scan-checker)
+                                :stale-scan-shape (stale-scan-checker)
                                 :txn-atomic (txn-atomic-checker)
                                 :timeline (timeline/html)})})))
 

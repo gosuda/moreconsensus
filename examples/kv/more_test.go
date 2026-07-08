@@ -1218,6 +1218,48 @@ func (i *terminalErrorIterator) Close() error {
 	return nil
 }
 
+type scriptedIteratorEntry struct {
+	key   []byte
+	value []byte
+}
+
+type scriptedIterator struct {
+	entries []scriptedIteratorEntry
+	index   int
+	err     error
+}
+
+func (i *scriptedIterator) First() bool {
+	i.index = 0
+	return len(i.entries) > 0
+}
+
+func (i *scriptedIterator) SeekGE([]byte) bool {
+	i.index = 0
+	return len(i.entries) > 0
+}
+
+func (i *scriptedIterator) Next() bool {
+	i.index++
+	return i.index < len(i.entries)
+}
+
+func (i *scriptedIterator) Key() []byte {
+	return i.entries[i.index].key
+}
+
+func (i *scriptedIterator) Value() []byte {
+	return i.entries[i.index].value
+}
+
+func (i *scriptedIterator) Error() error {
+	return i.err
+}
+
+func (i *scriptedIterator) Close() error {
+	return nil
+}
+
 type txnBatchWithSetErr struct {
 	err error
 }
@@ -1735,6 +1777,175 @@ func TestRelativeStalenessScansUseExplicitReferenceTimestamp(t *testing.T) {
 	assertKVRows(t, scan, []KV{
 		{Key: []byte("rel-scan-a"), Value: []byte("inside-a"), Time: 10},
 	})
+}
+
+func TestExactStalenessUnderflowDoesNotWrapAcrossCivilClockBoundary(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PutVersion([]byte("civil-underflow"), []byte("wrapped"), ^uint64(0)); err != nil {
+		t.Fatal(err)
+	}
+
+	value, ok, err := db.GetExactStaleness([]byte("civil-underflow"), 0, 1)
+	if err != nil || ok || value != nil {
+		t.Fatalf("exact staleness underflow value=%q ok=%v err=%v", value, ok, err)
+	}
+
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("civil-underflow"), Bounds: ExactStaleness(0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan) != 0 {
+		t.Fatalf("exact staleness underflow scan=%#v", scan)
+	}
+}
+
+func TestBoundedStalenessUsesNumericRecordTimesAcrossRepeatedCivilBoundary(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const boundary = uint64(20161231235960)
+	for _, write := range []struct {
+		value string
+		ts    uint64
+	}{
+		{value: "lower-adjacent", ts: boundary - 1},
+		{value: "first-at-boundary", ts: boundary},
+		{value: "winner-at-boundary", ts: boundary},
+		{value: "newer-adjacent", ts: boundary + 1},
+	} {
+		if err := db.PutVersion([]byte("civil-repeat"), []byte(write.value), write.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	value, ok, err := db.GetBoundedStaleness([]byte("civil-repeat"), boundary, 1)
+	if err != nil || !ok || string(value) != "winner-at-boundary" {
+		t.Fatalf("bounded staleness boundary value=%q ok=%v err=%v", value, ok, err)
+	}
+
+	value, ok, err = db.GetExactStaleness([]byte("civil-repeat"), boundary, 1)
+	if err != nil || !ok || string(value) != "lower-adjacent" {
+		t.Fatalf("exact staleness adjacent value=%q ok=%v err=%v", value, ok, err)
+	}
+}
+
+func TestStalenessScanKeepsPerKeyHistoryAcrossCivilBoundary(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const boundary = uint64(20161231235960)
+	for _, write := range []struct {
+		key   string
+		value string
+		ts    uint64
+	}{
+		{key: "civil-scan-a", value: "too-old-a", ts: boundary - 2},
+		{key: "civil-scan-a", value: "chosen-a", ts: boundary - 1},
+		{key: "civil-scan-a", value: "too-new-a", ts: boundary + 1},
+		{key: "civil-scan-b", value: "lower-b", ts: boundary - 1},
+		{key: "civil-scan-b", value: "chosen-b", ts: boundary},
+		{key: "civil-scan-b", value: "too-new-b", ts: boundary + 1},
+		{key: "civil-scan-c", value: "too-old-c", ts: boundary - 2},
+		{key: "civil-scan-c", value: "too-new-c", ts: boundary + 1},
+		{key: "civil-scan-d", value: "deleted-d", ts: boundary - 1},
+	} {
+		if err := db.PutVersion([]byte(write.key), []byte(write.value), write.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.DeleteVersion([]byte("civil-scan-d"), boundary); err != nil {
+		t.Fatal(err)
+	}
+
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("civil-scan-"), Bounds: BoundedStaleness(boundary, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("civil-scan-a"), Value: []byte("chosen-a"), Time: boundary - 1},
+		{Key: []byte("civil-scan-b"), Value: []byte("chosen-b"), Time: boundary},
+	})
+}
+
+func TestTimestampBoundsValidateRejectsInvalidInterval(t *testing.T) {
+	err := TimestampWithinBounds(11, 10).Validate()
+	if !errors.Is(err, ErrInvalidTimestampBounds) {
+		t.Fatalf("err=%v, want invalid timestamp bounds", err)
+	}
+}
+
+func TestZeroValueDBHasNoLatestRecordTime(t *testing.T) {
+	var db DB
+	if got := db.LatestRecordTime(); got != 0 {
+		t.Fatalf("latest record time=%d, want 0", got)
+	}
+}
+
+func TestExactStalenessUnderflowClassifiesAllRecordsTooOld(t *testing.T) {
+	bounds := ExactStaleness(2, 3)
+	for _, ts := range []uint64{0, 2, ^uint64(0)} {
+		if got := bounds.classify(ts); got != timestampTooOld {
+			t.Fatalf("classify(%d)=%v, want too old", ts, got)
+		}
+	}
+}
+
+func TestGetWithBoundsSkipsMalformedAndTooNewVersions(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	iter := &scriptedIterator{
+		index: -1,
+		entries: []scriptedIteratorEntry{
+			{key: []byte("not a data key"), value: []byte{valueRecord, 'b', 'a', 'd'}},
+			{key: EncodeDataKey(nil, db.cf, []byte("record"), 9), value: []byte{valueRecord, 'f', 'u', 't', 'u', 'r', 'e'}},
+			{key: EncodeDataKey(nil, db.cf, []byte("record"), 5), value: []byte{valueRecord, 'e', 'l', 'i', 'g', 'i', 'b', 'l', 'e'}},
+		},
+	}
+	db.newIter = func(*pebble.IterOptions) (kvIterator, error) {
+		return iter, nil
+	}
+
+	value, ok, err := db.GetWithBounds([]byte("record"), TimestampWithinBounds(1, 5))
+	if err != nil || !ok || string(value) != "eligible" {
+		t.Fatalf("value=%q ok=%v err=%v, want eligible row", value, ok, err)
+	}
+}
+
+func TestScanRejectsInvalidRangeKeys(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, tc := range []struct {
+		name string
+		opt  ScanOptions
+	}{
+		{name: "start", opt: ScanOptions{Start: []byte("bad\x00start")}},
+		{name: "end", opt: ScanOptions{End: []byte("bad\x00end")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.Scan(tc.opt); !errors.Is(err, errInvalidKey) {
+				t.Fatalf("err=%v, want invalid key", err)
+			}
+		})
+	}
 }
 
 func TestTimestampReadsRejectInvalidBoundsAndKeys(t *testing.T) {

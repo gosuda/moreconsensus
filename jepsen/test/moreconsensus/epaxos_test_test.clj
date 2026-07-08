@@ -4,6 +4,7 @@
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
+            [jepsen.checker.timeline :as timeline]
             [jepsen.client :as client]
             [jepsen.control :as control]
             [jepsen.control.util :as cu]
@@ -19,6 +20,7 @@
 (def client-operation-fs
   #{:read :write :delete
     :scan-write :scan-delete :scan-forward :scan-reverse
+    :scan-at :scan-bounded-staleness :scan-exact-staleness
     :txn-write :txn-delete :txn-read})
 
 (defn generated-ops-for [generator process n]
@@ -211,6 +213,49 @@
              :f :heal-storage
              :value "127.0.0.1:9101"}]
            nemesis-faults))))
+
+(deftest client-workload-generator-seeds-scan-keys-before-stale-scans
+  (testing "stale scan queries are generated only after deterministic scan writes and a learning scan"
+    (let [expected-stage-shape (vec (concat (map (fn [key]
+                                                   {:type :invoke
+                                                    :f :scan-write
+                                                    :key key
+                                                    :has-value? true})
+                                                 epaxos/scan-keys)
+                                            [{:type :invoke
+                                              :f :scan-forward
+                                              :value nil}
+                                             {:type :invoke
+                                              :f :scan-at
+                                              :value nil}
+                                             {:type :invoke
+                                              :f :scan-bounded-staleness
+                                              :value nil}
+                                             {:type :invoke
+                                              :f :scan-exact-staleness
+                                              :value nil}]))
+          relevant-fs #{:scan-write
+                        :scan-forward
+                        :scan-at
+                        :scan-bounded-staleness
+                        :scan-exact-staleness}
+          stage (->> (generated-ops-for (epaxos/client-workload-generator)
+                                        0
+                                        40)
+                     (filter #(contains? relevant-fs (:f %)))
+                     (take (count expected-stage-shape))
+                     vec)
+          stage-shape (mapv (fn [op]
+                              (if (= :scan-write (:f op))
+                                {:type (:type op)
+                                 :f (:f op)
+                                 :key (get-in op [:value :key])
+                                 :has-value? (contains? (:value op) :value)}
+                                (select-keys op [:type :f :value])))
+                            stage)]
+      (is (= expected-stage-shape stage-shape)
+          (str "expected the stale scan seed/learn/query stage before the mixed workload; saw "
+               stage)))))
 
 (deftest start-node-reports-healthy-launch
   (let [cfg {:base-port 9100
@@ -1214,3 +1259,186 @@
       (is (= {:valid? true :checked 0 :bad-count 0}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= [] (vec (:bad result)))))))
+
+(defn timed-scan-row [key value time]
+  (assoc (scan-row key value) :time time))
+
+(defn required-epaxos-var [sym]
+  (or (ns-resolve 'moreconsensus.epaxos-test sym)
+      (throw (ex-info (str "missing production var " sym) {:var sym}))))
+
+(defn check-stale-scan-history [history]
+  (checker/check ((required-epaxos-var 'stale-scan-checker))
+                 {:name "stale-scan-checker-test" :start-time 0}
+                 (index-history history)
+                 nil))
+
+(deftest stale-scan-client-sends-query-params-and-preserves-rows
+  (testing "each stale scan operation calls /scan with scan prefix and records the query beside response rows"
+    (doseq [{:keys [f query expected-params rows]}
+            [{:f :scan-at
+              :query {:at 120}
+              :expected-params {"prefix" epaxos/scan-prefix
+                                "at" "120"}
+              :rows [(timed-scan-row "scan-a" :old 120)]}
+             {:f :scan-bounded-staleness
+              :query {:reference-time 200 :max-staleness 25}
+              :expected-params {"prefix" epaxos/scan-prefix
+                                "reference-time" "200"
+                                "max-staleness" "25"}
+              :rows [(timed-scan-row "scan-a" :old 175)
+                     (timed-scan-row "scan-b" :newer 200)]}
+             {:f :scan-exact-staleness
+              :query {:reference-time 200 :exact-staleness 25}
+              :expected-params {"prefix" epaxos/scan-prefix
+                                "reference-time" "200"
+                                "exact-staleness" "25"}
+              :rows [(timed-scan-row "scan-a" :old 175)]}]]
+      (let [requests (atom [])
+            expected-query (assoc query :prefix epaxos/scan-prefix)]
+        (with-redefs [http/get (fn [url opts]
+                                 (swap! requests conj [url opts])
+                                 {:status 200 :body (json/write-str rows)})]
+          (is (= {:type :ok
+                  :f f
+                  :value {:query expected-query
+                          :rows rows}}
+                 (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                             {}
+                                             {:type :invoke :f f :value query})
+                              [:type :f :value]))
+              (str f " should preserve stale scan query metadata and rows"))
+          (is (= [["http://node/scan"
+                   {:query-params expected-params
+                    :throw-exceptions false}]]
+                 @requests)
+              (str f " should issue the expected /scan query")))))))
+
+(deftest stale-scan-checker-accepts-valid-results-and-empty-misses
+  (testing "row times inside each stale scan window are valid, and empty underflow/no-version results are valid"
+    (let [history [{:type :ok
+                    :f :scan-at
+                    :value {:query {:prefix epaxos/scan-prefix :at 120}
+                            :rows [(timed-scan-row "scan-a" :old 119)
+                                   (timed-scan-row "scan-b" :at 120)]}}
+                   {:type :ok
+                    :f :scan-bounded-staleness
+                    :value {:query {:prefix epaxos/scan-prefix
+                                    :reference-time 200
+                                    :max-staleness 25}
+                            :rows [(timed-scan-row "scan-a" :oldest 175)
+                                   (timed-scan-row "scan-b" :newest 200)]}}
+                   {:type :ok
+                    :f :scan-exact-staleness
+                    :value {:query {:prefix epaxos/scan-prefix
+                                    :reference-time 200
+                                    :exact-staleness 25}
+                            :rows [(timed-scan-row "scan-a" :exact 175)]}}
+                   {:type :ok
+                    :f :scan-exact-staleness
+                    :value {:query {:prefix epaxos/scan-prefix
+                                    :reference-time 10
+                                    :exact-staleness 25}
+                            :rows []}}
+                   {:type :ok
+                    :f :scan-bounded-staleness
+                    :value {:query {:prefix epaxos/scan-prefix
+                                    :reference-time 300
+                                    :max-staleness 10}
+                            :rows []}}]
+          result (check-stale-scan-history history)]
+      (is (= {:valid? true :checked 5 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
+
+(deftest stale-scan-checker-rejects-malformed-duplicate-and-wrong-prefix-rows
+  (testing "stale scan rows must be well-formed, unique, and under the requested scan prefix"
+    (let [malformed-row {:type :ok
+                         :f :scan-at
+                         :value {:query {:prefix epaxos/scan-prefix :at 120}
+                                 :rows ["not-a-row"]}}
+          missing-time {:type :ok
+                        :f :scan-at
+                        :value {:query {:prefix epaxos/scan-prefix :at 120}
+                                :rows [{:key "scan-a" :value (pr-str :old)}]}}
+          duplicate-key {:type :ok
+                         :f :scan-bounded-staleness
+                         :value {:query {:prefix epaxos/scan-prefix
+                                         :reference-time 200
+                                         :max-staleness 25}
+                                 :rows [(timed-scan-row "scan-a" :older 175)
+                                        (timed-scan-row "scan-a" :newer 180)]}}
+          outside-prefix {:type :ok
+                          :f :scan-exact-staleness
+                          :value {:query {:prefix epaxos/scan-prefix
+                                          :reference-time 200
+                                          :exact-staleness 25}
+                                  :rows [(timed-scan-row "other-a" :value 175)]}}
+          result (check-stale-scan-history [malformed-row
+                                            missing-time
+                                            duplicate-key
+                                            outside-prefix])]
+      (is (= {:valid? false :checked 4 :bad-count 4}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [{:f :scan-at :bad-stale-scan :row}
+              {:f :scan-at :bad-stale-scan :time}
+              {:f :scan-bounded-staleness :bad-stale-scan :duplicate-key}
+              {:f :scan-exact-staleness :bad-stale-scan :prefix}]
+             (mapv #(select-keys % [:f :bad-stale-scan]) (:bad result)))))))
+
+(deftest stale-scan-checker-rejects-row-times-outside-query-bounds
+  (testing "at and bounded scans reject rows newer/older than their query window, and exact scans require one exact timestamp"
+    (let [newer-than-at {:type :ok
+                         :f :scan-at
+                         :value {:query {:prefix epaxos/scan-prefix :at 120}
+                                 :rows [(timed-scan-row "scan-a" :newer 121)]}}
+          older-than-bounded-window {:type :ok
+                                     :f :scan-bounded-staleness
+                                     :value {:query {:prefix epaxos/scan-prefix
+                                                     :reference-time 200
+                                                     :max-staleness 25}
+                                             :rows [(timed-scan-row "scan-a" :too-old 174)]}}
+          newer-than-reference {:type :ok
+                                :f :scan-bounded-staleness
+                                :value {:query {:prefix epaxos/scan-prefix
+                                                :reference-time 200
+                                                :max-staleness 25}
+                                        :rows [(timed-scan-row "scan-a" :too-new 201)]}}
+          not-exact-staleness {:type :ok
+                                :f :scan-exact-staleness
+                                :value {:query {:prefix epaxos/scan-prefix
+                                                :reference-time 200
+                                                :exact-staleness 25}
+                                        :rows [(timed-scan-row "scan-a" :off-by-one 176)]}}
+          result (check-stale-scan-history [newer-than-at
+                                            older-than-bounded-window
+                                            newer-than-reference
+                                            not-exact-staleness])]
+      (is (= {:valid? false :checked 4 :bad-count 4}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [{:f :scan-at :bad-stale-scan :time}
+              {:f :scan-bounded-staleness :bad-stale-scan :time}
+              {:f :scan-bounded-staleness :bad-stale-scan :time}
+              {:f :scan-exact-staleness :bad-stale-scan :exact-staleness}]
+             (mapv #(select-keys % [:f :bad-stale-scan]) (:bad result)))))))
+
+(deftest workload-checker-includes-stale-scan-shape-validation
+  (testing "the composed workload checker rejects malformed successful stale scans"
+    (let [noop-checker (reify checker/Checker
+                         (check [_ _ _ _] {:valid? true}))
+          history (index-history [{:type :ok
+                                   :process 0
+                                   :f :scan-at
+                                   :value {:query {:prefix epaxos/scan-prefix :at 100}
+                                           :rows [(timed-scan-row "other-a" :leak 100)]}}])]
+      (with-redefs [timeline/html (fn [] noop-checker)]
+        (let [result (checker/check (:checker (epaxos/workload))
+                                    {:name "stale-scan-workload-test" :start-time 0}
+                                    history
+                                    nil)]
+          (is (= false (:valid? result)))
+          (is (= {:valid? false :checked 1 :bad-count 1}
+                 (select-keys (:stale-scan-shape result) [:valid? :checked :bad-count])))
+          (is (= [{:f :scan-at :bad-stale-scan :prefix}]
+                 (mapv #(select-keys % [:f :bad-stale-scan])
+                       (get-in result [:stale-scan-shape :bad])))))))))
