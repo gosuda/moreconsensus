@@ -88,7 +88,7 @@ func (m Message) Validate(conf ConfState) error {
 		return ErrMessageRejected
 	}
 	if !m.Reject && (m.Type == MsgPreAccept || m.Type == MsgPreAcceptResp || m.Type == MsgAccept || m.Type == MsgCommit || m.Type == MsgPrepareResp) {
-		if len(m.Deps) == 0 || len(m.Deps) > len(conf.Voters) {
+		if len(m.Deps) != len(conf.Voters) {
 			return ErrInvalidMessage
 		}
 	}

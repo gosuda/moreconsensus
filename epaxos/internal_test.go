@@ -109,6 +109,84 @@ func TestConfigValidationAndMessageValidation(t *testing.T) {
 	}
 }
 
+func TestMessageValidateRequiresDependencyVectorWidthForAttributes(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+
+	attrMessages := []MessageType{
+		MsgPreAccept,
+		MsgPreAcceptResp,
+		MsgAccept,
+		MsgCommit,
+		MsgPrepareResp,
+	}
+	for _, typ := range attrMessages {
+		for _, tc := range []struct {
+			name string
+			deps []InstanceNum
+		}{
+			{name: "short", deps: []InstanceNum{0, 0}},
+			{name: "overwide", deps: []InstanceNum{0, 0, 0, 0}},
+		} {
+			t.Run(typ.String()+"/"+tc.name, func(t *testing.T) {
+				msg := Message{Type: typ, From: 1, To: 2, Ref: ref, Deps: tc.deps}
+				if err := msg.Validate(conf); !errors.Is(err, ErrInvalidMessage) {
+					t.Fatalf("Validate err=%v, want %v", err, ErrInvalidMessage)
+				}
+			})
+		}
+	}
+}
+
+func TestMessageValidateDependencyWidthExemptions(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+
+	for _, tc := range []struct {
+		name string
+		msg  Message
+	}{
+		{
+			name: "prepare short deps",
+			msg:  Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}},
+		},
+		{
+			name: "prepare overwide deps",
+			msg:  Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}},
+		},
+		{
+			name: "accept response short deps",
+			msg:  Message{Type: MsgAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}},
+		},
+		{
+			name: "accept response overwide deps",
+			msg:  Message{Type: MsgAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}},
+		},
+		{
+			name: "preaccept reject short deps",
+			msg:  Message{Type: MsgPreAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}, Reject: true},
+		},
+		{
+			name: "preaccept reject overwide deps",
+			msg:  Message{Type: MsgPreAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}, Reject: true},
+		},
+		{
+			name: "prepare reject short deps",
+			msg:  Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}, Reject: true},
+		},
+		{
+			name: "prepare reject overwide deps",
+			msg:  Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}, Reject: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.msg.Validate(conf); err != nil {
+				t.Fatalf("Validate err=%v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestStorageEdgeCases(t *testing.T) {
 	st := NewMemoryStorage()
 	st.Configs = []ConfState{{ID: 2, Voters: makeIDs(3)}}
