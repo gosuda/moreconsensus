@@ -9,17 +9,20 @@ import (
 )
 
 type simCluster struct {
-	t      *testing.T
-	nodes  map[ReplicaID]*RawNode
-	stores map[ReplicaID]*MemoryStorage
-	apps   map[ReplicaID][]CommittedCommand
-	drop   map[[2]ReplicaID]bool
+	t       *testing.T
+	nodes   map[ReplicaID]*RawNode
+	stores  map[ReplicaID]*MemoryStorage
+	apps    map[ReplicaID][]CommittedCommand
+	drop    map[[2]ReplicaID]bool
+	paused  map[ReplicaID]bool
+	delayed []Message
+	opt     bool
 }
 
 func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 	t.Helper()
 	ids := makeIDs(n)
-	s := &simCluster{t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage), apps: make(map[ReplicaID][]CommittedCommand), drop: make(map[[2]ReplicaID]bool)}
+	s := &simCluster{t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage), apps: make(map[ReplicaID][]CommittedCommand), drop: make(map[[2]ReplicaID]bool), paused: make(map[ReplicaID]bool), opt: opt}
 	for _, id := range ids {
 		st := NewMemoryStorage()
 		rn, err := NewRawNode(Config{ID: id, Voters: ids, Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: opt, TimeOptimizationTicks: 1})
@@ -44,7 +47,21 @@ func (s *simCluster) ids() []ReplicaID {
 func (s *simCluster) drain() {
 	for round := 0; round < 1000; round++ {
 		progress := false
+		if len(s.delayed) != 0 {
+			blocked := s.delayed[:0]
+			for _, m := range s.delayed {
+				if s.deliver(m) {
+					progress = true
+				} else {
+					blocked = append(blocked, m)
+				}
+			}
+			s.delayed = blocked
+		}
 		for _, id := range s.ids() {
+			if s.paused[id] {
+				continue
+			}
 			rn := s.nodes[id]
 			if !rn.HasReady() {
 				continue
@@ -58,13 +75,8 @@ func (s *simCluster) drain() {
 				s.apps[id] = append(s.apps[id], c)
 			}
 			for _, m := range rd.Messages {
-				if s.drop[[2]ReplicaID{m.From, m.To}] {
-					continue
-				}
-				if to := s.nodes[m.To]; to != nil {
-					if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
-						s.t.Fatalf("step %s %d->%d: %v", m.Type, m.From, m.To, err)
-					}
+				if !s.deliver(m) {
+					s.delayed = append(s.delayed, m)
 				}
 			}
 			if err := rn.Advance(rd); err != nil {
@@ -78,13 +90,104 @@ func (s *simCluster) drain() {
 	s.t.Fatalf("simulation did not quiesce")
 }
 
+func (s *simCluster) deliver(m Message) bool {
+	s.t.Helper()
+	if s.drop[[2]ReplicaID{m.From, m.To}] {
+		return true
+	}
+	if s.paused[m.From] || s.paused[m.To] {
+		return false
+	}
+	if to := s.nodes[m.To]; to != nil {
+		if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
+			s.t.Fatalf("step %s %d->%d: %v", m.Type, m.From, m.To, err)
+		}
+	}
+	return true
+}
+
 func (s *simCluster) tickAll(n int) {
-	for i := 0; i < n; i++ {
+	for range n {
 		for _, id := range s.ids() {
-			s.nodes[id].Tick()
+			if !s.paused[id] {
+				s.nodes[id].Tick()
+			}
 		}
 		s.drain()
 	}
+}
+
+func (s *simCluster) tickOnly(id ReplicaID, n int) {
+	s.t.Helper()
+	if s.paused[id] {
+		s.t.Fatalf("tickOnly called on paused node %d", id)
+	}
+	for range n {
+		s.nodes[id].Tick()
+		s.drain()
+	}
+}
+
+func (s *simCluster) tickBurst(id ReplicaID, n int) {
+	s.t.Helper()
+	if s.paused[id] {
+		s.t.Fatalf("tickBurst called on paused node %d", id)
+	}
+	for range n {
+		s.nodes[id].Tick()
+	}
+	s.drain()
+}
+
+func (s *simCluster) pause(id ReplicaID) {
+	s.paused[id] = true
+}
+
+func (s *simCluster) resume(id ReplicaID) {
+	delete(s.paused, id)
+}
+
+func (s *simCluster) omit(id ReplicaID) {
+	for _, other := range s.ids() {
+		if other == id {
+			continue
+		}
+		s.drop[[2]ReplicaID{id, other}] = true
+		s.drop[[2]ReplicaID{other, id}] = true
+	}
+}
+
+func (s *simCluster) heal(id ReplicaID) {
+	for _, other := range s.ids() {
+		delete(s.drop, [2]ReplicaID{id, other})
+		delete(s.drop, [2]ReplicaID{other, id})
+	}
+}
+
+func (s *simCluster) restart(id ReplicaID, st *MemoryStorage) {
+	s.t.Helper()
+	s.stores[id] = st
+	rn, err := NewRawNode(Config{ID: id, Voters: makeIDs(len(s.nodes)), Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: s.opt, TimeOptimizationTicks: 1})
+	if err != nil {
+		s.t.Fatalf("restart node %d: %v", id, err)
+	}
+	s.nodes[id] = rn
+}
+
+func cloneMemoryStorage(st *MemoryStorage) *MemoryStorage {
+	out := &MemoryStorage{
+		Hard:       HardState{Conf: st.Hard.Conf.Clone(), Tick: st.Hard.Tick},
+		Configs:    make([]ConfState, len(st.Configs)),
+		Records:    make(map[InstanceRef]InstanceRecord, len(st.Records)),
+		FailWrites: st.FailWrites,
+	}
+	for i := range st.Configs {
+		out.Configs[i] = st.Configs[i].Clone()
+	}
+	for ref, rec := range st.Records {
+		out.Records[ref] = rec.Clone()
+	}
+	return out
 }
 
 func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
@@ -580,6 +683,216 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	}
 }
 
+func TestPausedSlowNodeQueuesDeliveryAndReadyUntilResume(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	s.pause(3)
+
+	cmd := Command{ID: CommandID{Client: 10, Sequence: 1}, Payload: []byte("slow-node"), ConflictKeys: [][]byte{[]byte("slow-node")}}
+	ref, err := s.nodes[1].Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(3)
+	for _, id := range []ReplicaID{1, 2} {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireCommittedPayloadCount(t, s.apps[3], 3, ref, cmd.Payload, 0)
+	if len(s.delayed) == 0 {
+		t.Fatal("paused node did not hold any in-flight messages")
+	}
+
+	s.resume(3)
+	s.tickAll(6)
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireConvergedRefs(t, s)
+}
+
+func TestSingleNodeOmissionDropsInboundOutboundThenHealConverges(t *testing.T) {
+	s := newSimCluster(t, 5, true)
+	s.omit(5)
+
+	cmd := Command{ID: CommandID{Client: 11, Sequence: 1}, Payload: []byte("omitted-node"), ConflictKeys: [][]byte{[]byte("omitted-node")}}
+	ref, err := s.nodes[1].Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(3)
+	for _, id := range []ReplicaID{1, 2, 3, 4} {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireCommittedPayloadCount(t, s.apps[5], 5, ref, cmd.Payload, 0)
+
+	s.heal(5)
+	s.tickAll(6)
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireConvergedRefs(t, s)
+}
+
+func TestSustainedQuorumProgressWhileSingleNodeUnavailableThenCatchUp(t *testing.T) {
+	tests := []struct {
+		name        string
+		unavailable func(*simCluster, ReplicaID)
+		available   func(*simCluster, ReplicaID)
+	}{
+		{
+			name:        "omitted",
+			unavailable: (*simCluster).omit,
+			available:   (*simCluster).heal,
+		},
+		{
+			name:        "paused",
+			unavailable: (*simCluster).pause,
+			available:   (*simCluster).resume,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSimCluster(t, 5, true)
+			const slow ReplicaID = 5
+			active := []ReplicaID{1, 2, 3, 4}
+			tc.unavailable(s, slow)
+
+			type proposal struct {
+				ref InstanceRef
+				cmd Command
+			}
+			proposals := make([]proposal, 0, 4)
+			for i, proposer := range active {
+				cmd := Command{
+					ID:           CommandID{Client: uint64(proposer), Sequence: uint64(i + 1)},
+					Payload:      []byte(fmt.Sprintf("%s-progress-%d", tc.name, i+1)),
+					ConflictKeys: [][]byte{[]byte("sustained-progress")},
+				}
+				ref, err := s.nodes[proposer].Propose(cmd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				proposals = append(proposals, proposal{ref: ref, cmd: cmd})
+				s.drain()
+				s.tickAll(2)
+			}
+
+			for _, p := range proposals {
+				for _, id := range active {
+					requireCommittedPayloadCount(t, s.apps[id], id, p.ref, p.cmd.Payload, 1)
+				}
+				requireCommittedPayloadCount(t, s.apps[slow], slow, p.ref, p.cmd.Payload, 0)
+			}
+
+			tc.available(s, slow)
+			s.tickAll(12)
+			for _, p := range proposals {
+				for _, id := range s.ids() {
+					requireCommittedPayloadCount(t, s.apps[id], id, p.ref, p.cmd.Payload, 1)
+				}
+			}
+			requireConvergedRefs(t, s)
+		})
+	}
+}
+
+func TestPausedClockDoesNotTickOrProcessReadyUntilResume(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	s.pause(2)
+	pausedTick := s.nodes[2].Status().Tick
+
+	cmd := Command{ID: CommandID{Client: 12, Sequence: 1}, Payload: []byte("clock-pause"), ConflictKeys: [][]byte{[]byte("clock-pause")}}
+	ref, err := s.nodes[1].Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 7 {
+		s.nodes[1].Tick()
+		s.nodes[3].Tick()
+		s.drain()
+	}
+	if got := s.nodes[2].Status().Tick; got != pausedTick {
+		t.Fatalf("paused node tick advanced from %d to %d", pausedTick, got)
+	}
+	for _, id := range []ReplicaID{1, 3} {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireCommittedPayloadCount(t, s.apps[2], 2, ref, cmd.Payload, 0)
+
+	s.resume(2)
+	s.tickAll(6)
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, 1)
+	}
+	requireConvergedRefs(t, s)
+}
+
+func TestUnevenLogicalTickSkewAndBurstConvergesWithoutDuplicates(t *testing.T) {
+	s := newSimCluster(t, 5, true)
+	first := Command{ID: CommandID{Client: 13, Sequence: 1}, Payload: []byte("skew-a"), ConflictKeys: [][]byte{[]byte("skew")}}
+	second := Command{ID: CommandID{Client: 14, Sequence: 1}, Payload: []byte("skew-b"), ConflictKeys: [][]byte{[]byte("skew")}}
+	firstRef, err := s.nodes[1].Propose(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRef, err := s.nodes[2].Propose(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.tickBurst(1, 5)
+	s.tickOnly(3, 2)
+	s.tickBurst(5, 8)
+	s.tickAll(8)
+
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, firstRef, first.Payload, 1)
+		requireCommittedPayloadCount(t, s.apps[id], id, secondRef, second.Payload, 1)
+	}
+	requireConvergedRefs(t, s)
+}
+
+func TestRolledBackNodeCatchesUpFromQuorumWithoutDuplicateApply(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	first := Command{ID: CommandID{Client: 15, Sequence: 1}, Payload: []byte("before-rollback"), ConflictKeys: [][]byte{[]byte("rollback")}}
+	firstRef, err := s.nodes[1].Propose(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, firstRef, first.Payload, 1)
+	}
+	rolledBackStore := cloneMemoryStorage(s.stores[3])
+
+	s.omit(3)
+	second := Command{ID: CommandID{Client: 15, Sequence: 2}, Payload: []byte("after-rollback"), ConflictKeys: [][]byte{[]byte("rollback")}}
+	secondRef, err := s.nodes[1].Propose(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(3)
+	for _, id := range []ReplicaID{1, 2} {
+		requireCommittedPayloadCount(t, s.apps[id], id, secondRef, second.Payload, 1)
+	}
+	requireCommittedPayloadCount(t, s.apps[3], 3, secondRef, second.Payload, 0)
+
+	s.restart(3, rolledBackStore)
+	if s.nodes[3].HasReady() {
+		t.Fatalf("rollback restart re-emitted already executed work: %#v", s.nodes[3].Ready())
+	}
+	s.heal(3)
+	s.tickAll(6)
+	for _, id := range s.ids() {
+		requireCommittedPayloadCount(t, s.apps[id], id, firstRef, first.Payload, 1)
+		requireCommittedPayloadCount(t, s.apps[id], id, secondRef, second.Payload, 1)
+	}
+	requireConvergedRefs(t, s)
+}
+
 func TestFiveNodePartitionHealConverges(t *testing.T) {
 	s := newSimCluster(t, 5, true)
 	majority := []ReplicaID{1, 2, 3}
@@ -620,6 +933,33 @@ func TestFiveNodePartitionHealConverges(t *testing.T) {
 			t.Fatalf("node %d did not converge on %s: %#v", id, ref, s.apps[id])
 		}
 	}
+}
+
+func requireConvergedRefs(t *testing.T, s *simCluster) {
+	t.Helper()
+	want := refs(s.apps[1])
+	for _, id := range s.ids() {
+		if got := refs(s.apps[id]); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("node %d refs = %v, want %v", id, got, want)
+		}
+	}
+}
+
+func requireCommittedPayloadCount(t *testing.T, app []CommittedCommand, id ReplicaID, ref InstanceRef, payload []byte, want int) {
+	t.Helper()
+	if got := committedPayloadCount(app, ref, payload); got != want {
+		t.Fatalf("node %d applied %s with payload %q %d times, want %d: %#v", id, ref, payload, got, want, app)
+	}
+}
+
+func committedPayloadCount(app []CommittedCommand, ref InstanceRef, payload []byte) int {
+	var count int
+	for _, c := range app {
+		if c.Ref == ref && bytes.Equal(c.Command.Payload, payload) {
+			count++
+		}
+	}
+	return count
 }
 
 func committedPayload(app []CommittedCommand, ref InstanceRef, payload []byte) bool {
