@@ -62,6 +62,92 @@ This report maps the current finite TLA+ models to the current Go implementation
 | Jepsen stale-scan validation | `jepsen/src/moreconsensus/epaxos_test.clj:661` learned stale-scan queries, `:981` stale-scan checker, and `jepsen/test/moreconsensus/epaxos_test_test.clj:1276` stale-scan client/checker tests | `cd jepsen && lein test moreconsensus.epaxos-test-test` |
 | CI and audit wiring | `tests/tla_model_check.sh` includes the new timestamp-staleness and omission-recovery models; `tests/ci.sh` continues to drive Go, coverage, TLA+, Jepsen, and repository audit gates | `tests/tla_model_check.sh`, `tests/go_coverage.sh`, `tests/ci.sh`, and `tests/audit_repo.sh` |
 
+## Production completion gate
+
+This gate defines the minimum evidence required before the project can be called production-complete under a mission-critical, high-assurance bar. The gate is intentionally blocker-driven: any failed blocker row keeps the release closed.
+
+### Entry criteria
+
+| Area | Entry criterion | Required evidence |
+| --- | --- | --- |
+| Scope lock | The release scope names every production binary, library API, transport, storage backend, deployment mode, and supported cluster size. | A signed release-scope file or issue links the exact commit, supported build tags, supported operating systems, supported cluster sizes, and excluded example/test-only artifacts. |
+| Review baseline | The production-readiness review has no unresolved blocker or high-severity finding. | A reviewed findings table lists each prior blocker, its fix commit, its regression test, and its reviewer signoff. |
+| Traceability | Every production requirement maps to source, tests, model evidence, Jepsen evidence, and documentation. | A trace matrix links requirement identifiers to file paths, test names, model configs, Jepsen workloads, and release notes. |
+| Determinism boundary | All protocol timing remains driven by deterministic logical ticks; any wall-clock use is outside the protocol core and has an explicit operational purpose. | A source audit plus tests showing protocol progress, retry, recovery, clock skew injection, clock pause, and civil-boundary timestamp behavior without protocol wall-clock reads. |
+| Toolchain lock | Verification tools and CI dependencies are reproducible. | Pinned Go, Java, Leiningen, TLC, GitHub Action, and Jepsen dependency versions with artifact checksums where downloads occur. |
+
+### Mandated scenario exit criteria
+
+| Scenario | Exit criterion | Required evidence |
+| --- | --- | --- |
+| Chaos and fault-injection campaign | Restart, transport partition, storage-unavailable, destructive-storage, message drop, message reorder, duplicate delivery, and slow/omitted node campaigns all pass on the release commit. | CI smoke results plus archived long-run campaign output list node count, duration, concurrency, injected fault sequence, checker results, and recovery evidence. |
+| Clock skew injection | Uneven logical tick advancement cannot violate safety, duplicate application, dependency order, or recovery progress. | Deterministic simulator tests burst ticks on selected replicas, hold other replicas behind, and prove all replicas converge without duplicate committed commands. |
+| Clock pause | A paused replica does not advance logical ticks, process Ready output, or apply commands until resumed; healthy quorum members continue to make permitted progress. | Tests pause one replica, drive ticks and proposals through the remaining quorum, then resume and prove catch-up without duplicate application. |
+| Leap-second-style civil-time boundary | Timestamp-bounded, bounded-staleness, and exact-staleness reads use explicit record timestamps only; civil-time boundary values, repeated boundary values, and underflow cannot wrap or select newer records. | KV point-read and scan tests use civil-time-shaped numeric timestamps around a leap-second-style boundary and prove exact, bounded, tombstone, and per-key historical behavior. |
+| VM rollback and restart catch-up | A replica rolled back to an earlier durable snapshot while isolated catches up from quorum after restore and does not reapply already delivered commands. | Simulator and KV restart tests clone or reopen durable storage, roll one node back, heal it, and prove convergence plus no duplicate application. |
+| Disk corruption and destructive-storage recovery | Storage removal, restoration, checksum rejection, invalid record rejection, and node-down-until-restore behavior are covered. | Local and remote destructive-storage campaign evidence, checksum tests, invalid durable-record tests, and restore-before-restart checks are archived. |
+
+### Core EPaxos blocker exit criteria
+
+| Blocker | Exit criterion | Required evidence |
+| --- | --- | --- |
+| Crash-idempotent application | A committed command cannot be applied twice after a crash at any point between durable command record, state-machine mutation, `Advance`, and executed-marker persistence. | A design note names the durable idempotence key; tests crash/restart after each persistence boundary and prove no duplicate application, no extra KV timestamp version, and no repeated transaction effect. |
+| Missing dependency closure | A nonzero dependency-vector entry blocks execution even when the referenced instance is not locally materialized. | Unit and simulator tests deliver commits out of order, with unseen dependencies, and assert `Ready.Committed` is withheld until dependencies are learned, recovered, or explicitly recorded as no-op. |
+| Owner-independent recovery | Any quorum member can recover an unfinished instance after the original owner stops permanently. | Simulator tests stop the owner after follower `StatusPreAccepted` and `StatusAccepted` records are durable, then prove another voter drives prepare/accept/commit and conflicting commands resume. |
+| Configuration-change ordering | User commands and membership changes are symmetrically ordered by the conflict relation. | Tests commit a membership change and a later user command from another replica, then prove the membership change is executed first on every replica. |
+| Ready failure handling | A failed durable `Ready` application cannot wedge the node or lose the outstanding batch. | Tests inject storage write failures inside `drainLocked`, clear the fault, and prove the same `Ready` batch is retried or safely reconstructed before new work proceeds. |
+
+### KV and service hardening exit criteria
+
+| Area | Exit criterion | Required evidence |
+| --- | --- | --- |
+| API separation | Client, peer, and admin/fault APIs are on separate listeners or explicitly isolated routes. | Integration tests prove production mode rejects fault endpoints unless test mode is enabled; peer endpoint rejects unauthenticated messages. |
+| Transport security | Peer and client traffic have authenticated transport in production mode. | mTLS or equivalent identity tests cover valid peer, invalid peer, expired credential, wrong cluster identity, and unauthorized client/admin requests. |
+| Request deadlines | Server and peer-client request handling have bounded deadline budgets and retry behavior. | Tests simulate slow clients and stalled peers, then prove request handlers, transport workers, and proposal paths release resources and surface retryable errors. |
+| Request size limits | Oversized raw and JSON bodies are rejected before consensus proposal or state mutation. | HTTP tests send limit-plus-one payloads for `/kv`, `/txn`, `/epaxos/message`, and fault endpoints; all return a rejection and leave state unchanged. |
+| Scan bounds | Scans have a production default limit, a hard maximum, and stop iterator work after enough visible rows are collected. | Iterator-count tests prove `limit=1` does not scan the whole range; API tests prove unbounded scans are rejected or explicitly gated. |
+| Latest-read semantics | `/scan` has an explicit consistency contract: either local/stale by name or barrier-backed by default. | HTTP and Jepsen tests prove latest scans satisfy the documented contract for normal, partitioned, and recovering clusters. |
+| Binary value fidelity | HTTP scan responses preserve arbitrary binary keys and values or reject non-text values at write time. | Round-trip tests cover invalid UTF-8 bytes through write, point read, scan, and historical scan. |
+| Health and readiness | Liveness and readiness are separate; readiness reflects storage, local drain health, and peer transport state. | Tests prove storage fault, Ready backlog, and peer isolation change readiness without breaking liveness. |
+| Observability | Production mode exports safe metrics and structured operational events. | Tests or smoke checks cover proposal outcomes, peer-send failures, queue depth, Ready backlog, storage errors, and health/readiness state without logging user values. |
+
+### Verification exit criteria
+
+| Gate | Exit criterion | Required evidence |
+| --- | --- | --- |
+| Go unit and race gates | Core, KV library, and tagged service packages pass unit, race, and coverage gates. | `tests/go_coverage.sh` plus a tagged `kvnode` coverage gate pass on the release commit; coverage exceptions, if any, are justified by reviewed rationale. |
+| Deterministic simulation | Deterministic simulator covers cluster sizes 1 through 7, duplicate/drop/reorder, omission, pause, rollback, owner failure, dependency recovery, and configuration ordering. | Named tests and seed logs are archived with the release evidence bundle. |
+| Formal models | TLA+ models cover dependency closure, response quorum behavior, Ready/Advance durability, quorum intersections, timestamp staleness, and omission recovery for the configured finite state spaces. | `tests/tla_model_check.sh` passes with state counts recorded; model-scope limits are listed and accepted by review. |
+| Jepsen local gates | Local restart, transport, storage, destructive-storage, stale scan, transaction, and register workloads pass. | Jepsen histories, checker output, and command lines are archived for each profile. |
+| Jepsen remote gates | Multi-host remote profiles pass for restart, transport, storage, and destructive-storage under materially longer duration and concurrency than CI smoke runs. | SSH-managed Jepsen histories, host topology, duration, concurrency, fault profile, and checker output are archived. |
+| Semantic scan checking | Jepsen scan and stale-scan checkers validate returned values against reconstructed per-key histories, not only shape, prefix, and timestamp window. | Tests inject wrong values, missing eligible rows, deleted rows, and out-of-window rows; each is rejected by the checker. |
+| Fuzz and stress | Decoder, wire-message, checksum, and simulator fuzz/stress campaigns pass fixed release budgets. | Seeds, durations, crashers, minimization results, and rerun commands are archived. |
+| Static and text audit | Repository audit passes and no banned scaffolding, external-project borrowing markers, or unintended wall-clock protocol APIs are present. | `tests/audit_repo.sh` output is empty on the release commit. |
+
+### Operations and deployment exit criteria
+
+| Area | Exit criterion | Required evidence |
+| --- | --- | --- |
+| Deployment manifest | Production deployment has reviewed process supervision, user permissions, persistent volumes, network policy, and restart policy. | systemd, container, or orchestration manifests are reviewed and tested in a disposable environment. |
+| Data lifecycle | Backup, restore, destructive test, and disaster-recovery procedures are documented and exercised. | A restore drill proves a cluster can recover from a backup and rejoin without data loss or duplicate application. |
+| Remote destructive safety | Destructive remote validation refuses unsafe directories and requires explicit operator confirmation. | Script tests reject empty, root, home, and shared temp paths; destructive profile logs the target hosts and directories before action. |
+| Upgrade and rollback | Rolling upgrade and rollback are tested across compatible versions. | An upgrade test runs mixed versions, then rolls back one node and proves quorum progress and catch-up. |
+| Capacity envelope | Supported key/value sizes, scan limits, queue sizes, peer counts, and storage growth are measured. | Load tests record throughput, latency, memory, disk growth, queue depth, and failure behavior at the declared envelope. |
+| Incident readiness | Runbooks exist for storage failure, network partition, peer compromise, replay suspicion, and recovery stalls. | Each runbook links detection signals, mitigation commands, safety checks, and post-incident verification gates. |
+
+### Documentation exit criteria
+
+| Document | Exit criterion | Required evidence |
+| --- | --- | --- |
+| Algorithm correspondence | The implementation-to-model mapping is current for all production-critical paths. | `MODEL_EQ_REPORT.MD` links every changed protocol path to model or implementation evidence. |
+| Production limits | All finite model limits, unsupported deployment modes, and example/test-only components are named. | README and release notes clearly separate production-supported artifacts from validation tools and examples. |
+| API contracts | Ready/Advance, persistence, idempotence, scan consistency, timestamp staleness, and binary-value contracts are documented. | API documentation includes failure cases and required embedder responsibilities. |
+| Evidence bundle | The release evidence bundle contains commands, outputs, histories, coverage summaries, model counts, source commit, and reviewer signoffs. | A release artifact or immutable storage path is linked from the release notes. |
+
+### Final release decision
+
+A release is production-complete only when every row above has current evidence for the release commit, no blocker or high-severity review finding remains open, and the release owner records an explicit go/no-go decision. If any blocker row fails, the only valid decision is no-go.
+
 ## Open correspondence risks
 
 - The TLA+ model is finite-bounded for TLC, so it demonstrates correspondence for the configured state space rather than unbounded proof.
