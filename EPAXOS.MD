@@ -56,7 +56,7 @@ The owner fast-commits when it receives a fast quorum of pre-accept votes and ev
 
 ## Slow accept path
 
-If a slow quorum of pre-accept replies is available but attributes differ, the owner merges the reply attributes. Without the optional time optimization, it immediately enters the slow accept path. With the optional logical-time optimization, it may wait a bounded number of ticks for enough additional matching replies to still fast-commit. This optimization is purely tick-driven and has no wall-clock dependency.
+If a slow quorum of pre-accept replies is available before a fast quorum, the owner merges the reply attributes. Without the optional time optimization, it immediately enters the slow accept path. With the optional logical-time optimization, it may wait a bounded number of ticks for more replies. A late fast commit is still possible only while the accumulated attributes exactly match the original attributes; once any divergent attributes are merged, the wait can only defer slow accept until the logical deadline. This optimization is purely tick-driven and has no wall-clock dependency.
 
 The slow path persists `StatusAccepted`, broadcasts `MsgAccept`, and waits for a slow quorum of `MsgAcceptResp`. After that quorum, the owner commits the merged attributes and broadcasts `MsgCommit`.
 
