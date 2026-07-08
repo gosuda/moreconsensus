@@ -83,6 +83,11 @@ func ExactStaleness(reference, staleness uint64) TimestampBounds {
 	return ExactTimestamp(reference - staleness)
 }
 
+// Validate reports whether bounds describe a usable timestamp interval.
+func (b TimestampBounds) Validate() error {
+	return b.validate()
+}
+
 func (b TimestampBounds) validate() error {
 	if b.mode == timestampWithin && b.min > b.max {
 		return ErrInvalidTimestampBounds

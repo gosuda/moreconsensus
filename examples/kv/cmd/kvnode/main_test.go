@@ -232,6 +232,204 @@ func TestHandleScanReturnsPrefixRows(t *testing.T) {
 	}
 }
 
+func TestHandleKVHistoricalReadSelectorsReturnVisibleVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{name: "at or before returns newest visible version", target: "/kv/hist?at=12", want: "mid"},
+		{name: "interval returns newest version inside bounds", target: "/kv/hist?min-time=6&max-time=15", want: "mid"},
+		{name: "exact timestamp returns only that version", target: "/kv/hist?exact-time=5", want: "old"},
+		{name: "bounded staleness returns newest version in reference window", target: "/kv/hist?reference-time=15&max-staleness=7", want: "mid"},
+		{name: "exact staleness returns version at reference offset", target: "/kv/hist?reference-time=15&exact-staleness=10", want: "old"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			seedHistoricalKV(t, s)
+
+			rr := httptest.NewRecorder()
+			s.handleKV(rr, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rr.Code != http.StatusOK || rr.Body.String() != tc.want {
+				t.Fatalf("status=%d body=%q, want status=%d body=%q", rr.Code, rr.Body.String(), http.StatusOK, tc.want)
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestHandleKVHistoricalReadSelectorsReturnNotFoundForInvisibleVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{name: "at before first version", target: "/kv/hist?at=4"},
+		{name: "exact timestamp without version", target: "/kv/hist?exact-time=6"},
+		{name: "tombstone at selected timestamp", target: "/kv/hist?at=25"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			seedHistoricalKV(t, s)
+			if err := s.db.DeleteVersion([]byte("hist"), 25); err != nil {
+				t.Fatal(err)
+			}
+
+			rr := httptest.NewRecorder()
+			s.handleKV(rr, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%q, want status=%d", rr.Code, rr.Body.String(), http.StatusNotFound)
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestHandleScanHistoricalReadSelectorsReturnVersionTimes(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   []scanResponseKV
+	}{
+		{
+			name:   "at or before returns newest visible row per key",
+			target: "/scan?prefix=scan-&at=8",
+			want: []scanResponseKV{
+				{Key: "scan-a", Value: "a-old", Time: 5},
+				{Key: "scan-b", Value: "b-old", Time: 7},
+			},
+		},
+		{
+			name:   "interval omits keys without a live version inside bounds",
+			target: "/scan?prefix=scan-&min-time=9&max-time=12",
+			want: []scanResponseKV{
+				{Key: "scan-a", Value: "a-new", Time: 10},
+			},
+		},
+		{
+			name:   "exact timestamp returns matching rows only",
+			target: "/scan?prefix=scan-&exact-time=7",
+			want: []scanResponseKV{
+				{Key: "scan-b", Value: "b-old", Time: 7},
+			},
+		},
+		{
+			name:   "bounded staleness returns rows inside reference window",
+			target: "/scan?prefix=scan-&reference-time=15&max-staleness=5",
+			want: []scanResponseKV{
+				{Key: "scan-a", Value: "a-new", Time: 10},
+				{Key: "scan-b", Value: "b-new", Time: 15},
+			},
+		},
+		{
+			name:   "exact staleness returns rows at reference offset",
+			target: "/scan?prefix=scan-&reference-time=15&exact-staleness=5",
+			want: []scanResponseKV{
+				{Key: "scan-a", Value: "a-new", Time: 10},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			seedHistoricalScan(t, s)
+
+			rr := httptest.NewRecorder()
+			s.handleScan(rr, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			var rows []scanResponseKV
+			if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != len(tc.want) {
+				t.Fatalf("rows=%v, want %v", rows, tc.want)
+			}
+			for i := range tc.want {
+				if rows[i] != tc.want[i] {
+					t.Fatalf("rows=%v, want %v", rows, tc.want)
+				}
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestHandleKVRejectsMalformedTimestampSelectorsBeforeConsensusProgress(t *testing.T) {
+	tests := malformedTimestampSelectorQueries()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleKV(rr, httptest.NewRequest(http.MethodGet, "/kv/hist?"+tc.query, nil))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%q, want status=%d", rr.Code, rr.Body.String(), http.StatusBadRequest)
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestHandleScanRejectsMalformedTimestampSelectorsBeforeConsensusProgress(t *testing.T) {
+	tests := malformedTimestampSelectorQueries()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			rr := httptest.NewRecorder()
+			s.handleScan(rr, httptest.NewRequest(http.MethodGet, "/scan?prefix=scan-&"+tc.query, nil))
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%q, want status=%d", rr.Code, rr.Body.String(), http.StatusBadRequest)
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestStalenessReadsHonorStorageFaultGate(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		handle func(*service, http.ResponseWriter, *http.Request)
+		seed   func(*testing.T, *service)
+	}{
+		{name: "kv at selector", target: "/kv/hist?at=12", handle: (*service).handleKV, seed: seedHistoricalKV},
+		{name: "scan at selector", target: "/scan?prefix=scan-&at=8", handle: (*service).handleScan, seed: seedHistoricalScan},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t)
+			tc.seed(t, s)
+			s.setStorageFault(true)
+
+			rr := httptest.NewRecorder()
+			tc.handle(s, rr, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rr.Code != http.StatusServiceUnavailable || rr.Body.String() != "storage fault active\n" {
+				t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+			}
+			requireNoConsensusProgress(t, s)
+		})
+	}
+}
+
+func TestHandleKVLatestReadWithoutSelectorStillWaitsForConsensusBarrier(t *testing.T) {
+	s := newTestService(t)
+	if err := s.db.PutVersion([]byte("latest"), []byte("direct"), 7); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleKV(rr, httptest.NewRequest(http.MethodGet, "/kv/latest", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "direct" {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	ref := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	if !hasExecutedRef(s.node.Status().Executed, ref) {
+		t.Fatalf("executed refs=%v, want %s", s.node.Status().Executed, ref)
+	}
+}
+
 func TestHandleScanRejectsBadQueryAndMethod(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -571,7 +769,7 @@ func requireNoConsensusProgress(t *testing.T, s *service) {
 	t.Helper()
 	status := s.node.Status()
 	if len(status.Instances) != 0 || len(status.Executed) != 0 {
-		t.Fatalf("node status after storage fault: instances=%v executed=%v", status.Instances, status.Executed)
+		t.Fatalf("node status after request: instances=%v executed=%v", status.Instances, status.Executed)
 	}
 }
 
@@ -588,6 +786,69 @@ func requireTransportDrops(t *testing.T, body []byte, want []transportFaultReque
 		if got[i] != want[i] {
 			t.Fatalf("drops=%v, want %v", got, want)
 		}
+	}
+}
+
+func seedHistoricalKV(t *testing.T, s *service) {
+	t.Helper()
+	if err := s.db.PutVersion([]byte("hist"), []byte("old"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("hist"), []byte("mid"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("hist"), []byte("new"), 20); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedHistoricalScan(t *testing.T, s *service) {
+	t.Helper()
+	if err := s.db.PutVersion([]byte("scan-a"), []byte("a-old"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("scan-a"), []byte("a-new"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("scan-b"), []byte("b-old"), 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("scan-b"), []byte("b-new"), 15); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.PutVersion([]byte("other"), []byte("outside-prefix"), 6); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func malformedTimestampSelectorQueries() []struct {
+	name  string
+	query string
+} {
+	return []struct {
+		name  string
+		query string
+	}{
+		{name: "empty at", query: "at="},
+		{name: "negative at", query: "at=-1"},
+		{name: "empty interval minimum", query: "min-time=&max-time=5"},
+		{name: "empty interval maximum", query: "min-time=1&max-time="},
+		{name: "empty staleness reference", query: "reference-time=&max-staleness=2"},
+		{name: "empty bounded staleness", query: "reference-time=10&max-staleness="},
+		{name: "empty exact staleness", query: "reference-time=10&exact-staleness="},
+		{name: "duplicate at", query: "at=1&at=2"},
+		{name: "negative interval minimum", query: "min-time=-1&max-time=5"},
+		{name: "negative bounded staleness", query: "reference-time=10&max-staleness=-1"},
+		{name: "non-numeric exact timestamp", query: "exact-time=soon"},
+		{name: "missing max-time partner", query: "min-time=1"},
+		{name: "missing min-time partner", query: "max-time=2"},
+		{name: "missing staleness partner", query: "reference-time=10"},
+		{name: "missing reference for bounded staleness", query: "max-staleness=2"},
+		{name: "missing reference for exact staleness", query: "exact-staleness=2"},
+		{name: "invalid interval", query: "min-time=5&max-time=4"},
+		{name: "duplicate interval param", query: "min-time=1&min-time=2&max-time=3"},
+		{name: "mutually exclusive at and exact groups", query: "at=1&exact-time=1"},
+		{name: "mutually exclusive bounded and exact staleness groups", query: "reference-time=10&max-staleness=2&exact-staleness=1"},
 	}
 }
 

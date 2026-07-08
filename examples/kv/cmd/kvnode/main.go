@@ -114,6 +114,90 @@ func parsePeers(raw string) (map[epaxos.ReplicaID]string, []epaxos.ReplicaID, er
 	return peers, voters, nil
 }
 
+func parseReadBounds(q url.Values) (kv.TimestampBounds, bool, error) {
+	at, hasAt, err := parseReadBoundUint(q, "at")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	minTime, hasMinTime, err := parseReadBoundUint(q, "min-time")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	maxTime, hasMaxTime, err := parseReadBoundUint(q, "max-time")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	exactTime, hasExactTime, err := parseReadBoundUint(q, "exact-time")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	referenceTime, hasReferenceTime, err := parseReadBoundUint(q, "reference-time")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	maxStaleness, hasMaxStaleness, err := parseReadBoundUint(q, "max-staleness")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	exactStaleness, hasExactStaleness, err := parseReadBoundUint(q, "exact-staleness")
+	if err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+
+	interval := hasMinTime || hasMaxTime
+	if interval && !(hasMinTime && hasMaxTime) {
+		return kv.TimestampBounds{}, false, fmt.Errorf("bad timestamp selector")
+	}
+	relative := hasReferenceTime || hasMaxStaleness || hasExactStaleness
+	if relative && (!hasReferenceTime || (hasMaxStaleness == hasExactStaleness)) {
+		return kv.TimestampBounds{}, false, fmt.Errorf("bad timestamp selector")
+	}
+	groups := 0
+	for _, set := range []bool{hasAt, interval, hasExactTime, relative} {
+		if set {
+			groups++
+		}
+	}
+	if groups == 0 {
+		return kv.TimestampBounds{}, false, nil
+	}
+	if groups != 1 {
+		return kv.TimestampBounds{}, false, fmt.Errorf("bad timestamp selector")
+	}
+	var bounds kv.TimestampBounds
+	switch {
+	case hasAt:
+		bounds = kv.TimestampAtOrBefore(at)
+	case interval:
+		bounds = kv.TimestampWithinBounds(minTime, maxTime)
+	case hasExactTime:
+		bounds = kv.ExactTimestamp(exactTime)
+	case hasMaxStaleness:
+		bounds = kv.BoundedStaleness(referenceTime, maxStaleness)
+	case hasExactStaleness:
+		bounds = kv.ExactStaleness(referenceTime, exactStaleness)
+	}
+	if err := bounds.Validate(); err != nil {
+		return kv.TimestampBounds{}, false, err
+	}
+	return bounds, true, nil
+}
+
+func parseReadBoundUint(q url.Values, name string) (uint64, bool, error) {
+	values, ok := q[name]
+	if !ok {
+		return 0, false, nil
+	}
+	if len(values) != 1 || values[0] == "" {
+		return 0, true, fmt.Errorf("bad timestamp selector")
+	}
+	value, err := strconv.ParseUint(values[0], 10, 64)
+	if err != nil {
+		return 0, true, err
+	}
+	return value, true, nil
+}
+
 func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	keyText, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/kv/"))
 	if err != nil {
@@ -127,15 +211,26 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		bounds, hasBounds, err := parseReadBounds(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if s.storageFaultActive() {
 			http.Error(w, "storage fault active", http.StatusServiceUnavailable)
 			return
 		}
-		if err := s.waitForKeys(r.Context(), key); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
+		var value []byte
+		var ok bool
+		if hasBounds {
+			value, ok, err = s.db.GetWithBounds(key, bounds)
+		} else {
+			if err := s.waitForKeys(r.Context(), key); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			value, ok, err = s.db.Get(key)
 		}
-		value, ok, err := s.db.Get(key)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -249,6 +344,15 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 		reverse = v
 	}
+	bounds, hasBounds, err := parseReadBounds(q)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if hasBounds && q.Get("barrier") != "" {
+		http.Error(w, "bad timestamp selector", http.StatusBadRequest)
+		return
+	}
 	if s.storageFaultActive() {
 		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
 		return
@@ -275,6 +379,7 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 		Prefix:  []byte(q.Get("prefix")),
 		Limit:   limit,
 		Reverse: reverse,
+		Bounds:  bounds,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
