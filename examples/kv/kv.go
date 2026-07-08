@@ -20,7 +20,11 @@ const (
 	opTxn        byte = 3
 )
 
-var errInvalidKey = errors.New("kv: key must be non-empty and must not contain separator byte")
+var (
+	errInvalidKey = errors.New("kv: key must be non-empty and must not contain separator byte")
+	// ErrInvalidTimestampBounds reports an unusable timestamp interval.
+	ErrInvalidTimestampBounds = errors.New("kv: invalid timestamp bounds")
+)
 
 // ValidateKey rejects user keys that cannot be encoded unambiguously.
 func ValidateKey(key []byte) error {
@@ -28,6 +32,109 @@ func ValidateKey(key []byte) error {
 		return errInvalidKey
 	}
 	return nil
+}
+
+type timestampBoundMode uint8
+
+const (
+	timestampLatest timestampBoundMode = iota
+	timestampAtOrBefore
+	timestampWithin
+	timestampExact
+	timestampEmpty
+)
+
+// TimestampBounds selects which stored versions are visible to a read.
+type TimestampBounds struct {
+	mode timestampBoundMode
+	min  uint64
+	max  uint64
+}
+
+// TimestampAtOrBefore returns bounds that expose the newest version at or before max.
+func TimestampAtOrBefore(max uint64) TimestampBounds {
+	return TimestampBounds{mode: timestampAtOrBefore, max: max}
+}
+
+// TimestampWithinBounds returns bounds that expose versions in the inclusive interval [min, max].
+func TimestampWithinBounds(min, max uint64) TimestampBounds {
+	return TimestampBounds{mode: timestampWithin, min: min, max: max}
+}
+
+// ExactTimestamp returns bounds that expose only versions written at ts.
+func ExactTimestamp(ts uint64) TimestampBounds {
+	return TimestampBounds{mode: timestampExact, min: ts, max: ts}
+}
+
+// BoundedStaleness returns timestamp bounds relative to a caller-provided reference timestamp.
+func BoundedStaleness(reference, maxStaleness uint64) TimestampBounds {
+	min := uint64(0)
+	if reference > maxStaleness {
+		min = reference - maxStaleness
+	}
+	return TimestampWithinBounds(min, reference)
+}
+
+// ExactStaleness returns exact timestamp bounds relative to a caller-provided reference timestamp.
+func ExactStaleness(reference, staleness uint64) TimestampBounds {
+	if staleness > reference {
+		return TimestampBounds{mode: timestampEmpty}
+	}
+	return ExactTimestamp(reference - staleness)
+}
+
+func (b TimestampBounds) validate() error {
+	if b.mode == timestampWithin && b.min > b.max {
+		return ErrInvalidTimestampBounds
+	}
+	return nil
+}
+
+func (b TimestampBounds) empty() bool {
+	return b.mode == timestampEmpty
+}
+
+func (b TimestampBounds) seekUpper() (uint64, bool) {
+	switch b.mode {
+	case timestampAtOrBefore, timestampWithin, timestampExact:
+		return b.max, true
+	default:
+		return 0, false
+	}
+}
+
+type timestampMatch int
+
+const (
+	timestampTooOld timestampMatch = iota
+	timestampVisible
+	timestampTooNew
+)
+
+func (b TimestampBounds) classify(ts uint64) timestampMatch {
+	switch b.mode {
+	case timestampAtOrBefore:
+		if ts > b.max {
+			return timestampTooNew
+		}
+	case timestampWithin:
+		if ts > b.max {
+			return timestampTooNew
+		}
+		if ts < b.min {
+			return timestampTooOld
+		}
+	case timestampExact:
+		if ts > b.max {
+			return timestampTooNew
+		}
+		if ts < b.max {
+			return timestampTooOld
+		}
+	case timestampEmpty:
+		return timestampTooOld
+	}
+	return timestampVisible
 }
 
 // DB stores EPaxos-applied commands in a Pebble database.
@@ -41,6 +148,7 @@ type DB struct {
 
 type kvIterator interface {
 	First() bool
+	SeekGE(key []byte) bool
 	Next() bool
 	Key() []byte
 	Value() []byte
@@ -75,6 +183,7 @@ type ScanOptions struct {
 	Prefix  []byte
 	Limit   int
 	Reverse bool
+	Bounds  TimestampBounds
 }
 
 // Open opens a Pebble-backed key-value store and resumes automatic version timestamps from existing records.
@@ -144,6 +253,14 @@ func (db *DB) observeRecordTime(ts uint64) {
 	if ts >= db.nextTime {
 		db.nextTime = ts + 1
 	}
+}
+
+// LatestRecordTime returns the largest version timestamp observed by this local store.
+func (db *DB) LatestRecordTime() uint64 {
+	if db.nextTime == 0 {
+		return 0
+	}
+	return db.nextTime - 1
 }
 
 func (db *DB) newWriteBatch() txnBatch {
@@ -318,8 +435,44 @@ func stageDeleteVersion(batch txnBatch, cf uint32, key []byte, ts uint64) error 
 
 // Get returns the newest live value for key.
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
+	return db.GetWithBounds(key, TimestampBounds{})
+}
+
+// GetAtOrBefore returns the newest live value for key at or before maxTimestamp.
+func (db *DB) GetAtOrBefore(key []byte, maxTimestamp uint64) ([]byte, bool, error) {
+	return db.GetWithBounds(key, TimestampAtOrBefore(maxTimestamp))
+}
+
+// GetWithinBounds returns the newest live value for key inside [minTimestamp, maxTimestamp].
+func (db *DB) GetWithinBounds(key []byte, minTimestamp, maxTimestamp uint64) ([]byte, bool, error) {
+	return db.GetWithBounds(key, TimestampWithinBounds(minTimestamp, maxTimestamp))
+}
+
+// GetExact returns the live value for key at exactly timestamp.
+func (db *DB) GetExact(key []byte, timestamp uint64) ([]byte, bool, error) {
+	return db.GetWithBounds(key, ExactTimestamp(timestamp))
+}
+
+// GetBoundedStaleness returns a value inside the caller-provided staleness window.
+func (db *DB) GetBoundedStaleness(key []byte, referenceTimestamp, maxStaleness uint64) ([]byte, bool, error) {
+	return db.GetWithBounds(key, BoundedStaleness(referenceTimestamp, maxStaleness))
+}
+
+// GetExactStaleness returns a value exactly staleness ticks behind the caller-provided reference timestamp.
+func (db *DB) GetExactStaleness(key []byte, referenceTimestamp, staleness uint64) ([]byte, bool, error) {
+	return db.GetWithBounds(key, ExactStaleness(referenceTimestamp, staleness))
+}
+
+// GetWithBounds returns the newest live value for key visible under bounds.
+func (db *DB) GetWithBounds(key []byte, bounds TimestampBounds) ([]byte, bool, error) {
 	if err := ValidateKey(key); err != nil {
 		return nil, false, err
+	}
+	if err := bounds.validate(); err != nil {
+		return nil, false, err
+	}
+	if bounds.empty() {
+		return nil, false, nil
 	}
 	prefix := EncodeUserPrefix(nil, db.cf, key)
 	upper := prefixLimit(prefix)
@@ -328,18 +481,56 @@ func (db *DB) Get(key []byte) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	defer func() { _ = iter.Close() }()
-	if !iter.First() {
-		return nil, false, iter.Error()
+	valid := false
+	if max, ok := bounds.seekUpper(); ok {
+		valid = iter.SeekGE(EncodeDataKey(nil, db.cf, key, max))
+	} else {
+		valid = iter.First()
 	}
-	v := iter.Value()
-	if len(v) == 0 || v[0] == deleteRecord {
-		return nil, false, nil
+	for ; valid; valid = iter.Next() {
+		_, ts, ok := DecodeDataKey(iter.Key(), db.cf)
+		if !ok {
+			continue
+		}
+		switch bounds.classify(ts) {
+		case timestampTooNew:
+			continue
+		case timestampTooOld:
+			return nil, false, iter.Error()
+		}
+		v := iter.Value()
+		if len(v) == 0 || v[0] == deleteRecord {
+			return nil, false, nil
+		}
+		return append([]byte(nil), v[1:]...), true, nil
 	}
-	return append([]byte(nil), v[1:]...), true, nil
+	return nil, false, iter.Error()
+}
+
+func validateOptionalScanKey(key []byte) error {
+	if len(key) > 0 && bytes.IndexByte(key, 0) >= 0 {
+		return errInvalidKey
+	}
+	return nil
 }
 
 // Scan returns the newest live version for each key in the requested range.
 func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
+	if err := opt.Bounds.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalScanKey(opt.Start); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalScanKey(opt.End); err != nil {
+		return nil, err
+	}
+	if err := validateOptionalScanKey(opt.Prefix); err != nil {
+		return nil, err
+	}
+	if opt.Bounds.empty() {
+		return nil, nil
+	}
 	lowerUser := opt.Start
 	upperUser := opt.End
 	if len(opt.Prefix) > 0 {
@@ -369,6 +560,13 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 		}
 		id := string(uk)
 		if _, exists := seen[id]; exists {
+			continue
+		}
+		switch opt.Bounds.classify(ts) {
+		case timestampTooNew:
+			continue
+		case timestampTooOld:
+			seen[id] = struct{}{}
 			continue
 		}
 		seen[id] = struct{}{}

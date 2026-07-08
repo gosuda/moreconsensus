@@ -1193,6 +1193,10 @@ func (i *terminalErrorIterator) First() bool {
 	return false
 }
 
+func (i *terminalErrorIterator) SeekGE([]byte) bool {
+	return false
+}
+
 func (i *terminalErrorIterator) Next() bool {
 	return false
 }
@@ -1456,4 +1460,376 @@ func TestReverseScanUsesNewestVersionForRepeatedKey(t *testing.T) {
 		}
 	}
 	t.Fatalf("reverse scan missed repeated key in %#v", scan)
+}
+
+func TestTimestampPointReadsApplyBoundsTombstonesAndExactMatching(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PutVersion([]byte("point"), []byte("old"), 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("point"), []byte("collision-loser"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("point"), []byte("collision-winner"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("point"), []byte("new"), 15); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteVersion([]byte("point"), 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutVersion([]byte("point"), []byte("after-delete"), 25); err != nil {
+		t.Fatal(err)
+	}
+
+	value, ok, err := db.GetExact([]byte("point"), 10)
+	if err != nil || !ok || string(value) != "collision-winner" {
+		t.Fatalf("exact collision value=%q ok=%v err=%v", value, ok, err)
+	}
+	value[0] = 'X'
+	value, ok, err = db.GetExact([]byte("point"), 10)
+	if err != nil || !ok || string(value) != "collision-winner" {
+		t.Fatalf("exact value was not copied: value=%q ok=%v err=%v", value, ok, err)
+	}
+
+	value, ok, err = db.GetAtOrBefore([]byte("point"), 17)
+	if err != nil || !ok || string(value) != "new" {
+		t.Fatalf("at-or-before value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetWithinBounds([]byte("point"), 6, 12)
+	if err != nil || !ok || string(value) != "collision-winner" {
+		t.Fatalf("bounded value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetExact([]byte("point"), 5)
+	if err != nil || !ok || string(value) != "old" {
+		t.Fatalf("exact old value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetExact([]byte("point"), 11)
+	if err != nil || ok || value != nil {
+		t.Fatalf("inexact timestamp value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetExact([]byte("point"), 20)
+	if err != nil || ok || value != nil {
+		t.Fatalf("exact tombstone value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetAtOrBefore([]byte("point"), 22)
+	if err != nil || ok || value != nil {
+		t.Fatalf("tombstone at upper bound value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetWithinBounds([]byte("point"), 6, 22)
+	if err != nil || ok || value != nil {
+		t.Fatalf("bounded tombstone value=%q ok=%v err=%v", value, ok, err)
+	}
+}
+
+func TestTimestampCollisionWithTombstoneMakesExactReadAbsent(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PutVersion([]byte("same-ts-delete"), []byte("live"), 44); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteVersion([]byte("same-ts-delete"), 44); err != nil {
+		t.Fatal(err)
+	}
+
+	value, ok, err := db.GetExact([]byte("same-ts-delete"), 44)
+	if err != nil || ok || value != nil {
+		t.Fatalf("exact same-timestamp tombstone value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetAtOrBefore([]byte("same-ts-delete"), 44)
+	if err != nil || ok || value != nil {
+		t.Fatalf("at-or-before same-timestamp tombstone value=%q ok=%v err=%v", value, ok, err)
+	}
+}
+
+func TestTimestampScanBoundsChooseEligibleVersionPerKey(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, write := range []struct {
+		key   string
+		value string
+		ts    uint64
+	}{
+		{key: "ts-scan-a", value: "old-a", ts: 10},
+		{key: "ts-scan-a", value: "too-new-a", ts: 30},
+		{key: "ts-scan-b", value: "old-b", ts: 12},
+		{key: "ts-scan-b", value: "too-new-b", ts: 25},
+		{key: "ts-scan-c", value: "inside-c", ts: 16},
+		{key: "ts-scan-d", value: "old-d", ts: 12},
+		{key: "ts-scan-d", value: "newest-inside-d", ts: 17},
+	} {
+		if err := db.PutVersion([]byte(write.key), []byte(write.value), write.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.DeleteVersion([]byte("ts-scan-b"), 18); err != nil {
+		t.Fatal(err)
+	}
+
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("ts-scan-"), Bounds: TimestampAtOrBefore(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("ts-scan-a"), Value: []byte("old-a"), Time: 10},
+		{Key: []byte("ts-scan-c"), Value: []byte("inside-c"), Time: 16},
+		{Key: []byte("ts-scan-d"), Value: []byte("newest-inside-d"), Time: 17},
+	})
+	scan[0].Key[0] = 'X'
+	scan[0].Value[0] = 'X'
+	scan, err = db.Scan(ScanOptions{Prefix: []byte("ts-scan-"), Bounds: TimestampAtOrBefore(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("ts-scan-a"), Value: []byte("old-a"), Time: 10},
+		{Key: []byte("ts-scan-c"), Value: []byte("inside-c"), Time: 16},
+		{Key: []byte("ts-scan-d"), Value: []byte("newest-inside-d"), Time: 17},
+	})
+
+	scan, err = db.Scan(ScanOptions{Prefix: []byte("ts-scan-"), Bounds: TimestampWithinBounds(12, 18)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("ts-scan-c"), Value: []byte("inside-c"), Time: 16},
+		{Key: []byte("ts-scan-d"), Value: []byte("newest-inside-d"), Time: 17},
+	})
+
+	scan, err = db.Scan(ScanOptions{Prefix: []byte("ts-scan-"), Bounds: ExactTimestamp(12)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("ts-scan-b"), Value: []byte("old-b"), Time: 12},
+		{Key: []byte("ts-scan-d"), Value: []byte("old-d"), Time: 12},
+	})
+}
+
+func TestRelativeStalenessPointReadsUseExplicitReferenceTimestamp(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, write := range []struct {
+		key   string
+		value string
+		ts    uint64
+	}{
+		{key: "stale-key", value: "lower-inclusive", ts: 10},
+		{key: "stale-key", value: "reference-newer", ts: 18},
+		{key: "stale-key", value: "per-key-too-new", ts: 22},
+		{key: "clock-key", value: "global-latest", ts: 30},
+		{key: "zero-key", value: "zero", ts: 0},
+	} {
+		if err := db.PutVersion([]byte(write.key), []byte(write.value), write.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	value, ok, err := db.GetBoundedStaleness([]byte("stale-key"), 12, 3)
+	if err != nil || !ok || string(value) != "lower-inclusive" {
+		t.Fatalf("bounded staleness explicit reference value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetBoundedStaleness([]byte("stale-key"), 18, 0)
+	if err != nil || !ok || string(value) != "reference-newer" {
+		t.Fatalf("bounded staleness upper-inclusive value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetBoundedStaleness([]byte("zero-key"), 2, 5)
+	if err != nil || !ok || string(value) != "zero" {
+		t.Fatalf("bounded staleness saturated lower bound value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetExactStaleness([]byte("stale-key"), 12, 2)
+	if err != nil || !ok || string(value) != "lower-inclusive" {
+		t.Fatalf("exact staleness explicit reference value=%q ok=%v err=%v", value, ok, err)
+	}
+	value, ok, err = db.GetExactStaleness([]byte("stale-key"), 1, 2)
+	if err != nil || ok || value != nil {
+		t.Fatalf("exact staleness underflow value=%q ok=%v err=%v", value, ok, err)
+	}
+}
+
+func TestRelativeStalenessReadsDoNotAdvanceLatestRecordTime(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PutVersion([]byte("latest-key"), []byte("latest"), 30); err != nil {
+		t.Fatal(err)
+	}
+	latest := db.LatestRecordTime()
+	if latest != 30 {
+		t.Fatalf("latest record time=%d, want 30", latest)
+	}
+
+	if _, _, err := db.GetBoundedStaleness([]byte("latest-key"), 30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.GetExactStaleness([]byte("latest-key"), 30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.LatestRecordTime(); got != latest {
+		t.Fatalf("staleness reads advanced latest record time from %d to %d", latest, got)
+	}
+}
+
+func TestRelativeStalenessScansUseExplicitReferenceTimestamp(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, write := range []struct {
+		key   string
+		value string
+		ts    uint64
+	}{
+		{key: "rel-scan-a", value: "inside-a", ts: 10},
+		{key: "rel-scan-a", value: "too-new-a", ts: 22},
+		{key: "rel-scan-b", value: "lower-inclusive-b", ts: 9},
+		{key: "rel-scan-b", value: "too-new-b", ts: 14},
+		{key: "rel-scan-c", value: "too-old-c", ts: 8},
+		{key: "rel-scan-c", value: "global-latest-c", ts: 30},
+		{key: "rel-scan-d", value: "deleted-inside-d", ts: 11},
+	} {
+		if err := db.PutVersion([]byte(write.key), []byte(write.value), write.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.DeleteVersion([]byte("rel-scan-d"), 12); err != nil {
+		t.Fatal(err)
+	}
+
+	scan, err := db.Scan(ScanOptions{Prefix: []byte("rel-scan-"), Bounds: BoundedStaleness(12, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("rel-scan-a"), Value: []byte("inside-a"), Time: 10},
+		{Key: []byte("rel-scan-b"), Value: []byte("lower-inclusive-b"), Time: 9},
+	})
+
+	scan, err = db.Scan(ScanOptions{Prefix: []byte("rel-scan-"), Bounds: ExactStaleness(12, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKVRows(t, scan, []KV{
+		{Key: []byte("rel-scan-a"), Value: []byte("inside-a"), Time: 10},
+	})
+}
+
+func TestTimestampReadsRejectInvalidBoundsAndKeys(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.PutVersion([]byte("valid"), []byte("value"), 7); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := db.GetWithinBounds([]byte("valid"), 9, 8)
+	if !errors.Is(err, ErrInvalidTimestampBounds) {
+		t.Fatalf("point read err=%v, want invalid timestamp bounds", err)
+	}
+	if ok || value != nil {
+		t.Fatalf("invalid point-read bounds returned value=%q ok=%v", value, ok)
+	}
+
+	if _, err := db.Scan(ScanOptions{Prefix: []byte("valid"), Bounds: TimestampWithinBounds(9, 8)}); !errors.Is(err, ErrInvalidTimestampBounds) {
+		t.Fatalf("scan err=%v, want invalid timestamp bounds", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		key  []byte
+	}{
+		{name: "empty", key: nil},
+		{name: "embedded separator", key: []byte("bad\x00key")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, read := range []struct {
+				name string
+				call func([]byte) ([]byte, bool, error)
+			}{
+				{
+					name: "at or before",
+					call: func(key []byte) ([]byte, bool, error) {
+						return db.GetAtOrBefore(key, 7)
+					},
+				},
+				{
+					name: "within bounds",
+					call: func(key []byte) ([]byte, bool, error) {
+						return db.GetWithinBounds(key, 1, 7)
+					},
+				},
+				{
+					name: "exact",
+					call: func(key []byte) ([]byte, bool, error) {
+						return db.GetExact(key, 7)
+					},
+				},
+				{
+					name: "bounded staleness",
+					call: func(key []byte) ([]byte, bool, error) {
+						return db.GetBoundedStaleness(key, 7, 1)
+					},
+				},
+				{
+					name: "exact staleness",
+					call: func(key []byte) ([]byte, bool, error) {
+						return db.GetExactStaleness(key, 0, 1)
+					},
+				},
+			} {
+				t.Run(read.name, func(t *testing.T) {
+					value, ok, err := read.call(tc.key)
+					if !errors.Is(err, errInvalidKey) {
+						t.Fatalf("err=%v, want invalid key", err)
+					}
+					if ok || value != nil {
+						t.Fatalf("invalid key returned value=%q ok=%v", value, ok)
+					}
+				})
+			}
+		})
+	}
+
+	if _, err := db.Scan(ScanOptions{Prefix: []byte("bad\x00key"), Bounds: TimestampAtOrBefore(7)}); !errors.Is(err, errInvalidKey) {
+		t.Fatalf("scan invalid prefix err=%v, want invalid key", err)
+	}
+}
+
+func assertKVRows(t *testing.T, got []KV, want []KV) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("rows=%#v, want %#v", got, want)
+	}
+	for i := range want {
+		if string(got[i].Key) != string(want[i].Key) ||
+			string(got[i].Value) != string(want[i].Value) ||
+			got[i].Time != want[i].Time {
+			t.Fatalf("row %d=%#v, want %#v in rows %#v", i, got[i], want[i], got)
+		}
+	}
 }
