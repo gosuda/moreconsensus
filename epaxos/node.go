@@ -557,7 +557,8 @@ func (n *RawNode) handlePreAccept(m Message) {
 	attrs := n.computeAttrs(m.Command, m.Ref)
 	attrs = mergeAttrs(attrs, m.Attributes())
 	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: inboundCommand(m.Command)}
-	if old := n.instances[m.Ref]; old != nil {
+	old := n.instances[m.Ref]
+	if old != nil {
 		if old.rec.Status >= StatusCommitted {
 			n.sendCommitTo(m.From, old.rec)
 			return
@@ -568,6 +569,11 @@ func (n *RawNode) handlePreAccept(m Message) {
 		}
 	}
 	rec.Checksum = ChecksumRecord(rec)
+	if old != nil && old.rec.Status == StatusPreAccepted && instanceRecordEqual(old.rec, rec) {
+		resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
+		n.enqueueMessage(resp)
+		return
+	}
 	n.instances[m.Ref] = &instance{rec: rec, phase: phasePreAccept}
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
@@ -610,7 +616,8 @@ func (n *RawNode) handlePreAcceptResp(m Message) {
 }
 
 func (n *RawNode) handleAccept(m Message) {
-	if old := n.instances[m.Ref]; old != nil {
+	old := n.instances[m.Ref]
+	if old != nil {
 		if old.rec.Status >= StatusCommitted {
 			n.sendCommitTo(m.From, old.rec)
 			return
@@ -622,6 +629,11 @@ func (n *RawNode) handleAccept(m Message) {
 	}
 	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command)}
 	rec.Checksum = ChecksumRecord(rec)
+	if old != nil && old.rec.Status == StatusAccepted && instanceRecordEqual(old.rec, rec) {
+		resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
+		n.enqueueMessage(resp)
+		return
+	}
 	n.instances[m.Ref] = &instance{rec: rec, phase: phaseAccept}
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)

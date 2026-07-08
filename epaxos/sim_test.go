@@ -158,6 +158,81 @@ func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 	}
 }
 
+func TestDuplicateInboundPreAcceptAndAcceptDoNotQueueDuplicateRecords(t *testing.T) {
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	command := Command{ID: CommandID{Client: 10, Sequence: 20}, Payload: []byte("duplicate-inbound"), ConflictKeys: [][]byte{[]byte("duplicate-key")}}
+	tests := []struct {
+		name       string
+		msg        Message
+		wantStatus Status
+	}{
+		{
+			name: "preaccept",
+			msg: Message{
+				Type:    MsgPreAccept,
+				From:    1,
+				To:      2,
+				Ref:     ref,
+				Ballot:  Ballot{Replica: 1},
+				Seq:     1,
+				Deps:    []InstanceNum{0, 0, 0},
+				Command: command,
+			},
+			wantStatus: StatusPreAccepted,
+		},
+		{
+			name: "accept",
+			msg: Message{
+				Type:    MsgAccept,
+				From:    1,
+				To:      2,
+				Ref:     ref,
+				Ballot:  Ballot{Replica: 1},
+				Seq:     1,
+				Deps:    []InstanceNum{0, 0, 0},
+				Command: command,
+			},
+			wantStatus: StatusAccepted,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			rn, err := NewRawNode(Config{ID: 2, Voters: makeIDs(3), Storage: store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.msg.Checksum = ChecksumMessage(tt.msg)
+
+			if err := rn.Step(tt.msg); err != nil {
+				t.Fatalf("first Step(%s) err=%v", tt.msg.Type, err)
+			}
+			first := rn.Ready()
+			if len(first.Records) != 1 || first.Records[0].Ref != ref || first.Records[0].Status != tt.wantStatus {
+				t.Fatalf("first duplicate target ready records = %#v, want exactly one %s record for %s", first.Records, tt.wantStatus, ref)
+			}
+			if err := store.ApplyReady(first); err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, first)
+
+			if err := rn.Step(tt.msg); err != nil {
+				t.Fatalf("duplicate Step(%s) err=%v", tt.msg.Type, err)
+			}
+			duplicate := rn.Ready()
+			if len(duplicate.Records) != 0 {
+				t.Fatalf("duplicate %s ready records = %#v, want no durable records for unchanged %s", tt.msg.Type, duplicate.Records, ref)
+			}
+			if !duplicate.Empty() {
+				if err := store.ApplyReady(duplicate); err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, rn, duplicate)
+			}
+		})
+	}
+}
+
 func TestCodecChecksumZeroCopy(t *testing.T) {
 	m := Message{
 		Type:         MsgCommit,
