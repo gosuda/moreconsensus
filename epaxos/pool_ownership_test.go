@@ -659,17 +659,12 @@ func decodeMessageSeedCorpus() [][]byte {
 		maxKeys.Command.ConflictKeys[i] = []byte{byte(i), byte(127 - i)}
 	}
 
-	tooManyDeps := base
-	tooManyDeps.Deps = make([]InstanceNum, 129)
-	tooManyKeys := base
-	tooManyKeys.Command.ConflictKeys = make([][]byte, 129)
-
 	seeds := [][]byte{
 		valid,
 		mustEncodeMessageSeed(maxDeps),
 		mustEncodeMessageSeed(maxKeys),
-		mustEncodeMessageSeed(tooManyDeps),
-		mustEncodeMessageSeed(tooManyKeys),
+		malformedCodecFrame(maxWireDeps+1, 0),
+		malformedCodecFrame(0, maxWireConflictKeys+1),
 		valid[:len(valid)-1],
 		valid[:len(wireMagic)],
 		valid[:len(wireMagic)+32],

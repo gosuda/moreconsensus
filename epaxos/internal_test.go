@@ -2,6 +2,7 @@ package epaxos
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -271,25 +272,111 @@ func TestRejectPathsAndTimers(t *testing.T) {
 	s.nodes[1].onTimer(inst, timerFastWait)
 }
 
+func TestEncodeMessageRejectsWireLimitOverflowWithoutAppending(t *testing.T) {
+	base := Message{
+		Type: MsgCommit,
+		From: 1,
+		To:   2,
+		Ref:  InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Deps: []InstanceNum{0},
+	}
+	tests := []struct {
+		name string
+		msg  Message
+	}{
+		{
+			name: "too many deps",
+			msg: Message{
+				Type: MsgCommit,
+				From: 1,
+				To:   2,
+				Ref:  InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+				Deps: make([]InstanceNum, maxWireDeps+1),
+			},
+		},
+		{
+			name: "too many conflict keys",
+			msg: func() Message {
+				msg := base
+				msg.Command.ConflictKeys = make([][]byte, maxWireConflictKeys+1)
+				return msg
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backing := []byte("caller-prefix|capacity-canary")
+			dst := backing[:len("caller-prefix")]
+			wantBacking := append([]byte(nil), backing...)
+
+			got, err := EncodeMessage(dst, tc.msg)
+			if !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("EncodeMessage err=%v, want %v", err, ErrInvalidMessage)
+			}
+			if !bytes.Equal(got, dst) {
+				t.Fatalf("EncodeMessage returned dst %q, want unchanged %q", got, dst)
+			}
+			if !bytes.Equal(backing, wantBacking) {
+				t.Fatalf("EncodeMessage modified caller backing: got %q want %q", backing, wantBacking)
+			}
+		})
+	}
+}
+
+func malformedCodecFrame(deps, conflictKeys uint64) []byte {
+	buf := append([]byte(nil), wireMagic[:]...)
+	for _, v := range []uint64{
+		uint64(MsgCommit),
+		1,
+		1,
+		1,
+		1,
+		1,
+		0,
+		0,
+		0,
+		0,
+		deps,
+	} {
+		buf = binary.AppendUvarint(buf, v)
+	}
+	if deps <= maxWireDeps {
+		for range deps {
+			buf = binary.AppendUvarint(buf, 0)
+		}
+		for _, v := range []uint64{
+			0,
+			0,
+			uint64(CommandNoop),
+			0,
+			conflictKeys,
+		} {
+			buf = binary.AppendUvarint(buf, v)
+		}
+		if conflictKeys <= maxWireConflictKeys {
+			for range conflictKeys {
+				buf = binary.AppendUvarint(buf, 0)
+			}
+		}
+		buf = append(buf, 0)
+		for range 4 {
+			buf = binary.AppendUvarint(buf, 0)
+		}
+	}
+	return append(buf, make([]byte, 32)...)
+}
+
 func TestCodecMalformedBranches(t *testing.T) {
 	var out Message
 	if err := DecodeMessage([]byte{'M', 'E', 'P', '1', 0xff}, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("bad varint err=%v", err)
 	}
-	m := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: make([]InstanceNum, 129)}
-	buf, err := EncodeMessage(nil, m)
-	if err != nil {
-		t.Fatal(err)
-	}
+	buf := malformedCodecFrame(maxWireDeps+1, 0)
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many deps err=%v", err)
 	}
-	m.Deps = []InstanceNum{0}
-	m.Command.ConflictKeys = make([][]byte, 129)
-	buf, err = EncodeMessage(nil, m)
-	if err != nil {
-		t.Fatal(err)
-	}
+	buf = malformedCodecFrame(0, maxWireConflictKeys+1)
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many keys err=%v", err)
 	}

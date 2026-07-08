@@ -7,6 +7,11 @@ import (
 
 var wireMagic = [...]byte{'M', 'E', 'P', '1'}
 
+const (
+	maxWireDeps         = 128
+	maxWireConflictKeys = 128
+)
+
 // DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
 //
 // The decoded message's Deps and ConflictKeys slice header alias these buffers
@@ -52,6 +57,9 @@ func (s *DecodeScratch) conflictKeys(n int) [][]byte {
 
 // EncodeMessage appends the canonical wire representation of m to dst.
 func EncodeMessage(dst []byte, m Message) ([]byte, error) {
+	if len(m.Deps) > maxWireDeps || len(m.Command.ConflictKeys) > maxWireConflictKeys {
+		return dst, ErrInvalidMessage
+	}
 	m.Checksum = ChecksumMessage(m)
 	dst = append(dst, wireMagic[:]...)
 	dst = binary.AppendUvarint(dst, uint64(m.Type))
@@ -110,7 +118,7 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	m.Ballot = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
 	m.Seq = p.uvarint()
 	deps := p.uvarint()
-	if deps > 128 {
+	if deps > maxWireDeps {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
 	if scratch != nil {
@@ -201,7 +209,7 @@ func (p *parser) command() Command {
 	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: CommandKind(p.uvarint())}
 	c.Payload = p.bytes()
 	keys := p.uvarint()
-	if keys > 128 {
+	if keys > maxWireConflictKeys {
 		p.err = true
 		return c
 	}
