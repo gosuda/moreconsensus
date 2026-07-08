@@ -773,15 +773,58 @@
         (seq shape-errors) (assoc :bad-shape shape-errors)
         (seq bad-groups) (assoc :bad-groups bad-groups)))))
 
+(defn txn-read-value [groups group]
+  (let [values (get groups group)]
+    (when (and (vector? values) (apply = values))
+      (first values))))
+
+(defn txn-op-for-group [group op]
+  (case (:f op)
+    :txn-write (when (= group (get-in op [:value :group]))
+                 (assoc op :f :write :value (get-in op [:value :value])))
+    :txn-delete (when (= group (get-in op [:value :group]))
+                  (assoc op :f :write :value nil))
+    :txn-read (case (:type op)
+                :invoke (assoc op :f :read :value nil)
+                :ok (when (and (empty? (txn-group-shape-errors (:value op)))
+                               (empty? (inconsistent-txn-groups (:value op))))
+                      (assoc op :f :read :value (txn-read-value (:value op) group)))
+                nil)
+    nil))
+
+(defn txn-group-history [group history]
+  (mapv identity (keep #(txn-op-for-group group %) history)))
+
+(defn txn-linearizable-results [test history opts]
+  (into {} (map (fn [group]
+                  (let [group-test (assoc test
+                                          :name (str (or (:name test) "txn-group")
+                                                     "-" (name group)))]
+                    [group (checker/check (checker/linearizable {:model (model/register)})
+                                          group-test
+                                          (txn-group-history group history)
+                                          opts)]))
+                txn-group-ids)))
+
+(defn txn-linearizable-errors [results]
+  (into {} (keep (fn [[group result]]
+                   (when-not (:valid? result)
+                     [group result]))
+                 results)))
+
 (defn txn-atomic-checker []
   (reify checker/Checker
-    (check [_ _ history _]
+    (check [_ test history opts]
       (let [reads (filter #(and (= :ok (:type %)) (= :txn-read (:f %))) history)
-            bad (vec (keep bad-txn-op reads))]
-        {:valid? (empty? bad)
+            bad (vec (keep bad-txn-op reads))
+            linear-results (txn-linearizable-results test history opts)
+            linear-errors (txn-linearizable-errors linear-results)]
+        {:valid? (and (empty? bad) (empty? linear-errors))
          :checked (count reads)
          :bad-count (count bad)
-         :bad (take 5 bad)}))))
+         :bad (take 5 bad)
+         :linearizable linear-results
+         :linearizable-errors linear-errors}))))
 
 (defn ordered-ascending? [xs]
   (every? (fn [[a b]] (not (pos? (compare a b)))) (partition 2 1 xs)))

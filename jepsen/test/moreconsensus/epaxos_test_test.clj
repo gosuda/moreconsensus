@@ -924,20 +924,34 @@
                                           {:type :invoke :f :read :value :stale})
                           [:type :f :value]))))))
 
+(defn index-history [history]
+  (mapv (fn [index op] (cond-> op (nil? (:index op)) (assoc :index index))) (range) history))
+
 (defn check-txn-history [history]
-  (checker/check (epaxos/txn-atomic-checker) nil history nil))
+  (checker/check (epaxos/txn-atomic-checker)
+                 {:name "txn-atomic-checker-test" :start-time 0}
+                 (index-history history)
+                 nil))
+
+(defn txn-read-state [values-by-group]
+  (into {} (map (fn [{:keys [group keys]}]
+                  [group (vec (repeat (count keys) (get values-by-group group)))])
+                epaxos/txn-key-groups)))
 
 (deftest txn-atomic-checker-checks-each-group-independently
   (testing "values may differ across groups when each group is internally atomic"
-    (let [result (check-txn-history [{:type :ok
-                                      :f :txn-read
-                                      :value {:tx-a [1 1]
-                                              :tx-b [2 2 2]
-                                              :tx-c [nil nil]}}])]
+    (let [result (check-txn-history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-a :value 1}}
+                                     {:type :ok :process 0 :f :txn-write :value {:group :tx-a :value 1}}
+                                     {:type :invoke :process 1 :f :txn-write :value {:group :tx-b :value 2}}
+                                     {:type :ok :process 1 :f :txn-write :value {:group :tx-b :value 2}}
+                                     {:type :invoke :process 2 :f :txn-read :value nil}
+                                     {:type :ok :process 2 :f :txn-read :value (txn-read-state {:tx-a 1 :tx-b 2})}])]
       (is (= {:valid? true :checked 1 :bad-count 0}
              (select-keys result [:valid? :checked :bad-count])))))
   (testing "fully deleted transaction groups are atomic reads"
-    (let [result (check-txn-history [{:type :ok
+    (let [result (check-txn-history [{:type :invoke :process 0 :f :txn-read :value nil}
+                                     {:type :ok
+                                      :process 0
                                       :f :txn-read
                                       :value {:tx-a [nil nil]
                                               :tx-b [nil nil nil]
@@ -946,11 +960,13 @@
              (select-keys result [:valid? :checked :bad-count])))))
   (testing "mixed or partial values inside any one group make the read invalid"
     (let [read-op {:type :ok
+                   :process 0
                    :f :txn-read
                    :value {:tx-a [1 2]
                            :tx-b [9 9 9]
                            :tx-c [nil 3]}}
-          result (check-txn-history [read-op])
+          result (check-txn-history [{:type :invoke :process 0 :f :txn-read :value nil}
+                                     read-op])
           bad-op (first (:bad result))]
       (is (= {:valid? false :checked 1 :bad-count 1}
              (select-keys result [:valid? :checked :bad-count])))
@@ -958,29 +974,90 @@
              (:bad-groups bad-op)))))
   (testing "mixed delete and write visibility inside a group is invalid"
     (let [read-op {:type :ok
+                   :process 0
                    :f :txn-read
                    :value {:tx-a [4 4]
                            :tx-b [nil 5 nil]
                            :tx-c [6 6]}}
-          result (check-txn-history [read-op])
+          result (check-txn-history [{:type :invoke :process 0 :f :txn-read :value nil}
+                                     read-op])
           bad-op (first (:bad result))]
       (is (= {:valid? false :checked 1 :bad-count 1}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= {:tx-b [nil 5 nil]}
              (:bad-groups bad-op))))))
 
+(deftest txn-atomic-checker-enforces-completed-write-visibility
+  (testing "a later read observing the completed write remains valid"
+    (let [history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-a :value :committed}}
+                   {:type :ok :process 0 :f :txn-write :value {:group :tx-a :value :committed}}
+                   {:type :invoke :process 1 :f :txn-read :value nil}
+                   {:type :ok :process 1 :f :txn-read :value (txn-read-state {:tx-a :committed})}]
+          result (check-txn-history history)]
+      (is (= true (:valid? result)))))
+  (testing "a later read of an older value after the completed write is invalid"
+    (let [history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-a :value :old}}
+                   {:type :ok :process 0 :f :txn-write :value {:group :tx-a :value :old}}
+                   {:type :invoke :process 1 :f :txn-write :value {:group :tx-a :value :committed}}
+                   {:type :ok :process 1 :f :txn-write :value {:group :tx-a :value :committed}}
+                   {:type :invoke :process 2 :f :txn-read :value nil}
+                   {:type :ok :process 2 :f :txn-read :value (txn-read-state {:tx-a :old})}]
+          result (check-txn-history history)]
+      (is (= false (:valid? result))))))
+
+(deftest txn-atomic-checker-enforces-completed-delete-visibility
+  (testing "a later read observing the completed delete remains valid"
+    (let [history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-b :value :old}}
+                   {:type :ok :process 0 :f :txn-write :value {:group :tx-b :value :old}}
+                   {:type :invoke :process 1 :f :txn-delete :value {:group :tx-b}}
+                   {:type :ok :process 1 :f :txn-delete :value {:group :tx-b}}
+                   {:type :invoke :process 2 :f :txn-read :value nil}
+                   {:type :ok :process 2 :f :txn-read :value (txn-read-state {})}]
+          result (check-txn-history history)]
+      (is (= true (:valid? result)))))
+  (testing "a later read of the deleted value is invalid"
+    (let [history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-b :value :old}}
+                   {:type :ok :process 0 :f :txn-write :value {:group :tx-b :value :old}}
+                   {:type :invoke :process 1 :f :txn-delete :value {:group :tx-b}}
+                   {:type :ok :process 1 :f :txn-delete :value {:group :tx-b}}
+                   {:type :invoke :process 2 :f :txn-read :value nil}
+                   {:type :ok :process 2 :f :txn-read :value (txn-read-state {:tx-b :old})}]
+          result (check-txn-history history)]
+      (is (= false (:valid? result))))))
+
+(deftest txn-atomic-checker-rejects-never-written-equal-transaction-value
+  (testing "equal values across every key in a group still require a prior write"
+    (let [history [{:type :invoke :process 0 :f :txn-read :value nil}
+                   {:type :ok :process 0 :f :txn-read :value (txn-read-state {:tx-c :phantom})}]
+          result (check-txn-history history)]
+      (is (= false (:valid? result))))))
+
+(deftest txn-atomic-checker-accepts-observed-indeterminate-write
+  (testing "an info write may be linearized when a later transaction read observes it"
+    (let [history [{:type :invoke :process 0 :f :txn-write :value {:group :tx-a :value :maybe}}
+                   {:type :info :process 0 :f :txn-write :value {:group :tx-a :value :maybe} :error 503}
+                   {:type :invoke :process 1 :f :txn-read :value nil}
+                   {:type :ok :process 1 :f :txn-read :value (txn-read-state {:tx-a :maybe})}]
+          result (check-txn-history history)]
+      (is (= true (:valid? result))))))
+
 (deftest txn-atomic-checker-rejects-missing-and-wrong-sized-groups
   (testing "every transaction read must contain exactly the configured groups with one value per key"
     (let [missing-group {:type :ok
+                         :process 0
                          :f :txn-read
                          :value {:tx-a [1 1]
                                  :tx-c [3 3]}}
           wrong-lengths {:type :ok
+                         :process 1
                          :f :txn-read
                          :value {:tx-a [7]
                                  :tx-b [8 8]
                                  :tx-c [9 9 9]}}
-          result (check-txn-history [missing-group wrong-lengths])]
+          result (check-txn-history [{:type :invoke :process 0 :f :txn-read :value nil}
+                                     missing-group
+                                     {:type :invoke :process 1 :f :txn-read :value nil}
+                                     wrong-lengths])]
       (is (= {:valid? false :checked 2 :bad-count 2}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= [(:value missing-group) (:value wrong-lengths)]
