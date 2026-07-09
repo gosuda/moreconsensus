@@ -129,6 +129,10 @@ for cfg in tla/EPaxosConfigTransitionRetry.cfg; do
   run_tlc tla/EPaxosConfigTransitionRetry.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigTransitionLostResponseRetry.cfg; do
+  run_tlc tla/EPaxosConfigTransitionLostResponseRetry.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigReplay.cfg; do
   run_tlc tla/EPaxosConfigReplay.tla "$cfg"
 done
