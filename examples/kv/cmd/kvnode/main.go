@@ -70,7 +70,7 @@ type storageFaultRequest struct {
 
 const (
 	maxDurationMillis        = int64(1<<63-1) / int64(time.Millisecond)
-	maxRequestBodySize      = int64(1<<63 - 2)
+	maxRequestBodySize       = int64(1<<63 - 2)
 	defaultMaxClientBodySize = int64(1 << 20)
 	defaultMaxPeerBodySize   = int64(1 << 20)
 	defaultMaxAdminBodySize  = int64(64 << 10)
@@ -137,7 +137,10 @@ func main() {
 	}
 	defer func() { _ = db.Close() }()
 	store := db.EPaxosStorage()
-	node, err := epaxos.NewRawNode(epaxos.Config{ID: epaxos.ReplicaID(*idFlag), Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+	// kvnode has no synchronized logical tick driver across replicas; keep this
+	// request-driven service on classic EPaxos so time-optimized pre-accepts
+	// cannot wait on slower peer ticks.
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: epaxos.ReplicaID(*idFlag), Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5})
 	if err != nil {
 		log.Fatal(err)
 	}
