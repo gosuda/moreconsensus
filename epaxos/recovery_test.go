@@ -516,6 +516,184 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterAddition(t *testing.T) {
 	recoveryApplyReady(t, store, restarted, rd)
 }
 
+func TestOldConfigTransitionRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		status     Status
+		ballot     Ballot
+		recordBall Ballot
+		msgType    MessageType
+		seq        uint64
+		deps       []InstanceNum
+		acceptSeq  uint64
+		acceptDeps []InstanceNum
+	}{
+		{
+			name:       "preaccepted",
+			status:     StatusPreAccepted,
+			ballot:     Ballot{Replica: 1},
+			recordBall: Ballot{Replica: 1},
+			msgType:    MsgPreAccept,
+			seq:        5,
+			deps:       []InstanceNum{0, 2, 3, 4},
+		},
+		{
+			name:       "accepted",
+			status:     StatusAccepted,
+			ballot:     Ballot{Replica: 1},
+			recordBall: Ballot{Replica: 1},
+			msgType:    MsgAccept,
+			seq:        6,
+			deps:       []InstanceNum{0, 4, 3, 2},
+			acceptSeq:  7,
+			acceptDeps: []InstanceNum{0, 5, 6, 7},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
+			ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+			cmd := Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("old-config-transition-removal-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-removal-key")}}
+			store.Records[ref] = checkedRecord(InstanceRecord{
+				Ref:              ref,
+				Ballot:           tt.ballot,
+				RecordBallot:     tt.recordBall,
+				Status:           tt.status,
+				Seq:              tt.seq,
+				Deps:             append([]InstanceNum(nil), tt.deps...),
+				AcceptSeq:        tt.acceptSeq,
+				AcceptDeps:       append([]InstanceNum(nil), tt.acceptDeps...),
+				Command:          cmd,
+				FastPathEligible: tt.status == StatusPreAccepted,
+			})
+
+			const retryTicks = 2
+			restarted, err := NewRawNode(Config{ID: 1, Voters: []ReplicaID{1, 2, 3, 4}, Storage: store, RetryTicks: retryTicks, RecoveryTicks: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3}})
+			if restarted.HasReady() {
+				t.Fatalf("restart emitted work before old-config transition retry deadline: %#v", restarted.Ready())
+			}
+			for tick := uint64(1); tick < retryTicks; tick++ {
+				restarted.Tick()
+				if restarted.HasReady() {
+					t.Fatalf("old-config transition %s retry fired after %d ticks, before deadline: %#v", tt.name, tick, restarted.Ready())
+				}
+			}
+
+			restarted.Tick()
+			rd := restarted.Ready()
+			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.msgType, ref, []ReplicaID{2, 3, 4}, cmd, tt.deps)
+			if retry.Ballot != tt.ballot || retry.RecordStatus != tt.status {
+				t.Fatalf("old-config transition %s retry tuple = ballot %v status %s, want ballot %v status %s: %#v", tt.name, retry.Ballot, retry.RecordStatus, tt.ballot, tt.status, retry)
+			}
+			if tt.status == StatusAccepted && retry.RecordBallot != tt.recordBall {
+				t.Fatalf("old-config transition accepted retry record ballot = %v, want %v: %#v", retry.RecordBallot, tt.recordBall, retry)
+			}
+			if retry.Seq != tt.seq {
+				t.Fatalf("old-config transition %s retry seq = %d, want %d: %#v", tt.name, retry.Seq, tt.seq, retry)
+			}
+			if tt.status == StatusAccepted && (retry.AcceptSeq != tt.acceptSeq || !instanceNumsEqual(retry.AcceptDeps, tt.acceptDeps)) {
+				t.Fatalf("old-config transition accepted retry accept attrs = seq %d deps %v, want seq %d deps %v: %#v", retry.AcceptSeq, retry.AcceptDeps, tt.acceptSeq, tt.acceptDeps, retry)
+			}
+			if len(rd.Records) != 0 || len(rd.Committed) != 0 || rd.MustSync {
+				t.Fatalf("old-config transition %s retry emitted durable/application effects: %#v", tt.name, rd)
+			}
+		})
+	}
+}
+
+func TestOldConfigTransitionRetryUsesPinnedVotersAfterAddition(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		status     Status
+		ballot     Ballot
+		recordBall Ballot
+		msgType    MessageType
+		seq        uint64
+		deps       []InstanceNum
+		acceptSeq  uint64
+		acceptDeps []InstanceNum
+	}{
+		{
+			name:       "preaccepted",
+			status:     StatusPreAccepted,
+			ballot:     Ballot{Replica: 1},
+			recordBall: Ballot{Replica: 1},
+			msgType:    MsgPreAccept,
+			seq:        5,
+			deps:       []InstanceNum{0, 2, 3},
+		},
+		{
+			name:       "accepted",
+			status:     StatusAccepted,
+			ballot:     Ballot{Replica: 1},
+			recordBall: Ballot{Replica: 1},
+			msgType:    MsgAccept,
+			seq:        6,
+			deps:       []InstanceNum{0, 4, 3},
+			acceptSeq:  7,
+			acceptDeps: []InstanceNum{0, 5, 6},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
+			ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+			cmd := Command{ID: CommandID{Client: 92, Sequence: 1}, Payload: []byte("old-config-transition-addition-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-addition-key")}}
+			store.Records[ref] = checkedRecord(InstanceRecord{
+				Ref:              ref,
+				Ballot:           tt.ballot,
+				RecordBallot:     tt.recordBall,
+				Status:           tt.status,
+				Seq:              tt.seq,
+				Deps:             append([]InstanceNum(nil), tt.deps...),
+				AcceptSeq:        tt.acceptSeq,
+				AcceptDeps:       append([]InstanceNum(nil), tt.acceptDeps...),
+				Command:          cmd,
+				FastPathEligible: tt.status == StatusPreAccepted,
+			})
+
+			const retryTicks = 2
+			restarted, err := NewRawNode(Config{ID: 1, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: retryTicks, RecoveryTicks: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}})
+			if restarted.HasReady() {
+				t.Fatalf("restart emitted work before old-config transition retry deadline: %#v", restarted.Ready())
+			}
+			for tick := uint64(1); tick < retryTicks; tick++ {
+				restarted.Tick()
+				if restarted.HasReady() {
+					t.Fatalf("old-config transition %s retry fired after %d ticks, before deadline: %#v", tt.name, tick, restarted.Ready())
+				}
+			}
+
+			restarted.Tick()
+			rd := restarted.Ready()
+			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.msgType, ref, []ReplicaID{2, 3}, cmd, tt.deps)
+			if retry.Ballot != tt.ballot || retry.RecordStatus != tt.status {
+				t.Fatalf("old-config transition %s retry tuple = ballot %v status %s, want ballot %v status %s: %#v", tt.name, retry.Ballot, retry.RecordStatus, tt.ballot, tt.status, retry)
+			}
+			if tt.status == StatusAccepted && retry.RecordBallot != tt.recordBall {
+				t.Fatalf("old-config transition accepted retry record ballot = %v, want %v: %#v", retry.RecordBallot, tt.recordBall, retry)
+			}
+			if retry.Seq != tt.seq {
+				t.Fatalf("old-config transition %s retry seq = %d, want %d: %#v", tt.name, retry.Seq, tt.seq, retry)
+			}
+			if tt.status == StatusAccepted && (retry.AcceptSeq != tt.acceptSeq || !instanceNumsEqual(retry.AcceptDeps, tt.acceptDeps)) {
+				t.Fatalf("old-config transition accepted retry accept attrs = seq %d deps %v, want seq %d deps %v: %#v", retry.AcceptSeq, retry.AcceptDeps, tt.acceptSeq, tt.acceptDeps, retry)
+			}
+			if len(rd.Records) != 0 || len(rd.Committed) != 0 || rd.MustSync {
+				t.Fatalf("old-config transition %s retry emitted durable/application effects: %#v", tt.name, rd)
+			}
+		})
+	}
+}
+
 func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	first := Command{ID: CommandID{Client: 30, Sequence: 1}, Payload: []byte("owner-command"), ConflictKeys: [][]byte{[]byte("shared")}}
@@ -774,6 +952,45 @@ func recoveryRequireMessageTargetsWithDepsWidth(t *testing.T, messages []Message
 		}
 	}
 	return ballot
+}
+
+func recoveryRequireMessageTargetsWithCommandAndDeps(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, wantTargets []ReplicaID, wantCommand Command, wantDeps []InstanceNum) Message {
+	t.Helper()
+	seen := make(map[ReplicaID]Message, len(wantTargets))
+	for _, m := range messages {
+		if m.Type != typ || m.Ref != ref {
+			t.Fatalf("unexpected message while checking %s retry for %s: %#v; all messages=%#v", typ, ref, m, messages)
+		}
+		if m.From == m.To {
+			t.Fatalf("%s retry for %s sent to self: %#v", typ, ref, m)
+		}
+		if !commandEqual(m.Command, wantCommand) {
+			t.Fatalf("%s retry for %s command = %#v, want %#v", typ, ref, m.Command, wantCommand)
+		}
+		if len(m.Deps) != len(wantDeps) || !instanceNumsEqual(m.Deps, wantDeps) {
+			t.Fatalf("%s retry for %s deps = %v, want old config deps %v: %#v", typ, ref, m.Deps, wantDeps, m)
+		}
+		seen[m.To] = m
+	}
+	if len(messages) != len(wantTargets) {
+		t.Fatalf("%s retry message count for %s = %d, want %d targets %v; messages=%#v", typ, ref, len(messages), len(wantTargets), wantTargets, messages)
+	}
+	if len(seen) != len(wantTargets) {
+		t.Fatalf("%s retry messages for %s targets = %v, want %v; messages=%#v", typ, ref, messageTargets(seen), wantTargets, messages)
+	}
+	var exemplar Message
+	for _, to := range wantTargets {
+		m, ok := seen[to]
+		if !ok {
+			t.Fatalf("%s retry messages for %s targets = %v, want %v; messages=%#v", typ, ref, messageTargets(seen), wantTargets, messages)
+		}
+		if exemplar.Type == 0 {
+			exemplar = m
+		} else if m.Ballot != exemplar.Ballot || m.RecordBallot != exemplar.RecordBallot || m.RecordStatus != exemplar.RecordStatus || m.Seq != exemplar.Seq || !instanceNumsEqual(m.AcceptDeps, exemplar.AcceptDeps) || m.AcceptSeq != exemplar.AcceptSeq {
+			t.Fatalf("%s retry messages for %s disagree on tuple metadata: %#v", typ, ref, messages)
+		}
+	}
+	return exemplar
 }
 
 func messageTargets(messages map[ReplicaID]Message) []ReplicaID {
