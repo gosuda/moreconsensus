@@ -27,6 +27,8 @@ Optional inputs:
   KVNODE_INCIDENT_READY_ATTEMPTS   Readiness polling attempts. Default: 120
   KVNODE_INCIDENT_CURL_TIMEOUT     curl per-request timeout seconds. Default: 5
   KVNODE_INCIDENT_OUT_DIR          Evidence/run directory. Default: <tmp>/kvnode-incident-tabletop-<timestamp>
+  KVNODE_INCIDENT_TABLETOP_REPORT   Optional success report path. When set,
+                                   writes a 0600 example/operator report.
 
 Example:
   KVNODE_INCIDENT_TABLETOP_RUN=yes tests/kvnode_incident_tabletop_drill.sh
@@ -83,6 +85,8 @@ require_command mkdir
 require_command rm
 require_command cat
 require_command grep
+require_command dirname
+require_command chmod
 
 BASE_PORT="${KVNODE_INCIDENT_BASE_PORT:-24080}"
 PEER_BASE_PORT="${KVNODE_INCIDENT_PEER_BASE_PORT:-24180}"
@@ -292,6 +296,25 @@ assert_metrics_contains() {
   fi
 }
 
+write_report() {
+  local report_path="${KVNODE_INCIDENT_TABLETOP_REPORT:-}"
+  [[ -n "$report_path" ]] || return 0
+  [[ "$report_path" != "." && "$report_path" != "/" ]] || fail "KVNODE_INCIDENT_TABLETOP_REPORT-must-name-a-file"
+  mkdir -p "$(dirname "$report_path")"
+  {
+    echo "status=example-operator-report"
+    echo "artifact=incident-tabletop-drill"
+    printf 'evidence_dir=%q\n' "$EVIDENCE_DIR"
+    echo "storage_fault=exercised-and-cleared"
+    echo "transport_fault=exercised-and-cleared"
+    echo "canaries=baseline-and-after-clear-visible-on-all-nodes"
+    echo "operator_review=not-performed"
+    echo "release_claim=none-target-environment-operator-review-still-required"
+  } > "$report_path"
+  chmod 0600 "$report_path"
+  printf 'report=%q\n' "$report_path"
+}
+
 cat > "$EVIDENCE_DIR/metadata.env" <<EOF
 status=local-tabletop-only
 run_id=$run_id
@@ -360,5 +383,6 @@ canaries=baseline-and-after-clear-visible-on-all-nodes
 release_claim=none-target-environment-operator-review-still-required
 EOF
 
+write_report
 cat "$EVIDENCE_DIR/summary.txt"
 echo "kvnode-incident-tabletop status=pass evidence_dir=$EVIDENCE_DIR"

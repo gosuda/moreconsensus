@@ -60,6 +60,32 @@ require_text_before() {
   fi
 }
 
+last_line_number() {
+  local file="$1"
+  local text="$2"
+  local line
+  line="$(LC_ALL=C grep -Fn -- "$text" "$file" | tail -n 1 | cut -d: -f1 || true)"
+  if [[ -z "$line" ]]; then
+    echo "missing operations-readiness text in $file: $text" >&2
+    exit 1
+  fi
+  printf '%s\n' "$line"
+}
+
+require_last_text_after() {
+  local file="$1"
+  local first="$2"
+  local second="$3"
+  local first_line
+  local second_line
+  first_line="$(line_number "$file" "$first")"
+  second_line="$(last_line_number "$file" "$second")"
+  if (( first_line >= second_line )); then
+    echo "expected last text in $file after '$first': $second" >&2
+    exit 1
+  fi
+}
+
 require_local_runner_lifecycle_reports() {
   local expected_report_list="reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env"
   local observed_reports=()
@@ -303,16 +329,75 @@ require_text "$checkpoint_helper_test" "TestRepairRejectsCorruptCheckpointWithou
 
 require_text "$checkpoint_helper_test" "TestRunWritesOperationReportsForSuccessfulCommands"
 require_text "$checkpoint_helper_test" "TestRunReportsBadReportPathOnlyAfterSuccessfulOperation"
-# Local incident tabletop harness: opt-in, loopback-only, and explicitly not a
-# target-environment/operator-review claim.
+# Local incident tabletop harness: opt-in, loopback-only, report-capable after
+# fault clearing, and explicitly not a target-environment/operator-review claim.
 require_text "$incident_drill" "kvnode incident tabletop drill (local loopback harness only)"
 require_text "$incident_drill" "KVNODE_INCIDENT_TABLETOP_RUN=yes"
+require_text "$incident_drill" "KVNODE_INCIDENT_TABLETOP_REPORT"
+require_text "$incident_drill" "writes a 0600 example/operator report"
 require_text "$incident_drill" "Refusing to run without KVNODE_INCIDENT_TABLETOP_RUN=yes."
+require_text "$incident_drill" "require_command chmod"
 require_text "$incident_drill" "status=local-tabletop-only"
 require_text "$incident_drill" "storage_fault=exercised-and-cleared"
 require_text "$incident_drill" "transport_fault=exercised-and-cleared"
+require_text "$incident_drill" "canaries=baseline-and-after-clear-visible-on-all-nodes"
+require_text "$incident_drill" "non_claim=not_target_environment_not_operator_reviewed"
 require_text "$incident_drill" "release_claim=none-target-environment-operator-review-still-required"
+require_text "$incident_drill" "write_report()"
+require_text "$incident_drill" '[[ "$report_path" != "." && "$report_path" != "/" ]] || fail "KVNODE_INCIDENT_TABLETOP_REPORT-must-name-a-file"'
+require_text "$incident_drill" "status=example-operator-report"
+require_text "$incident_drill" "artifact=incident-tabletop-drill"
+require_text "$incident_drill" "operator_review=not-performed"
+require_text "$incident_drill" "chmod 0600"
+require_last_text_after "$incident_drill" "put_value 3 tabletop-after-clear after-clear-value" "write_report"
 bash -n "$incident_drill"
+
+incident_report_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kvnode-incident-report-audit.XXXXXX")"
+trap 'rm -rf "$manifest_report_dir" "$incident_report_probe_dir"' EXIT
+incident_report_probe="$incident_report_probe_dir/write-report-probe.sh"
+{
+  cat <<'EOF'
+set -euo pipefail
+fail() {
+  echo "kvnode-incident-tabletop status=fail reason=$*" >&2
+  exit 1
+}
+: "${EVIDENCE_DIR:?}"
+EOF
+  LC_ALL=C sed -n '/^write_report() {/,/^}/p' "$incident_drill"
+  printf '%s\n' 'write_report'
+} > "$incident_report_probe"
+
+for bad_report_path in . /; do
+  if bad_incident_report_output="$(EVIDENCE_DIR="$incident_report_probe_dir/evidence" KVNODE_INCIDENT_TABLETOP_REPORT="$bad_report_path" bash "$incident_report_probe" 2>&1 >/dev/null)"; then
+    echo "incident tabletop report writer must reject KVNODE_INCIDENT_TABLETOP_REPORT=$bad_report_path" >&2
+    exit 1
+  fi
+  if [[ "$bad_incident_report_output" != *"KVNODE_INCIDENT_TABLETOP_REPORT-must-name-a-file"* ]]; then
+    echo "missing operations-readiness output from $incident_drill: KVNODE_INCIDENT_TABLETOP_REPORT-must-name-a-file" >&2
+    exit 1
+  fi
+done
+
+incident_report="$incident_report_probe_dir/report.env"
+EVIDENCE_DIR="$incident_report_probe_dir/evidence" KVNODE_INCIDENT_TABLETOP_REPORT="$incident_report" bash "$incident_report_probe" >/dev/null
+require_text "$incident_report" "status=example-operator-report"
+require_text "$incident_report" "artifact=incident-tabletop-drill"
+require_text "$incident_report" "evidence_dir="
+require_text "$incident_report" "storage_fault=exercised-and-cleared"
+require_text "$incident_report" "transport_fault=exercised-and-cleared"
+require_text "$incident_report" "canaries=baseline-and-after-clear-visible-on-all-nodes"
+require_text "$incident_report" "operator_review=not-performed"
+require_text "$incident_report" "release_claim=none-target-environment-operator-review-still-required"
+if incident_report_mode="$(stat -c '%a' "$incident_report" 2>/dev/null)"; then
+  :
+else
+  incident_report_mode="$(stat -f '%Lp' "$incident_report")"
+fi
+if [[ "$incident_report_mode" != "600" ]]; then
+  echo "incident tabletop report mode must be 0600, got $incident_report_mode" >&2
+  exit 1
+fi
 
 # Local Go runner: build-tagged, opt-in, loopback-only evidence that exercises
 # deployment manifest evidence plus admin fault/readiness/metrics endpoints.

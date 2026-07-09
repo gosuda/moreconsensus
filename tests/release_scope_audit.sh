@@ -14,6 +14,19 @@ require_text() {
   fi
 }
 
+require_scope_row_text() {
+  local row="$1"
+  local text="$2"
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" == *"$row"* && "$line" == *"$text"* ]]; then
+      return
+    fi
+  done < "$scope"
+  echo "missing release-scope row text: $row -> $text" >&2
+  exit 1
+}
+
 require_path() {
   local path="$1"
   if [[ ! -e "$path" ]]; then
@@ -294,6 +307,13 @@ require_text "also locally exercised \`/faults/storage\`, \`/faults/transport\`,
 require_text "three-node local wrapper sample"
 require_text "locally rehearses the storage-failure and network-partition"
 require_text "Operator-reviewed target-environment tabletop or live drill evidence remains open"
+require_scope_row_text "| Incident readiness |" "KVNODE_INCIDENT_TABLETOP_REPORT=/path/report.env"
+require_scope_row_text "| Incident readiness |" "machine-readable example/operator incident report"
+require_scope_row_text "| Incident readiness |" "status=example-operator-report"
+require_scope_row_text "| Incident readiness |" "artifact=incident-tabletop-drill"
+require_scope_row_text "| Incident readiness |" "operator_review=not-performed"
+require_scope_row_text "| Incident readiness |" "release_claim=none-target-environment-operator-review-still-required"
+require_scope_row_text "| Incident readiness |" "Operator-reviewed target-environment tabletop or live drill evidence remains open"
 require_text "release_claim=none-target-environment-operator-review-still-required"
 require_text "tests/kvnode_systemd_manifest_audit.sh"
 require_text "tests/kvnode_mixed_version_drill.sh"

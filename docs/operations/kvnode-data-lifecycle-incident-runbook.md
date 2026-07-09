@@ -345,7 +345,8 @@ The repository includes a local loopback tabletop harness for the test-fault bra
 Local tabletop command:
 
 ```sh
-KVNODE_INCIDENT_TABLETOP_RUN=yes bash tests/kvnode_incident_tabletop_drill.sh \
+KVNODE_INCIDENT_TABLETOP_REPORT="${EVIDENCE_DIR}/incident-tabletop-report.env" \
+  KVNODE_INCIDENT_TABLETOP_RUN=yes bash tests/kvnode_incident_tabletop_drill.sh \
   2>&1 | tee "${EVIDENCE_DIR}/incident-tabletop-local.txt"
 ```
 
@@ -353,8 +354,9 @@ This is local tabletop evidence only. It does not replace operator review, targe
 
 Evidence to retain:
 
-- `metadata.env`, `summary.txt`, and per-node `/livez`, `/readyz`, `/metrics`, `/faults/storage`, and `/faults/transport` captures from the script evidence directory.
-- The full tabletop transcript, including `storage_fault=exercised-and-cleared`, `transport_fault=exercised-and-cleared`, and `status=local-tabletop-only`.
+- `metadata.env`, `summary.txt`, optional `incident-tabletop-report.env`, and per-node `/livez`, `/readyz`, `/metrics`, `/faults/storage`, and `/faults/transport` captures from the script evidence directory.
+- The full tabletop transcript, including `storage_fault=exercised-and-cleared`, `transport_fault=exercised-and-cleared`, `status=local-tabletop-only`, and `release_claim=none-target-environment-operator-review-still-required`.
+  If the optional report path is used, retain its `status=example-operator-report`, `artifact=incident-tabletop-drill`, `operator_review=not-performed`, and `release_claim=none-target-environment-operator-review-still-required` fields.
 - Confirmation that no storage directories were wiped or restored during the network-partition branch.
 
 ## Incident response: storage failure
