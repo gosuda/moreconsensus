@@ -195,13 +195,58 @@ require_text "$env_example" "-tls-ca=/etc/kvnode/tls/ca.crt"
 require_text "$env_example" "transport configuration only; it does not add application authz/authn"
 
 # Cross-platform manifest exercise: renders the example EnvironmentFile into the
-# ExecStart contract and runs systemd-analyze verify when the host provides it.
+# ExecStart contract, writes an explicit non-claim report when requested, and
+# runs systemd-analyze verify when the host provides it.
+require_text "$manifest" "KVNODE_SYSTEMD_MANIFEST_REPORT=/path/report.env"
+require_text "$manifest" "write_manifest_report()"
+require_text "$manifest" "KVNODE_SYSTEMD_MANIFEST_REPORT must name a file"
+require_text "$manifest" "status=example-operator-report"
+require_text "$manifest" "artifact=systemd-manifest-audit"
 require_text "$manifest" "rendered_exec="
 require_text "$manifest" "systemd_analyze=skipped"
+require_text "$manifest" "systemd_analyze="
 require_text "$manifest" "KVNODE_SYSTEMD_ANALYZE=yes"
 require_text "$manifest" "systemd-analyze verify"
 require_text "$manifest" "release_claim=none-target-environment-deployment-manifest-still-required"
-bash "$manifest" >/dev/null
+require_text "$manifest" "chmod 0600"
+for bad_report_path in . /; do
+  if bad_manifest_report_output="$(KVNODE_SYSTEMD_MANIFEST_REPORT="$bad_report_path" bash "$manifest" 2>&1 >/dev/null)"; then
+    echo "systemd manifest audit must reject KVNODE_SYSTEMD_MANIFEST_REPORT=$bad_report_path" >&2
+    exit 1
+  fi
+  if [[ "$bad_manifest_report_output" != *"KVNODE_SYSTEMD_MANIFEST_REPORT must name a file"* ]]; then
+    echo "missing operations-readiness output from $manifest: KVNODE_SYSTEMD_MANIFEST_REPORT must name a file" >&2
+    exit 1
+  fi
+done
+manifest_report_dir="$(mktemp -d "${TMPDIR:-/tmp}/kvnode-systemd-manifest-audit.XXXXXX")"
+trap 'rm -rf "$manifest_report_dir"' EXIT
+manifest_report="$manifest_report_dir/report.env"
+KVNODE_SYSTEMD_MANIFEST_REPORT="$manifest_report" bash "$manifest" >/dev/null
+require_text "$manifest_report" "status=example-operator-report"
+require_text "$manifest_report" "artifact=systemd-manifest-audit"
+require_text "$manifest_report" "unit="
+require_text "$manifest_report" "environment_file="
+require_text "$manifest_report" "rendered_exec="
+if ! LC_ALL=C grep -Eq '^rendered_exec=/usr/local/bin/kvnode -id 1 -listen' "$manifest_report"; then
+  echo "systemd manifest report must include unescaped rendered_exec command prefix" >&2
+  exit 1
+fi
+if LC_ALL=C grep -Fq -- 'rendered_exec=/usr/local/bin/kvnode\ -id' "$manifest_report"; then
+  echo "systemd manifest report must not double-escape rendered_exec command prefix" >&2
+  exit 1
+fi
+require_text "$manifest_report" "systemd_analyze=skipped"
+require_text "$manifest_report" "release_claim=none-target-environment-deployment-manifest-still-required"
+if manifest_report_mode="$(stat -c '%a' "$manifest_report" 2>/dev/null)"; then
+  :
+else
+  manifest_report_mode="$(stat -f '%Lp' "$manifest_report")"
+fi
+if [[ "$manifest_report_mode" != "600" ]]; then
+  echo "systemd manifest report mode must be 0600, got $manifest_report_mode" >&2
+  exit 1
+fi
 
 # Offline checkpoint helper: example/operator command, verified restore boundary,
 # and no live-service backup endpoint claim.

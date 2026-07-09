@@ -6,6 +6,8 @@ cd "$ROOT"
 
 unit="deploy/systemd/kvnode@.service"
 env_example="deploy/systemd/kvnode.env.example"
+# Set KVNODE_SYSTEMD_MANIFEST_REPORT=/path/report.env to persist a
+# machine-readable example/operator report after a successful audit.
 
 fail() {
   echo "kvnode systemd manifest audit: $*" >&2
@@ -35,6 +37,26 @@ get_env_value() {
     value="${value:1:${#value}-2}"
   fi
   printf '%s' "$value"
+}
+
+write_manifest_report() {
+  local report_path="$1"
+  local rendered_exec="$2"
+  local systemd_analyze_status="$3"
+  [[ -n "$report_path" ]] || return 0
+  [[ "$report_path" != "." && "$report_path" != "/" ]] || fail "KVNODE_SYSTEMD_MANIFEST_REPORT must name a file"
+  mkdir -p "$(dirname "$report_path")"
+  {
+    echo "status=example-operator-report"
+    echo "artifact=systemd-manifest-audit"
+    printf 'unit=%q\n' "$unit"
+    printf 'environment_file=%q\n' "$env_example"
+    printf 'rendered_exec=%s\n' "$rendered_exec"
+    echo "systemd_analyze=$systemd_analyze_status"
+    echo "release_claim=none-target-environment-deployment-manifest-still-required"
+  } > "$report_path"
+  chmod 0600 "$report_path"
+  printf 'report=%q\n' "$report_path"
 }
 
 require_file "$unit"
@@ -115,15 +137,18 @@ if [[ -n "$KVNODE_TLS_ARGS" ]]; then
   done
 fi
 
-printf 'rendered_exec='
-printf '%q ' "${rendered[@]}"
-printf '\n'
+rendered_exec="$(printf '%q ' "${rendered[@]}")"
+printf 'rendered_exec=%s\n' "$rendered_exec"
 echo "release_claim=none-target-environment-deployment-manifest-still-required"
 
+systemd_analyze_status="skipped"
 if [[ "${KVNODE_SYSTEMD_ANALYZE:-}" == "yes" ]]; then
   command -v systemd-analyze >/dev/null 2>&1 || fail "KVNODE_SYSTEMD_ANALYZE=yes requested but systemd-analyze is unavailable"
   systemd-analyze verify "$unit"
+  systemd_analyze_status="verified"
   echo "systemd_analyze=verified"
 else
   echo "systemd_analyze=skipped (set KVNODE_SYSTEMD_ANALYZE=yes on a systemd host to verify with systemd-analyze)"
 fi
+
+write_manifest_report "${KVNODE_SYSTEMD_MANIFEST_REPORT:-}" "$rendered_exec" "$systemd_analyze_status"
