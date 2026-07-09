@@ -69,7 +69,8 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `go test -tags kvnode ./examples/kv/cmd/kvnode -run TestPeerBodyLimitAcceptsValidMessageAndRejectsOversizedWithoutSteppingNode -count=1 -v` (`artifact://627`) passed after making the synthetic peer commit carry the required `RecordBallot`.
 - `bash tests/go_coverage.sh` passed after the EPaxos residual fail-safe coverage, KV iterator/recovery seam coverage, and peer-commit `RecordBallot` test fix; `epaxos` and `examples/kv` coverage profiles reported 100.0%, and the tagged `kvnode` package passed under the script.
 - `bash tests/tla_model_check.sh` passed after adding `tla/EPaxosEvidenceQuery.tla` and wiring the 3-, 5-, and 7-replica evidence-query configs; `EPaxosEvidenceQuery.cfg` generated 352 states and 279 distinct states, `EPaxosEvidenceQueryFive.cfg` generated 14548 states and 9015 distinct states, and `EPaxosEvidenceQuerySeven.cfg` generated 393256 states and 224551 distinct states, with no TLC error.
-- `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, `bash tests/operations_readiness_audit.sh`, and `bash tests/go_no_go_workflow.sh` passed after the finite evidence-query model, documentation, and audit updates; the workflow reported `release_decision=No-go.` with `open_release_items=6` (`artifact://634`).
+- `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, `bash tests/operations_readiness_audit.sh`, and `bash tests/go_no_go_workflow.sh` passed after the finite evidence-query model, deployment-manifest audit, documentation, and audit updates; the workflow reported `release_decision=No-go.` with `open_release_items=6` (`artifact://655`).
+- `bash tests/kvnode_systemd_manifest_audit.sh` passed on this host after adding the cross-platform manifest exercise; it rendered the example `kvnode@.service`/EnvironmentFile `ExecStart` contract and skipped `systemd-analyze` because analyzer verification is opt-in via `KVNODE_SYSTEMD_ANALYZE=yes`.
 
 ### Fault-tolerance envelope proof summary
 
@@ -120,6 +121,8 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
   - Example/operator systemd template, not a verified production deployment.
 - `deploy/systemd/kvnode.env.example`
   - Example/operator environment file for a three-node topology.
+- `tests/kvnode_systemd_manifest_audit.sh`
+  - Cross-platform static manifest exercise that validates required environment variables, renders the example `ExecStart`, checks peer/deadline/body-limit values, and keeps host-context `systemd-analyze verify` opt-in through `KVNODE_SYSTEMD_ANALYZE=yes`.
 - `docs/operations/kvnode-data-lifecycle-incident-runbook.md`
   - Data lifecycle and incident runbook with backup, semantic checkpoint verification, explicit repair, restore, checksum, destructive-storage, live-source recovery boundaries, and incident procedures.
 - `docs/operations/kvnode-upgrade-rollback.md`
@@ -174,7 +177,7 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 The following blockers are still listed in `RELEASE_SCOPE.md` and prevent a go decision:
 
 - Broader formal model coverage remains open beyond the finite configured TLC suite; `tla/EPaxosResponses.tla` adds bounded prepare branch-priority/try-witness checks, `tla/EPaxosOptimizedRecovery.tla` adds finite 3-, 5-, and 7-replica Accept-Deps optimized-recovery evidence checks, `tla/EPaxosEvidenceQuery.tla` adds finite 3-, 5-, and 7-replica committed-conflict evidence-query guard/fail-closed checks, `tla/EPaxosConfigBarrier.tla` adds finite local config-barrier checks, `tla/EPaxosConfigTransition.tla` adds one finite add-voter config-transition pinning check, and `tla/TOQClockDiscipline.tla` adds a finite bounded-skew/bounded-delay `ProcessAt` contract check, but operational synchronized-clock/OWD-measurement implementation proof for TOQ deployments, unbounded proof, even-size optimized-quorum proof, arbitrary membership-change proof, remove-voter and multi-step reconfiguration proof, recovery under configuration changes, complete inlined recovery coverage in the normal-case model, and full technical-report optimized-recovery decision-tree coverage remain open/non-claims.
-- Deployment manifest artifacts are example/operator material only until exercised under a target service manager or orchestration environment.
+- Deployment manifest artifacts are example/operator material only; `tests/kvnode_systemd_manifest_audit.sh` renders and audits the example `ExecStart` contract, but reviewed execution under a target system manager, container, or orchestration environment remains open.
 - Data lifecycle runbook exists, but a reviewed operator backup/restore/disaster-recovery drill remains open.
 - Actual old/new-binary mixed-version rolling upgrade and rollback execution evidence remains open; current evidence is deterministic storage/wire restart rollback simulation only.
 - Target-environment capacity-envelope measurements remain open.

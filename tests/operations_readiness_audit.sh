@@ -26,8 +26,9 @@ env_example="deploy/systemd/kvnode.env.example"
 runbook="docs/operations/kvnode-data-lifecycle-incident-runbook.md"
 upgrade="docs/operations/kvnode-upgrade-rollback.md"
 capacity="tests/kvnode_capacity_envelope.sh"
+manifest="tests/kvnode_systemd_manifest_audit.sh"
 
-for file in "$unit" "$env_example" "$runbook" "$upgrade" "$capacity"; do
+for file in "$unit" "$env_example" "$runbook" "$upgrade" "$capacity" "$manifest"; do
   require_file "$file"
 done
 
@@ -89,6 +90,14 @@ require_text "$env_example" "-tls-cert=/etc/kvnode/tls/node1.crt"
 require_text "$env_example" "-tls-key=/etc/kvnode/tls/node1.key"
 require_text "$env_example" "-tls-ca=/etc/kvnode/tls/ca.crt"
 require_text "$env_example" "transport configuration only; it does not add application authz/authn"
+
+# Cross-platform manifest exercise: renders the example EnvironmentFile into the
+# ExecStart contract and runs systemd-analyze verify when the host provides it.
+require_text "$manifest" "rendered_exec="
+require_text "$manifest" "systemd_analyze=skipped"
+require_text "$manifest" "KVNODE_SYSTEMD_ANALYZE=yes"
+require_text "$manifest" "systemd-analyze verify"
+bash "$manifest" >/dev/null
 
 # Data lifecycle/incident runbook: backup/verify/repair/restore boundaries,
 # confirmations, evidence capture, and named incident response procedures.
