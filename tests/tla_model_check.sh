@@ -69,6 +69,10 @@ for cfg in tla/EPaxosOptimizedRecovery.cfg tla/EPaxosOptimizedRecoveryFive.cfg t
   run_tlc tla/EPaxosOptimizedRecovery.tla "$cfg"
 done
 
+for cfg in tla/EPaxosTryPreAcceptBranches.cfg tla/EPaxosTryPreAcceptBranchesFive.cfg tla/EPaxosTryPreAcceptBranchesSeven.cfg; do
+  run_tlc tla/EPaxosTryPreAcceptBranches.tla "$cfg"
+done
+
 for cfg in tla/EPaxosEvidenceQuery.cfg tla/EPaxosEvidenceQueryFive.cfg tla/EPaxosEvidenceQuerySeven.cfg; do
   run_tlc tla/EPaxosEvidenceQuery.tla "$cfg"
 done
