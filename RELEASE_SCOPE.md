@@ -85,6 +85,8 @@ This matrix is the current simulation/local-loopback fault-tolerance envelope. A
 | Evidence bundle and go/no-go workflow | `release/EPAXOS_READINESS_EVIDENCE.md`; `tests/go_no_go_workflow.sh`; `tests/ci.sh`; `bash tests/go_no_go_workflow.sh` returns the current `No-go.` decision and lists open release items; `bash tests/release_scope_audit.sh` checks the evidence/workflow paths. |
 
 TryPreAccept message-path coverage note: `tests/tla_model_check.sh` now runs `tla/EPaxosTryPreAcceptMessagePath.cfg`, `tla/EPaxosTryPreAcceptMessagePathFive.cfg`, and `tla/EPaxosTryPreAcceptMessagePathSeven.cfg`; each finite 3/5/7 config covers follower `MsgTryPreAccept` commit-only, stale/conflict reject, duplicate matching re-ack without durable rewrite, fresh durable ack, and coordinator `MsgTryPreAcceptResp` stale restart, older/duplicate OK ignore, first OK below quorum, pre-seeded quorum immediate accept, and OK slow-quorum accept.
+TryConflict force/defer quorum note: `tests/tla_model_check.sh` now runs `tla/EPaxosTryConflictForce.cfg`, `tla/EPaxosTryConflictForceFive.cfg`, and `tla/EPaxosTryConflictForceSeven.cfg`; the finite 3/5/7 model checks `leaderMustBeInCandidateFastQuorum` arithmetic for conflict-leader force, deferred-cycle force, optional-leader deferral, existing-dependency guard, and blocker-recovery deferral.
+
 
 ## Open release items
 
@@ -99,6 +101,8 @@ TryPreAccept message-path coverage note: `tests/tla_model_check.sh` now runs `tl
 TryPreAccept response branch-slice note: `tla/EPaxosTryPreAcceptBranches.tla` is only a finite abstract scenario/stage model for stale restart, committed evidence ignore/fail-closed, direct/forced accept, one uncommitted deferral with duplicate suppression, and OK slow-quorum accept. Its only quorum detail is `okVotes >= SlowQuorum`, it runs for 3/5/7, and complete optimized-recovery branch parity beyond this finite slice remains open.
 
 TryPreAccept message-path limit: `tla/EPaxosTryPreAcceptMessagePath.tla` is finite 3/5/7 request/response path coverage, not a full network, evidence-query-internal, complete optimized-recovery branch-parity, or unbounded recovery proof.
+TryConflict force/defer limit: `tla/EPaxosTryConflictForce.tla` is finite quorum-arithmetic coverage for one uncommitted-conflict force/defer decision, not arbitrary recovery history, full message delivery, complete optimized-recovery branch parity, or unbounded proof.
+
 
 ## Review baseline
 

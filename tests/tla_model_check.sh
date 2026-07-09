@@ -77,6 +77,10 @@ for cfg in tla/EPaxosTryPreAcceptMessagePath.cfg tla/EPaxosTryPreAcceptMessagePa
   run_tlc tla/EPaxosTryPreAcceptMessagePath.tla "$cfg"
 done
 
+for cfg in tla/EPaxosTryConflictForce.cfg tla/EPaxosTryConflictForceFive.cfg tla/EPaxosTryConflictForceSeven.cfg; do
+  run_tlc tla/EPaxosTryConflictForce.tla "$cfg"
+done
+
 for cfg in tla/EPaxosEvidenceQuery.cfg tla/EPaxosEvidenceQueryFive.cfg tla/EPaxosEvidenceQuerySeven.cfg; do
   run_tlc tla/EPaxosEvidenceQuery.tla "$cfg"
 done
