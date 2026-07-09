@@ -246,6 +246,89 @@ func TestSimulatorIsolatedLocalTimeoutRecoversAfterConflictingQuorumCommit(t *te
 	requireNoDuplicateCommittedRefs(t, s.apps[1], 1)
 }
 
+func TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	key := []byte("rollback-local-key")
+
+	beforeCheckpoint := Command{ID: CommandID{Client: 40, Sequence: 1}, Payload: []byte("before-checkpoint"), ConflictKeys: [][]byte{key}}
+	beforeCheckpointRef, err := s.nodes[3].Propose(beforeCheckpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	requireCommittedPayloadCount(t, s.apps[3], 3, beforeCheckpointRef, beforeCheckpoint.Payload, 1)
+
+	checkpointStore := cloneMemoryStorage(s.stores[3])
+	checkpointApp := cloneCommittedCommands(s.apps[3])
+
+	learned := Command{ID: CommandID{Client: 40, Sequence: 2}, Payload: []byte("learned-after-checkpoint"), ConflictKeys: [][]byte{key}}
+	learnedRef, err := s.nodes[3].Propose(learned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	if learnedRef.Replica != 3 || learnedRef.Instance <= beforeCheckpointRef.Instance {
+		t.Fatalf("post-checkpoint proposal ref=%s, want local instance after %s", learnedRef, beforeCheckpointRef)
+	}
+	for _, id := range []ReplicaID{1, 2, 3} {
+		requireCommittedPayloadCount(t, s.apps[id], id, learnedRef, learned.Payload, 1)
+	}
+
+	quorumRecords := make(map[ReplicaID]InstanceRecord, 2)
+	for _, id := range []ReplicaID{1, 2} {
+		rec, ok := s.stores[id].Records[learnedRef]
+		if !ok || rec.Status < StatusCommitted {
+			t.Fatalf("node %d storage record for %s = %#v, ok=%v; want committed quorum record", id, learnedRef, rec, ok)
+		}
+		quorumRecords[id] = rec
+	}
+
+	s.restart(3, checkpointStore)
+	s.apps[3] = checkpointApp
+	requireCommittedPayloadCount(t, s.apps[3], 3, learnedRef, learned.Payload, 0)
+
+	for _, id := range []ReplicaID{1, 2} {
+		if !s.deliver(recoveryCommitMessageFromRecord(id, 3, quorumRecords[id])) {
+			t.Fatalf("commit message for %s from node %d to restored node 3 was unexpectedly delayed", learnedRef, id)
+		}
+	}
+	s.drain()
+	requireCommittedPayloadCount(t, s.apps[3], 3, learnedRef, learned.Payload, 1)
+	requireNoDuplicateCommittedRefs(t, s.apps[3], 3)
+
+	afterCatchUp := Command{ID: CommandID{Client: 40, Sequence: 3}, Payload: []byte("after-catch-up"), ConflictKeys: [][]byte{key}}
+	afterCatchUpRef, err := s.nodes[3].Propose(afterCatchUp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCatchUpRef.Replica != 3 || afterCatchUpRef.Instance <= learnedRef.Instance {
+		t.Fatalf("proposal after learning local commit ref=%s, want local instance greater than learned ref %s", afterCatchUpRef, learnedRef)
+	}
+	s.drain()
+	for _, id := range []ReplicaID{1, 2, 3} {
+		requireCommittedPayloadCount(t, s.apps[id], id, afterCatchUpRef, afterCatchUp.Payload, 1)
+		requireNoDuplicateCommittedRefs(t, s.apps[id], id)
+	}
+}
+
+func recoveryCommitMessageFromRecord(from, to ReplicaID, rec InstanceRecord) Message {
+	return Message{
+		Type:           MsgCommit,
+		From:           from,
+		To:             to,
+		Ref:            rec.Ref,
+		Ballot:         rec.Ballot,
+		RecordBallot:   recordTupleBallot(rec),
+		Seq:            rec.Seq,
+		Deps:           append([]InstanceNum(nil), rec.Deps...),
+		AcceptSeq:      rec.AcceptSeq,
+		AcceptDeps:     append([]InstanceNum(nil), rec.AcceptDeps...),
+		AcceptEvidence: cloneAcceptEvidence(rec.AcceptEvidence),
+		Command:        rec.Command.Clone(),
+		RecordStatus:   StatusCommitted,
+	}
+}
+
 func recoveryRequireAppliedOrder(t *testing.T, app []CommittedCommand, id ReplicaID, want ...InstanceRef) {
 	t.Helper()
 	positions := make(map[InstanceRef]int, len(app))

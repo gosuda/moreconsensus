@@ -273,9 +273,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 			phase = phasePrepare
 		}
 		n.instances[rec.Ref] = &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
-		if rec.Ref.Replica == n.id && rec.Ref.Instance >= n.nextInstance {
-			n.nextInstance = rec.Ref.Instance + 1
-		}
+		n.observeInstanceRef(rec.Ref)
 		if rec.Status >= StatusPreAccepted && !rec.TOQPending {
 			n.indexConflicts(rec)
 		}
@@ -332,6 +330,12 @@ func phaseFromStatus(s Status) phase {
 		return phaseCommitted
 	default:
 		return phaseIdle
+	}
+}
+
+func (n *RawNode) observeInstanceRef(ref InstanceRef) {
+	if ref.Replica == n.id && ref.Instance >= n.nextInstance {
+		n.nextInstance = ref.Instance + 1
 	}
 }
 
@@ -570,6 +574,13 @@ func confChangeQuorumFrom(conf ConfState, cc ConfChange) (quorum, error) {
 }
 
 func (n *RawNode) propose(cmd Command) InstanceRef {
+	for {
+		ref := InstanceRef{Replica: n.id, Instance: n.nextInstance, Conf: n.q.conf.ID}
+		if _, exists := n.instances[ref]; !exists {
+			break
+		}
+		n.nextInstance++
+	}
 	ref := InstanceRef{Replica: n.id, Instance: n.nextInstance, Conf: n.q.conf.ID}
 	n.nextInstance++
 	processAt := uint64(0)
@@ -894,6 +905,7 @@ func (n *RawNode) handlePreAccept(m Message) {
 		n.enqueueMessage(resp)
 		return
 	}
+	n.observeInstanceRef(rec.Ref)
 	inst := &instance{rec: rec, phase: phaseIdle, processAt: m.ProcessAt}
 	n.instances[m.Ref] = inst
 	n.indexConflicts(rec)
@@ -978,6 +990,7 @@ func (n *RawNode) handleAccept(m Message) {
 		n.enqueueMessage(resp)
 		return
 	}
+	n.observeInstanceRef(rec.Ref)
 	inst := &instance{rec: rec, phase: phaseIdle}
 	n.instances[m.Ref] = inst
 	n.indexConflicts(rec)
@@ -1058,6 +1071,7 @@ func (n *RawNode) handleCommit(m Message) {
 		mergeAcceptEvidence(&rec, acceptAttrs)
 	}
 	rec.Checksum = ChecksumRecord(rec)
+	n.observeInstanceRef(rec.Ref)
 	n.instances[m.Ref] = &instance{rec: rec, phase: phaseCommitted}
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
@@ -1084,6 +1098,7 @@ func (n *RawNode) handlePrepare(m Message) {
 		rec.Checksum = ChecksumRecord(rec)
 		inst = &instance{rec: rec, phase: phaseIdle}
 		n.instances[m.Ref] = inst
+		n.observeInstanceRef(rec.Ref)
 		if m.Ballot.Number > 0 && m.Ballot.Replica != n.id {
 			inst.waitDeadline = n.tick + n.recoveryTicks
 		}
@@ -1432,6 +1447,7 @@ func (n *RawNode) handleTryPreAccept(m Message) {
 		n.enqueueMessage(resp)
 		return
 	}
+	n.observeInstanceRef(rec.Ref)
 	inst := &instance{rec: rec, phase: phaseIdle}
 	n.instances[m.Ref] = inst
 	n.indexConflicts(rec)
@@ -2525,6 +2541,7 @@ func (n *RawNode) ensureDependencyRecovery(ref InstanceRef) {
 		inst = &instance{rec: rec, phase: phaseIdle}
 		n.instances[ref] = inst
 	}
+	n.observeInstanceRef(ref)
 	if inst.rec.Status >= StatusCommitted {
 		return
 	}
