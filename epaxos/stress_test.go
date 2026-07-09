@@ -115,7 +115,7 @@ func (s *stressTransportCluster) deliver(m Message) {
 		return
 	}
 	if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
-		s.t.Fatalf("step %s %d->%d: %v", m.Type, m.From, m.To, err)
+		s.t.Fatalf("step %s %d->%d: %v; message=%#v", m.Type, m.From, m.To, err, m)
 	}
 }
 

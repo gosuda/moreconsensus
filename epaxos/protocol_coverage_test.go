@@ -209,6 +209,59 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 	})
 }
 
+func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
+	rn := optimizedNewRawNode(t, 1, 3)
+	ref := InstanceRef{Replica: 1, Instance: 31, Conf: 1}
+	rec := checkedRecord(InstanceRecord{
+		Ref:              ref,
+		Ballot:           Ballot{Number: 1, Replica: 1},
+		Status:           StatusPreAccepted,
+		Seq:              2,
+		Deps:             rn.q.deps(),
+		Command:          optimizedTestCommand("preaccept-nil-map", "preaccept-nil-map-key"),
+		FastPathEligible: true,
+	})
+	inst := &instance{rec: rec, phase: phasePreAccept, preOK: nil}
+	rn.instances[ref] = inst
+	rn.indexConflicts(rec)
+
+	respDeps := []InstanceNum{0, 1, 0}
+	const depsCommitted uint64 = 0b101
+	if err := rn.Step(Message{
+		Type:             MsgPreAcceptResp,
+		From:             2,
+		To:               1,
+		Ref:              ref,
+		Ballot:           rec.Ballot,
+		Seq:              4,
+		Deps:             respDeps,
+		RecordStatus:     StatusPreAccepted,
+		FastPathEligible: true,
+		DepsCommitted:    depsCommitted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if inst.preOK == nil {
+		t.Fatal("PreAccept response left nil vote map")
+	}
+	vote, ok := inst.preOK[2]
+	if !ok {
+		t.Fatalf("PreAccept response was not recorded: %#v", inst.preOK)
+	}
+	if vote.seq != 4 || !instanceNumsEqual(vote.deps, respDeps) || vote.depsCommitted != depsCommitted || !vote.fastPathEligible {
+		t.Fatalf("recorded PreAccept vote = %#v, want seq 4 deps %v depsCommitted %03b fast-path eligible", vote, respDeps, depsCommitted)
+	}
+	if got := len(inst.preOK); got != 1 {
+		t.Fatalf("PreAccept vote count = %d, want only the remote response recorded", got)
+	}
+	if inst.phase != phasePreAccept {
+		t.Fatalf("single PreAccept response with nil vote map phase = %d, want preaccept before quorum", inst.phase)
+	}
+	if rn.HasReady() {
+		t.Fatalf("single PreAccept response with nil vote map unexpectedly emitted ready work: %#v", rn.Ready())
+	}
+}
+
 func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testing.T) {
 	rn, inst, ref := protocolTryInstance(t, 3, 1)
 	conflictRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
@@ -612,16 +665,20 @@ func TestSenderPreservingEvidenceValidationAndMergeContracts(t *testing.T) {
 		[]AcceptEvidence{
 			{Sender: 0, Seq: 99, Deps: []InstanceNum{9, 9, 9}},
 			{Sender: 1, Seq: 2, Deps: []InstanceNum{1, 0, 0}},
-			{Sender: 1, Seq: 3, Deps: []InstanceNum{2, 0, 0}},
+			{Sender: 1, Seq: 3, Deps: []InstanceNum{0, 4, 0}},
 			{Sender: 2, Seq: 4, Deps: []InstanceNum{0, 3, 0}},
 		},
 	)
 	if !acceptEvidenceEqual(merged, []AcceptEvidence{
-		{Sender: 1, Seq: 2, Deps: []InstanceNum{1, 0, 0}},
-		{Sender: 1, Seq: 3, Deps: []InstanceNum{2, 0, 0}},
+		{Sender: 1, Seq: 3, Deps: []InstanceNum{1, 4, 0}},
 		{Sender: 2, Seq: 4, Deps: []InstanceNum{0, 3, 0}},
 	}) {
 		t.Fatalf("merged sender evidence = %#v", merged)
+	}
+	mergedEvidenceResp := validEvidenceResp.Clone()
+	mergedEvidenceResp.AcceptEvidence = cloneAcceptEvidence(merged)
+	if err := mergedEvidenceResp.Validate(conf); err != nil {
+		t.Fatalf("merged sender evidence response rejected: %v", err)
 	}
 	if acceptEvidenceEqual([]AcceptEvidence{{Sender: 1, Seq: 1, Deps: []InstanceNum{1}}}, []AcceptEvidence{{Sender: 1, Seq: 1, Deps: []InstanceNum{2}}}) {
 		t.Fatal("AcceptEvidence equality ignored dependency differences")

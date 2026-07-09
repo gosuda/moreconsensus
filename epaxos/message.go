@@ -99,18 +99,23 @@ func mergeAcceptEvidenceEntries(dst, src []AcceptEvidence) []AcceptEvidence {
 		if ev.Sender == 0 {
 			continue
 		}
-		duplicate := false
-		for _, existing := range out {
+		merged := false
+		for i, existing := range out {
 			if existing.Sender != ev.Sender {
 				continue
 			}
-			duplicate = true
-			if existing.Seq != ev.Seq || !instanceNumsEqual(existing.Deps, ev.Deps) {
-				out = append(out, AcceptEvidence{Sender: ev.Sender, Seq: ev.Seq, Deps: append([]InstanceNum(nil), ev.Deps...)})
+			attrs := mergeAttrs(
+				Attributes{Seq: existing.Seq, Deps: existing.Deps},
+				Attributes{Seq: ev.Seq, Deps: ev.Deps},
+			)
+			if out[i].Seq != attrs.Seq || !instanceNumsEqual(out[i].Deps, attrs.Deps) {
+				out[i].Seq = attrs.Seq
+				out[i].Deps = append([]InstanceNum(nil), attrs.Deps...)
 			}
+			merged = true
 			break
 		}
-		if duplicate {
+		if merged {
 			continue
 		}
 		out = append(out, AcceptEvidence{Sender: ev.Sender, Seq: ev.Seq, Deps: append([]InstanceNum(nil), ev.Deps...)})

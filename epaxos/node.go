@@ -270,7 +270,9 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		} else if rec.Status < StatusCommitted && rec.Ballot.Number > 0 && rec.Ballot.Replica == n.id {
 			phase = phasePrepare
 		}
-		n.instances[rec.Ref] = &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
+		inst := &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
+		n.seedLocalRestartVote(inst)
+		n.instances[rec.Ref] = inst
 		n.observeInstanceRef(rec.Ref)
 		if rec.Status >= StatusPreAccepted && !rec.TOQPending {
 			n.indexConflicts(rec)
@@ -386,6 +388,33 @@ func (n *RawNode) confFor(id ConfID) ConfState {
 
 func (n *RawNode) depsForConf(id ConfID) []InstanceNum {
 	return make([]InstanceNum, len(n.confFor(id).Voters))
+}
+
+func (n *RawNode) seedLocalRestartVote(inst *instance) {
+	if inst == nil || inst.rec.Ref.Replica != n.id || !n.confFor(inst.rec.Ref.Conf).Contains(n.id) {
+		return
+	}
+	switch inst.phase {
+	case phasePreAccept:
+		if inst.rec.Status != StatusPreAccepted || inst.rec.TOQPending || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != n.id {
+			return
+		}
+		if inst.preOK == nil {
+			inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
+		}
+		attrs := inst.rec.Attributes()
+		// Restart cannot reconstruct volatile fast-quorum dependency coverage; count the durable owner vote only for the slow path.
+		inst.rec.FastPathEligible = false
+		inst.preOK[n.id] = attrVote{seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), depsCommitted: 0, fastPathEligible: false}
+	case phaseAccept:
+		if inst.rec.Status != StatusAccepted || inst.rec.Ballot.Replica != n.id {
+			return
+		}
+		if inst.accOK == nil {
+			inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
+		}
+		inst.accOK[n.id] = struct{}{}
+	}
 }
 
 func (n *RawNode) votersForConf(id ConfID) []ReplicaID {
@@ -1017,12 +1046,18 @@ func (n *RawNode) handlePreAcceptResp(m Message) {
 	if inst == nil || inst.phase != phasePreAccept || m.Ref.Replica != n.id {
 		return
 	}
+	if inst.rec.Ballot.Replica != n.id {
+		return
+	}
 	if m.Reject {
 		if !inst.rec.Ballot.Less(m.RejectHint) {
 			return
 		}
 		inst.rec.Ballot = m.RejectHint.Next(n.id)
 		n.startPrepare(inst)
+		return
+	}
+	if m.Ballot != inst.rec.Ballot {
 		return
 	}
 	if inst.preOK == nil {
@@ -2333,6 +2368,9 @@ func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
 }
 
 func (n *RawNode) canFastCommitPreAccept(inst *instance, attrs Attributes) bool {
+	if !inst.rec.FastPathEligible || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != inst.rec.Ref.Replica {
+		return false
+	}
 	localAttrs := inst.rec.Attributes()
 	localMatches := attrs.Equal(localAttrs)
 	if !localMatches {
@@ -2343,22 +2381,9 @@ func (n *RawNode) canFastCommitPreAccept(inst *instance, attrs Attributes) bool 
 			return false
 		}
 	}
-	count := 0
+	count := 1
 	matchingRemotes := 0
-	covered := uint64(0)
-	if localMatches {
-		if !inst.rec.FastPathEligible {
-			return false
-		}
-		count = 1
-		covered = n.committedDepsMask(attrs, inst.rec.Ref.Conf)
-	} else {
-		count = 1
-		covered = n.committedDepsMask(attrs, inst.rec.Ref.Conf)
-		if n.toqEnabled && !inst.rec.FastPathEligible {
-			return false
-		}
-	}
+	covered := n.committedDepsMask(attrs, inst.rec.Ref.Conf)
 	for id, vote := range inst.preOK {
 		if id == n.id {
 			continue
