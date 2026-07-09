@@ -328,9 +328,9 @@ Why this is safe inside the bounded claim:
 
 Open limitation:
 
-- The current formal models cover a finite local barrier, one add-voter transition, and one remove-voter transition. They do not cover arbitrary/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, durable replay, or unbounded configuration histories.
+- The current formal models cover a finite local barrier, one add-voter transition, one remove-voter transition, and one add-then-remove chain. They do not cover arbitrary/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, durable replay, or unbounded configuration histories.
 
-Source anchors: `epaxos/node.go` (`Propose`, `ProposeConfChange`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `applyConfChange`, per-instance quorum/broadcast helpers), `epaxos/config_change_ordering_test.go`, `epaxos/sim_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`, `tla/EPaxosConfigRemoveTransition.tla`.
+Source anchors: `epaxos/node.go` (`Propose`, `ProposeConfChange`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `applyConfChange`, per-instance quorum/broadcast helpers), `epaxos/config_change_ordering_test.go`, `epaxos/sim_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`, `tla/EPaxosConfigRemoveTransition.tla`, `tla/EPaxosConfigChainTransition.tla`.
 
 ## 15. Property-by-property rationale
 
@@ -462,6 +462,7 @@ Evidence: `examples/kv/cmd/kvnode/main.go`, `examples/kv/cmd/kvnode/main_test.go
 | `tla/EPaxosConfigBarrier.tla` | Pending config barriers and user-command ordering against two fixed config refs. | Dynamic membership histories. |
 | `tla/EPaxosConfigTransition.tla` | One finite add-voter transition and config pinning. | Multi-step, joint consensus, recovery during config change. |
 | `tla/EPaxosConfigRemoveTransition.tla` | One finite remove-voter transition where an old in-flight instance remains pinned to old voters/quorum and a later instance excludes the removed voter. | Multi-step, joint consensus, recovery during config change. |
+| `tla/EPaxosConfigChainTransition.tla` | One finite add-then-remove chain where old and mid-flight instances remain pinned across two config changes. | Arbitrary multi-step, joint consensus, recovery during config change. |
 | `tla/EPaxosRevisited.tla` | TOQ envelope, delayed assignment, pending-decision blocking, receiver processing, fast-wait behavior, and chain pruning. | Real clock synchronization and OWD measurement. |
 | `tla/TOQClockDiscipline.tla` | Finite bounded-skew/bounded-delay `ProcessAt` contract; in Go this maps to `TOQOneWayDelay` values that already include skew margin. | Operational clock-sync implementation or delay measurement. |
 | `tla/ReadyAdvance.tla` | Durable Ready/Advance prefix acknowledgement and retry. | Concrete storage engine behavior. |
