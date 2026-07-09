@@ -26,13 +26,14 @@ env_example="deploy/systemd/kvnode.env.example"
 runbook="docs/operations/kvnode-data-lifecycle-incident-runbook.md"
 upgrade="docs/operations/kvnode-upgrade-rollback.md"
 capacity="tests/kvnode_capacity_envelope.sh"
+local_capacity="tests/kvnode_local_capacity_drill.sh"
 manifest="tests/kvnode_systemd_manifest_audit.sh"
 mixed_drill="tests/kvnode_mixed_version_drill.sh"
 checkpoint_helper="examples/kv/cmd/kvcheckpoint/main.go"
 checkpoint_helper_test="examples/kv/cmd/kvcheckpoint/main_test.go"
 incident_drill="tests/kvnode_incident_tabletop_drill.sh"
 
-for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$incident_drill" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
+for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$incident_drill" "$local_capacity" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
   require_file "$file"
 done
 
@@ -219,3 +220,14 @@ require_text "$capacity" "Memory RSS samples:"
 require_text "$capacity" "Disk growth samples:"
 require_text "$capacity" "Queue-depth samples:"
 require_text "$capacity" "Peer-count coverage:"
+
+# Local capacity wrapper: starts a disposable loopback cluster and delegates to
+# the bounded capacity harness without making a target-environment claim.
+require_text "$local_capacity" "kvnode local capacity loopback drill (opt-in, bounded)"
+require_text "$local_capacity" "KVNODE_LOCAL_CAPACITY_RUN=yes"
+require_text "$local_capacity" "Refusing to run without KVNODE_LOCAL_CAPACITY_RUN=yes."
+require_text "$local_capacity" "KVNODE_CAPACITY_RUN=yes"
+require_text "$local_capacity" "KVNODE_PEER_COUNT=3"
+require_text "$local_capacity" "status=local-loopback-only"
+require_text "$local_capacity" "not_target_environment_capacity_evidence"
+bash -n "$local_capacity"

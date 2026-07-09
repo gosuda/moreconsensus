@@ -110,6 +110,7 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 - `bash tests/release_scope_audit.sh` passed in this session after release-scope updates.
 - `go test ./examples/kv/cmd/kvcheckpoint -count=1` passed after adding the maintained offline checkpoint helper; the CLI verifies checkpoints before `restore` and `repair` replaces a data directory.
 - `KVNODE_INCIDENT_TABLETOP_RUN=yes bash tests/kvnode_incident_tabletop_drill.sh` passed on local loopback after adding the incident tabletop harness; the generated summary reported `status=local-tabletop-only`, `storage_fault=exercised-and-cleared`, `transport_fault=exercised-and-cleared`, and post-clear canaries visible on all nodes.
+- `KVNODE_LOCAL_CAPACITY_RUN=yes bash tests/kvnode_local_capacity_drill.sh` passed on local loopback after adding the three-node capacity wrapper; it ran `tests/kvnode_capacity_envelope.sh` with `peer_count=3`, 5 ops per value-size phase, 64/1024-byte values, scan limits 1/8, PID/data-dir resource sampling, and `status=local-loopback-only`.
 
 ### New or updated artifacts in this evidence bundle scope
 
@@ -143,6 +144,8 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
   - Rolling upgrade and rollback plan.
 - `tests/kvnode_capacity_envelope.sh`
   - Opt-in bounded capacity-envelope collection harness.
+- `tests/kvnode_local_capacity_drill.sh`
+  - Local loopback capacity wrapper only: starts a disposable three-node `kvnode` cluster, runs `tests/kvnode_capacity_envelope.sh` against all three client/admin listeners with PIDs and data directories supplied, and emits `status=local-loopback-only`.
 - `tests/kvnode_mixed_version_drill.sh`
   - Local loopback old/new binary rolling-upgrade and binary-rollback harness. It requires explicit `KVNODE_UPGRADE_OLD_REF`, builds old/new binaries from clean git archives with `-trimpath -buildvcs=false`, records source-tree hashes and binary SHA-256s, rejects identical refs/source/binaries unless `KVNODE_UPGRADE_SMOKE_ONLY=yes`, exercises one-node-at-a-time upgrade and rollback, and verifies each upgraded/rolled node with a 204 write plus latest GET and barrier scan from all nodes. Binary rollback uses the node's current data; checkpoint restore is documented as a separate data-lifecycle fallback, not this mixed-version drill. The currently archived old/new refs differ only by timeout-outcome wording, so this is drill-mechanics evidence for distinct binaries, not broad protocol/storage compatibility evidence.
 - `tests/kvnode_incident_tabletop_drill.sh`
@@ -203,7 +206,7 @@ The following blockers are still listed in `RELEASE_SCOPE.md` and prevent a go d
 - Broader formal model coverage remains open beyond the finite configured TLC suite; `tla/EPaxosResponses.tla` adds bounded prepare branch-priority/try-witness checks, `tla/EPaxosOptimizedRecovery.tla` adds finite 3-, 5-, and 7-replica Accept-Deps optimized-recovery evidence checks, `tla/EPaxosEvidenceQuery.tla` adds finite 3-, 5-, and 7-replica committed-conflict evidence-query guard/fail-closed checks, `tla/EPaxosConfigBarrier.tla` adds finite local config-barrier checks, `tla/EPaxosConfigTransition.tla` adds one finite add-voter config-transition pinning check, `tla/EPaxosConfigRemoveTransition.tla` adds one finite remove-voter config-transition pinning check, `tla/EPaxosConfigChainTransition.tla` adds one finite add-then-remove configuration-chain pinning check, `tla/EPaxosRollbackAllocation.tla` adds one finite rollback-allocation next-instance/skip/apply-order check, and `tla/TOQClockDiscipline.tla` adds a finite bounded-skew/bounded-delay `ProcessAt` contract check, but operational synchronized-clock/OWD-measurement implementation proof for TOQ deployments, unbounded proof, arbitrary membership-change proof, arbitrary multi-step reconfiguration proof, recovery under configuration changes, complete optimized-recovery branch parity, full rollback-history proof, and arbitrary application/state-machine semantics remain open.
 - Deployment manifest artifacts are example/operator material only; `tests/kvnode_systemd_manifest_audit.sh` renders and audits the example `ExecStart` contract, but reviewed execution under a target system manager, container, or orchestration environment remains open.
 - Data lifecycle now has a maintained local offline `kvcheckpoint` helper plus runbook/audit evidence, but a reviewed operator backup/restore/disaster-recovery drill in the target environment remains open. The mixed-version drill's binary rollback keeps current data and does not exercise checkpoint restore.
-- Target-environment capacity-envelope measurements remain open.
+- Target-environment capacity-envelope measurements remain open; local evidence now includes a single-node workstation sample plus a three-node loopback wrapper sample, but neither is a measured target-environment capacity result.
 - Incident readiness has runbook/audit evidence plus a local loopback tabletop harness for storage-failure and network-partition test-fault branches, but operator-reviewed target-environment tabletop or live drill evidence remains open.
 
 ## Final workflow command
