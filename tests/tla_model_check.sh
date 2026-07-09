@@ -113,6 +113,10 @@ for cfg in tla/EPaxosConfigChainTransition.cfg; do
   run_tlc tla/EPaxosConfigChainTransition.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigChainTransitionRetry.cfg; do
+  run_tlc tla/EPaxosConfigChainTransitionRetry.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigChainRecovery.cfg; do
   run_tlc tla/EPaxosConfigChainRecovery.tla "$cfg"
 done
