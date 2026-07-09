@@ -30,8 +30,9 @@ manifest="tests/kvnode_systemd_manifest_audit.sh"
 mixed_drill="tests/kvnode_mixed_version_drill.sh"
 checkpoint_helper="examples/kv/cmd/kvcheckpoint/main.go"
 checkpoint_helper_test="examples/kv/cmd/kvcheckpoint/main_test.go"
+incident_drill="tests/kvnode_incident_tabletop_drill.sh"
 
-for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
+for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$incident_drill" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
   require_file "$file"
 done
 
@@ -112,6 +113,16 @@ require_text "$checkpoint_helper" "kv.RestoreCheckpoint"
 require_text "$checkpoint_helper_test" "TestRestoreRejectsCorruptCheckpointWithoutReplacingLiveData"
 require_text "$checkpoint_helper_test" "TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData"
 
+# Local incident tabletop harness: opt-in, loopback-only, and explicitly not a
+# target-environment/operator-review claim.
+require_text "$incident_drill" "kvnode incident tabletop drill (local loopback harness only)"
+require_text "$incident_drill" "KVNODE_INCIDENT_TABLETOP_RUN=yes"
+require_text "$incident_drill" "Refusing to run without KVNODE_INCIDENT_TABLETOP_RUN=yes."
+require_text "$incident_drill" "status=local-tabletop-only"
+require_text "$incident_drill" "storage_fault=exercised-and-cleared"
+require_text "$incident_drill" "transport_fault=exercised-and-cleared"
+bash -n "$incident_drill"
+
 # Data lifecycle/incident runbook: backup/verify/repair/restore boundaries,
 # confirmations, evidence capture, and named incident response procedures.
 require_text "$runbook" "Status: example/operator runbook material"
@@ -149,6 +160,10 @@ require_text "$runbook" "## Incident response: network partition"
 require_text "$runbook" "## Incident response: peer compromise"
 require_text "$runbook" "## Incident response: replay or checksum suspicion"
 require_text "$runbook" "## Incident response: recovery stalls"
+require_text "$runbook" "## Local incident tabletop drill"
+require_text "$runbook" "tests/kvnode_incident_tabletop_drill.sh"
+require_text "$runbook" "status=local-tabletop-only"
+require_text "$runbook" "operator review"
 require_text "$runbook" "No one performed automatic in-place repair, checksum recomputation, corrupt-record deletion, or synthesized reconstruction without a verified checkpoint under this runbook."
 
 # Rolling upgrade/rollback plan: one-node-at-a-time upgrade, checkpoint before

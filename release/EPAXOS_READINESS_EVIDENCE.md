@@ -109,6 +109,7 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 - A local single-node loopback capacity-envelope sample passed with `KVNODE_CAPACITY_RUN=yes`, `KVNODE_CAPACITY_OPS_PER_PHASE=5`, `KVNODE_CAPACITY_VALUE_BYTES=64,1024`, and `KVNODE_CAPACITY_SCAN_LIMITS=1,8`; archived sample files are `local://kvnode-capacity-loopback-20260708T194748Z-summary.txt`, `local://kvnode-capacity-loopback-20260708T194748Z-latency.csv`, and `local://kvnode-capacity-loopback-20260708T194748Z-resources.csv`; generated summary reported 22 HTTP operations, 22.000 sampled operations/second, p50 0.007860s, p95 0.008602s, p99 0.008797s, and harness-only/non-production status.
 - `bash tests/release_scope_audit.sh` passed in this session after release-scope updates.
 - `go test ./examples/kv/cmd/kvcheckpoint -count=1` passed after adding the maintained offline checkpoint helper; the CLI verifies checkpoints before `restore` and `repair` replaces a data directory.
+- `KVNODE_INCIDENT_TABLETOP_RUN=yes bash tests/kvnode_incident_tabletop_drill.sh` passed on local loopback after adding the incident tabletop harness; the generated summary reported `status=local-tabletop-only`, `storage_fault=exercised-and-cleared`, `transport_fault=exercised-and-cleared`, and post-clear canaries visible on all nodes.
 
 ### New or updated artifacts in this evidence bundle scope
 
@@ -137,13 +138,15 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 - `tests/kvnode_systemd_manifest_audit.sh`
   - Cross-platform static manifest exercise that validates required environment variables, renders the example `ExecStart`, checks peer/deadline/body-limit values, and keeps host-context `systemd-analyze verify` opt-in through `KVNODE_SYSTEMD_ANALYZE=yes`.
 - `docs/operations/kvnode-data-lifecycle-incident-runbook.md`
-  - Data lifecycle and incident runbook with the maintained `kvcheckpoint` offline helper, backup, semantic checkpoint verification, explicit repair, verified restore, checksum, destructive-storage, live-source recovery boundaries, and incident procedures.
+  - Data lifecycle and incident runbook with the maintained `kvcheckpoint` offline helper, backup, semantic checkpoint verification, explicit repair, verified restore, checksum, destructive-storage, local incident tabletop, live-source recovery boundaries, and incident procedures.
 - `docs/operations/kvnode-upgrade-rollback.md`
   - Rolling upgrade and rollback plan.
 - `tests/kvnode_capacity_envelope.sh`
   - Opt-in bounded capacity-envelope collection harness.
 - `tests/kvnode_mixed_version_drill.sh`
   - Local loopback old/new binary rolling-upgrade and binary-rollback harness. It requires explicit `KVNODE_UPGRADE_OLD_REF`, builds old/new binaries from clean git archives with `-trimpath -buildvcs=false`, records source-tree hashes and binary SHA-256s, rejects identical refs/source/binaries unless `KVNODE_UPGRADE_SMOKE_ONLY=yes`, exercises one-node-at-a-time upgrade and rollback, and verifies each upgraded/rolled node with a 204 write plus latest GET and barrier scan from all nodes. Binary rollback uses the node's current data; checkpoint restore is documented as a separate data-lifecycle fallback, not this mixed-version drill. The currently archived old/new refs differ only by timeout-outcome wording, so this is drill-mechanics evidence for distinct binaries, not broad protocol/storage compatibility evidence.
+- `tests/kvnode_incident_tabletop_drill.sh`
+  - Local loopback tabletop harness only: starts a disposable three-node `kvnode` cluster, captures admin evidence, exercises and clears storage-fault and transport-fault test branches, verifies client canaries after clearing faults, and emits `status=local-tabletop-only`.
 - `tests/operations_readiness_audit.sh`
   - Audit for the operations artifacts above.
 - `tests/toolchain.env`, `.github/workflows/ci.yml`, and `tests/toolchain_audit.sh`
@@ -201,7 +204,7 @@ The following blockers are still listed in `RELEASE_SCOPE.md` and prevent a go d
 - Deployment manifest artifacts are example/operator material only; `tests/kvnode_systemd_manifest_audit.sh` renders and audits the example `ExecStart` contract, but reviewed execution under a target system manager, container, or orchestration environment remains open.
 - Data lifecycle now has a maintained local offline `kvcheckpoint` helper plus runbook/audit evidence, but a reviewed operator backup/restore/disaster-recovery drill in the target environment remains open. The mixed-version drill's binary rollback keeps current data and does not exercise checkpoint restore.
 - Target-environment capacity-envelope measurements remain open.
-- Incident readiness has runbook/audit evidence only; operator review/tabletop or live drill evidence remains open.
+- Incident readiness has runbook/audit evidence plus a local loopback tabletop harness for storage-failure and network-partition test-fault branches, but operator-reviewed target-environment tabletop or live drill evidence remains open.
 
 ## Final workflow command
 

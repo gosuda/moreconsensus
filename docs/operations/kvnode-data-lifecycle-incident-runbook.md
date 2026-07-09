@@ -315,6 +315,26 @@ Evidence to retain:
 - Full local Jepsen run output and generated store artifacts.
 - Per-process `kvnode` logs showing stop, storage remove, restore, restart, and health check.
 
+
+## Local incident tabletop drill
+
+The repository includes a local loopback tabletop harness for the test-fault branches of the storage-failure and network-partition procedures. It starts a disposable three-node `kvnode` cluster, captures admin evidence files, injects and clears one storage fault plus bidirectional transport drops around one node, and verifies post-clear client canaries on all nodes.
+
+Local tabletop command:
+
+```sh
+KVNODE_INCIDENT_TABLETOP_RUN=yes bash tests/kvnode_incident_tabletop_drill.sh \
+  2>&1 | tee "${EVIDENCE_DIR}/incident-tabletop-local.txt"
+```
+
+This is local tabletop evidence only. It does not replace operator review, target-environment execution, real host/network fault handling, credential rotation, or disaster-recovery sign-off.
+
+Evidence to retain:
+
+- `metadata.env`, `summary.txt`, and per-node `/livez`, `/readyz`, `/metrics`, `/faults/storage`, and `/faults/transport` captures from the script evidence directory.
+- The full tabletop transcript, including `storage_fault=exercised-and-cleared`, `transport_fault=exercised-and-cleared`, and `status=local-tabletop-only`.
+- Confirmation that no storage directories were wiped or restored during the network-partition branch.
+
 ## Incident response: storage failure
 
 Signals:
