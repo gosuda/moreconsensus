@@ -1,0 +1,70 @@
+# Example/operator material for the EPaxos KV node.
+# This template is not a verified production deployment manifest.
+# Install as /etc/systemd/system/kvnode@.service and create one
+# /etc/kvnode/%i.env file per instance from kvnode.env.example.
+
+[Unit]
+Description=Example EPaxos KV node (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=kvnode
+Group=kvnode
+EnvironmentFile=/etc/kvnode/%i.env
+WorkingDirectory=/var/lib/kvnode/%i
+StateDirectory=kvnode/%i
+StateDirectoryMode=0750
+RuntimeDirectory=kvnode
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# The final $KVNODE_TLS_ARGS is intentionally unbraced so systemd splits it
+# into zero or more optional TLS flag arguments. Keep TLS paths space-free.
+ExecStart=/usr/local/bin/kvnode \
+  -id ${KVNODE_ID} \
+  -listen ${KVNODE_CLIENT_LISTEN} \
+  -peer-listen ${KVNODE_PEER_LISTEN} \
+  -admin-listen ${KVNODE_ADMIN_LISTEN} \
+  -data ${KVNODE_DATA_DIR} \
+  -peers ${KVNODE_PEERS} \
+  -request-deadline-ms ${KVNODE_REQUEST_DEADLINE_MS} \
+  -peer-deadline-ms ${KVNODE_PEER_DEADLINE_MS} \
+  -max-client-body-bytes ${KVNODE_MAX_CLIENT_BODY_BYTES} \
+  -max-peer-body-bytes ${KVNODE_MAX_PEER_BODY_BYTES} \
+  -max-admin-body-bytes ${KVNODE_MAX_ADMIN_BODY_BYTES} \
+  -max-scan-limit ${KVNODE_MAX_SCAN_LIMIT} \
+  $KVNODE_TLS_ARGS
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kvnode/%i
+ReadWritePaths=/run/kvnode
+ReadOnlyPaths=/etc/kvnode
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

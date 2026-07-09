@@ -139,6 +139,69 @@ func TestMessageValidateRequiresDependencyVectorWidthForAttributes(t *testing.T)
 	}
 }
 
+func TestMessageValidateRequiresAcceptEvidenceEnvelope(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	base := Message{
+		Type:       MsgAccept,
+		From:       1,
+		To:         2,
+		Ref:        ref,
+		Ballot:     Ballot{Replica: 1},
+		Seq:        4,
+		Deps:       []InstanceNum{0, 2, 3},
+		AcceptSeq:  5,
+		AcceptDeps: []InstanceNum{1, 2, 3},
+	}
+	if err := base.Validate(conf); err != nil {
+		t.Fatalf("valid Accept evidence envelope rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		msg  Message
+	}{
+		{
+			name: "accept seq without accept deps",
+			msg: func() Message {
+				msg := base.Clone()
+				msg.AcceptDeps = nil
+				return msg
+			}(),
+		},
+		{
+			name: "accept deps without accept seq",
+			msg: func() Message {
+				msg := base.Clone()
+				msg.AcceptSeq = 0
+				return msg
+			}(),
+		},
+		{
+			name: "short accept deps",
+			msg: func() Message {
+				msg := base.Clone()
+				msg.AcceptDeps = []InstanceNum{1, 2}
+				return msg
+			}(),
+		},
+		{
+			name: "overwide accept deps",
+			msg: func() Message {
+				msg := base.Clone()
+				msg.AcceptDeps = []InstanceNum{1, 2, 3, 4}
+				return msg
+			}(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.msg.Validate(conf); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("Validate err=%v, want %v", err, ErrInvalidMessage)
+			}
+		})
+	}
+}
+
 func TestMessageValidateDependencyWidthExemptions(t *testing.T) {
 	conf := ConfState{ID: 1, Voters: makeIDs(3)}
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
@@ -198,7 +261,7 @@ func TestStorageEdgeCases(t *testing.T) {
 	if rn.Status().Conf.ID != 2 {
 		t.Fatal("loaded config history was ignored")
 	}
-	rec := InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0}, Command: Command{Payload: []byte("x")}}
+	rec := InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0}, Command: Command{Payload: []byte("x")}}
 	rec.Checksum = ChecksumRecord(rec)
 	st.Records[rec.Ref] = rec
 	got, ok := st.Instance(rec.Ref)
@@ -295,6 +358,15 @@ func TestEncodeMessageRejectsWireLimitOverflowWithoutAppending(t *testing.T) {
 			},
 		},
 		{
+			name: "too many accept deps",
+			msg: func() Message {
+				msg := base
+				msg.AcceptSeq = 1
+				msg.AcceptDeps = make([]InstanceNum, maxWireDeps+1)
+				return msg
+			}(),
+		},
+		{
 			name: "too many conflict keys",
 			msg: func() Message {
 				msg := base
@@ -324,7 +396,7 @@ func TestEncodeMessageRejectsWireLimitOverflowWithoutAppending(t *testing.T) {
 	}
 }
 
-func malformedCodecFrame(deps, conflictKeys uint64) []byte {
+func malformedCodecFrame(deps, acceptDeps, conflictKeys uint64) []byte {
 	buf := append([]byte(nil), wireMagic[:]...)
 	for _, v := range []uint64{
 		uint64(MsgCommit),
@@ -332,6 +404,15 @@ func malformedCodecFrame(deps, conflictKeys uint64) []byte {
 		1,
 		1,
 		1,
+		1,
+		0,
+	} {
+		buf = binary.AppendUvarint(buf, v)
+	}
+	buf = append(buf, 0)
+	for _, v := range []uint64{
+		0,
+		0,
 		1,
 		0,
 		0,
@@ -345,26 +426,86 @@ func malformedCodecFrame(deps, conflictKeys uint64) []byte {
 		for range deps {
 			buf = binary.AppendUvarint(buf, 0)
 		}
-		for _, v := range []uint64{
-			0,
-			0,
-			uint64(CommandNoop),
-			0,
-			conflictKeys,
-		} {
-			buf = binary.AppendUvarint(buf, v)
-		}
-		if conflictKeys <= maxWireConflictKeys {
-			for range conflictKeys {
+		buf = binary.AppendUvarint(buf, 0)
+		buf = binary.AppendUvarint(buf, acceptDeps)
+		if acceptDeps <= maxWireDeps {
+			for range acceptDeps {
 				buf = binary.AppendUvarint(buf, 0)
 			}
-		}
-		buf = append(buf, 0)
-		for range 4 {
-			buf = binary.AppendUvarint(buf, 0)
+			for _, v := range []uint64{
+				0,
+				0,
+				uint64(CommandNoop),
+				0,
+				conflictKeys,
+			} {
+				buf = binary.AppendUvarint(buf, v)
+			}
+			if conflictKeys <= maxWireConflictKeys {
+				for range conflictKeys {
+					buf = binary.AppendUvarint(buf, 0)
+				}
+				buf = append(buf, 0)
+				for range 8 {
+					buf = binary.AppendUvarint(buf, 0)
+				}
+				buf = append(buf, 0)
+				buf = binary.AppendUvarint(buf, 0)
+				buf = binary.AppendUvarint(buf, uint64(StatusCommitted))
+			}
 		}
 	}
 	return append(buf, make([]byte, 32)...)
+}
+
+func TestDecodeMessageRejectsOverwideDependencyAndConflictKeyCounts(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{
+			name:  "deps",
+			frame: malformedCodecFrame(maxWireDeps+1, 0, 0),
+		},
+		{
+			name:  "accept deps",
+			frame: malformedCodecFrame(0, maxWireDeps+1, 0),
+		},
+		{
+			name:  "conflict keys",
+			frame: malformedCodecFrame(0, 0, maxWireConflictKeys+1),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := Message{
+				Type:       MsgCommit,
+				Deps:       []InstanceNum{7},
+				AcceptSeq:  8,
+				AcceptDeps: []InstanceNum{9},
+				Command: Command{
+					Payload:      []byte("stale-payload"),
+					ConflictKeys: [][]byte{[]byte("stale-key")},
+				},
+			}
+			scratch := DecodeScratch{
+				Deps:         []InstanceNum{1, 2},
+				AcceptDeps:   []InstanceNum{3, 4},
+				ConflictKeys: [][]byte{[]byte("old-key")},
+			}
+
+			if err := DecodeMessageWithScratch(tc.frame, &out, &scratch); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("DecodeMessageWithScratch(%s) err=%v, want %v", tc.name, err, ErrInvalidMessage)
+			}
+			if out.Type != 0 || len(out.Deps) != 0 || out.AcceptSeq != 0 || len(out.AcceptDeps) != 0 || len(out.Command.Payload) != 0 || len(out.Command.ConflictKeys) != 0 {
+				t.Fatalf("decode failure left stale message data: %#v", out)
+			}
+			if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 || len(scratch.ConflictKeys) != 0 {
+				t.Fatalf("decode failure left scratch populated: deps=%v acceptDeps=%v keys=%v", scratch.Deps, scratch.AcceptDeps, scratch.ConflictKeys)
+			}
+		})
+	}
 }
 
 func TestCodecMalformedBranches(t *testing.T) {
@@ -372,11 +513,15 @@ func TestCodecMalformedBranches(t *testing.T) {
 	if err := DecodeMessage([]byte{'M', 'E', 'P', '1', 0xff}, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("bad varint err=%v", err)
 	}
-	buf := malformedCodecFrame(maxWireDeps+1, 0)
+	buf := malformedCodecFrame(maxWireDeps+1, 0, 0)
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many deps err=%v", err)
 	}
-	buf = malformedCodecFrame(0, maxWireConflictKeys+1)
+	buf = malformedCodecFrame(0, maxWireDeps+1, 0)
+	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("too many accept deps err=%v", err)
+	}
+	buf = malformedCodecFrame(0, 0, maxWireConflictKeys+1)
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many keys err=%v", err)
 	}

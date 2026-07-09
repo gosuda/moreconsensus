@@ -50,7 +50,8 @@
   (System/getenv (str fault-env-prefix suffix)))
 
 (def destructive-storage-fault "destructive-storage")
-(def supported-faults #{"restart" "transport" "storage" destructive-storage-fault})
+(def wall-clock-skew-fault "wall-clock-skew")
+(def supported-faults #{"restart" "transport" "storage" destructive-storage-fault wall-clock-skew-fault})
 (def enabled-env-values #{"1" "true" "yes"})
 
 (defn env-enabled? [suffix]
@@ -59,13 +60,46 @@
 (defn parse-env-long [suffix default]
   (Long/parseLong (or (fault-env suffix) (str default))))
 
+(def default-wall-clock-skew-seconds 120)
+
+(defn wall-clock-skew-seconds []
+  (parse-env-long "WALL_CLOCK_SKEW_SECONDS" default-wall-clock-skew-seconds))
+
 (defn node-port [node]
   (Long/parseLong (last (str/split (str node) #":"))))
 
-(defn node-http-port [cfg node]
+(defn node-host [node]
+  (first (str/split (str node) #":")))
+
+(defn node-with-port [node port]
+  (str (node-host node) ":" port))
+
+(defn node-client-port [cfg node]
   (if (str/includes? (str node) ":")
     (node-port node)
     (:http-port cfg)))
+
+(declare node-id)
+
+(defn node-peer-port [cfg node]
+  (if-let [base (:peer-base-port cfg)]
+    (+ base (node-id cfg node))
+    (if (str/includes? (str node) ":")
+      (node-port node)
+      (or (:peer-port cfg) (:http-port cfg)))))
+
+(defn node-admin-port [cfg node]
+  (if-let [base (:admin-base-port cfg)]
+    (+ base (node-id cfg node))
+    (if (str/includes? (str node) ":")
+      (node-port node)
+      (or (:admin-port cfg) (:http-port cfg)))))
+
+(defn peer-node [cfg node]
+  (node-with-port node (node-peer-port cfg node)))
+
+(defn admin-node [cfg node]
+  (node-with-port node (node-admin-port cfg node)))
 
 (defn local-node-id [cfg node]
   (- (node-port node) (:base-port cfg)))
@@ -77,19 +111,25 @@
   (or (get (:node-ids cfg) node)
       (local-node-id cfg node)))
 
+(defn signed-wall-clock-skew-seconds [cfg node]
+  (let [magnitude (wall-clock-skew-seconds)]
+    (if (odd? (node-id cfg node))
+      magnitude
+      (- magnitude))))
+
 (defn peer-spec [cfg]
   (str/join "," (map (fn [node]
-                       (str (node-id cfg node) "=" (endpoint cfg node)))
+                       (str (node-id cfg node) "=" (endpoint cfg (peer-node cfg node))))
                      (:nodes cfg))))
 
 (defn http-node [cfg node]
-  (if (or (nil? (:http-port cfg)) (str/includes? (str node) ":"))
-    node
-    (str node ":" (:http-port cfg))))
+  (node-with-port node (node-client-port cfg node)))
 
 (defn local-fault-config [opts]
   (let [faults (fault-env "FAULTS")
         base-port (parse-env-long "BASE_PORT" 0)
+        peer-base-port (parse-env-long "PEER_BASE_PORT" (+ base-port 100))
+        admin-base-port (parse-env-long "ADMIN_BASE_PORT" (+ base-port 200))
         nodes (:nodes opts)]
     (cond
       (#{"restart" destructive-storage-fault} faults)
@@ -99,6 +139,8 @@
                  :peers (fault-env "PEERS")
                  :pid-dir (fault-env "PID_DIR")
                  :base-port base-port
+                 :peer-base-port peer-base-port
+                 :admin-base-port admin-base-port
                  :nodes nodes}]
         (when (and (every? seq ((juxt :bin :data-dir :peers :pid-dir :nodes) cfg))
                    (pos? (:base-port cfg)))
@@ -107,6 +149,8 @@
       (#{"transport" "storage"} faults)
       (let [cfg {:faults faults
                  :base-port base-port
+                 :peer-base-port peer-base-port
+                 :admin-base-port admin-base-port
                  :nodes nodes}]
         (when (and (seq nodes) (pos? base-port))
           cfg))
@@ -151,7 +195,7 @@
 
 (defn node-health [cfg node]
   (try
-    (let [resp (http/get (str (endpoint cfg node) "/health")
+    (let [resp (http/get (str (endpoint cfg (admin-node cfg node)) "/health")
                          {:throw-exceptions false})]
       {:node node :status (:status resp) :healthy (= 200 (:status resp))})
     (catch Exception e
@@ -171,13 +215,17 @@
 
 (defn launch-node-process! [cfg node]
   (let [id (node-id cfg node)
-        port (node-port node)
+        client-port (node-client-port cfg node)
+        peer-port (node-peer-port cfg node)
+        admin-port (node-admin-port cfg node)
         log-file (io/file (:data-dir cfg) (str "node-" id ".log"))
         data-dir (io/file (:data-dir cfg) (str "node-" id))
         pb (ProcessBuilder.
             (into-array String [(:bin cfg)
                                 "-id" (str id)
-                                "-listen" (str ":" port)
+                                "-listen" (str ":" client-port)
+                                "-peer-listen" (str ":" peer-port)
+                                "-admin-listen" (str ":" admin-port)
                                 "-data" (.getPath data-dir)
                                 "-peers" (:peers cfg)]))]
     (.mkdirs data-dir)
@@ -298,7 +346,7 @@
 
 (defn set-transport-isolation! [cfg node drop?]
   (mapv (fn [{:keys [controller from to]}]
-          (transport-fault-request! (http-node cfg controller) from to drop?))
+          (transport-fault-request! (admin-node cfg controller) from to drop?))
         (transport-isolation-requests cfg node)))
 
 (defn storage-fault-request! [node fail?]
@@ -342,8 +390,8 @@
     (invoke! [this _ op]
       (try
         (case (:f op)
-          :fail-storage (assoc op :type :info :value (storage-fault-request! (http-node cfg (:value op)) true))
-          :heal-storage (assoc op :type :info :value (storage-fault-request! (http-node cfg (:value op)) false))
+          :fail-storage (assoc op :type :info :value (storage-fault-request! (admin-node cfg (:value op)) true))
+          :heal-storage (assoc op :type :info :value (storage-fault-request! (admin-node cfg (:value op)) false))
           (assoc op :type :info :value :unknown-nemesis-op))
         (catch Exception e
           (warn e "local storage nemesis operation failed")
@@ -351,7 +399,7 @@
     (teardown! [this _]
       (doseq [node (:nodes cfg)]
         (try
-          (storage-fault-request! (http-node cfg node) false)
+          (storage-fault-request! (admin-node cfg node) false)
           (catch Exception e
             (warn e "local storage nemesis repair failed"))))
       this)))
@@ -372,11 +420,21 @@
              {:type :info :f :restore-storage :value node}])
           nodes))
 
+(defn wall-clock-skew-generator [cfg]
+  (mapcat (fn [node]
+            (let [offset (signed-wall-clock-skew-seconds cfg node)]
+              [(gen/sleep 1)
+               {:type :info :f :skew-wall-clock :value {:node node :offset-seconds offset}}
+               (gen/sleep 1)
+               {:type :info :f :reset-wall-clock :value node}]))
+          (:nodes cfg)))
+
 (defn local-fault-generator [cfg]
   (case (:faults cfg)
     "transport" (local-transport-generator (:nodes cfg))
     "storage" (local-storage-generator (:nodes cfg))
     "destructive-storage" (destructive-storage-generator (:nodes cfg))
+    "wall-clock-skew" (wall-clock-skew-generator cfg)
     (local-restart-generator (:nodes cfg))))
 
 (defn local-fault-nemesis [cfg]
@@ -386,18 +444,76 @@
     "destructive-storage" (local-destructive-storage-nemesis cfg)
     (local-restart-nemesis cfg)))
 
+(def remote-dir-safe-prefixes ["/tmp/moreconsensus-jepsen" "/srv/kv"])
+
+(defn remote-dir-under-safe-prefix? [path prefix]
+  (or (= path prefix)
+      (str/starts-with? path (str prefix "/"))))
+
+(defn remote-dir-allowlisted? [path]
+  (boolean (some #(remote-dir-under-safe-prefix? path %) remote-dir-safe-prefixes)))
+
+(defn unsafe-remote-dir-reason [path]
+  (cond
+    (str/blank? path) "remote dir is blank"
+    (not (str/starts-with? path "/")) "remote dir must be absolute"
+    (contains? #{"/" "/tmp" "/var" "/srv"} path) "remote dir is too broad"
+    (some #{".."} (str/split path #"/+")) "remote dir contains parent traversal"
+    (re-find #"[*?\[\]{}]" path) "remote dir contains shell glob characters"
+    (and (not (env-enabled? "REMOTE_DIR_ALLOW_UNSAFE"))
+         (not (remote-dir-allowlisted? path)))
+    (str "remote dir must be under one of " remote-dir-safe-prefixes
+         " unless MORECONSENSUS_KVNODE_REMOTE_DIR_ALLOW_UNSAFE is enabled")))
+
+(defn validate-remote-dir! [raw]
+  (let [path (str/trim (or raw ""))]
+    (when-let [reason (unsafe-remote-dir-reason path)]
+      (throw (ex-info (str "unsafe remote dir " (pr-str path) ": " reason)
+                      {:remote-dir path
+                       :reason reason})))
+    path))
+
+(defn checked-remote-cfg [cfg]
+  (assoc cfg :remote-dir (validate-remote-dir! (:remote-dir cfg))))
+
+(defn validate-remote-destructive-confirmation! [faults]
+  (when (and (= destructive-storage-fault faults)
+             (not (env-enabled? "REMOTE_DESTRUCTIVE_CONFIRM")))
+    (throw (ex-info (str "remote destructive-storage requires "
+                         "MORECONSENSUS_KVNODE_REMOTE_DESTRUCTIVE_CONFIRM=yes")
+                    {:faults faults
+                     :reason :missing-remote-destructive-confirmation})))
+  faults)
+
+(defn validate-remote-wall-clock-confirmation! [faults]
+  (when (and (= wall-clock-skew-fault faults)
+             (not (env-enabled? "REMOTE_WALL_CLOCK_SKEW_CONFIRM")))
+    (throw (ex-info (str "remote wall-clock-skew requires "
+                         "MORECONSENSUS_KVNODE_REMOTE_WALL_CLOCK_SKEW_CONFIRM=yes")
+                    {:faults faults
+                     :reason :missing-remote-wall-clock-skew-confirmation})))
+  faults)
+
+
+
 (defn remote-config [opts]
   (let [nodes (:nodes opts)
         bin (fault-env "BIN")
+        faults (fault-env "FAULTS")
         http-port (parse-env-long "HTTP_PORT" 8080)
-        base {:faults (fault-env "FAULTS")
-              :bin bin
-              :remote-dir (or (fault-env "REMOTE_DIR") "/tmp/moreconsensus-jepsen")
-              :http-port http-port
-              :nodes nodes
-              :node-ids (indexed-node-ids nodes)}]
+        peer-port (parse-env-long "PEER_PORT" 8081)
+        admin-port (parse-env-long "ADMIN_PORT" 8082)]
     (when (and (env-enabled? "REMOTE") (seq bin) (seq nodes))
-      (assoc base :peers (peer-spec base)))))
+      (let [base {:faults (validate-remote-wall-clock-confirmation!
+                           (validate-remote-destructive-confirmation! faults))
+                  :bin bin
+                  :remote-dir (validate-remote-dir! (or (fault-env "REMOTE_DIR") "/tmp/moreconsensus-jepsen"))
+                  :http-port http-port
+                  :peer-port peer-port
+                  :admin-port admin-port
+                  :nodes nodes
+                  :node-ids (indexed-node-ids nodes)}]
+        (assoc base :peers (peer-spec base))))))
 
 (defn fault-enabled-config [cfg]
   (when (and cfg (contains? supported-faults (:faults cfg)))
@@ -432,23 +548,27 @@
                    :chdir (:remote-dir cfg)}
                   (remote-bin-path cfg)
                   "-id" (str (node-id cfg node))
-                  "-listen" (str ":" (node-http-port cfg node))
+                  "-listen" (str ":" (node-client-port cfg node))
+                  "-peer-listen" (str ":" (node-peer-port cfg node))
+                  "-admin-listen" (str ":" (node-admin-port cfg node))
                   "-data" data-dir
                   "-peers" (:peers cfg)))
         health (wait-node-health cfg node)]
     (merge health {:node node :action result})))
 
 (defn remote-setup-node! [cfg node]
-  (control/exec :mkdir :-p (:remote-dir cfg))
-  (control/upload (:bin cfg) (remote-bin-path cfg))
-  (control/exec :chmod :+x (remote-bin-path cfg))
-  (stop-remote-node! cfg node)
-  (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node))
-  (start-remote-node! cfg node))
+  (let [cfg (checked-remote-cfg cfg)]
+    (control/exec :mkdir :-p (:remote-dir cfg))
+    (control/upload (:bin cfg) (remote-bin-path cfg))
+    (control/exec :chmod :+x (remote-bin-path cfg))
+    (stop-remote-node! cfg node)
+    (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node))
+    (start-remote-node! cfg node)))
 
 (defn remote-teardown-node! [cfg node]
-  (stop-remote-node! cfg node)
-  (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node)))
+  (let [cfg (checked-remote-cfg cfg)]
+    (stop-remote-node! cfg node)
+    (control/exec :rm :-rf (remote-node-data-dir cfg node) (remote-node-backup-dir cfg node))))
 
 (defn remote-move-if-present! [source dest]
   (when (cu/exists? source)
@@ -456,14 +576,16 @@
     (control/exec :mv source dest)))
 
 (defn remove-remote-storage! [cfg node]
-  (let [stop (stop-remote-node! cfg node)
+  (let [cfg (checked-remote-cfg cfg)
+        stop (stop-remote-node! cfg node)
         data-dir (remote-node-data-dir cfg node)
         backup-dir (remote-node-backup-dir cfg node)]
     (remote-move-if-present! data-dir backup-dir)
     {:node node :action :storage-removed :stop stop}))
 
 (defn restore-remote-storage! [cfg node]
-  (let [data-dir (remote-node-data-dir cfg node)
+  (let [cfg (checked-remote-cfg cfg)
+        data-dir (remote-node-data-dir cfg node)
         backup-dir (remote-node-backup-dir cfg node)]
     (if (cu/exists? backup-dir)
       (let [stop (stop-remote-node! cfg node)]
@@ -539,12 +661,86 @@
                               (warn e "remote destructive storage nemesis repair failed")))))
       this)))
 
+(defn controller-now-ms []
+  (System/currentTimeMillis))
+
+(defn parse-remote-epoch-seconds [out]
+  (Long/parseLong (str/trim (str out))))
+
+(defn remote-wall-clock-epoch-seconds []
+  (parse-remote-epoch-seconds (control/exec :date :+%s)))
+
+(defn set-remote-wall-clock-epoch-seconds! [epoch-seconds]
+  (control/exec :date :-u :-s (str "@" epoch-seconds)))
+
+(defn remote-wall-clock-baseline! [baselines node]
+  (or (get @baselines node)
+      (let [baseline {:remote-seconds (remote-wall-clock-epoch-seconds)
+                      :controller-ms (controller-now-ms)}]
+        (get (swap! baselines #(if (contains? % node)
+                                 %
+                                 (assoc % node baseline)))
+             node))))
+
+(defn skew-remote-wall-clock! [baselines node offset-seconds]
+  (let [before (remote-wall-clock-baseline! baselines node)
+        current (remote-wall-clock-epoch-seconds)
+        target (+ current offset-seconds)]
+    (set-remote-wall-clock-epoch-seconds! target)
+    {:node node
+     :action :wall-clock-skewed
+     :offset-seconds offset-seconds
+     :baseline before
+     :before current
+     :target target}))
+
+(defn reset-remote-wall-clock! [baselines node]
+  (let [baseline (remote-wall-clock-baseline! baselines node)
+        elapsed-seconds (quot (- (controller-now-ms) (:controller-ms baseline)) 1000)
+        target (+ (:remote-seconds baseline) elapsed-seconds)]
+    (set-remote-wall-clock-epoch-seconds! target)
+    {:node node
+     :action :wall-clock-reset
+     :baseline baseline
+     :elapsed-seconds elapsed-seconds
+     :target target}))
+
+(defn remote-wall-clock-skew-nemesis [cfg]
+  (let [baselines (atom {})]
+    (reify nemesis/Nemesis
+      (setup! [this _] this)
+      (invoke! [this test op]
+        (try
+          (case (:f op)
+            :skew-wall-clock
+            (let [{:keys [node offset-seconds]} (:value op)]
+              (assoc op :type :info :value
+                     (remote-node-op! test node
+                                      #(skew-remote-wall-clock! baselines % offset-seconds))))
+            :reset-wall-clock
+            (assoc op :type :info :value
+                   (remote-node-op! test (:value op)
+                                    #(reset-remote-wall-clock! baselines %)))
+            (assoc op :type :info :value :unknown-nemesis-op))
+          (catch Exception e
+            (warn e "remote wall-clock skew nemesis operation failed")
+            (assoc op :type :info :value {:error (.getMessage e)}))))
+      (teardown! [this test]
+        (control/on-nodes test (:nodes cfg)
+                          (fn [_ node]
+                            (try
+                              (reset-remote-wall-clock! baselines node)
+                              (catch Exception e
+                                (warn e "remote wall-clock reset failed")))))
+        this))))
+
 (defn remote-fault-nemesis [cfg]
   (case (:faults cfg)
     "restart" (remote-restart-nemesis cfg)
     "transport" (local-transport-nemesis cfg)
     "storage" (local-storage-nemesis cfg)
     "destructive-storage" (remote-destructive-storage-nemesis cfg)
+    "wall-clock-skew" (remote-wall-clock-skew-nemesis cfg)
     (local-restart-nemesis cfg)))
 
 
@@ -858,9 +1054,14 @@
                   (assoc op :f :write :value nil))
     :txn-read (case (:type op)
                 :invoke (assoc op :f :read :value nil)
-                :ok (when (and (empty? (txn-group-shape-errors (:value op)))
-                               (empty? (inconsistent-txn-groups (:value op))))
-                      (assoc op :f :read :value (txn-read-value (:value op) group)))
+                :ok (let [shape-errors (txn-group-shape-errors (:value op))
+                          bad-groups (if (seq shape-errors)
+                                       {}
+                                       (inconsistent-txn-groups (:value op)))]
+                      (if (and (empty? shape-errors) (empty? bad-groups))
+                        (assoc op :f :read :value (txn-read-value (:value op) group))
+                        (assoc op :type :fail :f :read :value nil)))
+                (:fail :info) (assoc op :f :read :value nil)
                 nil)
     nil))
 
@@ -915,11 +1116,127 @@
       (and (= :scan-forward (:f op)) (not (ordered-ascending? keys))) (assoc op :bad-scan :order)
       (and (= :scan-reverse (:f op)) (not (ordered-descending? keys))) (assoc op :bad-scan :order))))
 
+(def scan-mutation-ops #{:scan-write :scan-delete})
+
+(defn op-invoke-index [history op]
+  (some (fn [candidate]
+          (when (and (= :invoke (:type candidate))
+                     (= (:process candidate) (:process op))
+                     (= (:f candidate) (:f op))
+                     (< (:index candidate) (:index op)))
+            (:index candidate)))
+        (reverse (take-while #(< (:index %) (:index op)) history))))
+
+(defn completed-scan-mutations [history]
+  (vec (keep (fn [op]
+               (when (and (= :ok (:type op)) (contains? scan-mutation-ops (:f op)))
+                 (let [{:keys [key value]} (:value op)]
+                   (when (string? key)
+                     {:f (:f op)
+                      :key key
+                      :value value
+                      :invoke-index (or (op-invoke-index history op) (:index op))
+                      :ok-index (:index op)}))))
+             history)))
+
+(defn scan-mutation-overlaps? [mutation scan-start scan-end]
+  (and (< (:invoke-index mutation) scan-end)
+       (> (:ok-index mutation) scan-start)))
+
+(defn scan-mutation-state [mutation]
+  (if (= :scan-delete (:f mutation))
+    {:present? false}
+    {:present? true :value (:value mutation)}))
+
+(defn scan-mutation-happens-before? [a b]
+  (< (:ok-index a) (:invoke-index b)))
+
+(defn possible-scan-states-before [mutations key scan-start]
+  (let [before (vec (filter #(and (= key (:key %))
+                                  (< (:ok-index %) scan-start))
+                            mutations))]
+    (if (seq before)
+      (set (map scan-mutation-state
+                (filter (fn [mutation]
+                          (not-any? #(scan-mutation-happens-before? mutation %)
+                                    before))
+                        before)))
+      #{{:present? false}})))
+
+(defn possible-scan-states [mutations key scan-start scan-end]
+  (let [before (possible-scan-states-before mutations key scan-start)
+        overlaps (filter #(and (= key (:key %))
+                               (scan-mutation-overlaps? % scan-start scan-end))
+                         mutations)]
+    (set (concat before (map scan-mutation-state overlaps)))))
+
+(defn maybe-present? [states]
+  (boolean (some :present? states)))
+
+(defn definitely-present? [states]
+  (and (seq states) (every? :present? states)))
+
+(defn possible-scan-values [states]
+  (set (keep #(when (:present? %) (:value %)) states)))
+
+(defn ordered-scan-keys [f keys]
+  (let [ordered (sort keys)]
+    (if (= :scan-reverse f)
+      (reverse ordered)
+      ordered)))
+
+(defn maybe-present-before-count [key-states ordered-keys key]
+  (count (filter #(maybe-present? (get key-states %))
+                 (take-while #(not= key %) ordered-keys))))
+
+(defn bad-scan-semantic-op [history mutations op]
+  (when-not (bad-scan-op op)
+    (when-let [scan-start (op-invoke-index history op)]
+      (let [scan-end (:index op)
+            observed (row-values (:value op))
+            check-keys (distinct (concat scan-keys
+                                         (keys observed)
+                                         (map :key mutations)))
+            ordered-keys (vec (ordered-scan-keys (:f op) check-keys))
+            key-states (into {} (map (fn [key]
+                                       [key (possible-scan-states mutations key scan-start scan-end)])
+                                     check-keys))]
+        (some (fn [key]
+                (let [states (get key-states key)
+                      observed? (contains? observed key)
+                      got (get observed key)
+                      possible (possible-scan-values states)
+                      key-overlap? (boolean (some #(and (= key (:key %))
+                                                        (scan-mutation-overlaps? % scan-start scan-end))
+                                                  mutations))
+                      required? (and (not key-overlap?)
+                                     (definitely-present? states)
+                                     (< (maybe-present-before-count key-states ordered-keys key)
+                                        scan-limit))]
+                  (cond
+                    (and required? (not observed?))
+                    (assoc op :bad-scan :missing-row :bad-key key)
+
+                    (and observed? (empty? possible))
+                    (assoc op :bad-scan :deleted-row :bad-key key)
+
+                    (and observed? (not (contains? possible got)))
+                    (assoc op :bad-scan :value :bad-key key :expected-values possible :got got))))
+              ordered-keys)))))
+
+
 (defn advanced-scan-checker []
   (reify checker/Checker
     (check [_ _ history _]
-      (let [reads (filter #(and (= :ok (:type %)) (contains? #{:scan-forward :scan-reverse} (:f %))) history)
-            bad (vec (keep bad-scan-op reads))]
+      (let [history (mapv (fn [index op]
+                            (cond-> op (nil? (:index op)) (assoc :index index)))
+                          (range)
+                          history)
+            reads (filter #(and (= :ok (:type %)) (contains? #{:scan-forward :scan-reverse} (:f %))) history)
+            mutations (completed-scan-mutations history)
+            shape-bad (vec (keep bad-scan-op reads))
+            semantic-bad (vec (keep #(bad-scan-semantic-op history mutations %) reads))
+            bad (vec (concat shape-bad semantic-bad))]
         {:valid? (empty? bad)
          :checked (count reads)
          :bad-count (count bad)

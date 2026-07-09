@@ -177,6 +177,114 @@ func TestChecksumRecordAndMessageReuseWarmHasherWithoutAllocation(t *testing.T) 
 	}
 }
 
+func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
+	record := InstanceRecord{
+		Ref:              InstanceRef{Replica: 1, Instance: 9, Conf: 1},
+		Ballot:           Ballot{Epoch: 2, Number: 3, Replica: 1},
+		RecordBallot:     Ballot{Epoch: 2, Number: 3, Replica: 1},
+		Status:           StatusPreAccepted,
+		Seq:              7,
+		Deps:             []InstanceNum{0, 4, 5},
+		Command:          Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("checksum-version"), ConflictKeys: [][]byte{[]byte("checksum-version-key")}},
+		FastPathEligible: true,
+		ProcessAt:        42,
+		TOQPending:       true,
+	}
+
+	canonical := record
+	canonical.Checksum = ChecksumRecord(canonical)
+	if !VerifyRecordChecksum(canonical) {
+		t.Fatalf("canonical checksum rejected for record %#v", canonical)
+	}
+	if VerifyRecordChecksumWithoutTOQ(canonical) || VerifyRecordChecksumWithoutFastPathOrTOQ(canonical) {
+		t.Fatalf("canonical checksum was accepted as an older layout")
+	}
+
+	withAcceptEvidence := record
+	withAcceptEvidence.AcceptSeq = 11
+	withAcceptEvidence.AcceptDeps = []InstanceNum{2, 4, 6}
+	withAcceptEvidence.AcceptEvidence = []AcceptEvidence{{Sender: 3, Seq: 11, Deps: []InstanceNum{2, 4, 6}}}
+
+	canonicalWithAcceptEvidence := withAcceptEvidence
+	canonicalWithAcceptEvidence.Checksum = ChecksumRecord(canonicalWithAcceptEvidence)
+	if !VerifyRecordChecksum(canonicalWithAcceptEvidence) {
+		t.Fatalf("canonical checksum with Accept-Deps evidence rejected for record %#v", canonicalWithAcceptEvidence)
+	}
+	if VerifyRecordChecksumWithoutAcceptEvidence(canonicalWithAcceptEvidence) {
+		t.Fatalf("canonical checksum with Accept-Deps evidence was accepted as the legacy no-Accept-evidence layout")
+	}
+	if VerifyRecordChecksumWithoutSenderAcceptEvidence(canonicalWithAcceptEvidence) {
+		t.Fatalf("canonical checksum with sender-preserving AcceptEvidence was accepted as the legacy no-sender layout")
+	}
+
+	senderChanged := canonicalWithAcceptEvidence.Clone()
+	senderChanged.AcceptEvidence[0].Sender = 2
+	if VerifyRecordChecksum(senderChanged) {
+		t.Fatalf("record with changed AcceptEvidence sender was accepted before recomputing checksum")
+	}
+	senderChangedChecksum := ChecksumRecord(senderChanged)
+	if senderChangedChecksum == canonicalWithAcceptEvidence.Checksum {
+		t.Fatalf("AcceptEvidence sender change did not change canonical checksum")
+	}
+	senderChanged.Checksum = senderChangedChecksum
+	if !VerifyRecordChecksum(senderChanged) {
+		t.Fatalf("record with changed AcceptEvidence sender was rejected after recomputing checksum")
+	}
+
+	depsChanged := canonicalWithAcceptEvidence.Clone()
+	depsChanged.AcceptEvidence[0].Deps[1] = 8
+	if VerifyRecordChecksum(depsChanged) {
+		t.Fatalf("record with changed AcceptEvidence deps was accepted before recomputing checksum")
+	}
+	depsChangedChecksum := ChecksumRecord(depsChanged)
+	if depsChangedChecksum == canonicalWithAcceptEvidence.Checksum {
+		t.Fatalf("AcceptEvidence deps change did not change canonical checksum")
+	}
+	depsChanged.Checksum = depsChangedChecksum
+	if !VerifyRecordChecksum(depsChanged) {
+		t.Fatalf("record with changed AcceptEvidence deps was rejected after recomputing checksum")
+	}
+
+	withoutSenderAcceptEvidence := withAcceptEvidence.Clone()
+	withoutSenderAcceptEvidence.Checksum = checksumRecord(withoutSenderAcceptEvidence, true, true, true, true, false)
+	if VerifyRecordChecksum(withoutSenderAcceptEvidence) {
+		t.Fatalf("legacy checksum without sender-preserving AcceptEvidence was accepted as canonical")
+	}
+	if !VerifyRecordChecksumWithoutSenderAcceptEvidence(withoutSenderAcceptEvidence) {
+		t.Fatalf("legacy checksum without sender-preserving AcceptEvidence was rejected by legacy verifier")
+	}
+
+	withoutAcceptEvidence := withAcceptEvidence
+	withoutAcceptEvidence.Checksum = checksumRecord(withoutAcceptEvidence, true, true, false, false, false)
+	if VerifyRecordChecksum(withoutAcceptEvidence) {
+		t.Fatalf("legacy checksum without Accept-Deps evidence was accepted as canonical")
+	}
+	if !VerifyRecordChecksumWithoutAcceptEvidence(withoutAcceptEvidence) {
+		t.Fatalf("legacy checksum without Accept-Deps evidence was rejected by legacy verifier")
+	}
+
+	withoutTOQ := record
+	withoutTOQ.Checksum = checksumRecord(withoutTOQ, true, false, false, false, false)
+	if VerifyRecordChecksum(withoutTOQ) {
+		t.Fatalf("checksum without TOQ metadata was accepted as canonical")
+	}
+	if !VerifyRecordChecksumWithoutTOQ(withoutTOQ) {
+		t.Fatalf("checksum without TOQ metadata was rejected by legacy verifier")
+	}
+	if VerifyRecordChecksumWithoutFastPathOrTOQ(withoutTOQ) {
+		t.Fatalf("checksum without TOQ metadata was accepted as the older no-fast-path layout")
+	}
+
+	withoutFastPathOrTOQ := record
+	withoutFastPathOrTOQ.Checksum = checksumRecord(withoutFastPathOrTOQ, false, false, false, false, false)
+	if VerifyRecordChecksum(withoutFastPathOrTOQ) || VerifyRecordChecksumWithoutTOQ(withoutFastPathOrTOQ) {
+		t.Fatalf("checksum without fast-path and TOQ metadata was accepted as a newer layout")
+	}
+	if !VerifyRecordChecksumWithoutFastPathOrTOQ(withoutFastPathOrTOQ) {
+		t.Fatalf("checksum without fast-path and TOQ metadata was rejected by oldest-layout verifier")
+	}
+}
+
 func TestProposeZeroCopyPayloadKeyCommandUsesLowerAllocationBudgetThanSafeCopyCommand(t *testing.T) {
 	safeCopyAllocs := proposePayloadKeyCommandAllocs(t, false)
 	zeroCopyAllocs := proposePayloadKeyCommandAllocs(t, true)
@@ -297,6 +405,176 @@ func TestDecodeMessageWithNilScratchMatchesDecodeMessage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEncodeDecodeMessagePreservesExplicitTOQPreAccept(t *testing.T) {
+	want := Message{
+		Type:      MsgPreAccept,
+		From:      1,
+		To:        2,
+		Ref:       InstanceRef{Replica: 1, Instance: 17, Conf: 1},
+		ProcessAt: 123,
+		TOQ:       true,
+		Ballot:    Ballot{Epoch: 2, Replica: 1},
+		Command: Command{
+			ID:           CommandID{Client: 77, Sequence: 3},
+			Payload:      []byte("toq-wire-payload"),
+			ConflictKeys: [][]byte{[]byte("toq-wire-key")},
+		},
+		RecordStatus: StatusNone,
+	}
+	encoded, err := EncodeMessage(nil, want)
+	if err != nil {
+		t.Fatalf("EncodeMessage explicit TOQ PreAccept: %v", err)
+	}
+
+	var got Message
+	if err := DecodeMessage(encoded, &got); err != nil {
+		t.Fatalf("DecodeMessage explicit TOQ PreAccept: %v", err)
+	}
+	want.Deps = []InstanceNum{}
+	want.AcceptDeps = []InstanceNum{}
+	want.Checksum = ChecksumMessage(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TOQ PreAccept wire round-trip mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+	if err := got.Validate(ConfState{ID: 1, Voters: makeIDs(3)}); err != nil {
+		t.Fatalf("decoded explicit TOQ PreAccept failed validation: %v", err)
+	}
+}
+
+func TestEncodeDecodeMessagePreservesAcceptEvidence(t *testing.T) {
+	want := Message{
+		Type:       MsgAccept,
+		From:       1,
+		To:         2,
+		Ref:        InstanceRef{Replica: 1, Instance: 18, Conf: 1},
+		Ballot:     Ballot{Epoch: 2, Number: 1, Replica: 1},
+		Seq:        7,
+		Deps:       []InstanceNum{0, 4, 5},
+		AcceptSeq:  9,
+		AcceptDeps: []InstanceNum{3, 4, 5},
+		AcceptEvidence: []AcceptEvidence{
+			{Sender: 3, Seq: 10, Deps: []InstanceNum{1, 4, 6}},
+			{Sender: 1, Seq: 9, Deps: []InstanceNum{3, 4, 5}},
+		},
+		Command: Command{
+			ID:           CommandID{Client: 78, Sequence: 4},
+			Payload:      []byte("accept-evidence-wire-payload"),
+			ConflictKeys: [][]byte{[]byte("accept-evidence-wire-key")},
+		},
+		RecordStatus: StatusAccepted,
+	}
+	encoded, err := EncodeMessage(nil, want)
+	if err != nil {
+		t.Fatalf("EncodeMessage AcceptEvidence: %v", err)
+	}
+
+	var got Message
+	if err := DecodeMessage(encoded, &got); err != nil {
+		t.Fatalf("DecodeMessage AcceptEvidence: %v", err)
+	}
+	want.Checksum = ChecksumMessage(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("AcceptEvidence wire round-trip mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+	if !reflect.DeepEqual(got.AcceptEvidence, want.AcceptEvidence) {
+		t.Fatalf("decoded AcceptEvidence = %#v, want %#v", got.AcceptEvidence, want.AcceptEvidence)
+	}
+	if got.Seq != 7 || !reflect.DeepEqual(got.Deps, []InstanceNum{0, 4, 5}) {
+		t.Fatalf("AcceptEvidence mutated chosen attributes: seq=%d deps=%v", got.Seq, got.Deps)
+	}
+	attrs, ok := got.AcceptAttributes()
+	if !ok || attrs.Seq != 9 || !reflect.DeepEqual(attrs.Deps, []InstanceNum{3, 4, 5}) {
+		t.Fatalf("decoded aggregate Accept-Deps attributes = %#v, %v", attrs, ok)
+	}
+	if err := got.Validate(ConfState{ID: 1, Voters: makeIDs(3)}); err != nil {
+		t.Fatalf("decoded AcceptEvidence message failed validation: %v", err)
+	}
+}
+
+func TestDecodeMessageRejectsOverwideWireCountsBeforeAllocation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "dependency count", frame: malformedWireCountFrame(maxWireDeps+1, 0)},
+		{name: "conflict key count", frame: malformedWireCountFrame(0, maxWireConflictKeys+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := Message{
+				Type: MsgCommit,
+				Deps: []InstanceNum{9},
+				Command: Command{
+					Payload:      []byte("stale-payload"),
+					ConflictKeys: [][]byte{[]byte("stale-key")},
+				},
+			}
+			scratch := DecodeScratch{
+				Deps:         []InstanceNum{1, 2, 3},
+				ConflictKeys: [][]byte{[]byte("old-key")},
+			}
+			if err := DecodeMessageWithScratch(tc.frame, &out, &scratch); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("DecodeMessageWithScratch(%s) err=%v, want %v", tc.name, err, ErrInvalidMessage)
+			}
+			assertMessageCleared(t, &out)
+			if len(scratch.Deps) != 0 || len(scratch.ConflictKeys) != 0 {
+				t.Fatalf("decode failure left scratch populated: deps=%v keys=%v", scratch.Deps, scratch.ConflictKeys)
+			}
+		})
+	}
+}
+
+func malformedWireCountFrame(deps, conflictKeys uint64) []byte {
+	buf := append([]byte(nil), wireMagic[:]...)
+	for _, v := range []uint64{
+		uint64(MsgCommit),
+		1,
+		1,
+		1,
+		1,
+		1,
+		0,
+	} {
+		buf = binary.AppendUvarint(buf, v)
+	}
+	buf = append(buf, 0)
+	for _, v := range []uint64{
+		0,
+		0,
+		1,
+		0,
+		deps,
+	} {
+		buf = binary.AppendUvarint(buf, v)
+	}
+	if deps <= maxWireDeps {
+		for range deps {
+			buf = binary.AppendUvarint(buf, 0)
+		}
+		for _, v := range []uint64{
+			0,
+			0,
+			uint64(CommandNoop),
+			0,
+			conflictKeys,
+		} {
+			buf = binary.AppendUvarint(buf, v)
+		}
+		if conflictKeys <= maxWireConflictKeys {
+			for range conflictKeys {
+				buf = binary.AppendUvarint(buf, 0)
+			}
+			buf = append(buf, 0)
+			for range 7 {
+				buf = binary.AppendUvarint(buf, 0)
+			}
+			buf = append(buf, 0)
+			buf = binary.AppendUvarint(buf, 0)
+			buf = binary.AppendUvarint(buf, uint64(StatusCommitted))
+		}
+	}
+	return append(buf, make([]byte, 32)...)
 }
 
 func TestDecodeMessageWithScratchUsesPresizedMetadataWithoutAllocation(t *testing.T) {
@@ -663,8 +941,9 @@ func decodeMessageSeedCorpus() [][]byte {
 		valid,
 		mustEncodeMessageSeed(maxDeps),
 		mustEncodeMessageSeed(maxKeys),
-		malformedCodecFrame(maxWireDeps+1, 0),
-		malformedCodecFrame(0, maxWireConflictKeys+1),
+		malformedCodecFrame(maxWireDeps+1, 0, 0),
+		malformedCodecFrame(0, maxWireDeps+1, 0),
+		malformedCodecFrame(0, 0, maxWireConflictKeys+1),
 		valid[:len(valid)-1],
 		valid[:len(wireMagic)],
 		valid[:len(wireMagic)+32],
@@ -707,12 +986,15 @@ func mustEncodeMessageSeed(m Message) []byte {
 
 func assertMessageCleared(t *testing.T, m *Message) {
 	t.Helper()
-	if m.Type != 0 || m.From != 0 || m.To != 0 || !m.Ref.IsZero() || m.Ballot != (Ballot{}) || m.Seq != 0 || len(m.Deps) != 0 || m.Reject || m.RejectHint != (Ballot{}) || m.RecordStatus != 0 {
+	if m.Type != 0 || m.From != 0 || m.To != 0 || !m.Ref.IsZero() || m.Ballot != (Ballot{}) || m.RecordBallot != (Ballot{}) || m.Seq != 0 || len(m.Deps) != 0 || m.AcceptSeq != 0 || len(m.AcceptDeps) != 0 || m.Reject || m.RejectHint != (Ballot{}) || m.RecordStatus != 0 {
 		t.Fatalf("message retained metadata: %#v", m)
 	}
 	assertCommandCleared(t, m.Command)
 	if m.Deps != nil {
 		t.Fatalf("message retained deps backing storage: %#v", m.Deps)
+	}
+	if m.AcceptDeps != nil {
+		t.Fatalf("message retained accept deps backing storage: %#v", m.AcceptDeps)
 	}
 	if m.Checksum != ([32]byte{}) {
 		t.Fatalf("message retained checksum: %#v", m.Checksum)

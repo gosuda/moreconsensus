@@ -3,6 +3,7 @@ package epaxos
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -50,6 +51,57 @@ func TestUserCommittedCommandQueuesExecutedRecordOnlyAfterAdvance(t *testing.T) 
 	advanceOK(t, rn, next)
 	if got := requireStoredStatus(t, store, ref); got != StatusExecuted {
 		t.Fatalf("stored status after executed ready = %s, want executed", got)
+	}
+}
+
+func TestOutstandingCommittedReadyRemainsVisibleUntilAdvance(t *testing.T) {
+	store := NewMemoryStorage()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := Command{ID: CommandID{Client: 44, Sequence: 55}, Payload: []byte("retry-user"), ConflictKeys: [][]byte{[]byte("retry-key")}}
+	ref, err := rn.Propose(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rd := rn.Ready()
+	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+		t.Fatalf("ready for %s = %#v", ref, rd)
+	}
+	if readyHasStatus(rd, ref, StatusExecuted) {
+		t.Fatalf("ready for %s persisted executed record before application was acknowledged: %#v", ref, rd.Records)
+	}
+
+	if !rn.HasReady() {
+		t.Fatal("outstanding Ready was hidden before Advance")
+	}
+	retry := rn.Ready()
+	requireSameReady(t, retry, rd)
+	committed := requireCommittedForRef(t, retry, ref)
+	if committed.Command.ID != cmd.ID || committed.Command.Kind != CommandUser || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+		t.Fatalf("retry committed command = %#v, want %#v", committed.Command, cmd)
+	}
+
+	if err := store.ApplyReady(retry); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, retry)
+	if got := requireStoredStatus(t, store, ref); got != StatusCommitted {
+		t.Fatalf("stored status after retried ready = %s, want committed", got)
+	}
+
+	executed := rn.Ready()
+	if len(executed.Committed) != 0 || !readyHasStatus(executed, ref, StatusExecuted) {
+		t.Fatalf("post-Advance ready for %s = %#v, want executed record without replaying command", ref, executed)
+	}
+	if err := store.ApplyReady(executed); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, executed)
+	if rn.HasReady() {
+		t.Fatalf("accepted retried ready for %s left pending work: %#v", ref, rn.Ready())
 	}
 }
 
@@ -586,11 +638,13 @@ func TestAdvanceRejectsOverlongCommittedAcknowledgement(t *testing.T) {
 
 	otherRef := InstanceRef{Replica: 1, Instance: ref.Instance + 10, Conf: 1}
 	other := InstanceRecord{
-		Ref:     otherRef,
-		Status:  StatusExecuted,
-		Seq:     99,
-		Deps:    rn.q.deps(),
-		Command: Command{ID: CommandID{Client: 91, Sequence: 13}, Payload: []byte("unrelated-user"), ConflictKeys: [][]byte{[]byte("unrelated-key")}},
+		Ref:          otherRef,
+		Ballot:       Ballot{Replica: 1},
+		RecordBallot: Ballot{Replica: 1},
+		Status:       StatusExecuted,
+		Seq:          99,
+		Deps:         rn.q.deps(),
+		Command:      Command{ID: CommandID{Client: 91, Sequence: 13}, Payload: []byte("unrelated-user"), ConflictKeys: [][]byte{[]byte("unrelated-key")}},
 	}
 	other.Checksum = ChecksumRecord(other)
 	rn.instances[otherRef] = &instance{rec: other, phase: phaseCommitted}
@@ -726,6 +780,13 @@ func cloneReady(rd Ready) Ready {
 		out.Committed[i] = rd.Committed[i].Clone()
 	}
 	return out
+}
+
+func requireSameReady(t *testing.T, got, want Ready) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ready = %#v, want same outstanding ready %#v", got, want)
+	}
 }
 
 func requireCommittedForRef(t *testing.T, rd Ready, ref InstanceRef) CommittedCommand {

@@ -5,11 +5,12 @@ import (
 	"encoding/binary"
 )
 
-var wireMagic = [...]byte{'M', 'E', 'P', '1'}
+var wireMagic = [...]byte{'M', 'E', 'P', '2'}
 
 const (
-	maxWireDeps         = 128
-	maxWireConflictKeys = 128
+	maxWireDeps           = 128
+	maxWireConflictKeys   = 128
+	maxWireAcceptEvidence = 128
 )
 
 // DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
@@ -19,6 +20,7 @@ const (
 // alias the input buffer.
 type DecodeScratch struct {
 	Deps         []InstanceNum
+	AcceptDeps   []InstanceNum
 	ConflictKeys [][]byte
 }
 
@@ -28,6 +30,7 @@ func (s *DecodeScratch) Reset() {
 		s.ConflictKeys[i] = nil
 	}
 	s.Deps = s.Deps[:0]
+	s.AcceptDeps = s.AcceptDeps[:0]
 	s.ConflictKeys = s.ConflictKeys[:0]
 }
 
@@ -38,6 +41,15 @@ func (s *DecodeScratch) deps(n int) []InstanceNum {
 		s.Deps = s.Deps[:n]
 	}
 	return s.Deps
+}
+
+func (s *DecodeScratch) acceptDeps(n int) []InstanceNum {
+	if cap(s.AcceptDeps) < n {
+		s.AcceptDeps = make([]InstanceNum, n)
+	} else {
+		s.AcceptDeps = s.AcceptDeps[:n]
+	}
+	return s.AcceptDeps
 }
 
 func (s *DecodeScratch) conflictKeys(n int) [][]byte {
@@ -57,8 +69,13 @@ func (s *DecodeScratch) conflictKeys(n int) [][]byte {
 
 // EncodeMessage appends the canonical wire representation of m to dst.
 func EncodeMessage(dst []byte, m Message) ([]byte, error) {
-	if len(m.Deps) > maxWireDeps || len(m.Command.ConflictKeys) > maxWireConflictKeys {
+	if len(m.Deps) > maxWireDeps || len(m.AcceptDeps) > maxWireDeps || len(m.AcceptEvidence) > maxWireAcceptEvidence || len(m.Command.ConflictKeys) > maxWireConflictKeys {
 		return dst, ErrInvalidMessage
+	}
+	for _, ev := range m.AcceptEvidence {
+		if len(ev.Deps) > maxWireDeps {
+			return dst, ErrInvalidMessage
+		}
 	}
 	m.Checksum = ChecksumMessage(m)
 	dst = append(dst, wireMagic[:]...)
@@ -68,14 +85,40 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Replica))
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Instance))
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Conf))
+	dst = binary.AppendUvarint(dst, m.ProcessAt)
+	if m.TOQ {
+		dst = append(dst, 1)
+	} else {
+		dst = append(dst, 0)
+	}
 	dst = binary.AppendUvarint(dst, m.Ballot.Epoch)
 	dst = binary.AppendUvarint(dst, m.Ballot.Number)
 	dst = binary.AppendUvarint(dst, uint64(m.Ballot.Replica))
+	dst = binary.AppendUvarint(dst, m.RecordBallot.Epoch)
+	dst = binary.AppendUvarint(dst, m.RecordBallot.Number)
+	dst = binary.AppendUvarint(dst, uint64(m.RecordBallot.Replica))
 	dst = binary.AppendUvarint(dst, m.Seq)
 	dst = binary.AppendUvarint(dst, uint64(len(m.Deps)))
 	for _, dep := range m.Deps {
 		dst = binary.AppendUvarint(dst, uint64(dep))
 	}
+	dst = binary.AppendUvarint(dst, m.AcceptSeq)
+	dst = binary.AppendUvarint(dst, uint64(len(m.AcceptDeps)))
+	for _, dep := range m.AcceptDeps {
+		dst = binary.AppendUvarint(dst, uint64(dep))
+	}
+	dst = binary.AppendUvarint(dst, uint64(len(m.AcceptEvidence)))
+	for _, ev := range m.AcceptEvidence {
+		dst = binary.AppendUvarint(dst, uint64(ev.Sender))
+		dst = binary.AppendUvarint(dst, ev.Seq)
+		dst = binary.AppendUvarint(dst, uint64(len(ev.Deps)))
+		for _, dep := range ev.Deps {
+			dst = binary.AppendUvarint(dst, uint64(dep))
+		}
+	}
+	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Replica))
+	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Instance))
+	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Conf))
 	dst = appendCommand(dst, m.Command)
 	if m.Reject {
 		dst = append(dst, 1)
@@ -85,6 +128,17 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	dst = binary.AppendUvarint(dst, m.RejectHint.Epoch)
 	dst = binary.AppendUvarint(dst, m.RejectHint.Number)
 	dst = binary.AppendUvarint(dst, uint64(m.RejectHint.Replica))
+	dst = binary.AppendUvarint(dst, uint64(m.RejectReason))
+	dst = binary.AppendUvarint(dst, uint64(m.ConflictRef.Replica))
+	dst = binary.AppendUvarint(dst, uint64(m.ConflictRef.Instance))
+	dst = binary.AppendUvarint(dst, uint64(m.ConflictRef.Conf))
+	dst = binary.AppendUvarint(dst, uint64(m.ConflictStatus))
+	if m.FastPathEligible {
+		dst = append(dst, 1)
+	} else {
+		dst = append(dst, 0)
+	}
+	dst = binary.AppendUvarint(dst, m.DepsCommitted)
 	dst = binary.AppendUvarint(dst, uint64(m.RecordStatus))
 	dst = append(dst, m.Checksum[:]...)
 	return dst, nil
@@ -115,7 +169,10 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	m.From = ReplicaID(p.uvarint())
 	m.To = ReplicaID(p.uvarint())
 	m.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
+	m.ProcessAt = p.uvarint()
+	m.TOQ = p.byte() == 1
 	m.Ballot = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
+	m.RecordBallot = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
 	m.Seq = p.uvarint()
 	deps := p.uvarint()
 	if deps > maxWireDeps {
@@ -129,9 +186,47 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	for i := range m.Deps {
 		m.Deps[i] = InstanceNum(p.uvarint())
 	}
+	m.AcceptSeq = p.uvarint()
+	acceptDeps := p.uvarint()
+	if acceptDeps > maxWireDeps {
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
+	}
+	if scratch != nil {
+		m.AcceptDeps = scratch.acceptDeps(int(acceptDeps))
+	} else {
+		m.AcceptDeps = make([]InstanceNum, int(acceptDeps))
+	}
+	for i := range m.AcceptDeps {
+		m.AcceptDeps[i] = InstanceNum(p.uvarint())
+	}
+	evidence := p.uvarint()
+	if evidence > maxWireAcceptEvidence {
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
+	}
+	if evidence > 0 {
+		m.AcceptEvidence = make([]AcceptEvidence, int(evidence))
+		for i := range m.AcceptEvidence {
+			m.AcceptEvidence[i].Sender = ReplicaID(p.uvarint())
+			m.AcceptEvidence[i].Seq = p.uvarint()
+			deps := p.uvarint()
+			if deps > maxWireDeps {
+				return decodeMessageError(m, scratch, ErrInvalidMessage)
+			}
+			m.AcceptEvidence[i].Deps = make([]InstanceNum, int(deps))
+			for j := range m.AcceptEvidence[i].Deps {
+				m.AcceptEvidence[i].Deps[j] = InstanceNum(p.uvarint())
+			}
+		}
+	}
+	m.IgnoreDependency.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
 	m.Command = p.command()
 	m.Reject = p.byte() == 1
 	m.RejectHint = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
+	m.RejectReason = RejectReason(p.uvarint())
+	m.ConflictRef = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
+	m.ConflictStatus = Status(p.uvarint())
+	m.FastPathEligible = p.byte() == 1
+	m.DepsCommitted = p.uvarint()
 	m.RecordStatus = Status(p.uvarint())
 	if p.err || len(p.b) != 0 {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)

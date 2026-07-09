@@ -48,7 +48,7 @@
                   "PID_DIR" "/tmp/pids"
                   "BASE_PORT" "9000"}
         nodes ["127.0.0.1:9001" "127.0.0.1:9002"]]
-    (doseq [faults [nil "" "crash" "Restart" " restart "]]
+    (doseq [faults [nil "" "crash" "Restart" " restart " "wall-clock-skew"]]
       (testing (str "fault selector " (pr-str faults))
         (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env "FAULTS" faults))]
           (is (nil? (epaxos/local-fault-config {:nodes nodes}))))))))
@@ -58,16 +58,20 @@
         env {"FAULTS" "restart"
              "BIN" "/opt/moreconsensus/kvnode"
              "DATA_DIR" "/var/lib/moreconsensus"
-             "PEERS" "127.0.0.1:9101,127.0.0.1:9102"
+             "PEERS" "1=http://127.0.0.1:9201,2=http://127.0.0.1:9202"
              "PID_DIR" "/var/run/moreconsensus"
-             "BASE_PORT" "9100"}]
+             "BASE_PORT" "9100"
+             "PEER_BASE_PORT" "9200"
+             "ADMIN_BASE_PORT" "9300"}]
     (with-redefs [epaxos/fault-env (fault-env-from env)]
       (is (= {:faults "restart"
               :bin "/opt/moreconsensus/kvnode"
               :data-dir "/var/lib/moreconsensus"
-              :peers "127.0.0.1:9101,127.0.0.1:9102"
+              :peers "1=http://127.0.0.1:9201,2=http://127.0.0.1:9202"
               :pid-dir "/var/run/moreconsensus"
               :base-port 9100
+              :peer-base-port 9200
+              :admin-base-port 9300
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
 
@@ -78,50 +82,215 @@
              "DATA_DIR" "/var/lib/moreconsensus"
              "PEERS" "127.0.0.1:9101,127.0.0.1:9102"
              "PID_DIR" "/var/run/moreconsensus"
-             "BASE_PORT" "9100"}]
+             "BASE_PORT" "9100"
+             "PEER_BASE_PORT" "9200"
+             "ADMIN_BASE_PORT" "9300"}]
     (with-redefs [epaxos/fault-env (fault-env-from env)]
       (is (= {:faults "transport"
               :base-port 9100
+              :peer-base-port 9200
+              :admin-base-port 9300
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
 
 (deftest local-fault-config-uses-provided-storage-env
   (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
         env {"FAULTS" "storage"
-             "BASE_PORT" "9100"}]
+             "BASE_PORT" "9100"
+             "PEER_BASE_PORT" "9200"
+             "ADMIN_BASE_PORT" "9300"}]
     (with-redefs [epaxos/fault-env (fault-env-from env)]
       (is (= {:faults "storage"
               :base-port 9100
+              :peer-base-port 9200
+              :admin-base-port 9300
               :nodes nodes}
              (epaxos/local-fault-config {:nodes nodes}))))))
 
-(deftest remote-config-is-opt-in-and-builds-peer-urls-for-bare-nodes
+(deftest remote-config-is-opt-in-and-builds-separated-plane-urls-for-bare-nodes
   (let [nodes ["alpha" "bravo"]
         env {"REMOTE" "yes"
              "FAULTS" "restart"
              "BIN" "/opt/kvnode"
              "HTTP_PORT" "19090"
+             "PEER_PORT" "19091"
+             "ADMIN_PORT" "19092"
              "REMOTE_DIR" "/srv/kv"}]
     (testing "remote harness stays disabled unless explicitly requested"
       (with-redefs [epaxos/fault-env (fault-env-from (assoc env "REMOTE" "0"))]
         (is (nil? (epaxos/remote-config {:nodes nodes})))))
-    (testing "bare hostnames get stable node ids and peer URLs on the configured HTTP port"
+    (testing "bare hostnames get stable node ids and separated client peer and admin ports"
       (with-redefs [epaxos/fault-env (fault-env-from env)]
         (let [cfg (epaxos/remote-config {:nodes nodes})]
           (is (= {:faults "restart"
                   :bin "/opt/kvnode"
                   :remote-dir "/srv/kv"
                   :http-port 19090
+                  :peer-port 19091
+                  :admin-port 19092
                   :nodes nodes
                   :node-ids {"alpha" 1 "bravo" 2}
-                  :peers "1=http://alpha:19090,2=http://bravo:19090"}
+                  :peers "1=http://alpha:19091,2=http://bravo:19091"}
                  cfg))
-          (is (= "1=http://alpha:19090,2=http://bravo:19090"
+          (is (= "1=http://alpha:19091,2=http://bravo:19091"
                  (epaxos/peer-spec cfg)))
           (is (= "alpha:19090"
                  (epaxos/http-node cfg "alpha")))
+          (is (= "alpha:19091"
+                 (epaxos/peer-node cfg "alpha")))
+          (is (= "alpha:19092"
+                 (epaxos/admin-node cfg "alpha")))
           (is (= "bravo:7777"
                  (epaxos/http-node cfg "bravo:7777"))))))))
+
+(deftest remote-config-requires-confirmation-for-remote-destructive-storage
+  (let [nodes ["alpha"]
+        base-env {"REMOTE" "yes"
+                  "FAULTS" "destructive-storage"
+                  "BIN" "/opt/kvnode"
+                  "REMOTE_DIR" "/srv/kv"}]
+    (testing "destructive storage requires explicit remote confirmation"
+      (with-redefs [epaxos/fault-env (fault-env-from base-env)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"REMOTE_DESTRUCTIVE_CONFIRM=yes"
+                              (epaxos/remote-config {:nodes nodes})))))
+    (testing "confirmation enables destructive storage"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "REMOTE_DESTRUCTIVE_CONFIRM" "yes"))]
+        (is (= "destructive-storage" (:faults (epaxos/remote-config {:nodes nodes}))))))
+    (testing "non-destructive remote faults do not require destructive confirmation"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "FAULTS" "restart"))]
+        (is (= "restart" (:faults (epaxos/remote-config {:nodes nodes}))))))))
+
+(deftest remote-config-requires-confirmation-for-remote-wall-clock-skew
+  (let [nodes ["alpha"]
+        base-env {"REMOTE" "yes"
+                  "FAULTS" "wall-clock-skew"
+                  "BIN" "/opt/kvnode"
+                  "REMOTE_DIR" "/srv/kv"}]
+    (testing "wall-clock skew requires explicit remote confirmation"
+      (with-redefs [epaxos/fault-env (fault-env-from base-env)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"REMOTE_WALL_CLOCK_SKEW_CONFIRM=yes"
+                              (epaxos/remote-config {:nodes nodes})))))
+    (testing "confirmation enables wall-clock skew"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "REMOTE_WALL_CLOCK_SKEW_CONFIRM" "yes"))]
+        (is (= "wall-clock-skew" (:faults (epaxos/remote-config {:nodes nodes}))))))
+    (testing "destructive confirmation alone does not enable wall-clock skew"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "REMOTE_DESTRUCTIVE_CONFIRM" "yes"))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"REMOTE_WALL_CLOCK_SKEW_CONFIRM=yes"
+                              (epaxos/remote-config {:nodes nodes})))))))
+
+
+(deftest remote-config-validates-remote-dir-before-destructive-use
+  (let [nodes ["alpha"]
+        base-env {"REMOTE" "yes"
+                  "FAULTS" "destructive-storage"
+                  "BIN" "/opt/kvnode"
+                  "REMOTE_DESTRUCTIVE_CONFIRM" "yes"}]
+    (doseq [path ["" "/" "/tmp" "/var" "/srv"
+                  "relative/kv"
+                  "/tmp/../kv"
+                  "/srv/../kv"
+                  "/tmp/moreconsensus-jepsen*"
+                  "/tmp/moreconsensus-jepsen-old"
+                  "/srv/kv-old"
+                  "/opt/other"]]
+      (testing (str "rejects unsafe remote dir " (pr-str path))
+        (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env "REMOTE_DIR" path))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                #"unsafe remote dir"
+                                (epaxos/remote-config {:nodes nodes}))))))
+    (doseq [[path want] [[nil "/tmp/moreconsensus-jepsen"]
+                         ["/tmp/moreconsensus-jepsen" "/tmp/moreconsensus-jepsen"]
+                         ["/tmp/moreconsensus-jepsen/cluster-a" "/tmp/moreconsensus-jepsen/cluster-a"]
+                         ["/srv/kv" "/srv/kv"]
+                         ["/srv/kv/cluster-a" "/srv/kv/cluster-a"]]]
+      (testing (str "accepts project-owned remote dir " (pr-str path))
+        (let [env (if path
+                    (assoc base-env "REMOTE_DIR" path)
+                    base-env)]
+          (with-redefs [epaxos/fault-env (fault-env-from env)]
+            (is (= want (:remote-dir (epaxos/remote-config {:nodes nodes}))))))))
+    (testing "explicit operator override allows a structurally safe non-default tree"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "REMOTE_DIR" "/opt/moreconsensus/kv"
+                                                            "REMOTE_DIR_ALLOW_UNSAFE" "yes"))]
+        (is (= "/opt/moreconsensus/kv"
+               (:remote-dir (epaxos/remote-config {:nodes nodes}))))))
+    (testing "operator override still rejects broad system directories"
+      (with-redefs [epaxos/fault-env (fault-env-from (assoc base-env
+                                                            "REMOTE_DIR" "/tmp"
+                                                            "REMOTE_DIR_ALLOW_UNSAFE" "yes"))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"unsafe remote dir"
+                              (epaxos/remote-config {:nodes nodes})))))))
+
+(deftest remote-destructive-ops-validate-dir-before-side-effects
+  (let [cfg {:remote-dir "/srv"
+             :node-ids {"alpha" 1}}
+        calls (atom [])]
+    (with-redefs [control/exec (fn [& args]
+                                 (swap! calls conj (into [:exec] args))
+                                 {:exit 0})
+                  control/upload (fn [source dest]
+                                   (swap! calls conj [:upload source dest]))
+                  cu/exists? (fn [path]
+                               (swap! calls conj [:exists path])
+                               false)
+                  cu/stop-daemon! (fn [pid-file]
+                                    (swap! calls conj [:stop-daemon pid-file])
+                                    :stopped)
+                  cu/start-daemon! (fn [opts cmd & args]
+                                     (swap! calls conj [:start-daemon opts cmd (vec args)])
+                                     :started)
+                  epaxos/wait-node-health (fn [_ node]
+                                            (swap! calls conj [:health node])
+                                            {:status 200 :healthy true})]
+      (doseq [[name op] [["setup" #(epaxos/remote-setup-node! cfg "alpha")]
+                         ["teardown" #(epaxos/remote-teardown-node! cfg "alpha")]
+                         ["remove" #(epaxos/remove-remote-storage! cfg "alpha")]
+                         ["restore" #(epaxos/restore-remote-storage! cfg "alpha")]]]
+        (testing name
+          (reset! calls [])
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                #"unsafe remote dir"
+                                (op)))
+          (is (= [] @calls)))))))
+
+(deftest remote-wall-clock-skew-restores-from-captured-baseline
+  (let [now-ms (atom 5000)
+        epochs (atom [1000 1005])
+        sets (atom [])
+        baselines (atom {})]
+    (with-redefs [epaxos/controller-now-ms (fn [] @now-ms)
+                  epaxos/remote-wall-clock-epoch-seconds (fn []
+                                                           (let [epoch (first @epochs)]
+                                                             (swap! epochs #(vec (rest %)))
+                                                             epoch))
+                  epaxos/set-remote-wall-clock-epoch-seconds! (fn [epoch]
+                                                                (swap! sets conj epoch))]
+      (let [skewed (epaxos/skew-remote-wall-clock! baselines "alpha" 120)]
+        (is (= {:node "alpha"
+                :action :wall-clock-skewed
+                :offset-seconds 120
+                :baseline {:remote-seconds 1000 :controller-ms 5000}
+                :before 1005
+                :target 1125}
+               skewed))
+        (reset! now-ms 7000)
+        (let [reset (epaxos/reset-remote-wall-clock! baselines "alpha")]
+          (is (= {:node "alpha"
+                  :action :wall-clock-reset
+                  :baseline {:remote-seconds 1000 :controller-ms 5000}
+                  :elapsed-seconds 2
+                  :target 1002}
+                 reset)))))
+    (is (= [1125 1002] @sets))))
 
 (deftest local-restart-generator-emits-node-restarts-in-order
   (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
@@ -160,6 +329,18 @@
             {:type :info :f :restore-storage :value "127.0.0.1:9101"}
             {:type :info :f :remove-storage :value "127.0.0.1:9102"}
             {:type :info :f :restore-storage :value "127.0.0.1:9102"}]
+           (fault-ops ops)))
+    (is (= 8 (count ops)))))
+
+(deftest wall-clock-skew-generator-emits-signed-skew-and-reset-in-order
+  (let [cfg {:nodes ["alpha" "bravo"]
+             :node-ids {"alpha" 1 "bravo" 2}}
+        ops (with-redefs [epaxos/wall-clock-skew-seconds (fn [] 300)]
+              (vec (take 9 (epaxos/wall-clock-skew-generator cfg))))]
+    (is (= [{:type :info :f :skew-wall-clock :value {:node "alpha" :offset-seconds 300}}
+            {:type :info :f :reset-wall-clock :value "alpha"}
+            {:type :info :f :skew-wall-clock :value {:node "bravo" :offset-seconds -300}}
+            {:type :info :f :reset-wall-clock :value "bravo"}]
            (fault-ops ops)))
     (is (= 8 (count ops)))))
 
@@ -212,6 +393,25 @@
             {:type :info
              :f :heal-storage
              :value "127.0.0.1:9101"}]
+           nemesis-faults))))
+
+(deftest workload-routes-wall-clock-skew-faults-to-clock-generator
+  (let [fault-cfg {:faults "wall-clock-skew"
+                   :nodes ["alpha" "bravo"]
+                   :node-ids {"alpha" 1 "bravo" 2}}
+        generator (:generator (epaxos/workload fault-cfg))
+        [client-op] (generated-ops-for generator 0 1)
+        nemesis-faults (with-redefs [epaxos/wall-clock-skew-seconds (fn [] 60)]
+                         (fault-ops (take 5 (epaxos/local-fault-generator fault-cfg))))]
+    (is (= :invoke (:type client-op)))
+    (is (= 0 (:process client-op)))
+    (is (contains? client-operation-fs (:f client-op)))
+    (is (= [{:type :info
+             :f :skew-wall-clock
+             :value {:node "alpha" :offset-seconds 60}}
+            {:type :info
+             :f :reset-wall-clock
+             :value "alpha"}]
            nemesis-faults))))
 
 (deftest client-workload-generator-seeds-scan-keys-before-stale-scans
@@ -295,6 +495,54 @@
               [:write cfg node "4242"]]
              @calls)))))
 
+(deftest node-health-requests-admin-plane
+  (let [cfg {:http-port 19090
+             :admin-port 19092
+             :nodes ["alpha"]}
+        requests (atom [])]
+    (with-redefs [http/get (fn [url opts]
+                             (swap! requests conj [url opts])
+                             {:status 200})]
+      (is (= {:node "alpha" :status 200 :healthy true}
+             (epaxos/node-health cfg "alpha")))
+      (is (= [["http://alpha:19092/health"
+               {:throw-exceptions false}]]
+             @requests)))))
+
+(deftest launch-node-process-passes-separated-client-peer-and-admin-listeners
+  (let [root (doto (java.io.File/createTempFile "epaxos-launch" "args")
+               (.delete)
+               (.mkdirs))
+        data-dir (io/file root "data")
+        args-file (io/file root "args.txt")
+        bin (io/file root "kvnode")
+        cfg {:bin (.getPath bin)
+             :data-dir (.getPath data-dir)
+             :base-port 9100
+             :peer-base-port 9200
+             :admin-base-port 9300
+             :peers "1=http://127.0.0.1:9201,2=http://127.0.0.1:9202"}
+        node "127.0.0.1:9101"]
+    (try
+      (spit bin (str "#!/bin/sh\n"
+                     "for arg in \"$@\"; do\n"
+                     "  printf '%s\\n' \"$arg\"\n"
+                     "done > '" (.getPath args-file) "'\n"))
+      (.setExecutable bin true)
+      (let [pid (epaxos/launch-node-process! cfg node)
+            handle (java.lang.ProcessHandle/of (Long/parseLong pid))]
+        (when (.isPresent handle)
+          (.get (.onExit (.get handle)) 5 java.util.concurrent.TimeUnit/SECONDS))
+        (is (= ["-id" "1"
+                "-listen" ":9101"
+                "-peer-listen" ":9201"
+                "-admin-listen" ":9301"
+                "-data" (.getPath (io/file data-dir "node-1"))
+                "-peers" "1=http://127.0.0.1:9201,2=http://127.0.0.1:9202"]
+               (vec (line-seq (io/reader args-file))))))
+    (finally
+      (epaxos/local-rm-rf! root)))))
+
 (deftest local-restart-nemesis-reports-unhealthy-restart
   (let [cfg {:faults "restart"
              :nodes ["127.0.0.1:9101"]}
@@ -371,6 +619,7 @@
 (deftest local-transport-nemesis-issues-control-requests-for-source-and-destination-pairs
   (let [cfg {:faults "transport"
              :base-port 9100
+             :admin-base-port 9300
              :nodes ["127.0.0.1:9101" "127.0.0.1:9102"]}
         calls (atom [])]
     (with-redefs [epaxos/transport-fault-request! (fn [node from to drop?]
@@ -385,28 +634,28 @@
                                      {:type :invoke
                                       :f :heal-node
                                       :value "127.0.0.1:9101"})]
-        (is (= [["127.0.0.1:9101" 1 2 true]
-                ["127.0.0.1:9101" 2 1 true]
-                ["127.0.0.1:9102" 1 2 true]
-                ["127.0.0.1:9102" 2 1 true]
-                ["127.0.0.1:9101" 1 2 false]
-                ["127.0.0.1:9101" 2 1 false]
-                ["127.0.0.1:9102" 1 2 false]
-                ["127.0.0.1:9102" 2 1 false]]
+        (is (= [["127.0.0.1:9301" 1 2 true]
+                ["127.0.0.1:9301" 2 1 true]
+                ["127.0.0.1:9302" 1 2 true]
+                ["127.0.0.1:9302" 2 1 true]
+                ["127.0.0.1:9301" 1 2 false]
+                ["127.0.0.1:9301" 2 1 false]
+                ["127.0.0.1:9302" 1 2 false]
+                ["127.0.0.1:9302" 2 1 false]]
                @calls))
         (is (= {:type :info
                 :f :isolate-node
-                :value [{:node "127.0.0.1:9101" :from 1 :to 2 :drop true :status 204}
-                        {:node "127.0.0.1:9101" :from 2 :to 1 :drop true :status 204}
-                        {:node "127.0.0.1:9102" :from 1 :to 2 :drop true :status 204}
-                        {:node "127.0.0.1:9102" :from 2 :to 1 :drop true :status 204}]}
+                :value [{:node "127.0.0.1:9301" :from 1 :to 2 :drop true :status 204}
+                        {:node "127.0.0.1:9301" :from 2 :to 1 :drop true :status 204}
+                        {:node "127.0.0.1:9302" :from 1 :to 2 :drop true :status 204}
+                        {:node "127.0.0.1:9302" :from 2 :to 1 :drop true :status 204}]}
                (select-keys isolate-op [:type :f :value])))
         (is (= {:type :info
                 :f :heal-node
-                :value [{:node "127.0.0.1:9101" :from 1 :to 2 :drop false :status 204}
-                        {:node "127.0.0.1:9101" :from 2 :to 1 :drop false :status 204}
-                        {:node "127.0.0.1:9102" :from 1 :to 2 :drop false :status 204}
-                        {:node "127.0.0.1:9102" :from 2 :to 1 :drop false :status 204}]}
+                :value [{:node "127.0.0.1:9301" :from 1 :to 2 :drop false :status 204}
+                        {:node "127.0.0.1:9301" :from 2 :to 1 :drop false :status 204}
+                        {:node "127.0.0.1:9302" :from 1 :to 2 :drop false :status 204}
+                        {:node "127.0.0.1:9302" :from 2 :to 1 :drop false :status 204}]}
                (select-keys heal-op [:type :f :value])))))))
 
 
@@ -414,6 +663,7 @@
   (let [nodes ["127.0.0.1:9101" "127.0.0.1:9102"]
         cfg {:faults "storage"
              :base-port 9100
+             :admin-base-port 9300
              :nodes nodes}
         requests (atom [])]
     (with-redefs [http/post (fn [url opts]
@@ -431,25 +681,25 @@
         (nemesis/teardown! nemesis {:nodes ["127.0.0.1:9999"]})
         (is (= {:type :info
                 :f :fail-storage
-                :value {:node "127.0.0.1:9101" :fail true :status 204}}
+                :value {:node "127.0.0.1:9301" :fail true :status 204}}
                (select-keys fail-op [:type :f :value])))
         (is (= {:type :info
                 :f :heal-storage
-                :value {:node "127.0.0.1:9101" :fail false :status 204}}
+                :value {:node "127.0.0.1:9301" :fail false :status 204}}
                (select-keys heal-op [:type :f :value])))
-        (is (= [["http://127.0.0.1:9101/faults/storage"
+        (is (= [["http://127.0.0.1:9301/faults/storage"
                  {:body (json/write-str {"fail" true})
                   :content-type :json
                   :throw-exceptions false}]
-                ["http://127.0.0.1:9101/faults/storage"
+                ["http://127.0.0.1:9301/faults/storage"
                  {:body (json/write-str {"fail" false})
                   :content-type :json
                   :throw-exceptions false}]
-                ["http://127.0.0.1:9101/faults/storage"
+                ["http://127.0.0.1:9301/faults/storage"
                  {:body (json/write-str {"fail" false})
                   :content-type :json
                   :throw-exceptions false}]
-                ["http://127.0.0.1:9102/faults/storage"
+                ["http://127.0.0.1:9302/faults/storage"
                  {:body (json/write-str {"fail" false})
                   :content-type :json
                   :throw-exceptions false}]]
@@ -640,11 +890,13 @@
       (is (= [[:exists "/srv/kv/node-1.removed"]]
              @calls)))))
 
-(deftest remote-start-node-constructs-command-from-node-id-port-and-peer-spec
+(deftest remote-start-node-constructs-command-from-separated-node-ports-and-peer-spec
   (let [cfg {:remote-dir "/srv/kv"
              :http-port 19090
+             :peer-port 19091
+             :admin-port 19092
              :node-ids {"alpha" 1 "bravo" 2}
-             :peers "1=http://alpha:19090,2=http://bravo:19090"}
+             :peers "1=http://alpha:19091,2=http://bravo:19091"}
         calls (atom [])]
     (with-redefs [control/exec (fn [& args]
                                  (swap! calls conj (into [:exec] args))
@@ -667,8 +919,10 @@
                "/srv/kv/kvnode"
                ["-id" "2"
                 "-listen" ":19090"
+                "-peer-listen" ":19091"
+                "-admin-listen" ":19092"
                 "-data" "/srv/kv/node-2"
-                "-peers" "1=http://alpha:19090,2=http://bravo:19090"]]
+                "-peers" "1=http://alpha:19091,2=http://bravo:19091"]]
               [:health "bravo"]]
              @calls)))))
 
@@ -676,8 +930,10 @@
   (let [cfg {:bin "/opt/kvnode"
              :remote-dir "/srv/kv"
              :http-port 19090
+             :peer-port 19091
+             :admin-port 19092
              :node-ids {"alpha" 1}
-             :peers "1=http://alpha:19090"}
+             :peers "1=http://alpha:19091"}
         calls (atom [])]
     (with-redefs [control/exec (fn [& args]
                                  (swap! calls conj (into [:exec] args))
@@ -710,8 +966,10 @@
                "/srv/kv/kvnode"
                ["-id" "1"
                 "-listen" ":19090"
+                "-peer-listen" ":19091"
+                "-admin-listen" ":19092"
                 "-data" "/srv/kv/node-1"
-                "-peers" "1=http://alpha:19090"]]
+                "-peers" "1=http://alpha:19091"]]
               [:health "alpha"]]
              @calls)))))
 
@@ -797,9 +1055,10 @@
                         :start {:node "alpha" :action :started}}}
                (select-keys restore-op [:type :f :value])))))))
 
-(deftest remote-storage-http-faults-use-configured-port-for-bare-hostnames
+(deftest remote-storage-http-faults-use-admin-port-for-bare-hostnames
   (let [cfg {:faults "storage"
              :http-port 19090
+             :admin-port 19092
              :nodes ["alpha" "bravo"]}
         requests (atom [])]
     (with-redefs [http/post (fn [url opts]
@@ -812,9 +1071,9 @@
                                  :value "alpha"})]
         (is (= {:type :info
                 :f :fail-storage
-                :value {:node "alpha:19090" :fail true :status 204}}
+                :value {:node "alpha:19092" :fail true :status 204}}
                (select-keys op [:type :f :value])))
-        (is (= [["http://alpha:19090/faults/storage"
+        (is (= [["http://alpha:19092/faults/storage"
                  {:body (json/write-str {"fail" true})
                   :content-type :json
                   :throw-exceptions false}]]
@@ -830,6 +1089,8 @@
              "PID_DIR" "/tmp/pids"
              "BASE_PORT" "9000"
              "HTTP_PORT" "19090"
+             "PEER_PORT" "19091"
+             "ADMIN_PORT" "19092"
              "REMOTE_DIR" "/srv/kv"}
         calls (atom [])]
     (with-redefs [epaxos/fault-env (fault-env-from env)
@@ -848,7 +1109,7 @@
                                  :value "bravo"})]
         (is (= 19090 (:http-port test)))
         (is (= [[:on-nodes ["bravo"] 19090]
-                [:remote-stop "1=http://alpha:19090,2=http://bravo:19090" "bravo"]]
+                [:remote-stop "1=http://alpha:19091,2=http://bravo:19091" "bravo"]]
                @calls))
         (is (= {:type :info
                 :f :kill-node
@@ -1003,6 +1264,14 @@
                                               :tx-c [nil nil]}}])]
       (is (= {:valid? true :checked 1 :bad-count 0}
              (select-keys result [:valid? :checked :bad-count])))))
+  (testing "failed transaction reads complete each per-group history"
+    (let [result (check-txn-history [{:type :invoke :process 0 :f :txn-read :value nil}
+                                     {:type :fail :process 0 :f :txn-read :value "connection refused"}
+                                     {:type :invoke :process 0 :f :txn-read :value nil}
+                                     {:type :ok :process 0 :f :txn-read :value (txn-read-state {})}])]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (empty? (:linearizable-errors result)))))
   (testing "mixed or partial values inside any one group make the read invalid"
     (let [read-op {:type :ok
                    :process 0
@@ -1016,7 +1285,8 @@
       (is (= {:valid? false :checked 1 :bad-count 1}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= {:tx-a [1 2] :tx-c [nil 3]}
-             (:bad-groups bad-op)))))
+             (:bad-groups bad-op)))
+      (is (empty? (:linearizable-errors result)))))
   (testing "mixed delete and write visibility inside a group is invalid"
     (let [read-op {:type :ok
                    :process 0
@@ -1030,7 +1300,8 @@
       (is (= {:valid? false :checked 1 :bad-count 1}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= {:tx-b [nil 5 nil]}
-             (:bad-groups bad-op))))))
+             (:bad-groups bad-op)))
+      (is (empty? (:linearizable-errors result))))))
 
 (deftest txn-atomic-checker-enforces-completed-write-visibility
   (testing "a later read observing the completed write remains valid"
@@ -1110,7 +1381,7 @@
 
 
 (defn check-advanced-scan-history [history]
-  (checker/check (epaxos/advanced-scan-checker) nil history nil))
+  (checker/check (epaxos/advanced-scan-checker) nil (index-history history) nil))
 
 (defn scan-row [key value]
   {:key key :value (pr-str value) :time 0})
@@ -1259,6 +1530,130 @@
       (is (= {:valid? true :checked 0 :bad-count 0}
              (select-keys result [:valid? :checked :bad-count])))
       (is (= [] (vec (:bad result)))))))
+
+(deftest advanced-scan-checker-accepts-completed-scan-write-values
+  (testing "sequential forward and reverse scans return the latest completed scan writes"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :invoke :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :ok :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :invoke :process 2 :f :scan-write :value {:key "scan-c" :value :c1}}
+                   {:type :ok :process 2 :f :scan-write :value {:key "scan-c" :value :c1}}
+                   {:type :invoke :process 3 :f :scan-forward :value nil}
+                   {:type :ok :process 3 :f :scan-forward :value [(scan-row "scan-a" :a1)
+                                                                  (scan-row "scan-b" :b1)
+                                                                  (scan-row "scan-c" :c1)]}
+                   {:type :invoke :process 4 :f :scan-reverse :value nil}
+                   {:type :ok :process 4 :f :scan-reverse :value [(scan-row "scan-c" :c1)
+                                                                  (scan-row "scan-b" :b1)
+                                                                  (scan-row "scan-a" :a1)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 2 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
+
+(deftest advanced-scan-checker-rejects-wrong-completed-scan-write-value
+  (testing "a scan cannot return a different value for a key whose latest write completed before the scan invocation"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :committed}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :committed}}
+                   {:type :invoke :process 1 :f :scan-forward :value nil}
+                   {:type :ok :process 1 :f :scan-forward :value [(scan-row "scan-a" :wrong)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [:scan-forward]
+             (mapv :f (:bad result)))))))
+
+(deftest advanced-scan-checker-rejects-missing-nonoverlapping-scan-key
+  (testing "a scan cannot omit a key whose latest write completed before the scan invocation and has no overlapping mutation"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :invoke :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :ok :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :invoke :process 2 :f :scan-reverse :value nil}
+                   {:type :ok :process 2 :f :scan-reverse :value [(scan-row "scan-b" :b1)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [:scan-reverse]
+             (mapv :f (:bad result)))))))
+
+(deftest advanced-scan-checker-rejects-returned-deleted-scan-key
+  (testing "a scan cannot return a key whose delete completed before the scan invocation and has no overlapping mutation"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-a"}}
+                   {:type :ok :process 1 :f :scan-delete :value {:key "scan-a"}}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :ok :process 2 :f :scan-forward :value [(scan-row "scan-a" :a1)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [:scan-forward]
+             (mapv :f (:bad result)))))))
+
+(deftest advanced-scan-checker-accepts-overlapping-scan-mutations
+  (testing "overlapping writes may be omitted or observed at either old or new value"
+    (doseq [[name rows] [["omitted key" []]
+                         ["old value" [(scan-row "scan-a" :old)]]
+                         ["overlapping value" [(scan-row "scan-a" :new)]]]]
+      (testing name
+        (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                       {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                       {:type :invoke :process 1 :f :scan-write :value {:key "scan-a" :value :new}}
+                       {:type :invoke :process 2 :f :scan-forward :value nil}
+                       {:type :ok :process 2 :f :scan-forward :value rows}
+                       {:type :ok :process 1 :f :scan-write :value {:key "scan-a" :value :new}}]
+              result (check-advanced-scan-history history)]
+          (is (= {:valid? true :checked 1 :bad-count 0}
+                 (select-keys result [:valid? :checked :bad-count])))
+          (is (= [] (vec (:bad result))))))))
+  (testing "an overlapping delete permits the scan to omit the key"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-a"}}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :ok :process 2 :f :scan-forward :value []}
+                   {:type :ok :process 1 :f :scan-delete :value {:key "scan-a"}}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
+
+(deftest advanced-scan-checker-accepts-overlapping-pre-scan-mutation-orders
+  (testing "a write and delete that both finish before a scan but overlap each other may linearize in either order"
+    (doseq [[name rows] [["write after delete" [(scan-row "scan-a" :new)]]
+                         ["delete after write" []]]]
+      (testing name
+        (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                       {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                       {:type :invoke :process 1 :f :scan-write :value {:key "scan-a" :value :new}}
+                       {:type :invoke :process 2 :f :scan-delete :value {:key "scan-a"}}
+                       {:type :ok :process 1 :f :scan-write :value {:key "scan-a" :value :new}}
+                       {:type :ok :process 2 :f :scan-delete :value {:key "scan-a"}}
+                       {:type :invoke :process 3 :f :scan-forward :value nil}
+                       {:type :ok :process 3 :f :scan-forward :value rows}]
+              result (check-advanced-scan-history history)]
+          (is (= {:valid? true :checked 1 :bad-count 0}
+                 (select-keys result [:valid? :checked :bad-count])))
+          (is (= [] (vec (:bad result)))))))))
+
+(deftest advanced-scan-checker-requires-unrelated-nonoverlapping-rows
+  (testing "an overlapping mutation for one key does not permit omission of another definitely present key"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :a1}}
+                   {:type :invoke :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :ok :process 1 :f :scan-write :value {:key "scan-b" :value :b1}}
+                   {:type :invoke :process 2 :f :scan-write :value {:key "scan-c" :value :c1}}
+                   {:type :invoke :process 3 :f :scan-forward :value nil}
+                   {:type :ok :process 3 :f :scan-forward :value [(scan-row "scan-a" :a1)]}
+                   {:type :ok :process 2 :f :scan-write :value {:key "scan-c" :value :c1}}]
+          result (check-advanced-scan-history history)
+          bad (first (:bad result))]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= {:f :scan-forward :bad-scan :missing-row :bad-key "scan-b"}
+             (select-keys bad [:f :bad-scan :bad-key]))))))
 
 (defn timed-scan-row [key value time]
   (assoc (scan-row key value) :time time))

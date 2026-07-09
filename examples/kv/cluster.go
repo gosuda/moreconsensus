@@ -1,9 +1,11 @@
 package kv
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
+	"github.com/cockroachdb/pebble"
 	"gosuda.org/moreconsensus/epaxos"
 )
 
@@ -17,9 +19,85 @@ type Cluster struct {
 	next           uint64
 }
 
+var (
+	clusterStopReplica       = func(c *Cluster, id epaxos.ReplicaID) error { return c.StopReplica(id) }
+	clusterOpenDB            = Open
+	clusterCloseCheckpointDB = func(db *DB) error { return db.Close() }
+)
+
 // OpenCluster opens one Pebble DB per path and wires EPaxos nodes together.
 func OpenCluster(paths []string) (*Cluster, error) {
 	return openCluster(paths, epaxos.NewRawNode)
+}
+
+// StopReplica closes one in-process replica and leaves it absent from
+// deterministic transport. A remaining healthy quorum can continue to make
+// progress; callers can bring the member back with RecoverReplicaFromLiveCheckpoint.
+func (c *Cluster) StopReplica(id epaxos.ReplicaID) error {
+	if !c.hasReplicaID(id) {
+		return fmt.Errorf("kv: unknown replica %d", id)
+	}
+	db := c.DBs[id]
+	delete(c.Nodes, id)
+	delete(c.DBs, id)
+	delete(c.readyAppliers, id)
+	if db == nil {
+		return nil
+	}
+	return db.Close()
+}
+
+// RecoverReplicaFromLiveCheckpoint replaces replica id's data directory with a
+// fresh checkpoint from a live source replica, verifies that checkpoint, checks
+// that committed checkpoint records are supported by the live quorum, and then
+// reopens the repaired replica. It is a whole-directory replacement mode for a
+// stopped or corrupt member; it does not skip, delete, or recompute individual
+// EPaxos records.
+func (c *Cluster) RecoverReplicaFromLiveCheckpoint(id, source epaxos.ReplicaID, dataDir, checkpointDir string) error {
+	if !c.hasReplicaID(id) {
+		return fmt.Errorf("kv: unknown replica %d", id)
+	}
+	if !c.hasReplicaID(source) {
+		return fmt.Errorf("kv: unknown checkpoint source replica %d", source)
+	}
+	if id == source {
+		return fmt.Errorf("kv: recovery source must differ from target replica %d", id)
+	}
+	sourceDB := c.DBs[source]
+	if sourceDB == nil {
+		return fmt.Errorf("kv: checkpoint source replica %d is not live", source)
+	}
+	if c.liveReplicaCountExcluding(id) < clusterSlowQuorum(len(c.ids)) {
+		return fmt.Errorf("kv: live checkpoint recovery requires a healthy quorum excluding replica %d", id)
+	}
+	if err := sourceDB.Checkpoint(checkpointDir); err != nil {
+		return err
+	}
+	if err := VerifyCheckpoint(checkpointDir); err != nil {
+		return fmt.Errorf("kv: live checkpoint verification failed: %w", err)
+	}
+	if err := c.verifyCheckpointAgainstLiveQuorum(checkpointDir, id); err != nil {
+		return err
+	}
+	if err := clusterStopReplica(c, id); err != nil {
+		return err
+	}
+	if err := RepairFromCheckpoint(dataDir, checkpointDir); err != nil {
+		return err
+	}
+	db, err := clusterOpenDB(dataDir)
+	if err != nil {
+		return err
+	}
+	rn, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: c.ids, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+	if err != nil {
+		_ = db.Close()
+		return err
+	}
+	c.DBs[id] = db
+	c.readyAppliers[id] = db.ApplyReady
+	c.Nodes[id] = rn
+	return c.Drain()
 }
 
 func openCluster(paths []string, newNode func(epaxos.Config) (*epaxos.RawNode, error)) (*Cluster, error) {
@@ -67,14 +145,14 @@ func (c *Cluster) Close() error {
 	return errors.Join(errs...)
 }
 
-// Put proposes and applies a replicated put through the first replica.
+// Put proposes and applies a replicated put through the first live replica.
 func (c *Cluster) Put(key, value []byte) error {
 	seq := c.next
 	c.next++
 	return c.proposeAndDrain(CommandForPut(1, seq, key, value))
 }
 
-// Delete proposes and applies a replicated delete through the first replica.
+// Delete proposes and applies a replicated delete through the first live replica.
 func (c *Cluster) Delete(key []byte) error {
 	seq := c.next
 	c.next++
@@ -82,11 +160,24 @@ func (c *Cluster) Delete(key []byte) error {
 }
 
 func (c *Cluster) proposeAndDrain(cmd epaxos.Command) error {
-	_, err := c.Nodes[c.ids[0]].Propose(cmd)
+	proposer := c.firstLiveReplica()
+	if proposer == nil {
+		return fmt.Errorf("kv: no live replica available for proposal")
+	}
+	_, err := proposer.Propose(cmd)
 	if err != nil {
 		return err
 	}
 	return c.Drain()
+}
+
+func (c *Cluster) firstLiveReplica() *epaxos.RawNode {
+	for _, id := range c.ids {
+		if node := c.Nodes[id]; node != nil {
+			return node
+		}
+	}
+	return nil
 }
 
 // Get reads from one replica's local Pebble state.
@@ -96,6 +187,182 @@ func (c *Cluster) Get(id epaxos.ReplicaID, key []byte) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("kv: unknown replica %d", id)
 	}
 	return db.Get(key)
+}
+
+func (c *Cluster) hasReplicaID(id epaxos.ReplicaID) bool {
+	for _, candidate := range c.ids {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Cluster) liveReplicaCountExcluding(id epaxos.ReplicaID) int {
+	var count int
+	for _, candidate := range c.ids {
+		if candidate == id {
+			continue
+		}
+		if c.Nodes[candidate] != nil && c.DBs[candidate] != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func clusterSlowQuorum(size int) int {
+	return size/2 + 1
+}
+
+func (c *Cluster) verifyCheckpointAgainstLiveQuorum(checkpointDir string, target epaxos.ReplicaID) error {
+	pebbleDB, err := pebble.Open(checkpointDir, &pebble.Options{ReadOnly: true, ErrorIfNotExists: true})
+	if err != nil {
+		return err
+	}
+	checkpointDB := &DB{pebble: pebbleDB, cf: 1}
+	checkpointState, err := verifyCheckpointDB(checkpointDB)
+	closeErr := clusterCloseCheckpointDB(checkpointDB)
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	liveRecords := make(map[epaxos.ReplicaID]map[epaxos.InstanceRef]epaxos.InstanceRecord)
+	for _, id := range c.ids {
+		if id == target {
+			continue
+		}
+		db := c.DBs[id]
+		if db == nil {
+			continue
+		}
+		records := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
+		if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+			records[rec.Ref] = rec
+			return nil
+		}); err != nil {
+			return fmt.Errorf("kv: live replica %d checkpoint support scan failed: %w", id, err)
+		}
+		liveRecords[id] = records
+	}
+	if err := verifyCheckpointTargetOwnerFloor(checkpointState.records, liveRecords, target); err != nil {
+		return err
+	}
+	required := clusterSlowQuorum(len(c.ids))
+	for ref, rec := range checkpointState.records {
+		if rec.Status < epaxos.StatusCommitted {
+			continue
+		}
+		support := 0
+		for _, records := range liveRecords {
+			if other, ok := records[ref]; ok && sameChosenEPaxosRecord(rec, other) {
+				support++
+			}
+		}
+		if support < required {
+			return fmt.Errorf("kv: checkpoint record %s has live support %d, want quorum %d", ref, support, required)
+		}
+	}
+	return nil
+}
+
+func verifyCheckpointTargetOwnerFloor(checkpointRecords map[epaxos.InstanceRef]epaxos.InstanceRecord, liveRecords map[epaxos.ReplicaID]map[epaxos.InstanceRef]epaxos.InstanceRecord, target epaxos.ReplicaID) error {
+	maxByConf := make(map[epaxos.ConfID]epaxos.InstanceNum)
+	for _, records := range liveRecords {
+		for ref := range records {
+			if ref.Replica == target && ref.Instance > maxByConf[ref.Conf] {
+				maxByConf[ref.Conf] = ref.Instance
+			}
+		}
+	}
+	for conf, maxInstance := range maxByConf {
+		for instance := epaxos.InstanceNum(1); instance <= maxInstance; instance++ {
+			ref := epaxos.InstanceRef{Replica: target, Instance: instance, Conf: conf}
+			if _, ok := checkpointRecords[ref]; !ok {
+				return fmt.Errorf("kv: checkpoint missing target-owned prefix record %s", ref)
+			}
+		}
+	}
+	for liveID, records := range liveRecords {
+		for ref, live := range records {
+			if ref.Replica != target {
+				continue
+			}
+			checkpoint := checkpointRecords[ref]
+			if live.Status < epaxos.StatusCommitted {
+				if !sameEPaxosRecordTuple(checkpoint, live) {
+					return fmt.Errorf("kv: checkpoint target-owned record %s is older or differs from live replica %d", ref, liveID)
+				}
+				continue
+			}
+			if !sameChosenEPaxosRecord(checkpoint, live) {
+				return fmt.Errorf("kv: checkpoint committed target-owned record %s differs from live replica %d", ref, liveID)
+			}
+		}
+	}
+	return nil
+}
+
+func sameEPaxosRecordTuple(left, right epaxos.InstanceRecord) bool {
+	return left.Ref == right.Ref &&
+		left.Ballot == right.Ballot &&
+		left.RecordBallot == right.RecordBallot &&
+		left.Status == right.Status &&
+		left.Seq == right.Seq &&
+		left.AcceptSeq == right.AcceptSeq &&
+		left.ProcessAt == right.ProcessAt &&
+		left.TOQPending == right.TOQPending &&
+		left.FastPathEligible == right.FastPathEligible &&
+		instanceNumsEqualKV(left.Deps, right.Deps) &&
+		instanceNumsEqualKV(left.AcceptDeps, right.AcceptDeps) &&
+		acceptEvidenceEqualKV(left.AcceptEvidence, right.AcceptEvidence) &&
+		sameEPaxosCommand(left.Command, right.Command)
+}
+
+func acceptEvidenceEqualKV(left, right []epaxos.AcceptEvidence) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Sender != right[i].Sender || left[i].Seq != right[i].Seq || !instanceNumsEqualKV(left[i].Deps, right[i].Deps) {
+			return false
+		}
+	}
+	return true
+}
+func sameChosenEPaxosRecord(left, right epaxos.InstanceRecord) bool {
+	return left.Ref == right.Ref &&
+		left.Status >= epaxos.StatusCommitted &&
+		right.Status >= epaxos.StatusCommitted &&
+		left.Seq == right.Seq &&
+		instanceNumsEqualKV(left.Deps, right.Deps) &&
+		sameEPaxosCommand(left.Command, right.Command)
+}
+
+func instanceNumsEqualKV(left, right []epaxos.InstanceNum) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameEPaxosCommand(left, right epaxos.Command) bool {
+	if left.ID != right.ID || left.Kind != right.Kind || !bytes.Equal(left.Payload, right.Payload) || len(left.ConflictKeys) != len(right.ConflictKeys) {
+		return false
+	}
+	for i := range left.ConflictKeys {
+		if !bytes.Equal(left.ConflictKeys[i], right.ConflictKeys[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Drain runs deterministic transport until no node has ready work.
@@ -108,7 +375,7 @@ func (c *Cluster) drainWithLimit(limit int) error {
 		progress := false
 		for _, id := range c.ids {
 			rn := c.Nodes[id]
-			if !rn.HasReady() {
+			if rn == nil || !rn.HasReady() {
 				continue
 			}
 			progress = true
@@ -126,7 +393,19 @@ func (c *Cluster) drainWithLimit(limit int) error {
 			}
 		}
 		if !progress {
-			return nil
+			for _, id := range c.ids {
+				rn := c.Nodes[id]
+				if rn == nil {
+					continue
+				}
+				rn.Tick()
+				if rn.HasReady() {
+					progress = true
+				}
+			}
+			if !progress {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("kv: cluster did not quiesce")

@@ -2,12 +2,18 @@
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Sizes
+
+(* This module checks the repository quorum table: optimized EPaxos paper    *)
+(* fast quorum for odd N=2F+1, with conservative quorums retained for even  *)
+(* supported sizes because the paper proof assumes odd replica counts.       *)
 VARIABLE dummy
 
 AllowedSizes == 1..7
 
 SlowQuorum(n) == (n \div 2) + 1
-FastQuorum(n) == n - ((n - 1) \div 4)
+OptimizedOddFastQuorum(n) == IF n = 1 THEN 1 ELSE (n \div 2) + (((n \div 2) + 1) \div 2)
+ConservativeFastQuorum(n) == n - ((n - 1) \div 4)
+FastQuorum(n) == IF n \in {1, 3, 5, 7} THEN OptimizedOddFastQuorum(n) ELSE ConservativeFastQuorum(n)
 
 ReplicaSet(n) == 1..n
 
@@ -33,11 +39,11 @@ ExpectedSlow(n) ==
 ExpectedFast(n) ==
     CASE n = 1 -> 1
       [] n = 2 -> 2
-      [] n = 3 -> 3
+      [] n = 3 -> 2
       [] n = 4 -> 4
-      [] n = 5 -> 4
+      [] n = 5 -> 3
       [] n = 6 -> 5
-      [] n = 7 -> 6
+      [] n = 7 -> 5
 
 TypeOK ==
     /\ Sizes = AllowedSizes

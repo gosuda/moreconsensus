@@ -29,6 +29,8 @@
 // acknowledge only records after partial durable writes, but messages and
 // committed commands require all records from the same Ready batch to be
 // acknowledged first. This preserves the durable-before-visible barrier.
+// If storage or application work fails before Advance, Ready returns the same
+// outstanding batch again so the caller can retry without losing progress.
 //
 // Transport integrations use EncodeMessage to append into caller-owned buffers
 // and DecodeMessageWithScratch to reuse decoded dependency and conflict-key

@@ -31,18 +31,30 @@ func newQuorum(voters []ReplicaID) (quorum, error) {
 		idx[id] = i
 	}
 	n := len(vv)
-	return quorum{conf: ConfState{ID: 1, Voters: vv}, index: idx, slow: n/2 + 1, fast: n - ((n - 1) / 4)}, nil
+	// Optimized EPaxos fast quorum from the paper/TR for odd N=2F+1:
+	// F + floor((F+1)/2) total voters including the command leader. Even
+	// cluster sizes keep the previous conservative quorum because the paper
+	// proof assumes odd replica counts.
+	fast := n - ((n - 1) / 4)
+	if n%2 == 1 {
+		f := n / 2
+		fast = f + ((f + 1) / 2)
+		if fast == 0 {
+			fast = 1
+		}
+	}
+	return quorum{conf: ConfState{ID: 1, Voters: vv}, index: idx, slow: n/2 + 1, fast: fast}, nil
 }
 
 func (q quorum) contains(id ReplicaID) bool { _, ok := q.index[id]; return ok }
-
-func (q quorum) depIndex(id ReplicaID) (int, bool) { i, ok := q.index[id]; return i, ok }
 
 func (q quorum) deps() []InstanceNum { return make([]InstanceNum, len(q.conf.Voters)) }
 
 func (q quorum) slowQuorum() int { return q.slow }
 
 func (q quorum) fastQuorum() int { return q.fast }
+
+func (q quorum) tryWitnessQuorum() int { return q.fastQuorum() + q.slowQuorum() - len(q.conf.Voters) }
 
 // SlowQuorum returns the majority quorum size for n voters.
 func SlowQuorum(n int) (int, error) {
@@ -53,13 +65,22 @@ func SlowQuorum(n int) (int, error) {
 	return q.slowQuorum(), nil
 }
 
-// FastQuorum returns the conservative EPaxos fast quorum size for n voters.
+// FastQuorum returns the optimized EPaxos fast quorum size for n voters.
 func FastQuorum(n int) (int, error) {
 	q, err := newQuorum(makeIDs(n))
 	if err != nil {
 		return 0, err
 	}
 	return q.fastQuorum(), nil
+}
+
+// TryWitnessQuorum returns the optimized fast/slow intersection threshold.
+func TryWitnessQuorum(n int) (int, error) {
+	q, err := newQuorum(makeIDs(n))
+	if err != nil {
+		return 0, err
+	}
+	return q.tryWitnessQuorum(), nil
 }
 
 func makeIDs(n int) []ReplicaID {

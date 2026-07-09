@@ -190,6 +190,14 @@ func cloneMemoryStorage(st *MemoryStorage) *MemoryStorage {
 	return out
 }
 
+func cloneCommittedCommands(cmds []CommittedCommand) []CommittedCommand {
+	out := make([]CommittedCommand, len(cmds))
+	for i := range cmds {
+		out[i] = cmds[i].Clone()
+	}
+	return out
+}
+
 func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
 	for size := 1; size <= 7; size++ {
 		t.Run(fmt.Sprintf("n=%d", size), func(t *testing.T) {
@@ -343,6 +351,7 @@ func TestCodecChecksumZeroCopy(t *testing.T) {
 		To:           2,
 		Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Ballot:       Ballot{Replica: 1},
+		RecordBallot: Ballot{Replica: 1},
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
 		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), ConflictKeys: [][]byte{[]byte("conflict-key-beta")}},
@@ -503,23 +512,60 @@ func TestConfChangeAndPools(t *testing.T) {
 }
 
 func TestQuorumTables(t *testing.T) {
-	wantSlow := []int{1, 2, 2, 3, 3, 4, 4}
-	wantFast := []int{1, 2, 3, 4, 4, 5, 6}
-	for n := 1; n <= 7; n++ {
-		slow, err := SlowQuorum(n)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fast, err := FastQuorum(n)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if slow != wantSlow[n-1] || fast != wantFast[n-1] {
-			t.Fatalf("n=%d slow=%d fast=%d", n, slow, fast)
-		}
+	tests := []struct {
+		n          int
+		slow       int
+		fast       int
+		tryWitness int
+	}{
+		{n: 1, slow: 1, fast: 1, tryWitness: 1},
+		{n: 2, slow: 2, fast: 2, tryWitness: 2},
+		{n: 3, slow: 2, fast: 2, tryWitness: 1},
+		{n: 4, slow: 3, fast: 4, tryWitness: 3},
+		{n: 5, slow: 3, fast: 3, tryWitness: 1},
+		{n: 6, slow: 4, fast: 5, tryWitness: 3},
+		{n: 7, slow: 4, fast: 5, tryWitness: 2},
 	}
-	if _, err := SlowQuorum(8); err == nil {
-		t.Fatal("expected invalid size")
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("n=%d", tt.n), func(t *testing.T) {
+			slow, err := SlowQuorum(tt.n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fast, err := FastQuorum(tt.n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tryWitness, err := TryWitnessQuorum(tt.n)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q, err := newQuorum(makeIDs(tt.n))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slow != tt.slow || fast != tt.fast || tryWitness != tt.tryWitness || q.tryWitnessQuorum() != tt.tryWitness {
+				t.Fatalf("n=%d slow=%d fast=%d tryWitness=%d q.tryWitness=%d, want slow=%d fast=%d tryWitness=%d",
+					tt.n, slow, fast, tryWitness, q.tryWitnessQuorum(), tt.slow, tt.fast, tt.tryWitness)
+			}
+			if got := fast + slow - tt.n; got != tryWitness {
+				t.Fatalf("n=%d fast/slow intersection=%d, want try witness quorum %d", tt.n, got, tryWitness)
+			}
+		})
+	}
+	for _, fn := range []struct {
+		name string
+		call func(int) (int, error)
+	}{
+		{name: "slow", call: SlowQuorum},
+		{name: "fast", call: FastQuorum},
+		{name: "tryWitness", call: TryWitnessQuorum},
+	} {
+		for _, n := range []int{0, 8} {
+			if _, err := fn.call(n); err == nil {
+				t.Fatalf("%s quorum accepted invalid cluster size %d", fn.name, n)
+			}
+		}
 	}
 }
 
@@ -556,7 +602,7 @@ func TestExecutionEqualSeqTieBreaksByRef(t *testing.T) {
 	}
 }
 
-func TestExecutionComponentsSkipInactiveDependencyRefs(t *testing.T) {
+func TestExecutionComponentsWaitForInactiveDependencyRefs(t *testing.T) {
 	tests := []struct {
 		name string
 		dep  *instance
@@ -579,7 +625,10 @@ func TestExecutionComponentsSkipInactiveDependencyRefs(t *testing.T) {
 
 			comps := rn.executionComponents()
 			if len(comps) != 1 || len(comps[0]) != 1 || comps[0][0] != x {
-				t.Fatalf("component with inactive dependency = %#v, want only %s", comps, x)
+				t.Fatalf("component with inactive dependency = %#v, want unresolved %s component", comps, x)
+			}
+			if rn.componentReady(comps[0]) {
+				t.Fatalf("component with inactive dependency %s was ready: %#v", y, comps)
 			}
 		})
 	}
@@ -639,9 +688,10 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	if _, ok := store.Instance(ref); ok {
 		t.Fatalf("record %s was stored after rejected write", ref)
 	}
-	if rn.HasReady() {
-		t.Fatal("node exposed new work before the current ready was advanced")
+	if !rn.HasReady() {
+		t.Fatal("failed write hid outstanding ready before retry")
 	}
+	requireSameReady(t, rn.Ready(), rd)
 
 	store.FailWrites = false
 	if err := store.ApplyReady(rd); err != nil {
@@ -893,6 +943,103 @@ func TestRolledBackNodeCatchesUpFromQuorumWithoutDuplicateApply(t *testing.T) {
 	requireConvergedRefs(t, s)
 }
 
+func TestStorageWireRestartUpgradeRollbackSimulationConvergesWithoutDuplicateApply(t *testing.T) {
+	s := newSimCluster(t, 5, false)
+	rollbackID := ReplicaID(5)
+	conflictKey := []byte("storage-wire-upgrade-rollback")
+	var canaries []struct {
+		ref InstanceRef
+		cmd Command
+	}
+	nextSequence := uint64(1)
+
+	proposeCanary := func(proposer ReplicaID, payload string) (InstanceRef, Command) {
+		s.t.Helper()
+		cmd := Command{
+			ID:           CommandID{Client: 210, Sequence: nextSequence},
+			Payload:      []byte(payload),
+			ConflictKeys: [][]byte{conflictKey},
+		}
+		nextSequence++
+		ref, err := s.nodes[proposer].Propose(cmd)
+		if err != nil {
+			s.t.Fatalf("propose %q from node %d: %v", payload, proposer, err)
+		}
+		return ref, cmd
+	}
+	remember := func(ref InstanceRef, cmd Command) {
+		canaries = append(canaries, struct {
+			ref InstanceRef
+			cmd Command
+		}{ref: ref, cmd: cmd})
+	}
+	liveProposer := func(restarting ReplicaID) ReplicaID {
+		if restarting == 1 {
+			return 2
+		}
+		return 1
+	}
+	requireAllCanariesOnceEverywhere := func() {
+		s.t.Helper()
+		for _, id := range s.ids() {
+			requireNoDuplicateCommittedRefs(t, s.apps[id], id)
+			for _, canary := range canaries {
+				requireCommittedPayloadCount(t, s.apps[id], id, canary.ref, canary.cmd.Payload, 1)
+			}
+		}
+		requireConvergedRefs(t, s)
+	}
+
+	beforeRef, beforeCmd := proposeCanary(1, "before-restart-checkpoint")
+	s.tickAll(30)
+	remember(beforeRef, beforeCmd)
+	requireAllCanariesOnceEverywhere()
+	rollbackStoreCheckpoint := cloneMemoryStorage(s.stores[rollbackID])
+	rollbackAppCheckpoint := cloneCommittedCommands(s.apps[rollbackID])
+
+	for _, restarting := range s.ids() {
+		s.pause(restarting)
+		ref, cmd := proposeCanary(liveProposer(restarting), fmt.Sprintf("during-restart-%d", restarting))
+		s.tickAll(30)
+		for _, id := range s.ids() {
+			want := 1
+			if id == restarting {
+				want = 0
+			}
+			requireCommittedPayloadCount(t, s.apps[id], id, ref, cmd.Payload, want)
+		}
+
+		s.restart(restarting, cloneMemoryStorage(s.stores[restarting]))
+		s.resume(restarting)
+		s.tickAll(30)
+		remember(ref, cmd)
+		requireAllCanariesOnceEverywhere()
+	}
+
+	afterRef, afterCmd := proposeCanary(1, "after-rolling-restarts")
+	s.tickAll(30)
+	remember(afterRef, afterCmd)
+	requireAllCanariesOnceEverywhere()
+
+	s.pause(rollbackID)
+	s.restart(rollbackID, cloneMemoryStorage(rollbackStoreCheckpoint))
+	s.apps[rollbackID] = cloneCommittedCommands(rollbackAppCheckpoint)
+	rollbackWindowRef, rollbackWindowCmd := proposeCanary(1, "during-storage-rollback")
+	s.tickAll(30)
+	for _, id := range s.ids() {
+		want := 1
+		if id == rollbackID {
+			want = 0
+		}
+		requireCommittedPayloadCount(t, s.apps[id], id, rollbackWindowRef, rollbackWindowCmd.Payload, want)
+	}
+
+	s.resume(rollbackID)
+	s.tickAll(30)
+	remember(rollbackWindowRef, rollbackWindowCmd)
+	requireAllCanariesOnceEverywhere()
+}
+
 func TestFiveNodePartitionHealConverges(t *testing.T) {
 	s := newSimCluster(t, 5, true)
 	majority := []ReplicaID{1, 2, 3}
@@ -949,6 +1096,17 @@ func requireCommittedPayloadCount(t *testing.T, app []CommittedCommand, id Repli
 	t.Helper()
 	if got := committedPayloadCount(app, ref, payload); got != want {
 		t.Fatalf("node %d applied %s with payload %q %d times, want %d: %#v", id, ref, payload, got, want, app)
+	}
+}
+
+func requireNoDuplicateCommittedRefs(t *testing.T, app []CommittedCommand, id ReplicaID) {
+	t.Helper()
+	seen := make(map[InstanceRef]struct{}, len(app))
+	for _, cmd := range app {
+		if _, ok := seen[cmd.Ref]; ok {
+			t.Fatalf("node %d applied %s more than once: %#v", id, cmd.Ref, app)
+		}
+		seen[cmd.Ref] = struct{}{}
 	}
 }
 

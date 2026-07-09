@@ -208,6 +208,13 @@ func TestPutGetScanAndApplyCommitted(t *testing.T) {
 	if len(scan) != 2 || string(scan[0].Key) != "alpha" || string(scan[1].Key) != "beta" {
 		t.Fatalf("scan %#v", scan)
 	}
+	limited, err := db.Scan(ScanOptions{Start: []byte("a"), End: []byte("z"), Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || string(limited[0].Key) != "alpha" {
+		t.Fatalf("limited scan %#v", limited)
+	}
 	rev, err := db.Scan(ScanOptions{Start: []byte("a"), End: []byte("z"), Reverse: true, Limit: 1})
 	if err != nil {
 		t.Fatal(err)

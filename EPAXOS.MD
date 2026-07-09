@@ -1,6 +1,6 @@
 # Implemented EPaxos Algorithm
 
-This document describes the algorithm implemented by `gosuda.org/moreconsensus/epaxos`. It is intentionally more detailed than `README.md`; the README stays feature-level.
+This document describes the algorithm implemented by `gosuda.org/moreconsensus/epaxos`. It is intentionally more detailed than `README.md`; the README stays feature-level. For property-by-property proof rationale, failure-count boundaries, and evidence/non-claims, see `EPAXOS_IMPLEMENTATION_PROOF.md`.
 
 ## Public execution model
 
@@ -12,7 +12,18 @@ An application owns transport, persistence, and time. A replica is a determinist
 4. `HasReady` and `Ready` expose records to persist, messages to send, and commands to apply.
 5. `Advance` confirms the caller completed the `Ready` obligations.
 
-The core starts no goroutines, reads no wall-clock time, and performs no I/O. Storage and transport are virtualized by the embedding application and by tests.
+The core starts no goroutines, performs no I/O, and does not call the OS wall clock directly. Non-TOQ timing uses logical ticks; TOQ mode reads time only through the caller-supplied `TOQClock` function. Storage and transport are virtualized by the embedding application and by tests.
+
+## Paper claim map
+
+| Paper claim | Paper anchor | Repository implementation | Release status |
+| --- | --- | --- | --- |
+| Optimized EPaxos fast quorum | EPaxos SOSP 2013 §4.3/§4.4, ACM proceedings pp.362-365, and the EPaxos technical report §6 define the optimized fast quorum as `F + floor((F + 1) / 2)` including the command leader for odd `N = 2F + 1` clusters. That permits `N=3 -> 2`, `N=5 -> 3`, and `N=7 -> 5` pre-accept votes, with matching recovery evidence obligations. | Odd supported cluster sizes use the paper threshold (`N=3 -> 2`, `N=5 -> 3`, `N=7 -> 5`); even supported sizes keep the previous conservative quorum because the paper proof assumes `N=2F+1`. Fast commits also require FP-deps-committed prefix evidence tied to the matching fast quorum. | Implemented normal fast-path threshold/evidence for odd supported sizes plus Go committed stale-dependency evidence-search/resend-ignore; normal un-timed originator-disagrees fast commit, even-size optimized quorums, and unbounded proof remain non-claims. |
+| EPaxos Revisited TOQ | EPaxos Revisited NSDI 2021 §4/§4.1, USENIX proceedings pp.616-617, requires synchronized physical clocks, one-way-delay estimates with clock-skew/sync margin and sync groups, outgoing `PreAccept` messages with sequence number `0` and empty dependencies, and delayed originator dependency assignment at `ProcessAt`. | `Config.TOQ` is an explicit mode separate from `Config.TimeOptimization`. The embedding application supplies `TOQClock`, `TOQOneWayDelay` that includes one-way network delay plus clock-skew/sync uncertainty margin, and an optional `TOQSyncGroup`; the core computes `ProcessAt`, persists a `StatusNone`/`TOQPending` record with the command, sends flagged `MsgPreAccept{TOQ:true, Seq:0, Deps:nil}`, delays local dependency assignment until `ProcessAt`, and makes receivers compute attributes at the flagged `ProcessAt`. The core does not synchronize clocks or measure one-way delay. | Implemented core TOQ behavior with caller-supplied synchronized-clock and OWD/skew-margin discipline; real clock synchronization and delay measurement are embedding obligations. |
+| EPaxos Revisited chain pruning | EPaxos Revisited NSDI 2021 §3, USENIX proceedings p.616, prunes dependency `B` from `A` when `B` already depends on `A` and has higher sequence number. | Dependency-graph construction applies this pruning before SCC execution. | Implemented claim. |
+| EPaxos recovery | EPaxos SOSP 2013 §4.6, ACM proceedings p.366, requires prepare/accept recovery, try-pre-accept conflict checks, and dependency evidence sufficient for the quorum formula in use. CMU-PDL-13-111 §6/§6.2 also describes Accept-Deps evidence carried on Accept/AcceptReply for optimized recovery corner cases. | The implementation has owner-independent prepare, durable fast-path markers, FP-deps-committed prefix evidence on `MsgPreAcceptResp`, durable `InstanceRecord.RecordBallot` value-ballot evidence separate from promise `Ballot`, recovery-only aggregate `AcceptSeq`/`AcceptDeps` plus sender-preserving `AcceptEvidence`, TryPreAccept committed stale-dependency evidence search with read-only `MsgEvidence`/`MsgEvidenceResp`, authorized `IgnoreDependency` resends, fail-closed slow accept, and stopped-owner recovery for the implemented quorum table. | Implemented safety-focused recovery path for the finite evidence suite and Go committed stale-dependency evidence-search/resend-ignore for supported `F <= 3`; complete TLA coverage of the new query path, full deferred-cycle decision-tree parity, and unbounded proof remain non-claims. |
+
+Primary paper references: [EPaxos SOSP 2013](https://sigops.org/s/conferences/sosp/2013/papers/p358-moraru.pdf), [EPaxos technical report CMU-PDL-13-111](https://www.pdl.cmu.edu/PDL-FTP/associated/CMU-PDL-13-111.pdf), and [EPaxos Revisited NSDI 2021](https://www.usenix.org/system/files/nsdi21-tollman.pdf).
 
 ## Instance identity
 
@@ -28,41 +39,58 @@ The Go implementation stores dependency vectors as per-replica instance-number p
 
 ## Quorums
 
-The implementation supports cluster sizes 1, 2, 3, 4, 5, 6, and 7 exactly. Slow quorum is majority: `n/2 + 1`. Fast quorum uses the conservative EPaxos formula `n - ((n - 1) / 4)`, yielding this table:
+The implementation supports cluster sizes 1, 2, 3, 4, 5, 6, and 7 exactly. Slow quorum is majority: `n/2 + 1`. Odd cluster sizes use the optimized EPaxos paper fast quorum for `N=2F+1`; even cluster sizes keep the previous conservative quorum because the paper proof assumes odd `N`.
 
-| Voters | Slow quorum | Fast quorum |
-| --- | ---: | ---: |
-| 1 | 1 | 1 |
-| 2 | 2 | 2 |
-| 3 | 2 | 3 |
-| 4 | 3 | 4 |
-| 5 | 3 | 4 |
-| 6 | 4 | 5 |
-| 7 | 4 | 6 |
+| Voters | Slow quorum | Fast quorum | Max unavailable for progress | No-quorum boundary |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 1 | 1 | 0 | 1 unavailable voter |
+| 2 | 2 | 2 | 0 | 1 unavailable voter |
+| 3 | 2 | 2 | 1 | 2 unavailable voters |
+| 4 | 3 | 4 | 1 | 2 unavailable voters |
+| 5 | 3 | 3 | 2 | 3 unavailable voters |
+| 6 | 4 | 5 | 2 | 3 unavailable voters |
+| 7 | 4 | 5 | 3 | 4 unavailable voters |
+
+The fast-commit predicate is stricter than quorum size alone. A matching fast quorum must have exact/default fast-path markers, and every compact dependency prefix in the final attributes must be covered by `DepsCommitted` evidence from at least one participant in that matching quorum. For dependency vector slot `i` with value `k`, the evidence bit means the sender has durably recorded every implicit dependency for that replica through instance `k` as committed or executed.
 
 ## Pre-accept fast path
 
-When a local application proposes a command, the owner replica:
+When a local application proposes a command outside TOQ mode, the owner replica:
 
 1. Allocates the next local instance number.
-2. Computes initial attributes from local conflict indexes.
-3. Persists a `StatusPreAccepted` record in `Ready.Records`.
-4. Sends `MsgPreAccept` to other voters.
-5. Counts the local vote as one matching pre-accept reply.
+2. Assigns a deterministic logical `ProcessAt` tick when the optional `TimeOptimization` mode is enabled.
+3. Computes initial attributes from conflicts ordered before that `ProcessAt` value, or from the local conflict indexes when the optimization is disabled.
+4. Persists a `StatusPreAccepted` record in `Ready.Records`.
+5. Sends `MsgPreAccept` to other voters with the same `ProcessAt` value on the initial send and every retry.
+6. Counts the local vote as one pre-accept reply.
 
-A receiving replica validates the message envelope and checksum when present. It recomputes attributes using its local conflict index, merges them with the proposer attributes, persists the pre-accepted record, updates conflict indexes, and replies with `MsgPreAcceptResp` carrying the attributes it stored.
+`Config.TOQ` follows the EPaxos Revisited TOQ shape instead of the legacy attribute-carrying pre-accept. The owner samples `TOQClock` once, sets `ProcessAt` to the maximum of that sample plus the configured one-way delay for every member of `TOQSyncGroup` (defaulting to the voters), persists the command as `StatusNone` with `TOQPending=true`, and does not index the command as a local conflict yet. Outbound TOQ `MsgPreAccept` messages are explicit: `TOQ=true`, `Seq=0`, and empty `Deps`. Retries keep that same explicit TOQ envelope even after the owner has assigned its local attributes.
 
-The owner fast-commits when it receives a fast quorum of pre-accept votes and every vote exactly matches the original attributes. The commit changes the record to `StatusCommitted`, persists it, broadcasts `MsgCommit`, and attempts deterministic execution.
+For TOQ deployments, every `TOQOneWayDelay[id]` value is a conservative delivery bound supplied by the embedding application. It must include the measured one-way network delay plus the maximum clock-skew/synchronization uncertainty for that receiver and sync group. The core does not implement clock synchronization or delay measurement.
+
+At local `ProcessAt`, the owner computes attributes from conflicts ordered before the TOQ timestamp, clears `TOQPending`, persists the ordinary `StatusPreAccepted` record, indexes the command as a conflict, seeds the local pre-accept vote, and only then evaluates fast/slow pre-accept completion. `MsgPreAcceptResp` votes that arrive while the local record is still pending are stored but cannot commit, fast-wait, or slow-accept the instance until the pending assignment is durably cleared.
+
+A receiving replica validates the message envelope and checksum when present. An unflagged `MsgPreAccept` must carry a full-width dependency vector; a flagged TOQ `MsgPreAccept` must carry the zero-sequence/empty-dependency envelope. Future pre-accepts are queued, with command bytes cloned, until the appropriate clock reaches `ProcessAt`: logical `Tick` for `TimeOptimization`, and `TOQClock` for TOQ. Due pre-accepts are processed by `ProcessAt`, then instance reference, then sender; this keeps equal-time processing deterministic across replicas. When an unflagged message is due, the receiver recomputes attributes, ignores timed pre-accepted conflicts ordered after the message, merges proposer attributes, persists the pre-accepted record, updates conflict indexes, and replies with `MsgPreAcceptResp` carrying the attributes it stored, its exact/default fast-path marker, and committed-prefix dependency evidence for those attributes. When a flagged TOQ message is due, the receiver computes attributes at `ProcessAt` and replies with those locally computed attributes; it does not merge legacy proposer attributes from the zero envelope.
+
+The owner fast-commits when it can identify a matching fast quorum for the implemented quorum table and the matching quorum covers every final dependency prefix with committed evidence. In TOQ mode, the delayed local assignment is the local fast-path witness, so optimized odd-size quorums such as `N=5 -> 3` can commit after local assignment plus enough covering remote replies without waiting for every remote voter. With the older deterministic `TimeOptimization` heuristic, the stale-originator greater-tuple rule remains stricter and requires unanimous remote replies. The commit changes the record to `StatusCommitted`, persists it, broadcasts `MsgCommit`, and attempts deterministic execution.
 
 ## Slow accept path
 
-If a slow quorum of pre-accept replies is available before a fast quorum, the owner merges the reply attributes. Without the optional time optimization, it immediately enters the slow accept path. With the optional logical-time optimization, it may wait a bounded number of ticks for more replies. A late fast commit is still possible only while the accumulated attributes exactly match the original attributes; once any divergent attributes are merged, the wait can only defer slow accept until the logical deadline. This optimization is purely tick-driven and has no wall-clock dependency.
-
-The slow path persists `StatusAccepted`, broadcasts `MsgAccept`, and waits for a slow quorum of `MsgAcceptResp`. After that quorum, the owner commits the merged attributes and broadcasts `MsgCommit`.
+The slow path persists `StatusAccepted`, broadcasts `MsgAccept`, and waits for a slow quorum of current-ballot `MsgAcceptResp`. A non-reject `MsgAcceptResp` whose ballot differs from the coordinator's current accept ballot is ignored before it can count toward `accOK` or merge recovery-only Accept-Deps evidence. `MsgAccept` and `MsgAcceptResp` carry the chosen execution attributes in `Seq`/`Deps` plus separate recovery-only `AcceptSeq`/`AcceptDeps` aggregate evidence and sender-preserving `AcceptEvidence` entries. Each `AcceptEvidence` entry records the original Accept/AcceptReply sender, sequence, and dependencies for the containing value tuple; receivers persist it, commits propagate it, and `MsgPrepareResp`/`MsgEvidenceResp` return it for recovery. Legacy aggregate evidence is retained for compatibility but cannot authorize committed stale-dependency ignore decisions.
 
 ## Recovery path
 
-The implementation includes prepare/recovery message types and a timer-driven recovery transition. When a ballot rejection or stalled timer requires recovery, the owner raises its ballot, broadcasts `MsgPrepare`, collects a slow quorum of `MsgPrepareResp`, chooses a committed value if any response contains one, otherwise chooses the highest-ballot accepted or pre-accepted value, merges attributes, and finishes through `MsgAccept` before committing. Periodic logical-tick commit rebroadcasts help replicas that missed a commit during a transport outage.
+The implementation includes owner-independent prepare/recovery message types and timer-driven recovery transitions. A replica may recover an instance it owns, or a foreign instance whose missing or uncommitted dependency blocks local execution, when it is the deterministic recovery coordinator for that reference.
+
+Recovery raises a promise ballot, broadcasts `MsgPrepare`, and waits for a slow quorum of `MsgPrepareResp`. `MsgPrepareResp.Ballot` is the responder's promise ballot, not an accepted-value ballot. `MsgPrepareResp.RecordBallot` carries the responder's durable `InstanceRecord.RecordBallot`, the value ballot that is not overwritten by prepare promises and is covered by the record checksum/invariant. Value selection is therefore based on durable response status and value metadata:
+
+1. Any committed response wins immediately.
+2. Otherwise, accepted responses choose the highest durable previous-record-ballot accepted tuple and finish through `MsgAccept`; lower-ballot accepted/pre-accepted attributes are not unioned into that tuple.
+3. Otherwise, matching pre-accepted responses that carry the durable `FastPathEligible` marker may enter `MsgTryPreAccept` recovery once they meet the fast/slow intersection threshold `fast + slow - n`.
+4. Otherwise, any pre-accepted response falls back to merged `MsgAccept`.
+5. If the prepare quorum reports `StatusNone`, recovery chooses a no-op and commits it through `MsgAccept`.
+
+`MsgTryPreAccept` is the EPaxos optimized-recovery check: witnesses reject stale ballots, committed conflicts, mutually unordered uncommitted conflicts, and stale-dependency conflicts. A committed stale-dependency rejection for a conflict already present in the candidate's `Deps` starts a read-only `MsgEvidence`/`MsgEvidenceResp` check for that committed conflict, keyed by the candidate ref. Once the coordinator has `F` unique checked replicas for the committed conflict tuple and no sender-preserving Accept/AcceptReply evidence from a sender forced into the candidate's possible fast quorum whose deps omit the candidate, it resends `MsgTryPreAccept` with `IgnoreDependency.Ref` for that one conflict. The witness consumes that marker only for the named committed stale dependency. Conflicting duplicate evidence, legacy-only evidence, missing tuple evidence, an evidence retry timeout, or a second simultaneous ignored conflict fails closed to slow `MsgAccept`; the slow path folds the same-configuration `ConflictRef` into `Deps` and bumps `Seq` using the committed tuple sequence when known. Uncommitted conflicts either force slow `MsgAccept` when leader-in-fast-quorum or recorded deferral-cycle evidence says the candidate fast quorum must contain the conflict leader, or they defer the candidate while recovering the blocker. Successful conceptual witnesses from prepare plus actual try-pre-accept witnesses advance to `MsgAccept`; recovery records and commit records do not retain `FastPathEligible`. Periodic logical-tick commit rebroadcasts help replicas that missed a commit during a transport outage.
 
 ## Execution ordering
 
@@ -70,11 +98,13 @@ Committed records are not emitted directly. The node builds a dependency graph o
 
 The executor also waits when it knows a conflicting pre-accepted or accepted instance that has not committed yet. This prevents a replica from emitting a command while a known conflicting command is still unresolved.
 
+EPaxos Revisited chain pruning is applied inside dependency-graph construction: when dependency `B` already depends on `A` and has a higher sequence number, `A` does not need to keep `B` in its blocking component because `B` must execute after `A`.
+
 User commands are emitted to the embedding application through `Ready.Committed`. No-op recovery commands have no application effect. Configuration changes are applied inside the core when their component executes because they update future quorum membership.
 
 ## Configuration changes
 
-`ProposeConfChange` validates that a membership operation changes the current voter set and keeps the size within the supported one-to-seven-replica range, then encodes it as a configuration command. Only one configuration change may be pending. The command conflicts with every non-noop command. When the command executes, future instances use the new sorted voter set and an incremented configuration id. Existing instances remain pinned to their original configuration id.
+`ProposeConfChange` validates that a membership operation changes the current voter set and keeps the size within the supported one-to-seven-replica range, then encodes it as a configuration command. A node treats any observed, unexecuted configuration command as a membership barrier: local user proposals and additional local configuration proposals are rejected until the barrier executes. Configuration commands conflict with every non-noop command, and user-command attribute computation also includes known configuration-command instances even when user conflict keys are disjoint. When a configuration command executes, future instances use the new sorted voter set and an incremented configuration id. Existing instances remain pinned to their original configuration id. A stale same-generation configuration command that executes after a later configuration is already installed is recorded as executed but does not overwrite the installed configuration history.
 
 ## Ready contract
 
@@ -82,11 +112,15 @@ User commands are emitted to the embedding application through `Ready.Committed`
 
 `Advance` returns an error and acknowledges only an exact prefix of the outstanding `Ready`. The acknowledged values must match the records, messages, committed commands, and `MustSync` bit returned by `Ready`; otherwise `Advance` returns `ErrInvalidReady` and leaves the outstanding batch unchanged for retry. A record-only prefix is valid, which lets storage persist part of a batch without marking application commands executed. `Messages` or `Committed` acknowledgements are accepted only after all earlier `Records` from that outstanding batch are acknowledged. When `MaxReadyMessages` caps `Ready.Messages`, records and committed commands still appear in full; after their successful acknowledgement the remaining message tail appears in later `Ready` batches with `MustSync` false.
 
+`Ready` remains visible until `Advance` accepts it. If durable storage or application work fails before `Advance`, the caller can call `Ready` again and retry the same batch. The example KV applier writes an applied marker keyed by consensus instance in the same Pebble batch as the KV mutation, so a crash or `Advance` failure after the Pebble commit replays the consensus command without creating a second KV version.
+
 For user commands, `Advance` queues the corresponding `StatusExecuted` records only after the application has observed and acknowledged `Ready.Committed`; those executed markers appear in a later `Ready.Records` batch and make replay after restart idempotent. Configuration changes and no-op commands do not appear in `Ready.Committed`; their executed records are queued internally when they execute.
 
 ## Checksums and serialization
 
 `InstanceRecord` and `Message` checksums are canonical BLAKE3 digests. The digest includes fixed-endian primitive fields, length-prefixed slices, command payload, and conflict keys. The checksum field itself is excluded from its digest. The wire codec appends the checksum at the end of each encoded message. Decode returns typed errors on malformed input or checksum mismatch and never panics for malformed network bytes.
+
+The example KV storage rejects persisted EPaxos record key/value reference mismatches during load. Its checkpoint repair path uses whole-directory replacement from a semantically verified checkpoint; the live-source helper additionally requires live quorum support and a target-owned next-instance floor before reopening a stopped corrupt member. It never repairs by deleting corrupt records or recomputing checksums.
 
 ## Allocation and ownership
 

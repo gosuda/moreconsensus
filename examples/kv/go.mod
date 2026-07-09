@@ -2,6 +2,8 @@ module gosuda.org/moreconsensus/examples/kv
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	gosuda.org/moreconsensus v0.0.0

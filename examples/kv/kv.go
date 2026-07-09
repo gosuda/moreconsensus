@@ -144,11 +144,12 @@ func (b TimestampBounds) classify(ts uint64) timestampMatch {
 
 // DB stores EPaxos-applied commands in a Pebble database.
 type DB struct {
-	pebble   *pebble.DB
-	cf       uint32
-	nextTime uint64
-	newIter  func(*pebble.IterOptions) (kvIterator, error)
-	newBatch func() txnBatch
+	pebble              *pebble.DB
+	cf                  uint32
+	nextTime            uint64
+	newIter             func(*pebble.IterOptions) (kvIterator, error)
+	newBatch            func() txnBatch
+	lookupAppliedMarker appliedMarkerLookup
 }
 
 type kvIterator interface {
@@ -577,7 +578,20 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 		seen[id] = struct{}{}
 		v := iter.Value()
 		if len(v) > 0 && v[0] == valueRecord {
-			out = append(out, KV{Key: append([]byte(nil), uk...), Value: append([]byte(nil), v[1:]...), Time: ts})
+			row := KV{Key: append([]byte(nil), uk...), Value: append([]byte(nil), v[1:]...), Time: ts}
+			if opt.Reverse {
+				if len(out) == limit {
+					copy(out, out[1:])
+					out[len(out)-1] = row
+				} else {
+					out = append(out, row)
+				}
+			} else {
+				out = append(out, row)
+				if len(out) == limit {
+					break
+				}
+			}
 		}
 	}
 	scanErr := iter.Error()
@@ -585,9 +599,6 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}
-	}
-	if len(out) > limit {
-		out = out[:limit]
 	}
 	return out, scanErr
 }

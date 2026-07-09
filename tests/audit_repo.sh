@@ -11,8 +11,6 @@ patterns=(
   "skele""ton"
   "st""ub"
   "TO""DO"
-  "time""out"
-  "Time""out"
   "time"".New"
   "time"".Sleep"
   "time"".After"

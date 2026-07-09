@@ -217,10 +217,26 @@ type Config struct {
 	RetryTicks uint64
 	// RecoveryTicks is the logical tick interval for recovery attempts.
 	RecoveryTicks uint64
-	// TimeOptimization enables the EPaxos Revisited fast-wait optimization.
+	// TimeOptimization enables deterministic logical ProcessAt timing for
+	// PreAccept handling and a bounded logical fast-wait before slow accept.
 	TimeOptimization bool
-	// TimeOptimizationTicks is the logical fast-wait duration before slow accept.
+	// TimeOptimizationTicks is the logical ProcessAt offset and fast-wait duration.
 	TimeOptimizationTicks uint64
+	// TOQ enables EPaxos Revisited Timestamp-Ordered Queueing. It is a separate
+	// mode from TimeOptimization and requires explicit synchronized-clock and
+	// conservative delay-bound inputs from the embedding application.
+	TOQ bool
+	// TOQClock returns the local synchronized clock value used for TOQ ProcessAt
+	// timestamps. Units must match TOQOneWayDelay.
+	TOQClock func() uint64
+	// TOQOneWayDelay contains originator-to-replica conservative delivery bounds
+	// used to compute ProcessAt as TOQClock()+max(bound over the sync group).
+	// Each value must include one-way network delay plus the clock-skew/
+	// synchronization uncertainty margin for that receiver and sync group.
+	TOQOneWayDelay map[ReplicaID]uint64
+	// TOQSyncGroup is the optional group used when choosing the maximum TOQ delay.
+	// Empty means all current voters.
+	TOQSyncGroup []ReplicaID
 	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
 	// slices instead of cloning them. When true, the caller transfers ownership
 	// of those slices and must not mutate or reuse them while they remain
@@ -240,19 +256,42 @@ type HardState struct {
 
 // InstanceRecord is the durable value for one EPaxos instance.
 type InstanceRecord struct {
-	Ref      InstanceRef
-	Ballot   Ballot
-	Status   Status
-	Seq      uint64
-	Deps     []InstanceNum
-	Command  Command
-	Checksum [32]byte
+	Ref    InstanceRef
+	Ballot Ballot
+	// RecordBallot is the ballot at which Seq/Deps/Command were last chosen as
+	// a preaccepted, accepted, or committed value. Prepare promises may advance
+	// Ballot without changing RecordBallot.
+	RecordBallot Ballot
+	Status       Status
+	Seq          uint64
+	Deps         []InstanceNum
+	// AcceptSeq and AcceptDeps are recovery-only Accept-Deps evidence from the
+	// paper/TR optimized recovery path. They record dependencies carried on
+	// Accept/AcceptReply without changing the chosen execution attributes in
+	// Seq/Deps.
+	AcceptSeq  uint64
+	AcceptDeps []InstanceNum
+	// AcceptEvidence preserves original Accept/AcceptReply senders. It is tied
+	// to this record's current value tuple and must be cleared when that tuple changes.
+	AcceptEvidence   []AcceptEvidence
+	Command          Command
+	FastPathEligible bool
+	// ProcessAt is persisted for TOQ-pending local proposals so a restart can
+	// finish delayed originator dependency assignment in the same timestamp order.
+	ProcessAt uint64
+	// TOQPending means the command has been durably accepted by the local API but
+	// has not yet assigned its originator dependencies at ProcessAt. It must not
+	// be indexed, recovered, or counted as an ordinary PreAccepted tuple.
+	TOQPending bool
+	Checksum   [32]byte
 }
 
 // Clone returns a deep copy of the instance record.
 func (r InstanceRecord) Clone() InstanceRecord {
 	out := r
 	out.Deps = append([]InstanceNum(nil), r.Deps...)
+	out.AcceptDeps = append([]InstanceNum(nil), r.AcceptDeps...)
+	out.AcceptEvidence = cloneAcceptEvidence(r.AcceptEvidence)
 	out.Command = r.Command.Clone()
 	return out
 }
@@ -260,6 +299,16 @@ func (r InstanceRecord) Clone() InstanceRecord {
 // Attributes returns the ordering attributes carried by the record.
 func (r InstanceRecord) Attributes() Attributes {
 	return Attributes{Seq: r.Seq, Deps: append([]InstanceNum(nil), r.Deps...)}
+}
+
+// AcceptAttributes returns the recovery-only Accept-Deps evidence carried by
+// this record. The boolean is false for records with no separately recorded
+// Accept-Deps evidence.
+func (r InstanceRecord) AcceptAttributes() (Attributes, bool) {
+	if r.AcceptSeq == 0 || len(r.AcceptDeps) == 0 {
+		return Attributes{}, false
+	}
+	return Attributes{Seq: r.AcceptSeq, Deps: append([]InstanceNum(nil), r.AcceptDeps...)}, true
 }
 
 // Attributes are EPaxos sequence/dependency ordering metadata.
