@@ -109,6 +109,10 @@ for cfg in tla/EPaxosConfigRecovery.cfg; do
   run_tlc tla/EPaxosConfigRecovery.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigAddRecovery.cfg; do
+  run_tlc tla/EPaxosConfigAddRecovery.tla "$cfg"
+done
+
 for cfg in tla/EPaxosRollbackAllocation.cfg; do
   run_tlc tla/EPaxosRollbackAllocation.tla "$cfg"
 done

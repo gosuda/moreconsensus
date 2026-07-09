@@ -2,6 +2,7 @@ package epaxos
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -236,6 +237,78 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	recoveryApplyReady(t, store, restarted, rd)
 }
 
+func TestOldConfigRecoveryUsesPinnedVotersAfterAddition(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
+	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0},
+		Command: Command{Kind: CommandNoop},
+	})
+
+	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}})
+	if restarted.HasReady() {
+		t.Fatalf("restart emitted work before old-config recovery deadline: %#v", restarted.Ready())
+	}
+	for tick := 1; tick < 4; tick++ {
+		restarted.Tick()
+		if restarted.HasReady() {
+			t.Fatalf("old-config recovery fired after %d ticks, before deadline", tick)
+		}
+	}
+
+	restarted.Tick()
+	rd := restarted.Ready()
+	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3}, 3)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	prepareResp := func(from ReplicaID) Message {
+		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0}}
+	}
+	if err := restarted.Step(prepareResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery counted newly added voter 4 prepare response: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(prepareResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3}, 3)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
+	acceptResp := func(from ReplicaID) Message {
+		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
+	}
+	if err := restarted.Step(acceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery counted newly added voter 4 accept response: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(acceptResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3}, 3)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	}
+	recoveryApplyReady(t, store, restarted, rd)
+}
+
 func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	first := Command{ID: CommandID{Client: 30, Sequence: 1}, Payload: []byte("owner-command"), ConflictKeys: [][]byte{[]byte("shared")}}
@@ -454,6 +527,11 @@ func recoveryRequirePrepareRefs(t *testing.T, messages []Message, want []Instanc
 
 func recoveryRequireMessageTargets(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, want []ReplicaID) Ballot {
 	t.Helper()
+	return recoveryRequireMessageTargetsWithDepsWidth(t, messages, typ, ref, want, 4)
+}
+
+func recoveryRequireMessageTargetsWithDepsWidth(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, want []ReplicaID, depsWidth int) Ballot {
+	t.Helper()
 	seen := make(map[ReplicaID]Message, len(want))
 	for _, m := range messages {
 		if m.Type != typ || m.Ref != ref {
@@ -466,8 +544,8 @@ func recoveryRequireMessageTargets(t *testing.T, messages []Message, typ Message
 		if m.Command.Kind != CommandNoop {
 			t.Fatalf("%s for %s command kind = %v, want %v: %#v", typ, ref, m.Command.Kind, CommandNoop, m)
 		}
-		if len(m.Deps) != 4 {
-			t.Fatalf("%s for %s deps width = %d, want old config width 4: %#v", typ, ref, len(m.Deps), m)
+		if len(m.Deps) != depsWidth {
+			t.Fatalf("%s for %s deps width = %d, want old config width %d: %#v", typ, ref, len(m.Deps), depsWidth, m)
 		}
 	}
 	if len(seen) != len(want) {

@@ -109,9 +109,9 @@ User commands are emitted to the embedding application through `Ready.Committed`
 On restart, `NewRawNode` loads durable records, remembers any stored historical configurations, then replays executed configuration-change records in instance order to rebuild intermediate configuration ids that are needed by old in-flight instances. Replay rejects a stored configuration id whose voters conflict with the voters deterministically produced by executed configuration commands. A replayed unexecuted configuration command remains a pending barrier, so the restarted node still rejects new local proposals until that command executes.
 
 When TOQ is enabled, default `TOQSyncGroup` selection and one-way-delay validation run after executed configuration replay, so an omitted sync group defaults to the replayed current voters and an explicit stale sync group containing a removed voter is rejected.
-Recovery, retry, and broadcast paths select voter sets and slow-quorum thresholds by the instance `Ref.Conf`, so an old instance can still use a removed voter for its old pinned quorum while current-configuration proposals from that removed local replica remain rejected.
+Recovery, retry, and broadcast paths select voter sets and slow-quorum thresholds by the instance `Ref.Conf`, so an old instance can still use a removed voter for its old pinned quorum, newly added voters cannot count for pre-addition instances, and current-configuration proposals from a removed local replica remain rejected.
 
-The finite configuration evidence currently covers an executed add/remove durable replay slice plus one staged old-instance recovery-after-removal slice. Arbitrary durable histories, arbitrary recovery under reconfiguration, joint consensus, and unbounded membership changes remain outside the current claim.
+The finite configuration evidence currently covers an executed add/remove durable replay slice plus staged old-instance recovery-after-removal and recovery-after-addition slices. Arbitrary durable histories, arbitrary recovery under reconfiguration, joint consensus, and unbounded membership changes remain outside the current claim.
 
 ## Ready contract
 
