@@ -1021,7 +1021,7 @@ func TestLatestReadBarrierAfterFailedLocalProposalCurrentCluster(t *testing.T) {
 	cluster.setInboundDrop(3, 1, true)
 	failedPut := httptest.NewRecorder()
 	first.handleKV(failedPut, httptest.NewRequest(http.MethodPut, "/kv/"+failedKey, bytes.NewReader([]byte("value-from-node-1"))))
-	if failedPut.Code != http.StatusServiceUnavailable || !strings.Contains(failedPut.Body.String(), "proposal outcome unknown after logical tick budget") {
+	if failedPut.Code != http.StatusServiceUnavailable || !strings.Contains(failedPut.Body.String(), "proposal outcome unknown after logical tick deadline") {
 		t.Fatalf("first put status=%d body=%q, want 503 unknown outcome", failedPut.Code, failedPut.Body.String())
 	}
 
