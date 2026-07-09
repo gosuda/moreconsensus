@@ -9,6 +9,7 @@ bash tests/go_coverage.sh
 bash tests/tla_model_check.sh
 bash tests/fuzz_stress_campaign.sh
 bash tests/chaos_fault_campaign.sh
+bash tests/jepsen_remote_preflight_audit.sh
 bash tests/operations_readiness_audit.sh
 bash tests/go_no_go_workflow.sh
 bash tests/release_scope_audit.sh

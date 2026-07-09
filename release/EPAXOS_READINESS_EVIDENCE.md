@@ -54,7 +54,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `bash tests/release_scope_audit.sh` and `bash tests/audit_repo.sh` passed after refreshing release scope, model/proof docs, and audit requirements for the current evidence.
 - `bash tests/go_coverage.sh` passed after the branch-test current-ballot fix; it reported 100.0% coverage for `./epaxos` and `./examples/kv`, and the `kvnode` package test passed under the script.
 - `MORECONSENSUS_FUZZTIME=1s bash tests/fuzz_stress_campaign.sh` passed after the current AcceptResp, TOQ, storage-boundary, API-hardening, and documentation updates; `FuzzDecodeMessage` ran 9242 executions under the 1s override.
-- `EPAXOS_IMPLEMENTATION_PROOF.md` was added as the paper-grounded implementation proof/rationale document and linked from `README.md`; `AGENTS.md` now states that mission-critical production readiness requires explicit evidence and the active goal remains incomplete/no-go unless current evidence proves that standard.
+- `EPAXOS_IMPLEMENTATION_PROOF.md` was added as the paper-grounded implementation proof/rationale document and linked from `README.md`; committed release documents (`RELEASE_SCOPE.md` and this evidence bundle) state that the active production-readiness goal remains incomplete/no-go unless current evidence proves every release item.
 - `go test ./epaxos -run Test.*Upgrade.*Rollback -count=1` and `go test ./epaxos -count=1` passed after adding deterministic storage/wire restart rollback simulation; raw outputs are archived at `artifact://237` and `artifact://238`.
 - `bash tests/operations_readiness_audit.sh`, `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, and `bash tests/go_no_go_workflow.sh` passed after the sender-preserving evidence-query/resend-ignore plus checkpoint-backed live corruption recovery scope updates; the workflow reported `release_decision=No-go.` with `open_release_items=6` (`artifact://539`).
 - Focused durable RecordBallot and optimized-recovery regressions passed: `go test ./epaxos -run 'TestPreparePromiseDoesNotOverwritePersistedRecordBallotAcrossRestart|TestPrepareRecoveryChoosesHighestPersistedRecordBallot|TestPrepareResponseCarriesPromiseAndPreviousRecordBallot|TestPrepareRecoveryUsesOnlyHighestAcceptedRecordBallot' -count=1` (`artifact://308`) and `go test ./examples/kv -run 'TestEncodeDecodeEPaxosRecordPreservesRecordBallot|TestDecodeEPaxosRecordV4BackfillsRecordBallot|TestEncodeDecodeEPaxosRecordPreservesAcceptDepsEvidence|TestDecodeEPaxosRecordMigratesVersion3ChecksumWithoutAcceptEvidence' -count=1` (`artifact://310`).
@@ -71,6 +71,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `bash tests/tla_model_check.sh` passed after adding `tla/EPaxosEvidenceQuery.tla` and wiring the 3-, 5-, and 7-replica evidence-query configs; `EPaxosEvidenceQuery.cfg` generated 352 states and 279 distinct states, `EPaxosEvidenceQueryFive.cfg` generated 14548 states and 9015 distinct states, and `EPaxosEvidenceQuerySeven.cfg` generated 393256 states and 224551 distinct states, with no TLC error.
 - `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, `bash tests/operations_readiness_audit.sh`, and `bash tests/go_no_go_workflow.sh` passed after the finite evidence-query model, deployment-manifest audit, documentation, and audit updates; the workflow reported `release_decision=No-go.` with `open_release_items=6` (`artifact://655`).
 - `bash tests/kvnode_systemd_manifest_audit.sh` passed on this host after adding the cross-platform manifest exercise; it rendered the example `kvnode@.service`/EnvironmentFile `ExecStart` contract and skipped `systemd-analyze` because analyzer verification is opt-in via `KVNODE_SYSTEMD_ANALYZE=yes`.
+- `bash tests/jepsen_remote_preflight_audit.sh` passed after adding remote Jepsen preflight-only safety coverage; it verifies destructive-storage and wall-clock-skew confirmations, broad remote-directory rejection, and safe confirmed preflight paths without touching remote hosts.
 
 ### Fault-tolerance envelope proof summary
 
@@ -107,6 +108,8 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
   - Contains local loopback restart, transport, storage, and destructive-storage profiles plus the advanced scan checker used by the simulation/local-loopback evidence.
 - `jepsen/test/moreconsensus/epaxos_test_test.clj`
   - Adds scan-checker regressions and optional external-tooling unit guardrails; optional external tooling is not current release evidence.
+- `tests/jepsen_remote_preflight_audit.sh`
+  - Exercises `tests/jepsen_remote.sh` in preflight-only mode for missing destructive-storage confirmation, unsafe remote-directory rejection, confirmed safe destructive-storage preflight, missing wall-clock-skew confirmation, and confirmed wall-clock-skew preflight; `tests/ci.sh` now runs this audit before operations/release-scope checks.
 - `examples/kv/cmd/kvnode/main.go`
   - Peer replication handler now rejects non-POST requests before reading or decoding the body.
 - `examples/kv/cmd/kvnode/main_test.go`
