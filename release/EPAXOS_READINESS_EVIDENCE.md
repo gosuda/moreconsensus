@@ -72,6 +72,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, `bash tests/operations_readiness_audit.sh`, and `bash tests/go_no_go_workflow.sh` passed after the finite evidence-query model, deployment-manifest audit, documentation, and audit updates; the workflow reported `release_decision=No-go.` with `open_release_items=6` (`artifact://655`).
 - `bash tests/kvnode_systemd_manifest_audit.sh` passed on this host after adding the cross-platform manifest exercise; it rendered the example `kvnode@.service`/EnvironmentFile `ExecStart` contract and skipped `systemd-analyze` because analyzer verification is opt-in via `KVNODE_SYSTEMD_ANALYZE=yes`.
 - `bash tests/jepsen_remote_preflight_audit.sh` passed after adding remote Jepsen preflight-only safety coverage; it verifies destructive-storage and wall-clock-skew confirmations, broad remote-directory rejection, and safe confirmed preflight paths without touching remote hosts.
+- `KVNODE_UPGRADE_OLD_REF=66428ba KVNODE_UPGRADE_NEW_REF=64cff8d KVNODE_UPGRADE_BASE_PORT=50080 KVNODE_UPGRADE_PEER_BASE_PORT=50180 KVNODE_UPGRADE_ADMIN_BASE_PORT=50280 KVNODE_UPGRADE_READY_ATTEMPTS=80 KVNODE_UPGRADE_CANARY_ATTEMPTS=10 KVNODE_UPGRADE_SETTLE_SECONDS=1 bash tests/kvnode_mixed_version_drill.sh` passed on local loopback after adding `tests/kvnode_mixed_version_drill.sh`; metadata reported old commit `66428baafa1ec75deb00ff1cedb2a55d934594c3`, new commit `64cff8d58fffcf882a7156f4459138055f4b0510`, differing source hashes, differing binary SHA-256s, split client/peer/admin support in both binaries, `build_source=git_archive_trimpath`, `smoke_only=no`, per-node upgraded-writer and rolled-back-writer 204 canaries, latest GET checks, barrier scan checks, binary rollback on current data, and final `phase=complete`.
 
 ### Fault-tolerance envelope proof summary
 
@@ -132,6 +133,8 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
   - Rolling upgrade and rollback plan.
 - `tests/kvnode_capacity_envelope.sh`
   - Opt-in bounded capacity-envelope collection harness.
+- `tests/kvnode_mixed_version_drill.sh`
+  - Local loopback old/new binary rolling-upgrade and binary-rollback harness. It requires explicit `KVNODE_UPGRADE_OLD_REF`, builds old/new binaries from clean git archives with `-trimpath -buildvcs=false`, records source-tree hashes and binary SHA-256s, rejects identical refs/source/binaries unless `KVNODE_UPGRADE_SMOKE_ONLY=yes`, exercises one-node-at-a-time upgrade and rollback, and verifies each upgraded/rolled node with a 204 write plus latest GET and barrier scan from all nodes. Binary rollback uses the node's current data; checkpoint restore is documented as a separate data-lifecycle fallback, not this mixed-version drill.
 - `tests/operations_readiness_audit.sh`
   - Audit for the operations artifacts above.
 - `tests/toolchain.env`, `.github/workflows/ci.yml`, and `tests/toolchain_audit.sh`
@@ -181,8 +184,7 @@ The following blockers are still listed in `RELEASE_SCOPE.md` and prevent a go d
 
 - Broader formal model coverage remains open beyond the finite configured TLC suite; `tla/EPaxosResponses.tla` adds bounded prepare branch-priority/try-witness checks, `tla/EPaxosOptimizedRecovery.tla` adds finite 3-, 5-, and 7-replica Accept-Deps optimized-recovery evidence checks, `tla/EPaxosEvidenceQuery.tla` adds finite 3-, 5-, and 7-replica committed-conflict evidence-query guard/fail-closed checks, `tla/EPaxosConfigBarrier.tla` adds finite local config-barrier checks, `tla/EPaxosConfigTransition.tla` adds one finite add-voter config-transition pinning check, and `tla/TOQClockDiscipline.tla` adds a finite bounded-skew/bounded-delay `ProcessAt` contract check, but operational synchronized-clock/OWD-measurement implementation proof for TOQ deployments, unbounded proof, even-size optimized-quorum proof, arbitrary membership-change proof, remove-voter and multi-step reconfiguration proof, recovery under configuration changes, complete inlined recovery coverage in the normal-case model, and full technical-report optimized-recovery decision-tree coverage remain open/non-claims.
 - Deployment manifest artifacts are example/operator material only; `tests/kvnode_systemd_manifest_audit.sh` renders and audits the example `ExecStart` contract, but reviewed execution under a target system manager, container, or orchestration environment remains open.
-- Data lifecycle runbook exists, but a reviewed operator backup/restore/disaster-recovery drill remains open.
-- Actual old/new-binary mixed-version rolling upgrade and rollback execution evidence remains open; current evidence is deterministic storage/wire restart rollback simulation only.
+- Data lifecycle runbook exists, but a reviewed operator backup/restore/disaster-recovery drill remains open. The mixed-version drill's binary rollback keeps current data and does not exercise checkpoint restore.
 - Target-environment capacity-envelope measurements remain open.
 - Incident readiness has runbook/audit evidence only; operator review/tabletop or live drill evidence remains open.
 

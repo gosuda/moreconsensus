@@ -11,6 +11,10 @@ kvnode mixed-version upgrade/rollback drill (local loopback harness only)
 Status: local evidence harness only. This script starts local loopback kvnode
 processes and does not assert production readiness, target-environment coverage,
 operator backup/restore readiness, or deployment safety.
+Binary rollback in this drill restarts the old binary on the node's current data.
+Pre-upgrade data checkpoints are captured as rollback inputs, but
+checkpoint restore is a separate data-lifecycle fallback and is not exercised by
+this mixed-version harness.
 
 Required input:
   KVNODE_UPGRADE_OLD_REF       Git ref for the old kvnode build. There is no
@@ -588,18 +592,6 @@ checkpoint_node() {
   cp -Rp "$DATA_DIR/node-$id" "$checkpoint"
 }
 
-restore_node_checkpoint() {
-  local id="$1"
-  local checkpoint="$CHECKPOINT_DIR/node-$id-pre-upgrade"
-  LAST_PHASE="restore-node-$id-checkpoint"
-  if [[ ! -d "$checkpoint" ]]; then
-    fail "missing-node-$id-checkpoint"
-  fi
-  stop_node "$id"
-  safe_remove_data_path "$DATA_DIR/node-$id"
-  cp -Rp "$checkpoint" "$DATA_DIR/node-$id"
-}
-
 emit_success() {
   local phase="$1"
   echo "kvnode-mixed-version status=success phase=$phase"
@@ -651,7 +643,7 @@ put_and_verify_all 1 mv-drill-mixed-new-node-1 mixed-new-node-1-writer
 put_and_verify_all 2 mv-drill-mixed-old-node-2 mixed-old-node-2-writer
 put_and_verify_all 3 mv-drill-mixed-old-node-3 mixed-old-node-3-writer
 emit_success one-node-upgrade-mixed-read-write-scan
-restore_node_checkpoint 1
+stop_node 1
 start_node 1 "$OLD_BIN" old-rollback "$OLD_SPLIT_PLANES"
 wait_ready 1
 LAST_PHASE="rollback-old-binary-catchup"
@@ -704,7 +696,7 @@ assert_all_scan_has mv-drill-roll-node-3 roll-node-3-writer
 emit_success node-3-upgrade
 
 LAST_PHASE="reverse-rollback-node-3"
-restore_node_checkpoint 3
+stop_node 3
 start_node 3 "$OLD_BIN" old-reverse-rollback "$OLD_SPLIT_PLANES"
 wait_ready 3
 verify_cluster_health
@@ -721,7 +713,7 @@ put_and_verify_all 3 mv-drill-reverse-rollback-node-3 reverse-rollback-node-3-wr
 emit_success node-3-reverse-rollback
 
 LAST_PHASE="reverse-rollback-node-2"
-restore_node_checkpoint 2
+stop_node 2
 start_node 2 "$OLD_BIN" old-reverse-rollback "$OLD_SPLIT_PLANES"
 wait_ready 2
 verify_cluster_health
@@ -733,7 +725,7 @@ put_and_verify_all 2 mv-drill-reverse-rollback-node-2 reverse-rollback-node-2-wr
 emit_success node-2-reverse-rollback
 
 LAST_PHASE="reverse-rollback-node-1"
-restore_node_checkpoint 1
+stop_node 1
 start_node 1 "$OLD_BIN" old-reverse-rollback "$OLD_SPLIT_PLANES"
 wait_ready 1
 verify_cluster_health

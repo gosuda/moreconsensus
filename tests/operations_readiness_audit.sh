@@ -27,8 +27,9 @@ runbook="docs/operations/kvnode-data-lifecycle-incident-runbook.md"
 upgrade="docs/operations/kvnode-upgrade-rollback.md"
 capacity="tests/kvnode_capacity_envelope.sh"
 manifest="tests/kvnode_systemd_manifest_audit.sh"
+mixed_drill="tests/kvnode_mixed_version_drill.sh"
 
-for file in "$unit" "$env_example" "$runbook" "$upgrade" "$capacity" "$manifest"; do
+for file in "$unit" "$env_example" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
   require_file "$file"
 done
 
@@ -146,9 +147,19 @@ require_text "$upgrade" "## Rollback criteria"
 require_text "$upgrade" "Rollback is mandatory when any of these conditions occur"
 require_text "$upgrade" "## Rollback procedure"
 require_text "$upgrade" "Rollback one node at a time, using the latest node that was changed first."
-require_text "$upgrade" "Restore the pre-upgrade data checkpoint only while the node is stopped."
+require_text "$upgrade" "Start the old binary on the node's current data directory"
+require_text "$upgrade" "checkpoint restore can discard committed entries"
 require_text "$upgrade" "Run the same node and cluster post-checks used after upgrade"
 require_text "$upgrade" "this plan by itself is not production evidence"
+
+# Mixed-version drill harness: maintained local-loopback artifact only. Syntax is
+# audited here; execution requires explicit old/new refs and remains opt-in.
+require_text "$mixed_drill" "kvnode mixed-version upgrade/rollback drill"
+require_text "$mixed_drill" "KVNODE_UPGRADE_OLD_REF"
+require_text "$mixed_drill" "build_source=git_archive_trimpath"
+require_text "$mixed_drill" "Binary rollback in this drill restarts the old binary on the node's current data"
+require_text "$mixed_drill" "checkpoint restore is a separate data-lifecycle fallback"
+bash -n "$mixed_drill"
 
 # Capacity-envelope harness: opt-in execution, bounded inputs, output evidence
 # files, and no standalone production-evidence claim.

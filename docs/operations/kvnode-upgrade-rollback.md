@@ -61,11 +61,11 @@ Rollback one node at a time, using the latest node that was changed first.
 
 1. Remove the affected node's client listener from routing.
 2. Stop only the affected `kvnode` and wait for process exit.
-3. Preserve the failed-upgrade data directory for later investigation by moving or archiving it; never overwrite it in place.
+3. Preserve a copy or archive of the current failed-upgrade data directory for later investigation; never overwrite it in place.
 4. Restore the pre-upgrade binary or rollback symlink and verify its checksum.
-5. Restore the pre-upgrade data checkpoint only while the node is stopped. Use the tested restore path; do not splice individual Pebble files into a live data directory.
-6. Start the node with the exact pre-upgrade flags and TLS files.
-7. Run the same node and cluster post-checks used after upgrade: `/livez`, `/readyz`, `/metrics`, canary write/read/scan, old-key read, disk/RSS capture, and log review.
+5. Start the old binary on the node's current data directory with the exact pre-upgrade flags and TLS files. This is the normal binary rollback path and is what `tests/kvnode_mixed_version_drill.sh` exercises.
+6. Run the same node and cluster post-checks used after upgrade: `/livez`, `/readyz`, `/metrics`, canary write/read/scan, old-key read, disk/RSS capture, and log review.
+7. Keep the pre-upgrade data checkpoint available as a separate data-lifecycle fallback only. Restore that checkpoint only under the backup/restore runbook, while the node is stopped, after preserving the current data directory; do not splice individual Pebble files into a live data directory. A checkpoint restore can discard committed entries learned after the checkpoint and therefore is not the default mixed-version binary rollback path.
 8. Keep the node out of client routing until the observation window passes. If rollback does not restore health, stop the rollout and escalate with the checkpoint path, failed-upgrade data archive, logs, metrics snapshots, and binary checksums.
 
 ## Completion record
