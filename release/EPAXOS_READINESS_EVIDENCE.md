@@ -152,6 +152,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `bash tests/go_coverage.sh` passed after the AcceptEvidence sender-merge model updates; `./epaxos`, `./examples/kv`, and `./examples/kv/cmd/kvcheckpoint` coverage profiles reported 100.0%, and `./examples/kv/cmd/kvnode` passed under the script.
 - `bash tests/release_scope_audit.sh`, `bash tests/audit_repo.sh`, and `bash tests/go_no_go_workflow.sh` passed after the AcceptEvidence sender-merge scope/evidence/audit updates; the workflow preserved `release_decision=No-go.` with `open_release_items=5`.
 - `bash tests/ci.sh` passed after the AcceptEvidence sender-merge model, documentation, audit, and evidence updates; the go/no-go workflow preserved `release_decision=No-go.` with `open_release_items=5`.
+- `EPAXOS.MD` and `MODEL_EQ_REPORT.MD` now document the exact TOQ operational-clock boundary for the broader formal open item: the core consumes embedder-supplied clock, one-way-delay, and sync-group values, while synchronized-clock implementation, one-way-delay measurement, runtime drift enforcement, target-environment validation, and operational clock-discipline proof remain open.
 
 ### Fault-tolerance envelope proof summary
 

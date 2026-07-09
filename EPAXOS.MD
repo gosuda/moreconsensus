@@ -25,6 +25,10 @@ The core starts no goroutines, performs no I/O, and does not call the OS wall cl
 
 Primary paper references: [EPaxos SOSP 2013](https://sigops.org/s/conferences/sosp/2013/papers/p358-moraru.pdf), [EPaxos technical report CMU-PDL-13-111](https://www.pdl.cmu.edu/PDL-FTP/associated/CMU-PDL-13-111.pdf), and [EPaxos Revisited NSDI 2021](https://www.usenix.org/system/files/nsdi21-tollman.pdf).
 
+## TOQ operational-clock boundary
+
+The core does not synchronize clocks, measure one-way delay, select a production sync group, or quarantine nodes whose measured drift exceeds a bound. `Config.TOQClock`, `Config.TOQOneWayDelay`, and `Config.TOQSyncGroup` are embedder-owned inputs; each `TOQOneWayDelay` value must already include network one-way delay plus the clock-skew/synchronization uncertainty margin for that peer. `tla/TOQClockDiscipline.tla` proves only the finite contract that these supplied bounds make `ProcessAt` late enough for the configured sync group. Synchronized-clock implementation, one-way-delay measurement, runtime drift enforcement, and operational clock-discipline proof remain outside the current release claim.
+
 ## Instance identity
 
 Each command is stored in an `InstanceRecord` named by `(ReplicaID, InstanceNum, ConfID)`. `ReplicaID` identifies the owner replica. `InstanceNum` is monotonically allocated by that owner. `ConfID` pins the voter set used by the instance, which makes dependency vectors deterministic.

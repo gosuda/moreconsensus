@@ -38,6 +38,8 @@ The repository now uses a split model suite rather than one monolithic implement
 | `tla/Quorum.tla` | Supported quorum tables and quorum intersections. |
 | `tla/KVTimestampStaleness.tla`, `tla/KVOmissionRecovery.tla` | Example KV timestamp semantics and omission/recovery scenarios. |
 
+TOQ operational-clock boundary: `tla/TOQClockDiscipline.tla` assumes the embedder has already supplied bounded clock skew, bounded one-way delay, and the intended sync group. The repository core consumes those values but does not implement NTP/PTP-style synchronization, delay measurement, drift monitoring, sync-group rollout procedure, or target-environment validation. Those items remain release-blocking operational-clock proof, not hidden model coverage.
+
 
 ## Paper-grounded claim map
 
