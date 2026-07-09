@@ -117,6 +117,10 @@ for cfg in tla/EPaxosConfigChainRecovery.cfg; do
   run_tlc tla/EPaxosConfigChainRecovery.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigChainRecoveryLostResponseRetry.cfg; do
+  run_tlc tla/EPaxosConfigChainRecoveryLostResponseRetry.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigTransitionDedup.cfg; do
   run_tlc tla/EPaxosConfigTransitionDedup.tla "$cfg"
 done
