@@ -12,7 +12,7 @@ The word "proof" in this repository means a combination of:
 4. Go unit, fuzz, stress, and coverage gates; and
 5. local Jepsen harness evidence plus optional external validation tooling where separately exercised.
 
-This is not an unbounded mathematical proof of every possible EPaxos execution. The finite TLA+ models cover configured bounded state spaces. The current repository still names open non-claims: full technical-report optimized-recovery decision-tree parity, even-size optimized-quorum proof, operational synchronized-clock/one-way-delay implementation for TOQ deployments, arbitrary membership-change proof, in-place disk-corruption repair or synthesized reconstruction without a verified checkpoint, actual old/new-binary mixed-version upgrade/rollback execution, target-environment capacity proof, and incident-drill evidence.
+This is not an unbounded mathematical proof of every possible EPaxos execution. The finite TLA+ models cover configured bounded state spaces. The current repository still names open non-claims: full technical-report optimized-recovery decision-tree parity, even-size optimized-quorum proof, operational synchronized-clock/one-way-delay implementation for TOQ deployments, arbitrary membership-change proof, in-place disk-corruption repair or synthesized reconstruction without a verified checkpoint, target-environment mixed-version compatibility beyond the local loopback drill, target-environment capacity proof, and incident-drill evidence.
 
 ## 2. Primary paper obligations checked
 
@@ -200,11 +200,13 @@ Why this is safe inside the implemented envelope:
 - Conflicting local state can veto TryPreAccept unless chosen dependency evidence orders the conflict, or sender-preserving recovery-only `AcceptEvidence` proves a committed stale-dependency ignore is safe after that chosen dependency edge already exists.
 - No-op recovery for all-none prepare quorums is safe because no quorum member knows a proposed command for that instance.
 
+Rollback/restart catch-up also protects per-replica local instance allocation. `NewRawNode`, commit/pre-accept/accept/prepare, and dependency-recovery paths call `observeInstanceRef` for observed refs, so learning an own local ref from quorum advances `nextInstance`; `propose` additionally skips any already materialized local ref if `nextInstance` is stale. `tla/EPaxosRollbackAllocation.tla` checks a finite rollback sequence with a checkpoint before local instance 2, quorum-learned local instance 2, a defensive known future local instance 3 while `nextInstance` is stale, fresh allocation at 4, and an apply sequence where learned instance 2 precedes fresh instance 4. `TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit` checks the Go path and asserts applied order for all replicas after catch-up.
+
 Open limitation:
 
 - CMU-PDL-13-111 Section 6.2 contains a full optimized-recovery decision tree. This repository implements the Go committed stale-dependency evidence-search/resend-ignore path for supported `F <= 3` configurations, durable value-ballot recovery evidence, targeted leader-in-fast-quorum/deferred-cycle handling, and finite TLA coverage for the committed-conflict evidence-query guard/fail-closed slice. Complete optimized-recovery decision-tree coverage in TLA and unbounded proof remain non-claims.
 
-Source anchors: `epaxos/node.go` (`startPrepare`, `handlePrepare`, `handlePrepareResp`, `handleEvidence`, `handleEvidenceResp`, `startTryPreAccept`, `handleTryPreAccept`, `handleTryPreAcceptResp`, `tryPreAcceptConflict`, `ensureDependencyRecovery`), `tla/EPaxosResponses.tla`, `tla/EPaxosRecovery.tla`, `tla/EPaxosOptimizedRecovery.tla`, `tla/EPaxosEvidenceQuery.tla`.
+Source anchors: `epaxos/node.go` (`startPrepare`, `handlePrepare`, `handlePrepareResp`, `handleEvidence`, `handleEvidenceResp`, `startTryPreAccept`, `handleTryPreAccept`, `handleTryPreAcceptResp`, `tryPreAcceptConflict`, `ensureDependencyRecovery`, `observeInstanceRef`, `propose`), `epaxos/recovery_test.go` (`TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit`), `tla/EPaxosResponses.tla`, `tla/EPaxosRecovery.tla`, `tla/EPaxosRollbackAllocation.tla`, `tla/EPaxosOptimizedRecovery.tla`, `tla/EPaxosEvidenceQuery.tla`.
 
 ## 9. Execution path
 
@@ -455,6 +457,7 @@ Evidence: `examples/kv/cmd/kvnode/main.go`, `examples/kv/cmd/kvnode/main_test.go
 | `tla/EPaxosOptimizedRecovery.tla` | Focused 3/5/7 Accept-Deps stale-dependency optimized-recovery evidence slices. | The concrete `MsgEvidence` exchange, every technical-report branch, and unbounded proof. |
 | `tla/EPaxosEvidenceQuery.tla` | Focused 3/5/7 committed-conflict evidence-query slice: guard-gated `MsgEvidence`, read-only responses, duplicate/mismatched drops, sender-preserving evidence validation, stale rejection restart, and fail-closed fallback. | Every technical-report branch, arbitrary membership/reconfiguration recovery, and unbounded proof. |
 | `tla/EPaxosRecovery.tla` | Stopped-owner dependency recovery and no-op unblocking for finite configs. | Arbitrary recovery under reconfiguration. |
+| `tla/EPaxosRollbackAllocation.tla` | Rollback allocation: a restored local checkpoint learns a later own committed instance from quorum, advances `nextInstance`, skips a known future local ref under a defensive stale-next state, allocates a fresh local ref, and preserves learned-before-fresh apply order. | Full EPaxos recovery, unbounded rollback histories, storage checksums, message loss, or arbitrary multi-replica rollback. |
 | `tla/EPaxosConfigBarrier.tla` | Pending config barriers and user-command ordering against two fixed config refs. | Dynamic membership histories. |
 | `tla/EPaxosConfigTransition.tla` | One finite add-voter transition and config pinning. | Remove-voter, multi-step, joint consensus, recovery during config change. |
 | `tla/EPaxosRevisited.tla` | TOQ envelope, delayed assignment, pending-decision blocking, receiver processing, fast-wait behavior, and chain pruning. | Real clock synchronization and OWD measurement. |
@@ -503,7 +506,7 @@ The implementation and evidence currently support a bounded library/example clai
 - in-place disk-corruption repair, checksum recomputation/deletion, synthesized reconstruction without a verified checkpoint, or multi-replica/quorum-loss recovery;
 - exercised production deployment manifest;
 - target-environment backup/restore and disaster-recovery drill;
-- mixed-version upgrade/rollback execution;
+- target-environment mixed-version compatibility beyond the local loopback old/new-binary drill;
 - target-environment capacity envelope;
 - incident readiness tabletop or live drill.
 

@@ -307,6 +307,7 @@ func TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit(t *testing.
 	s.drain()
 	for _, id := range []ReplicaID{1, 2, 3} {
 		requireCommittedPayloadCount(t, s.apps[id], id, afterCatchUpRef, afterCatchUp.Payload, 1)
+		recoveryRequireAppliedOrder(t, s.apps[id], id, learnedRef, afterCatchUpRef)
 		requireNoDuplicateCommittedRefs(t, s.apps[id], id)
 	}
 }
