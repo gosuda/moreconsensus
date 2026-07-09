@@ -88,86 +88,47 @@ du -sh "${DATA_DIR}" > "${EVIDENCE_DIR}/data-dir-size.txt" 2>&1 || true
 
 ## One-time offline checkpoint/restore helper
 
-Use this helper in a disposable operator workspace. It is intentionally outside the repository tree. It imports `gosuda.org/moreconsensus/examples/kv` and calls `DB.Checkpoint`, `kv.VerifyCheckpoint`, `kv.RestoreCheckpoint`, or `kv.RepairFromCheckpoint`; semantic live-source replacement remains covered by the in-process `Cluster` test harness, not this standalone `kvnode` helper.
+Use the maintained offline helper in `examples/kv/cmd/kvcheckpoint`. It imports `gosuda.org/moreconsensus/examples/kv` and exposes the same checkpoint, semantic verification, verified restore, and verified repair operations documented below; semantic live-source replacement remains covered by the in-process `Cluster` test harness, not this standalone `kvnode` helper.
+
+Build it from the checkout that matches the deployed binary version you are drilling:
+
+```sh
+cd /path/to/moreconsensus/examples/kv
+go build -o /opt/moreconsensus/bin/kvcheckpoint ./cmd/kvcheckpoint
+```
 
 Preconditions:
 
-- Run from a checkout that matches the deployed binary version you are drilling.
 - The `kvnode` process using `DATA_DIR` is stopped before `checkpoint`, `restore`, or `repair`. `verify` opens only `CHECKPOINT_DIR` read-only and may run before stopping the node.
 - `CHECKPOINT_DIR` is on storage with enough capacity for a complete Pebble checkpoint plus manifest files.
 - The checkpoint directory must be new or empty for backup. Do not overwrite an existing checkpoint.
+- Use the helper from the same repository version as the deployed `kvnode` binary and data format.
 
-Create the helper:
+Commands:
 
 ```sh
-export REPO="/path/to/moreconsensus"
-export HELPER_DIR="/tmp/kvnode-checkpoint-helper"
-rm -rf "${HELPER_DIR}"
-mkdir -p "${HELPER_DIR}"
-cat > "${HELPER_DIR}/go.mod" <<EOF
-module kvnode-checkpoint-helper
+export CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${STAMP}"
+test ! -e "${CHECKPOINT_DIR}"
 
-go 1.26
-
-require gosuda.org/moreconsensus/examples/kv v0.0.0
-
-replace gosuda.org/moreconsensus/examples/kv => ${REPO}/examples/kv
-replace gosuda.org/moreconsensus => ${REPO}
-EOF
-cat > "${HELPER_DIR}/main.go" <<'GO'
-package main
-
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-
-	kv "gosuda.org/moreconsensus/examples/kv"
-)
-
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s checkpoint|verify|restore|repair DATA_DIR CHECKPOINT_DIR\n", os.Args[0])
-	os.Exit(2)
-}
-
-func main() {
-	if len(os.Args) != 4 {
-		usage()
-	}
-	cmd, dataDir, checkpointDir := os.Args[1], os.Args[2], os.Args[3]
-	switch cmd {
-	case "checkpoint":
-		if err := os.MkdirAll(filepath.Dir(checkpointDir), 0o700); err != nil {
-			panic(err)
-		}
-		db, err := kv.Open(dataDir)
-		if err != nil {
-			panic(err)
-		}
-		defer func() { _ = db.Close() }()
-		if err := db.Checkpoint(checkpointDir); err != nil {
-			panic(err)
-		}
-	case "verify":
-		if err := kv.VerifyCheckpoint(checkpointDir); err != nil {
-			panic(err)
-		}
-	case "restore":
-		if err := kv.RestoreCheckpoint(dataDir, checkpointDir); err != nil {
-			panic(err)
-		}
-	case "repair":
-		if err := kv.RepairFromCheckpoint(dataDir, checkpointDir); err != nil {
-			panic(err)
-		}
-	default:
-		usage()
-	}
-}
-GO
+/opt/moreconsensus/bin/kvcheckpoint checkpoint "${DATA_DIR}" "${CHECKPOINT_DIR}"
+/opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}"
 ```
 
-Rollback note: deleting `HELPER_DIR` is sufficient to remove the helper. It does not modify data until you run `checkpoint`, `restore`, or `repair`; `verify` opens the checkpoint read-only.
+After verification, choose exactly one recovery path. For checksum/corruption response, use the preferred repair path:
+
+```sh
+/opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}"
+```
+
+For full-directory rollback instead, use the restore path:
+
+```sh
+/opt/moreconsensus/bin/kvcheckpoint restore "${DATA_DIR}" "${CHECKPOINT_DIR}"
+```
+
+`repair` is the preferred operator command for checksum/corruption response because it calls semantic checkpoint verification before whole-directory replacement. `restore` is retained for full-directory rollback and also verifies the checkpoint before copying; the helper intentionally does not expose an unverified raw byte-copy restore path. Do not run both recovery commands for the same incident unless a reviewed rollback plan explicitly calls for a second replacement.
+
+Rollback note: deleting the built helper binary is sufficient to remove the helper. It does not modify data until you run `checkpoint`, `restore`, or `repair`; `verify` opens the checkpoint read-only.
 
 ## Pebble checkpoint backup
 
@@ -197,10 +158,7 @@ journalctl -u "${SERVICE}" --since "15 minutes ago" --no-pager > "${EVIDENCE_DIR
 sudo systemctl stop "${SERVICE}"
 
 # Run the offline checkpoint.
-(
-  cd "${HELPER_DIR}"
-  go run . checkpoint "${DATA_DIR}" "${CHECKPOINT_DIR}"
-)
+/opt/moreconsensus/bin/kvcheckpoint checkpoint "${DATA_DIR}" "${CHECKPOINT_DIR}"
 
 # Record a relocatable checkpoint manifest and protect the checkpoint from accidental edits.
 (
@@ -252,6 +210,7 @@ Preconditions:
 Commands:
 
 ```sh
+set -euo pipefail
 export CHECKPOINT_DIR="/srv/kv-checkpoints/node-${NODE_ID}/YYYYMMDDTHHMMSSZ"
 export RESTORE_EVIDENCE_DIR="${INCIDENT_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-restore-node-${NODE_ID}"
 mkdir -p "${RESTORE_EVIDENCE_DIR}"
@@ -263,10 +222,8 @@ mkdir -p "${RESTORE_EVIDENCE_DIR}"
 ) | tee "${RESTORE_EVIDENCE_DIR}/checkpoint-verify.txt"
 
 # Verify the checkpoint can be opened read-only and semantically matches its applied EPaxos commands.
-(
-  cd "${HELPER_DIR}"
-  go run . verify "${DATA_DIR}" "${CHECKPOINT_DIR}"
-) | tee "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
+/opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
+cat "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
 
 # Stop and preserve a separate quarantine copy if retention is required.
 sudo systemctl stop "${SERVICE}"
@@ -274,10 +231,8 @@ rsync -a --numeric-ids "${DATA_DIR}/" "${RESTORE_EVIDENCE_DIR}/live-data-before-
 find "${DATA_DIR}" -type f -print0 | sort -z | xargs -0 shasum -a 256 > "${RESTORE_EVIDENCE_DIR}/live-data-before-restore.sha256" 2>/dev/null || true
 
 # Repair from the whole checkpoint; this verifies again before byte-copy replacement.
-(
-  cd "${HELPER_DIR}"
-  go run . repair "${DATA_DIR}" "${CHECKPOINT_DIR}"
-) | tee "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
+/opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
+cat "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
 
 # Restart one restored node and check only its admin plane first.
 sudo systemctl start "${SERVICE}"
@@ -319,7 +274,7 @@ chmod -R a-w "${INCIDENT}/quarantine-data" || true
 
 Decision path:
 
-1. If a checkpoint exists, first verify its manifest and then use `go run . verify` plus `go run . repair` from the offline helper. This authenticates persisted EPaxos records before whole-directory replacement.
+1. If a checkpoint exists, first verify its manifest and then use `kvcheckpoint verify` plus `kvcheckpoint repair` from the offline helper. This authenticates persisted EPaxos records before whole-directory replacement.
 2. If no verified checkpoint exists and quorum remains healthy without this node, keep this node stopped and preserve evidence. Do not restart it against the cluster with suspected corrupt state.
 3. If a quorum is unavailable and multiple nodes have suspected corruption, stop and escalate to incident command. This runbook does not claim majority reconstruction or corrupt-record deletion.
 4. If the checksum mismatch follows a test fault injection rather than real disk evidence, still preserve logs and confirm the test harness restored original storage before restarting.

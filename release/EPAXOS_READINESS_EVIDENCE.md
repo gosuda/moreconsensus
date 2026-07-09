@@ -108,6 +108,7 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 - `bash tests/kvnode_capacity_envelope.sh --help` passed in this session and showed the opt-in bounded harness usage.
 - A local single-node loopback capacity-envelope sample passed with `KVNODE_CAPACITY_RUN=yes`, `KVNODE_CAPACITY_OPS_PER_PHASE=5`, `KVNODE_CAPACITY_VALUE_BYTES=64,1024`, and `KVNODE_CAPACITY_SCAN_LIMITS=1,8`; archived sample files are `local://kvnode-capacity-loopback-20260708T194748Z-summary.txt`, `local://kvnode-capacity-loopback-20260708T194748Z-latency.csv`, and `local://kvnode-capacity-loopback-20260708T194748Z-resources.csv`; generated summary reported 22 HTTP operations, 22.000 sampled operations/second, p50 0.007860s, p95 0.008602s, p99 0.008797s, and harness-only/non-production status.
 - `bash tests/release_scope_audit.sh` passed in this session after release-scope updates.
+- `go test ./examples/kv/cmd/kvcheckpoint -count=1` passed after adding the maintained offline checkpoint helper; the CLI verifies checkpoints before `restore` and `repair` replaces a data directory.
 
 ### New or updated artifacts in this evidence bundle scope
 
@@ -125,6 +126,8 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
   - Adds offline Pebble checkpoint, semantic read-only checkpoint verification for EPaxos records/applied markers/dense timestamped KV rows/dependency order, explicit checkpoint-backed repair, and whole-directory restore helpers for the example KV store.
 - `examples/kv/more_test.go`
   - Adds checkpoint restore, explicit checkpoint-backed repair, semantic checkpoint rejection, live-source recovery, unsupported-source rejection, target-owned floor mismatch rejection, corrupt checkpoint rejection, missing checkpoint rejection, and post-repair writes.
+- `examples/kv/cmd/kvcheckpoint`
+  - Adds a maintained offline example/operator helper for `checkpoint`, `verify`, verified `restore`, and `repair` operations. The helper verifies checkpoints before any restore or repair path and remains outside the live `kvnode` service plane.
 - `tests/chaos_fault_campaign.sh`
   - Adds checkpoint restore, explicit checkpoint-backed repair, semantic checkpoint verification, and live-source recovery tests to the KV persistence fault matrix.
 - `deploy/systemd/kvnode@.service`
@@ -134,7 +137,7 @@ Non-claims remain explicit: No target-environment remote claim, no in-place Pebb
 - `tests/kvnode_systemd_manifest_audit.sh`
   - Cross-platform static manifest exercise that validates required environment variables, renders the example `ExecStart`, checks peer/deadline/body-limit values, and keeps host-context `systemd-analyze verify` opt-in through `KVNODE_SYSTEMD_ANALYZE=yes`.
 - `docs/operations/kvnode-data-lifecycle-incident-runbook.md`
-  - Data lifecycle and incident runbook with backup, semantic checkpoint verification, explicit repair, restore, checksum, destructive-storage, live-source recovery boundaries, and incident procedures.
+  - Data lifecycle and incident runbook with the maintained `kvcheckpoint` offline helper, backup, semantic checkpoint verification, explicit repair, verified restore, checksum, destructive-storage, live-source recovery boundaries, and incident procedures.
 - `docs/operations/kvnode-upgrade-rollback.md`
   - Rolling upgrade and rollback plan.
 - `tests/kvnode_capacity_envelope.sh`
@@ -196,7 +199,7 @@ The following blockers are still listed in `RELEASE_SCOPE.md` and prevent a go d
 
 - Broader formal model coverage remains open beyond the finite configured TLC suite; `tla/EPaxosResponses.tla` adds bounded prepare branch-priority/try-witness checks, `tla/EPaxosOptimizedRecovery.tla` adds finite 3-, 5-, and 7-replica Accept-Deps optimized-recovery evidence checks, `tla/EPaxosEvidenceQuery.tla` adds finite 3-, 5-, and 7-replica committed-conflict evidence-query guard/fail-closed checks, `tla/EPaxosConfigBarrier.tla` adds finite local config-barrier checks, `tla/EPaxosConfigTransition.tla` adds one finite add-voter config-transition pinning check, `tla/EPaxosConfigRemoveTransition.tla` adds one finite remove-voter config-transition pinning check, `tla/EPaxosConfigChainTransition.tla` adds one finite add-then-remove configuration-chain pinning check, `tla/EPaxosRollbackAllocation.tla` adds one finite rollback-allocation next-instance/skip/apply-order check, and `tla/TOQClockDiscipline.tla` adds a finite bounded-skew/bounded-delay `ProcessAt` contract check, but operational synchronized-clock/OWD-measurement implementation proof for TOQ deployments, unbounded proof, arbitrary membership-change proof, arbitrary multi-step reconfiguration proof, recovery under configuration changes, complete optimized-recovery branch parity, full rollback-history proof, and arbitrary application/state-machine semantics remain open.
 - Deployment manifest artifacts are example/operator material only; `tests/kvnode_systemd_manifest_audit.sh` renders and audits the example `ExecStart` contract, but reviewed execution under a target system manager, container, or orchestration environment remains open.
-- Data lifecycle runbook exists, but a reviewed operator backup/restore/disaster-recovery drill remains open. The mixed-version drill's binary rollback keeps current data and does not exercise checkpoint restore.
+- Data lifecycle now has a maintained local offline `kvcheckpoint` helper plus runbook/audit evidence, but a reviewed operator backup/restore/disaster-recovery drill in the target environment remains open. The mixed-version drill's binary rollback keeps current data and does not exercise checkpoint restore.
 - Target-environment capacity-envelope measurements remain open.
 - Incident readiness has runbook/audit evidence only; operator review/tabletop or live drill evidence remains open.
 

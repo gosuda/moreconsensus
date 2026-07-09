@@ -28,8 +28,10 @@ upgrade="docs/operations/kvnode-upgrade-rollback.md"
 capacity="tests/kvnode_capacity_envelope.sh"
 manifest="tests/kvnode_systemd_manifest_audit.sh"
 mixed_drill="tests/kvnode_mixed_version_drill.sh"
+checkpoint_helper="examples/kv/cmd/kvcheckpoint/main.go"
+checkpoint_helper_test="examples/kv/cmd/kvcheckpoint/main_test.go"
 
-for file in "$unit" "$env_example" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
+for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
   require_file "$file"
 done
 
@@ -100,6 +102,16 @@ require_text "$manifest" "KVNODE_SYSTEMD_ANALYZE=yes"
 require_text "$manifest" "systemd-analyze verify"
 bash "$manifest" >/dev/null
 
+# Offline checkpoint helper: example/operator command, verified restore boundary,
+# and no live-service backup endpoint claim.
+require_text "$checkpoint_helper" "Command kvcheckpoint performs offline checkpoint, verification, restore, and"
+require_text "$checkpoint_helper" "Status: offline example/operator helper only"
+require_text "$checkpoint_helper" "restoreVerified"
+require_text "$checkpoint_helper" "kv.VerifyCheckpoint"
+require_text "$checkpoint_helper" "kv.RestoreCheckpoint"
+require_text "$checkpoint_helper_test" "TestRestoreRejectsCorruptCheckpointWithoutReplacingLiveData"
+require_text "$checkpoint_helper_test" "TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData"
+
 # Data lifecycle/incident runbook: backup/verify/repair/restore boundaries,
 # confirmations, evidence capture, and named incident response procedures.
 require_text "$runbook" "Status: example/operator runbook material"
@@ -115,6 +127,13 @@ require_text "$runbook" "kv.Cluster.RecoverReplicaFromLiveCheckpoint"
 require_text "$runbook" "target-owned next-instance floor"
 require_text "$runbook" "## Evidence capture baseline"
 require_text "$runbook" "## One-time offline checkpoint/restore helper"
+require_text "$runbook" "examples/kv/cmd/kvcheckpoint"
+require_text "$runbook" "verified restore"
+require_text "$runbook" "does not expose an unverified raw byte-copy restore path"
+require_text "$runbook" "choose exactly one recovery path"
+require_text "$runbook" "set -euo pipefail"
+require_text "$runbook" "checkpoint-epaxos-verify.txt"
+require_text "$runbook" "repair-helper.txt"
 require_text "$runbook" "## Pebble checkpoint backup"
 require_text "$runbook" "## Offline whole-directory repair or restore from a checkpoint"
 require_text "$runbook" "## Checksum-mismatch response"
