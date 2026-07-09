@@ -326,11 +326,15 @@ Why this is safe inside the bounded claim:
 - Quorum membership for an instance is stable because `Ref.Conf` selects the historical configuration.
 - Later instances use the successor configuration only after the configuration command executes.
 
+Finite replay coverage:
+
+- `NewRawNode` loads durable instance records, remembers stored configuration states, replays executed configuration-change records in instance order, reconstructs intermediate `ConfID` domains needed by old in-flight records, and rejects a stored historical `ConfID` if its voters conflict with the voters deterministically produced by replayed commands. A replayed unexecuted configuration command remains a proposal barrier. TOQ configuration is validated after replay, so the default sync group uses the replayed current voters and explicit stale sync groups fail closed.
+
 Open limitation:
 
-- The current formal models cover a finite local barrier, one add-voter transition, one remove-voter transition, and one add-then-remove chain. They do not cover arbitrary/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, durable replay, or unbounded configuration histories.
+- The current formal models cover a finite local barrier, one add-voter transition, one remove-voter transition, one add-then-remove chain, and one durable restart-replay slice. They do not cover arbitrary/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, arbitrary durable histories, or unbounded configuration histories.
 
-Source anchors: `epaxos/node.go` (`Propose`, `ProposeConfChange`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `applyConfChange`, per-instance quorum/broadcast helpers), `epaxos/config_change_ordering_test.go`, `epaxos/sim_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`, `tla/EPaxosConfigRemoveTransition.tla`, `tla/EPaxosConfigChainTransition.tla`.
+Source anchors: `epaxos/node.go` (`NewRawNode`, `Propose`, `ProposeConfChange`, `configureTOQ`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `rememberConf`, `replayExecutedConfig`, `replayConfChange`, `applyConfChange`, per-instance quorum/broadcast helpers), `epaxos/config_change_ordering_test.go`, `epaxos/toq_test.go`, `epaxos/sim_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`, `tla/EPaxosConfigRemoveTransition.tla`, `tla/EPaxosConfigChainTransition.tla`, `tla/EPaxosConfigReplay.tla`.
 
 ## 15. Property-by-property rationale
 

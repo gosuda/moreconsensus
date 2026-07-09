@@ -101,6 +101,10 @@ for cfg in tla/EPaxosConfigChainTransition.cfg; do
   run_tlc tla/EPaxosConfigChainTransition.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigReplay.cfg; do
+  run_tlc tla/EPaxosConfigReplay.tla "$cfg"
+done
+
 for cfg in tla/EPaxosRollbackAllocation.cfg; do
   run_tlc tla/EPaxosRollbackAllocation.tla "$cfg"
 done

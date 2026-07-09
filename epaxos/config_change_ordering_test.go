@@ -251,6 +251,307 @@ func TestSingleVoterConfChangeClearsPendingBarrierAfterImmediateExecution(t *tes
 	}
 }
 
+func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	addRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	removeRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
+	oldRef := InstanceRef{Replica: 3, Instance: 2, Conf: 1}
+	midRef := InstanceRef{Replica: 4, Instance: 1, Conf: 2}
+
+	store.Records[addRef] = checkedRecord(InstanceRecord{
+		Ref:              addRef,
+		Ballot:           Ballot{Replica: 1},
+		Status:           StatusExecuted,
+		Seq:              1,
+		Deps:             []InstanceNum{0, 0, 0},
+		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		FastPathEligible: true,
+	})
+	store.Records[removeRef] = checkedRecord(InstanceRecord{
+		Ref:              removeRef,
+		Ballot:           Ballot{Replica: 2},
+		Status:           StatusExecuted,
+		Seq:              1,
+		Deps:             []InstanceNum{0, 0, 0, 0},
+		Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+		FastPathEligible: true,
+	})
+	store.Records[oldRef] = checkedRecord(InstanceRecord{
+		Ref:              oldRef,
+		Ballot:           Ballot{Replica: 3},
+		Status:           StatusPreAccepted,
+		Seq:              2,
+		Deps:             []InstanceNum{0, 0, 1},
+		Command:          configOrderingUserCommand(40, "old-conf"),
+		FastPathEligible: true,
+	})
+	store.Records[midRef] = checkedRecord(InstanceRecord{
+		Ref:              midRef,
+		Ballot:           Ballot{Replica: 4},
+		Status:           StatusPreAccepted,
+		Seq:              2,
+		Deps:             []InstanceNum{0, 0, 1, 0},
+		Command:          configOrderingUserCommand(41, "mid-conf"),
+		FastPathEligible: true,
+	})
+
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store, RetryTicks: 10, RecoveryTicks: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.confFor(1), ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+	assertConfState(t, restarted.confFor(2), ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}})
+	assertConfState(t, restarted.confFor(3), ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
+
+	assertConfigOrderingDepsWidth(t, restarted, oldRef, 3)
+	assertConfigOrderingDepsWidth(t, restarted, midRef, 4)
+	assertConfigOrderingDependencyRefs(t, restarted, oldRef, []InstanceRef{{Replica: 3, Instance: 1, Conf: 1}})
+	assertConfigOrderingDependencyRefs(t, restarted, midRef, []InstanceRef{{Replica: 3, Instance: 1, Conf: 2}})
+
+	if err := restarted.Step(Message{
+		Type:    MsgPreAccept,
+		From:    3,
+		To:      1,
+		Ref:     InstanceRef{Replica: 3, Instance: 3, Conf: 1},
+		Ballot:  Ballot{Replica: 3},
+		Seq:     3,
+		Deps:    []InstanceNum{0, 0, 2},
+		Command: configOrderingUserCommand(42, "old-conf-after-restart"),
+	}); err != nil {
+		t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
+	}
+	if err := restarted.Step(Message{
+		Type:    MsgPreAccept,
+		From:    4,
+		To:      1,
+		Ref:     InstanceRef{Replica: 4, Instance: 2, Conf: 2},
+		Ballot:  Ballot{Replica: 4},
+		Seq:     3,
+		Deps:    []InstanceNum{0, 0, 1, 1},
+		Command: configOrderingUserCommand(43, "mid-conf-after-restart"),
+	}); err != nil {
+		t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
+	}
+
+	ref, err := restarted.Propose(configOrderingUserCommand(44, "current-conf-after-restart"))
+	if err != nil {
+		t.Fatalf("Propose on current configuration after restart err=%v", err)
+	}
+	if ref.Conf != 3 {
+		t.Fatalf("proposal after restart used ref=%s, want current configuration 3", ref)
+	}
+	assertConfigOrderingDepsWidth(t, restarted, ref, 3)
+
+	removed, err := NewRawNode(Config{ID: 3, Voters: makeIDs(3), Storage: store, RetryTicks: 10, RecoveryTicks: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, removed.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
+	if _, err := removed.Propose(configOrderingUserCommand(45, "removed-user")); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("removed voter Propose err=%v, want %v", err, ErrMessageRejected)
+	}
+	if _, err := removed.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 5}); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("removed voter ProposeConfChange err=%v, want %v", err, ErrMessageRejected)
+	}
+}
+
+func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	addRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	removeRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
+	pendingRef := InstanceRef{Replica: 4, Instance: 1, Conf: 3}
+
+	store.Records[addRef] = checkedRecord(InstanceRecord{
+		Ref:              addRef,
+		Ballot:           Ballot{Replica: 1},
+		Status:           StatusExecuted,
+		Seq:              1,
+		Deps:             []InstanceNum{0, 0, 0},
+		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		FastPathEligible: true,
+	})
+	store.Records[removeRef] = checkedRecord(InstanceRecord{
+		Ref:              removeRef,
+		Ballot:           Ballot{Replica: 2},
+		Status:           StatusExecuted,
+		Seq:              1,
+		Deps:             []InstanceNum{0, 0, 0, 0},
+		Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+		FastPathEligible: true,
+	})
+	store.Records[pendingRef] = checkedRecord(InstanceRecord{
+		Ref:              pendingRef,
+		Ballot:           Ballot{Replica: 4},
+		Status:           StatusPreAccepted,
+		Seq:              2,
+		Deps:             []InstanceNum{0, 0, 0},
+		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5}),
+		FastPathEligible: true,
+	})
+
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store, RetryTicks: 10, RecoveryTicks: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
+	pending := restarted.instances[pendingRef]
+	if pending == nil || pending.rec.Status != StatusPreAccepted || pending.rec.Command.Kind != CommandConfChange {
+		t.Fatalf("restarted pending config-change record for %s = %#v, want unexecuted config change", pendingRef, pending)
+	}
+	if !restarted.pendingConf {
+		t.Fatalf("restarted node did not restore pending configuration barrier for unexecuted config change %s", pendingRef)
+	}
+	if _, err := restarted.Propose(configOrderingUserCommand(46, "blocked-by-replayed-pending-conf")); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("Propose with replayed pending config change %s err=%v, want %v", pendingRef, err, ErrMessageRejected)
+	}
+	if _, err := restarted.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 6}); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("ProposeConfChange with replayed pending config change %s err=%v, want %v", pendingRef, err, ErrMessageRejected)
+	}
+}
+
+func TestConfigReplayRejectsConflictingStoredConfigsOnRestart(t *testing.T) {
+	newStore := func() *MemoryStorage {
+		store := NewMemoryStorage()
+		addRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+		removeRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
+
+		store.Records[addRef] = checkedRecord(InstanceRecord{
+			Ref:              addRef,
+			Ballot:           Ballot{Replica: 1},
+			Status:           StatusExecuted,
+			Seq:              1,
+			Deps:             []InstanceNum{0, 0, 0},
+			Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			FastPathEligible: true,
+		})
+		store.Records[removeRef] = checkedRecord(InstanceRecord{
+			Ref:              removeRef,
+			Ballot:           Ballot{Replica: 2},
+			Status:           StatusExecuted,
+			Seq:              1,
+			Deps:             []InstanceNum{0, 0, 0, 0},
+			Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+			FastPathEligible: true,
+		})
+		return store
+	}
+
+	for _, tc := range []struct {
+		name    string
+		configs []ConfState
+	}{
+		{
+			name: "conf2 conflicts with executed add voter replay",
+			configs: []ConfState{
+				{ID: 2, Voters: []ReplicaID{1, 2, 4}},
+			},
+		},
+		{
+			name: "conf3 conflicts with executed remove voter replay",
+			configs: []ConfState{
+				{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}},
+				{ID: 3, Voters: []ReplicaID{1, 2, 3, 4}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore()
+			store.Configs = append([]ConfState(nil), tc.configs...)
+
+			_, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store, RetryTicks: 10, RecoveryTicks: 10})
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("NewRawNode replaying executed config records with stored configs %#v err=%v, want %v", tc.configs, err, ErrInvalidConfig)
+			}
+		})
+	}
+}
+
+func TestConflictingHardStateConfigRejectedOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Hard = HardState{Conf: ConfState{ID: 1, Voters: []ReplicaID{1, 2, 4}}}
+
+	_, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewRawNode with hard-state voters conflicting with initial config err=%v, want %v", err, ErrInvalidConfig)
+	}
+}
+
+func TestConflictingDuplicateStoredConfigsRejectedOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{
+		{ID: 2, Voters: []ReplicaID{1, 2, 3}},
+		{ID: 2, Voters: []ReplicaID{1, 2, 4}},
+	}
+
+	_, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewRawNode with duplicate config ID and conflicting voters err=%v, want %v", err, ErrInvalidConfig)
+	}
+}
+
+func TestConfigReplayIgnoresMalformedConfChangeOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusExecuted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0},
+		Command: Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter), 4}},
+	})
+
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if err != nil {
+		t.Fatalf("NewRawNode replaying malformed config change err=%v", err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+}
+
+func TestInvalidConfChangeConfigReplayIgnoredOnRestart(t *testing.T) {
+	store := NewMemoryStorage()
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusExecuted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0},
+		Command: confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+	})
+
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if err != nil {
+		t.Fatalf("NewRawNode replaying invalid config change err=%v", err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+}
+
+func assertConfigOrderingDepsWidth(t *testing.T, rn *RawNode, ref InstanceRef, want int) {
+	t.Helper()
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatalf("missing instance %s after restart", ref)
+	}
+	if got := len(inst.rec.Deps); got != want {
+		t.Fatalf("instance %s deps=%v, want width %d", ref, inst.rec.Deps, want)
+	}
+}
+
+func assertConfigOrderingDependencyRefs(t *testing.T, rn *RawNode, ref InstanceRef, want []InstanceRef) {
+	t.Helper()
+	got := rn.dependencyRefs(ref)
+	if len(got) != len(want) {
+		t.Fatalf("dependencyRefs(%s)=%v, want %v", ref, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dependencyRefs(%s)=%v, want %v", ref, got, want)
+		}
+	}
+}
+
 func configOrderingUserCommand(sequence uint64, payload string) Command {
 	return Command{
 		ID:           CommandID{Client: 91, Sequence: sequence},

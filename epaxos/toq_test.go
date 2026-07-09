@@ -380,6 +380,85 @@ func TestTOQPendingConfChangeRestartRejectsNewProposalsBeforeProcessAt(t *testin
 	}
 }
 
+func TestTOQConfigReplayRestartUsesReplayedCurrentVoters(t *testing.T) {
+	newReplayStore := func() *MemoryStorage {
+		store := NewMemoryStorage()
+		addRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+		removeRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
+
+		store.Records[addRef] = checkedRecord(InstanceRecord{
+			Ref:              addRef,
+			Ballot:           Ballot{Replica: 1},
+			Status:           StatusExecuted,
+			Seq:              1,
+			Deps:             []InstanceNum{0, 0, 0},
+			Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			FastPathEligible: true,
+		})
+		store.Records[removeRef] = checkedRecord(InstanceRecord{
+			Ref:              removeRef,
+			Ballot:           Ballot{Replica: 2},
+			Status:           StatusExecuted,
+			Seq:              1,
+			Deps:             []InstanceNum{0, 0, 0, 0},
+			Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+			FastPathEligible: true,
+		})
+		return store
+	}
+	clock := uint64(80)
+	newConfig := func(store *MemoryStorage) Config {
+		return Config{
+			ID:             1,
+			Voters:         makeIDs(3),
+			Storage:        store,
+			RetryTicks:     2,
+			RecoveryTicks:  10,
+			TOQ:            true,
+			TOQClock:       func() uint64 { return clock },
+			TOQOneWayDelay: map[ReplicaID]uint64{2: 5, 4: 9},
+		}
+	}
+
+	t.Run("implicit sync group uses replayed current voters", func(t *testing.T) {
+		restarted, err := NewRawNode(newConfig(newReplayStore()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
+		if !sameReplicaIDs(restarted.toqSyncGroup, []ReplicaID{1, 2, 4}) {
+			t.Fatalf("restarted TOQ sync group = %v, want replayed current voters [1 2 4]", restarted.toqSyncGroup)
+		}
+		for id, want := range map[ReplicaID]uint64{1: 0, 2: 5, 4: 9} {
+			if got, ok := restarted.toqOneWayDelay[id]; !ok || got != want {
+				t.Fatalf("restarted TOQ delay for voter %d = %d, ok=%v; want %d", id, got, ok, want)
+			}
+		}
+		if _, ok := restarted.toqOneWayDelay[3]; ok {
+			t.Fatalf("restarted TOQ delay state included removed voter 3: %#v", restarted.toqOneWayDelay)
+		}
+	})
+
+	t.Run("implicit sync group requires delay for replayed remote voter", func(t *testing.T) {
+		cfg := newConfig(newReplayStore())
+		cfg.TOQOneWayDelay = map[ReplicaID]uint64{2: 5}
+		_, err := NewRawNode(cfg)
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("NewRawNode with missing delay for replayed voter 4 err=%v, want %v", err, ErrInvalidConfig)
+		}
+	})
+
+	t.Run("explicit stale sync group rejects removed voter", func(t *testing.T) {
+		cfg := newConfig(newReplayStore())
+		cfg.TOQSyncGroup = []ReplicaID{1, 2, 3}
+		cfg.TOQOneWayDelay[3] = 7
+		_, err := NewRawNode(cfg)
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("NewRawNode with stale TOQ sync group %v err=%v, want %v", cfg.TOQSyncGroup, err, ErrInvalidConfig)
+		}
+	})
+}
+
 func TestTOQReceiverComputesAttrsAtProcessAtFromFlaggedPreAccept(t *testing.T) {
 	clock := uint64(50)
 	rn := newTOQTestRawNode(t, 2, 3, &clock, nil, nil, map[ReplicaID]uint64{1: 5, 2: 0, 3: 5})

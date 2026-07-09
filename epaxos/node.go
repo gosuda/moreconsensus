@@ -220,6 +220,8 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		executed:              make(map[InstanceRef]struct{}),
 		confHistory:           make(map[ConfID]ConfState),
 	}
+	q.conf.ID = normalizeConfID(q.conf.ID)
+	n.confHistory[q.conf.ID] = q.conf.Clone()
 	hs, configs, err := cfg.Storage.InitialState()
 	if err != nil {
 		return nil, err
@@ -229,32 +231,27 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		if err != nil {
 			return nil, err
 		}
-		loaded.conf.ID = hs.Conf.ID
+		loaded.conf.ID = normalizeConfID(hs.Conf.ID)
+		if err := n.rememberConf(loaded.conf); err != nil {
+			return nil, err
+		}
 		n.q = loaded
-		n.confHistory[loaded.conf.ID] = loaded.conf.Clone()
 	}
-	if len(configs) > 0 {
-		last := configs[len(configs)-1]
-		loaded, err := newQuorum(last.Voters)
+	for i, stored := range configs {
+		loaded, err := newQuorum(stored.Voters)
 		if err != nil {
 			return nil, err
 		}
-		loaded.conf.ID = last.ID
-		n.confHistory[loaded.conf.ID] = loaded.conf.Clone()
-		n.q = loaded
+		loaded.conf.ID = normalizeConfID(stored.ID)
+		if err := n.rememberConf(loaded.conf); err != nil {
+			return nil, err
+		}
+		if i == len(configs)-1 {
+			n.q = loaded
+		}
 	}
-	if n.q.conf.ID == 0 {
-		n.q.conf.ID = 1
-	}
-	n.confHistory[n.q.conf.ID] = n.q.conf.Clone()
-	toqClock, toqOneWayDelay, toqSyncGroup, err := configureTOQ(cfg, n.q)
-	if err != nil {
-		return nil, err
-	}
+	n.q.conf.ID = normalizeConfID(n.q.conf.ID)
 	n.toqEnabled = cfg.TOQ
-	n.toqClock = toqClock
-	n.toqOneWayDelay = toqOneWayDelay
-	n.toqSyncGroup = toqSyncGroup
 	n.tick = hs.Tick
 	if err := cfg.Storage.LoadInstances(func(rec InstanceRecord) error {
 		if !VerifyRecordChecksum(rec) {
@@ -286,7 +283,16 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		return nil, err
 	}
 	heap.Init(&n.timers)
-	n.replayExecutedConfig()
+	if err := n.replayExecutedConfig(); err != nil {
+		return nil, err
+	}
+	toqClock, toqOneWayDelay, toqSyncGroup, err := configureTOQ(cfg, n.q)
+	if err != nil {
+		return nil, err
+	}
+	n.toqClock = toqClock
+	n.toqOneWayDelay = toqOneWayDelay
+	n.toqSyncGroup = toqSyncGroup
 	for _, inst := range n.instances {
 		if inst.rec.Status >= StatusCommitted {
 			continue
@@ -318,6 +324,37 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	n.processDuePreAccepts()
 	n.tryExecute()
 	return n, nil
+}
+
+func normalizeConfID(id ConfID) ConfID {
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
+func (n *RawNode) rememberConf(conf ConfState) error {
+	conf.ID = normalizeConfID(conf.ID)
+	if existing, ok := n.confHistory[conf.ID]; ok {
+		if !sameReplicaIDs(existing.Voters, conf.Voters) {
+			return fmt.Errorf("%w: conflicting voters for config %d", ErrInvalidConfig, conf.ID)
+		}
+		return nil
+	}
+	n.confHistory[conf.ID] = conf.Clone()
+	return nil
+}
+
+func sameReplicaIDs(a, b []ReplicaID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func phaseFromStatus(s Status) phase {
@@ -377,7 +414,7 @@ func (n *RawNode) ensureRecordDeps(rec *InstanceRecord) bool {
 	return true
 }
 
-func (n *RawNode) replayExecutedConfig() {
+func (n *RawNode) replayExecutedConfig() error {
 	refs := make([]InstanceRef, 0, len(n.instances))
 	for ref, inst := range n.instances {
 		if inst.rec.Status == StatusExecuted && inst.rec.Command.Kind == CommandConfChange {
@@ -386,8 +423,35 @@ func (n *RawNode) replayExecutedConfig() {
 	}
 	sortRefs(refs)
 	for _, ref := range refs {
-		n.applyConfChange(ref, n.instances[ref].rec.Command)
+		if err := n.replayConfChange(ref, n.instances[ref].rec.Command); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (n *RawNode) replayConfChange(ref InstanceRef, cmd Command) error {
+	if len(cmd.Payload) != 9 {
+		return nil
+	}
+	cc := ConfChange{Type: ConfChangeType(cmd.Payload[0]), Replica: ReplicaID(binary.LittleEndian.Uint64(cmd.Payload[1:]))}
+	base := n.confFor(ref.Conf)
+	q, err := confChangeQuorumFrom(base, cc)
+	if err != nil {
+		return nil
+	}
+	q.conf.ID = ref.Conf + 1
+	if existing, exists := n.confHistory[q.conf.ID]; exists {
+		if !sameReplicaIDs(existing.Voters, q.conf.Voters) {
+			return fmt.Errorf("%w: replayed config %d conflicts with stored voters", ErrInvalidConfig, q.conf.ID)
+		}
+		return nil
+	}
+	n.confHistory[q.conf.ID] = q.conf.Clone()
+	if ref.Conf == n.q.conf.ID {
+		n.q = q
+	}
+	return nil
 }
 
 func (n *RawNode) markPendingConf(rec InstanceRecord) {
