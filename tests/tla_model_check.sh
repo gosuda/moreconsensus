@@ -121,6 +121,10 @@ for cfg in tla/EPaxosConfigRecoveryDedup.cfg; do
   run_tlc tla/EPaxosConfigRecoveryDedup.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigRecoveryRetry.cfg; do
+  run_tlc tla/EPaxosConfigRecoveryRetry.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigAddRecovery.cfg; do
   run_tlc tla/EPaxosConfigAddRecovery.tla "$cfg"
 done
