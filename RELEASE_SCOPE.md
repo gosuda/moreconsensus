@@ -84,6 +84,8 @@ This matrix is the current simulation/local-loopback fault-tolerance envelope. A
 | Operations readiness artifact audit | Example/operator artifacts exist and are audit-gated, not production-proven: `deploy/systemd/kvnode@.service`; `deploy/systemd/kvnode.env.example`; `examples/kv/cmd/kvcheckpoint`; `examples/kv/cmd/kvcheckpoint/main_test.go`; `tests/kvnode_systemd_manifest_audit.sh`; `tests/kvnode_incident_tabletop_drill.sh`; `tests/kvnode_local_capacity_drill.sh`; `docs/operations/kvnode-data-lifecycle-incident-runbook.md`; `docs/operations/kvnode-upgrade-rollback.md`; `tests/kvnode_capacity_envelope.sh`; `tests/operations_readiness_audit.sh`; `bash tests/operations_readiness_audit.sh`; `tests/ci.sh` now runs the operations readiness audit before release-scope and repository audits. |
 | Evidence bundle and go/no-go workflow | `release/EPAXOS_READINESS_EVIDENCE.md`; `tests/go_no_go_workflow.sh`; `tests/ci.sh`; `bash tests/go_no_go_workflow.sh` returns the current `No-go.` decision and lists open release items; `bash tests/release_scope_audit.sh` checks the evidence/workflow paths. |
 
+TryPreAccept message-path coverage note: `tests/tla_model_check.sh` now runs `tla/EPaxosTryPreAcceptMessagePath.cfg`, `tla/EPaxosTryPreAcceptMessagePathFive.cfg`, and `tla/EPaxosTryPreAcceptMessagePathSeven.cfg`; each finite 3/5/7 config covers follower `MsgTryPreAccept` commit-only, stale/conflict reject, duplicate matching re-ack without durable rewrite, fresh durable ack, and coordinator `MsgTryPreAcceptResp` stale restart, older/duplicate OK ignore, first OK below quorum, pre-seeded quorum immediate accept, and OK slow-quorum accept.
+
 ## Open release items
 
 | Item | Current state |
@@ -95,6 +97,8 @@ This matrix is the current simulation/local-loopback fault-tolerance envelope. A
 | Incident readiness | `docs/operations/kvnode-data-lifecycle-incident-runbook.md` now covers storage failure, network partition, peer compromise, replay/checksum suspicion, and recovery stalls, with evidence-capture steps and non-claims; `tests/kvnode_incident_tabletop_drill.sh` locally rehearses the storage-failure and network-partition test-fault branches on a disposable loopback cluster; `tests/operations_readiness_audit.sh` checks those artifacts. Operator-reviewed target-environment tabletop or live drill evidence remains open. |
 
 TryPreAccept response branch-slice note: `tla/EPaxosTryPreAcceptBranches.tla` is only a finite abstract scenario/stage model for stale restart, committed evidence ignore/fail-closed, direct/forced accept, one uncommitted deferral with duplicate suppression, and OK slow-quorum accept. Its only quorum detail is `okVotes >= SlowQuorum`, it runs for 3/5/7, and complete optimized-recovery branch parity beyond this finite slice remains open.
+
+TryPreAccept message-path limit: `tla/EPaxosTryPreAcceptMessagePath.tla` is finite 3/5/7 request/response path coverage, not a full network, evidence-query-internal, complete optimized-recovery branch-parity, or unbounded recovery proof.
 
 ## Review baseline
 
