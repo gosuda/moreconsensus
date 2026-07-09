@@ -181,18 +181,24 @@ require_local_runner_deployment_manifest() {
 
   require_text "$local_runner" "deployment"
   require_text "$local_runner" "[--mode all|deployment|incident|capacity|data]"
-  require_text "$local_runner" "deployment  Run the static systemd manifest audit, start a local direct-args cluster with manifest example defaults, and write deployment non-claim evidence."
+  require_text "$local_runner" "deployment  Run the static systemd manifest audit"
   require_text "$local_runner" "deployment-manifest-summary.txt"
   require_text "$local_runner" "systemd-manifest-report.env"
   require_text "$local_runner" "systemd-manifest-audit.log"
+  require_text "$local_runner" "deployment-manifest-local-launch.env"
   require_text "$local_runner" 'cmd := exec.Command("bash", "tests/kvnode_systemd_manifest_audit.sh")'
   require_text "$local_runner" '"KVNODE_SYSTEMD_MANIFEST_REPORT="+reportPath'
   require_text "$local_runner" "systemd_manifest_audit=passed"
   require_text "$local_runner" "manifest_report=systemd-manifest-report.env"
-  require_text "$local_runner" "launch_path=direct-local-runner-args"
+  require_text "$local_runner" "local_launch_report=deployment-manifest-local-launch.env"
+  require_text "$local_runner" "_exec_argv_json="
+  require_text "$local_runner" "launch_path=manifest-derived-local-substitution"
   require_text "$local_runner" "$expected_launch_defaults"
+  require_text "$local_runner" "local_substitution=temp-binary-temp-data-loopback-listeners"
+  require_text "$local_runner" "systemd_exec_contract=rendered-then-substituted"
+  require_text "$local_runner" "artifact=systemd-manifest-local-launch"
   require_text "$local_runner" "canary=deployment-manifest-value-visible-on-all-nodes"
-  require_text "$local_runner" "non_claim=local-static-render-plus-loopback-process-check-only"
+  require_text "$local_runner" "non_claim=local-static-render-plus-manifest-derived-loopback-process-check-only"
   require_text "$local_runner" "deployment_manifest_ran="
   require_text "$local_runner" "release_claim=none-target-environment-deployment-manifest-still-required"
 
