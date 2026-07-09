@@ -666,6 +666,123 @@ func TestRemoveVoterConfChangeAllowsLaterProgress(t *testing.T) {
 	}
 }
 
+func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
+	s := newSimCluster(t, 4, false)
+	oldCmd := Command{ID: CommandID{Client: 70, Sequence: 1}, Payload: []byte("old-inflight-across-removal"), ConflictKeys: [][]byte{[]byte("old-inflight-across-removal")}}
+	oldRef, err := s.nodes[1].Propose(oldCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldRef.Conf != 1 {
+		t.Fatalf("old proposal used config %d, want 1", oldRef.Conf)
+	}
+	oldReady := s.nodes[1].Ready()
+	if len(oldReady.Committed) != 0 {
+		t.Fatalf("old proposal committed before any quorum response: %#v", oldReady.Committed)
+	}
+	var oldPreAccepts []Message
+	foundOldRecord := false
+	for _, rec := range oldReady.Records {
+		if rec.Ref != oldRef {
+			continue
+		}
+		foundOldRecord = true
+		if len(rec.Deps) != 4 {
+			t.Fatalf("old record deps width = %d, want old config width 4: %#v", len(rec.Deps), rec)
+		}
+	}
+	if !foundOldRecord {
+		t.Fatalf("ready did not contain old record %s: %#v", oldRef, oldReady.Records)
+	}
+	for _, m := range oldReady.Messages {
+		if m.Ref == oldRef && m.Type == MsgPreAccept {
+			oldPreAccepts = append(oldPreAccepts, m.Clone())
+		}
+	}
+	if len(oldPreAccepts) != 3 {
+		t.Fatalf("old proposal sent %d pre-accepts, want one per remote old voter: %#v", len(oldPreAccepts), oldReady.Messages)
+	}
+	if err := s.stores[1].ApplyReady(oldReady); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, s.nodes[1], oldReady)
+
+	s.pause(1)
+	confRef, err := s.nodes[2].ProposeConfChange(ConfChange{Type: ConfChangeRemoveVoter, Replica: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confRef.Conf != 1 {
+		t.Fatalf("config change used config %d, want 1", confRef.Conf)
+	}
+	s.drain()
+	for _, id := range []ReplicaID{2, 3, 4} {
+		conf := s.nodes[id].Status().Conf
+		if conf.ID != 2 || conf.Contains(4) || !conf.Contains(1) || !conf.Contains(2) || !conf.Contains(3) {
+			t.Fatalf("node %d config after voter removal = %#v", id, conf)
+		}
+		requireCommittedPayloadCount(t, s.apps[id], id, oldRef, oldCmd.Payload, 0)
+	}
+
+	s.resume(1)
+	for _, m := range oldPreAccepts {
+		if !s.deliver(m) {
+			t.Fatalf("saved old pre-accept to node %d was unexpectedly blocked", m.To)
+		}
+	}
+	s.drain()
+
+	for _, id := range s.ids() {
+		conf := s.nodes[id].Status().Conf
+		if conf.ID != 2 || conf.Contains(4) || !conf.Contains(1) || !conf.Contains(2) || !conf.Contains(3) {
+			t.Fatalf("node %d config after replaying delayed removal = %#v", id, conf)
+		}
+		oldRec, ok := s.stores[id].Records[oldRef]
+		if !ok {
+			t.Fatalf("node %d did not retain old instance %s", id, oldRef)
+		}
+		if oldRec.Ref.Conf != 1 || len(oldRec.Deps) != 4 {
+			t.Fatalf("node %d old record after removal = %#v, want config 1 deps width 4", id, oldRec)
+		}
+		requireCommittedPayloadCount(t, s.apps[id], id, oldRef, oldCmd.Payload, 1)
+	}
+
+	removedCmd := Command{ID: CommandID{Client: 70, Sequence: 3}, Payload: []byte("removed-node-proposal"), ConflictKeys: [][]byte{[]byte("removed-node-proposal")}}
+	if _, err := s.nodes[4].Propose(removedCmd); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("removed voter Propose error = %v, want %v", err, ErrMessageRejected)
+	}
+	if _, err := s.nodes[4].ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); !errors.Is(err, ErrMessageRejected) {
+		t.Fatalf("removed voter ProposeConfChange error = %v, want %v", err, ErrMessageRejected)
+	}
+	if s.nodes[4].HasReady() {
+		t.Fatal("removed voter proposal rejection created Ready work")
+	}
+
+	newCmd := Command{ID: CommandID{Client: 70, Sequence: 2}, Payload: []byte("new-after-removal"), ConflictKeys: [][]byte{[]byte("new-after-removal")}}
+	newRef, err := s.nodes[2].Propose(newCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newRef.Conf != 2 {
+		t.Fatalf("new proposal used config %d, want 2", newRef.Conf)
+	}
+	s.drain()
+	newRec, ok := s.stores[2].Records[newRef]
+	if !ok {
+		t.Fatalf("node 2 did not store new instance %s", newRef)
+	}
+	if len(newRec.Deps) != 3 {
+		t.Fatalf("new record deps width = %d, want new config width 3: %#v", len(newRec.Deps), newRec)
+	}
+	for _, id := range []ReplicaID{1, 2, 3} {
+		requireCommittedPayloadCount(t, s.apps[id], id, newRef, newCmd.Payload, 1)
+	}
+	requireCommittedPayloadCount(t, s.apps[4], 4, newRef, newCmd.Payload, 0)
+	if rec, ok := s.stores[4].Records[newRef]; ok {
+		t.Fatalf("removed voter stored new-config instance %s: %#v", newRef, rec)
+	}
+}
+
 func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	store := NewMemoryStorage()
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})

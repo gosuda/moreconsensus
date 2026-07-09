@@ -350,6 +350,22 @@ func (n *RawNode) depsForConf(id ConfID) []InstanceNum {
 	return make([]InstanceNum, len(n.confFor(id).Voters))
 }
 
+func (n *RawNode) votersForConf(id ConfID) []ReplicaID {
+	return n.confFor(id).Voters
+}
+
+func (n *RawNode) slowQuorumForConf(id ConfID) int {
+	return slowQuorumSize(len(n.votersForConf(id)))
+}
+
+func (n *RawNode) fastQuorumForConf(id ConfID) int {
+	return fastQuorumSize(len(n.votersForConf(id)))
+}
+
+func (n *RawNode) tryWitnessQuorumForConf(id ConfID) int {
+	return tryWitnessQuorumSize(len(n.votersForConf(id)))
+}
+
 func (n *RawNode) ensureRecordDeps(rec *InstanceRecord) bool {
 	width := len(n.confFor(rec.Ref.Conf).Voters)
 	if len(rec.Deps) == width {
@@ -492,21 +508,31 @@ func (n *RawNode) handleLocalTOQPreAccept(m Message) {
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
 	n.indexConflicts(inst.rec)
 	if inst.preOK == nil {
-		inst.preOK = make(map[ReplicaID]attrVote, n.q.fastQuorum())
+		inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
 	}
 	inst.preOK[n.id] = attrVote{seq: inst.rec.Seq, deps: append([]InstanceNum(nil), inst.rec.Deps...), depsCommitted: n.committedDepsMask(inst.rec.Attributes(), inst.rec.Ref.Conf), fastPathEligible: inst.rec.FastPathEligible}
 	n.enqueueRecord(inst.rec)
-	if n.q.slowQuorum() == 1 {
+	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
 		n.commit(inst, inst.rec.Attributes())
 		return
 	}
 	n.maybeFinalizePreAccept(inst)
 }
 
+func (n *RawNode) requireLocalVoter() error {
+	if n.q.contains(n.id) {
+		return nil
+	}
+	return fmt.Errorf("%w: local replica %d is not a voter in config %d", ErrMessageRejected, n.id, n.q.conf.ID)
+}
+
 // Propose creates a new local EPaxos instance for an application command.
 func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 	if cmd.Kind == CommandConfChange {
 		return InstanceRef{}, fmt.Errorf("%w: use ProposeConfChange", ErrInvalidConfig)
+	}
+	if err := n.requireLocalVoter(); err != nil {
+		return InstanceRef{}, err
 	}
 	if n.pendingConf && cmd.Kind != CommandNoop {
 		return InstanceRef{}, fmt.Errorf("%w: configuration change pending", ErrMessageRejected)
@@ -522,6 +548,9 @@ func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 
 // ProposeConfChange proposes a validated membership change encoded as a consensus command.
 func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
+	if err := n.requireLocalVoter(); err != nil {
+		return InstanceRef{}, err
+	}
 	if n.pendingConf {
 		return InstanceRef{}, fmt.Errorf("%w: configuration change already pending", ErrMessageRejected)
 	}
@@ -588,7 +617,7 @@ func (n *RawNode) propose(cmd Command) InstanceRef {
 		processAt = n.nextTOQProcessAt()
 		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, Status: StatusNone, Seq: 0, Deps: n.depsForConf(ref.Conf), Command: cmd, ProcessAt: processAt, TOQPending: true}
 		rec.Checksum = ChecksumRecord(rec)
-		inst := &instance{rec: rec, phase: phasePreAccept, preOK: make(map[ReplicaID]attrVote, n.q.fastQuorum()), createdTick: n.tick, processAt: processAt}
+		inst := &instance{rec: rec, phase: phasePreAccept, preOK: make(map[ReplicaID]attrVote, n.fastQuorumForConf(ref.Conf)), createdTick: n.tick, processAt: processAt}
 		n.instances[ref] = inst
 		n.enqueueRecord(rec)
 		n.delayedPreAccepts = append(n.delayedPreAccepts, n.localTOQPreAcceptMessage(inst))
@@ -607,7 +636,7 @@ func (n *RawNode) propose(cmd Command) InstanceRef {
 	n.instances[ref] = inst
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
-	if n.q.slowQuorum() == 1 {
+	if n.slowQuorumForConf(ref.Conf) == 1 {
 		n.commit(inst, rec.Attributes())
 		return ref
 	}
@@ -932,7 +961,7 @@ func (n *RawNode) handlePreAcceptResp(m Message) {
 		return
 	}
 	if inst.preOK == nil {
-		inst.preOK = make(map[ReplicaID]attrVote, n.q.fastQuorum())
+		inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.preOK[m.From]; duplicate {
 		return
@@ -950,7 +979,7 @@ func (n *RawNode) maybeFinalizePreAccept(inst *instance) {
 		n.commit(inst, fastAttrs)
 		return
 	}
-	if len(inst.preOK) >= n.q.slowQuorum() {
+	if len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		deadline := inst.createdTick + n.timeOptimizationTicks
 		if n.timeOptimization && n.tick < deadline && len(inst.preOK) < len(n.confFor(inst.rec.Ref.Conf).Voters) {
 			inst.waitDeadline = deadline
@@ -1020,7 +1049,7 @@ func (n *RawNode) handleAcceptResp(m Message) {
 		return
 	}
 	if inst.accOK == nil {
-		inst.accOK = make(map[ReplicaID]struct{}, n.q.slowQuorum())
+		inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.accOK[m.From]; duplicate {
 		return
@@ -1034,7 +1063,7 @@ func (n *RawNode) handleAcceptResp(m Message) {
 		inst.rec.Checksum = ChecksumRecord(inst.rec)
 		n.enqueueRecord(inst.rec)
 	}
-	if len(inst.accOK) >= n.q.slowQuorum() {
+	if len(inst.accOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.commit(inst, inst.rec.Attributes())
 	}
 }
@@ -1202,7 +1231,7 @@ func (n *RawNode) handlePrepareResp(m Message) {
 		return
 	}
 	if inst.prepareOK == nil {
-		inst.prepareOK = make(map[ReplicaID]InstanceRecord, n.q.slowQuorum())
+		inst.prepareOK = make(map[ReplicaID]InstanceRecord, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.prepareOK[m.From]; duplicate {
 		return
@@ -1215,7 +1244,7 @@ func (n *RawNode) handlePrepareResp(m Message) {
 	n.ensureRecordDeps(&rec)
 	rec.Checksum = ChecksumRecord(rec)
 	inst.prepareOK[m.From] = rec
-	if len(inst.prepareOK) < n.q.slowQuorum() {
+	if len(inst.prepareOK) < n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		return
 	}
 
@@ -1292,7 +1321,7 @@ func (n *RawNode) handlePrepareResp(m Message) {
 		}
 	}
 	for _, candidate := range candidates {
-		if len(candidate.voters) >= n.q.tryWitnessQuorum() {
+		if len(candidate.voters) >= n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
 			inst.rec.Command = candidate.rec.Command.Clone()
 			n.startTryPreAccept(inst, candidate.rec.Attributes(), candidate.voters)
 			return
@@ -1375,7 +1404,7 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	inst.accOK = map[ReplicaID]struct{}{n.id: {}}
 	inst.generation++
 	n.enqueueRecord(inst.rec)
-	if n.q.slowQuorum() == 1 {
+	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
 		n.commit(inst, attrs)
 		return
 	}
@@ -1411,7 +1440,7 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 	}
 	inst.generation++
 	n.enqueueRecord(inst.rec)
-	if len(inst.tryOK) >= n.q.slowQuorum() {
+	if len(inst.tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, attrs)
 		return
 	}
@@ -1493,13 +1522,13 @@ func (n *RawNode) handleTryPreAcceptResp(m Message) {
 		return
 	}
 	if inst.tryOK == nil {
-		inst.tryOK = make(map[ReplicaID]struct{}, n.q.slowQuorum())
+		inst.tryOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.tryOK[m.From]; duplicate {
 		return
 	}
 	inst.tryOK[m.From] = struct{}{}
-	if len(inst.tryOK) >= n.q.slowQuorum() {
+	if len(inst.tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, inst.rec.Attributes())
 	}
 }
@@ -1975,7 +2004,7 @@ func (n *RawNode) commit(inst *instance, attrs Attributes) {
 func (n *RawNode) onTimer(inst *instance, kind timerKind) {
 	switch kind {
 	case timerFastWait:
-		if inst.phase == phasePreAccept && len(inst.preOK) >= n.q.slowQuorum() {
+		if inst.phase == phasePreAccept && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			n.startAccept(inst, attrsFromVotes(inst.preOK))
 		}
 	case timerPreAccept:
@@ -2018,7 +2047,7 @@ func (n *RawNode) schedule(inst *instance, kind timerKind, after uint64) {
 func (n *RawNode) broadcastPreAccept(inst *instance) {
 	processAt := inst.processAt
 	toq := n.toqEnabled && inst.rec.Ref.Replica == n.id && inst.rec.Ballot.Number == 0 && inst.rec.Ballot.Replica == inst.rec.Ref.Replica
-	for _, to := range n.q.conf.Voters {
+	for _, to := range n.votersForConf(inst.rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
@@ -2048,7 +2077,7 @@ func (n *RawNode) broadcastTryPreAccept(inst *instance) {
 }
 
 func (n *RawNode) broadcastTryPreAcceptIgnore(inst *instance, ignore InstanceRef) {
-	for _, to := range n.q.conf.Voters {
+	for _, to := range n.votersForConf(inst.rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
@@ -2058,7 +2087,7 @@ func (n *RawNode) broadcastTryPreAcceptIgnore(inst *instance, ignore InstanceRef
 }
 
 func (n *RawNode) broadcast(t MessageType, rec InstanceRecord) {
-	for _, to := range n.q.conf.Voters {
+	for _, to := range n.votersForConf(rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
@@ -2077,7 +2106,7 @@ func (n *RawNode) sendReject(t MessageType, to ReplicaID, ref InstanceRef, hint 
 	if t == MsgTryPreAcceptResp {
 		reason = RejectStaleBallot
 	}
-	m := Message{Type: t, From: n.id, To: to, Ref: ref, Ballot: hint, Reject: true, RejectReason: reason, RejectHint: hint, Deps: n.q.deps()}
+	m := Message{Type: t, From: n.id, To: to, Ref: ref, Ballot: hint, Reject: true, RejectReason: reason, RejectHint: hint, Deps: n.depsForConf(ref.Conf)}
 	n.enqueueMessage(m)
 }
 
@@ -2096,7 +2125,7 @@ func (n *RawNode) enqueueRecord(rec InstanceRecord) {
 
 func (n *RawNode) enqueueMessage(m Message) {
 	if len(m.Deps) == 0 && (m.Type == MsgPreAcceptResp || m.Type == MsgAcceptResp || m.Type == MsgPrepareResp || m.Type == MsgTryPreAcceptResp || m.Type == MsgEvidenceResp) {
-		m.Deps = n.q.deps()
+		m.Deps = n.depsForConf(m.Ref.Conf)
 	}
 	m.Checksum = ChecksumMessage(m)
 	n.pendingReady.Messages = append(n.pendingReady.Messages, m.Clone())
@@ -2265,7 +2294,7 @@ func (n *RawNode) canFastCommitPreAccept(inst *instance, attrs Attributes) bool 
 	if !localMatches && !n.toqEnabled && matchingRemotes < len(n.confFor(inst.rec.Ref.Conf).Voters)-1 {
 		return false
 	}
-	return count >= n.q.fastQuorum() && dependencyMask(attrs.Deps)&^covered == 0
+	return count >= n.fastQuorumForConf(inst.rec.Ref.Conf) && dependencyMask(attrs.Deps)&^covered == 0
 }
 
 func attrsCover(base, candidate Attributes) bool {

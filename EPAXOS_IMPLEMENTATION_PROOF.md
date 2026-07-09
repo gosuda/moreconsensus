@@ -317,7 +317,8 @@ Configuration changes are encoded as commands and use the same dependency machin
 - configuration commands conflict with every non-noop command;
 - user commands include known unexecuted configuration commands as barriers;
 - executing a configuration command installs the next `ConfState` for future instances;
-- old in-flight instances remain pinned to the `ConfID` they were created under.
+- old in-flight instances remain pinned to the `ConfID` they were created under;
+- replicas that have applied a configuration excluding themselves reject local `Propose` and `ProposeConfChange` before allocating an instance.
 
 Why this is safe inside the bounded claim:
 
@@ -327,9 +328,9 @@ Why this is safe inside the bounded claim:
 
 Open limitation:
 
-- The current formal model covers a finite local barrier and one add-voter transition. It does not cover arbitrary/remove-voter/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, durable replay, or unbounded configuration histories.
+- The current formal models cover a finite local barrier, one add-voter transition, and one remove-voter transition. They do not cover arbitrary/multi-step reconfiguration chains, joint consensus, recovery under configuration changes, durable replay, or unbounded configuration histories.
 
-Source anchors: `epaxos/node.go` (`ProposeConfChange`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `applyConfChange`), `epaxos/config_change_ordering_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`.
+Source anchors: `epaxos/node.go` (`Propose`, `ProposeConfChange`, `confChangeQuorumFrom`, `markPendingConf`, `refreshPendingConf`, `computeAttrsAt`, `applyConfChange`, per-instance quorum/broadcast helpers), `epaxos/config_change_ordering_test.go`, `epaxos/sim_test.go`, `tla/EPaxosConfigBarrier.tla`, `tla/EPaxosConfigTransition.tla`, `tla/EPaxosConfigRemoveTransition.tla`.
 
 ## 15. Property-by-property rationale
 
@@ -459,7 +460,8 @@ Evidence: `examples/kv/cmd/kvnode/main.go`, `examples/kv/cmd/kvnode/main_test.go
 | `tla/EPaxosRecovery.tla` | Stopped-owner dependency recovery and no-op unblocking for finite configs. | Arbitrary recovery under reconfiguration. |
 | `tla/EPaxosRollbackAllocation.tla` | Rollback allocation: a restored local checkpoint learns a later own committed instance from quorum, advances `nextInstance`, skips a known future local ref under a defensive stale-next state, allocates a fresh local ref, and preserves learned-before-fresh apply order. | Full EPaxos recovery, unbounded rollback histories, storage checksums, message loss, or arbitrary multi-replica rollback. |
 | `tla/EPaxosConfigBarrier.tla` | Pending config barriers and user-command ordering against two fixed config refs. | Dynamic membership histories. |
-| `tla/EPaxosConfigTransition.tla` | One finite add-voter transition and config pinning. | Remove-voter, multi-step, joint consensus, recovery during config change. |
+| `tla/EPaxosConfigTransition.tla` | One finite add-voter transition and config pinning. | Multi-step, joint consensus, recovery during config change. |
+| `tla/EPaxosConfigRemoveTransition.tla` | One finite remove-voter transition where an old in-flight instance remains pinned to old voters/quorum and a later instance excludes the removed voter. | Multi-step, joint consensus, recovery during config change. |
 | `tla/EPaxosRevisited.tla` | TOQ envelope, delayed assignment, pending-decision blocking, receiver processing, fast-wait behavior, and chain pruning. | Real clock synchronization and OWD measurement. |
 | `tla/TOQClockDiscipline.tla` | Finite bounded-skew/bounded-delay `ProcessAt` contract; in Go this maps to `TOQOneWayDelay` values that already include skew margin. | Operational clock-sync implementation or delay measurement. |
 | `tla/ReadyAdvance.tla` | Durable Ready/Advance prefix acknowledgement and retry. | Concrete storage engine behavior. |

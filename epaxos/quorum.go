@@ -31,6 +31,12 @@ func newQuorum(voters []ReplicaID) (quorum, error) {
 		idx[id] = i
 	}
 	n := len(vv)
+	return quorum{conf: ConfState{ID: 1, Voters: vv}, index: idx, slow: slowQuorumSize(n), fast: fastQuorumSize(n)}, nil
+}
+
+func slowQuorumSize(n int) int { return n/2 + 1 }
+
+func fastQuorumSize(n int) int {
 	// Optimized EPaxos fast quorum from the paper/TR for odd N=2F+1:
 	// F + floor((F+1)/2) total voters including the command leader. Even
 	// cluster sizes keep the previous conservative quorum because the paper
@@ -43,8 +49,10 @@ func newQuorum(voters []ReplicaID) (quorum, error) {
 			fast = 1
 		}
 	}
-	return quorum{conf: ConfState{ID: 1, Voters: vv}, index: idx, slow: n/2 + 1, fast: fast}, nil
+	return fast
 }
+
+func tryWitnessQuorumSize(n int) int { return fastQuorumSize(n) + slowQuorumSize(n) - n }
 
 func (q quorum) contains(id ReplicaID) bool { _, ok := q.index[id]; return ok }
 
@@ -54,33 +62,30 @@ func (q quorum) slowQuorum() int { return q.slow }
 
 func (q quorum) fastQuorum() int { return q.fast }
 
-func (q quorum) tryWitnessQuorum() int { return q.fastQuorum() + q.slowQuorum() - len(q.conf.Voters) }
+func (q quorum) tryWitnessQuorum() int { return tryWitnessQuorumSize(len(q.conf.Voters)) }
 
 // SlowQuorum returns the majority quorum size for n voters.
 func SlowQuorum(n int) (int, error) {
-	q, err := newQuorum(makeIDs(n))
-	if err != nil {
+	if _, err := newQuorum(makeIDs(n)); err != nil {
 		return 0, err
 	}
-	return q.slowQuorum(), nil
+	return slowQuorumSize(n), nil
 }
 
 // FastQuorum returns the optimized EPaxos fast quorum size for n voters.
 func FastQuorum(n int) (int, error) {
-	q, err := newQuorum(makeIDs(n))
-	if err != nil {
+	if _, err := newQuorum(makeIDs(n)); err != nil {
 		return 0, err
 	}
-	return q.fastQuorum(), nil
+	return fastQuorumSize(n), nil
 }
 
 // TryWitnessQuorum returns the optimized fast/slow intersection threshold.
 func TryWitnessQuorum(n int) (int, error) {
-	q, err := newQuorum(makeIDs(n))
-	if err != nil {
+	if _, err := newQuorum(makeIDs(n)); err != nil {
 		return 0, err
 	}
-	return q.tryWitnessQuorum(), nil
+	return tryWitnessQuorumSize(n), nil
 }
 
 func makeIDs(n int) []ReplicaID {

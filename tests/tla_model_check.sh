@@ -81,6 +81,10 @@ for cfg in tla/EPaxosConfigTransition.cfg; do
   run_tlc tla/EPaxosConfigTransition.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigRemoveTransition.cfg; do
+  run_tlc tla/EPaxosConfigRemoveTransition.tla "$cfg"
+done
+
 for cfg in tla/EPaxosRollbackAllocation.cfg; do
   run_tlc tla/EPaxosRollbackAllocation.tla "$cfg"
 done
