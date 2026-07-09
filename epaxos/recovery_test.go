@@ -445,6 +445,188 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	}
 }
 
+func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
+	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0, 0},
+		Command: Command{Kind: CommandNoop},
+	})
+
+	const retryTicks = 2
+	const recoveryTicks = 4
+	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}, Storage: store, RetryTicks: retryTicks, RecoveryTicks: recoveryTicks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3}})
+	recoveryRequireNoReady(t, restarted, "restart before old-config recovery deadline")
+	for tick := uint64(1); tick < recoveryTicks; tick++ {
+		restarted.Tick()
+		recoveryRequireNoReady(t, restarted, "old-config recovery before deadline")
+	}
+
+	restarted.Tick()
+	rd := restarted.Ready()
+	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	prepareResp := func(from ReplicaID) Message {
+		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
+	}
+	if err := restarted.Step(prepareResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRequireNoReady(t, restarted, "old-config recovery counted one prepare response as quorum")
+	if err := restarted.Step(prepareResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	}
+	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	acceptResp := func(from ReplicaID) Message {
+		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
+	}
+	if err := restarted.Step(acceptResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRequireNoReady(t, restarted, "old-config recovery counted one accept response as quorum")
+	lostPreRetryResponse := acceptResp(4)
+	if lostPreRetryResponse.Type != MsgAcceptResp || lostPreRetryResponse.From != 4 || lostPreRetryResponse.To != 2 {
+		t.Fatalf("lost pre-retry response fixture = %#v", lostPreRetryResponse)
+	}
+
+	for tick := uint64(1); tick < retryTicks; tick++ {
+		restarted.Tick()
+		recoveryRequireNoReady(t, restarted, "old-config recovery accept retry before deadline")
+	}
+	restarted.Tick()
+	retry := restarted.Ready()
+	retryAcceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
+	if retryAcceptBallot != acceptBallot {
+		t.Fatalf("old-config recovery accept retry ballot = %#v, want original rebroadcast ballot %#v", retryAcceptBallot, acceptBallot)
+	}
+	acceptRetryMsg := optimizedRequireMessage(t, retry.Messages, MsgAccept, 4)
+	if acceptRetryMsg.Seq != acceptMsg.Seq || !instanceNumsEqual(acceptRetryMsg.Deps, acceptMsg.Deps) {
+		t.Fatalf("old-config recovery accept retry attrs = seq %d deps %v, want original seq %d deps %v", acceptRetryMsg.Seq, acceptRetryMsg.Deps, acceptMsg.Seq, acceptMsg.Deps)
+	}
+	if len(retry.Records) != 0 || len(retry.Committed) != 0 || retry.MustSync {
+		t.Fatalf("old-config recovery accept retry emitted durable/application effects: %#v", retry)
+	}
+	recoveryApplyReady(t, store, restarted, retry)
+
+	if err := restarted.Step(acceptResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	}
+	recoveryApplyReady(t, store, restarted, rd)
+}
+
+func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
+	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0, 0},
+		Command: Command{Kind: CommandNoop},
+	})
+
+	const retryTicks = 2
+	const recoveryTicks = 4
+	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}, Storage: store, RetryTicks: retryTicks, RecoveryTicks: recoveryTicks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3}})
+	recoveryRequireNoReady(t, restarted, "restart before old-config recovery deadline")
+	for tick := uint64(1); tick < recoveryTicks; tick++ {
+		restarted.Tick()
+		recoveryRequireNoReady(t, restarted, "old-config recovery before deadline")
+	}
+
+	restarted.Tick()
+	rd := restarted.Ready()
+	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	prepareResp := func(from ReplicaID) Message {
+		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
+	}
+	if err := restarted.Step(prepareResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRequireNoReady(t, restarted, "old-config recovery counted one prepare response as quorum")
+	lostPreRetryResponse := prepareResp(4)
+	if lostPreRetryResponse.Type != MsgPrepareResp || lostPreRetryResponse.From != 4 || lostPreRetryResponse.To != 2 {
+		t.Fatalf("lost pre-retry response fixture = %#v", lostPreRetryResponse)
+	}
+
+	for tick := uint64(1); tick < recoveryTicks; tick++ {
+		restarted.Tick()
+		recoveryRequireNoReady(t, restarted, "old-config recovery prepare retry before deadline")
+	}
+	restarted.Tick()
+	retry := restarted.Ready()
+	retryPrepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
+	if retryPrepareBallot != prepareBallot {
+		t.Fatalf("old-config recovery prepare retry ballot = %#v, want original rebroadcast ballot %#v", retryPrepareBallot, prepareBallot)
+	}
+	if len(retry.Records) != 0 || len(retry.Committed) != 0 || retry.MustSync {
+		t.Fatalf("old-config recovery prepare retry emitted durable/application effects: %#v", retry)
+	}
+	recoveryApplyReady(t, store, restarted, retry)
+
+	if err := restarted.Step(prepareResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	}
+	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	acceptResp := func(from ReplicaID) Message {
+		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
+	}
+	if err := restarted.Step(acceptResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRequireNoReady(t, restarted, "old-config recovery counted one accept response as quorum")
+	if err := restarted.Step(acceptResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4}, 4)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	}
+	recoveryApplyReady(t, store, restarted, rd)
+}
+
 func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 	store := NewMemoryStorage()
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}

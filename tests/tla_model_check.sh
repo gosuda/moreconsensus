@@ -141,6 +141,10 @@ for cfg in tla/EPaxosConfigRecoveryRetry.cfg; do
   run_tlc tla/EPaxosConfigRecoveryRetry.tla "$cfg"
 done
 
+for cfg in tla/EPaxosConfigRecoveryLostResponseRetry.cfg; do
+  run_tlc tla/EPaxosConfigRecoveryLostResponseRetry.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigAddRecovery.cfg; do
   run_tlc tla/EPaxosConfigAddRecovery.tla "$cfg"
 done
