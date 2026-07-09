@@ -199,6 +199,74 @@ func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	}
 }
 
+func TestSimulatorIsolatedLocalTimeoutRecoversAfterConflictingQuorumCommit(t *testing.T) {
+	s := newSimCluster(t, 3, true)
+	key := []byte("current-canary-recovery")
+
+	s.omit(1)
+	isolated := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("isolated-local"), ConflictKeys: [][]byte{key}}
+	isolatedRef, err := s.nodes[1].Propose(isolated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickOnly(1, 6)
+	if committedPayload(s.apps[1], isolatedRef, isolated.Payload) {
+		t.Fatalf("isolated replica applied %s without quorum before heal: %#v", isolatedRef, s.apps[1])
+	}
+
+	quorum := Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("quorum-commit"), ConflictKeys: [][]byte{key}}
+	quorumRef, err := s.nodes[2].Propose(quorum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(6)
+	for _, id := range []ReplicaID{2, 3} {
+		requireCommittedPayloadCount(t, s.apps[id], id, quorumRef, quorum.Payload, 1)
+	}
+	if committedPayload(s.apps[1], quorumRef, quorum.Payload) {
+		t.Fatalf("isolated replica applied quorum commit %s before transport healed: %#v", quorumRef, s.apps[1])
+	}
+
+	s.heal(1)
+	s.tickAll(20)
+	requireCommittedPayloadCount(t, s.apps[1], 1, quorumRef, quorum.Payload, 1)
+
+	barrier := Command{ID: CommandID{Client: 1, Sequence: 2}, ConflictKeys: [][]byte{key}}
+	barrierRef, err := s.nodes[1].Propose(barrier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	s.tickAll(20)
+	requireCommittedPayloadCount(t, s.apps[1], 1, barrierRef, barrier.Payload, 1)
+	requireCommittedPayloadCount(t, s.apps[1], 1, isolatedRef, isolated.Payload, 1)
+	recoveryRequireAppliedOrder(t, s.apps[1], 1, quorumRef, isolatedRef, barrierRef)
+	requireNoDuplicateCommittedRefs(t, s.apps[1], 1)
+}
+
+func recoveryRequireAppliedOrder(t *testing.T, app []CommittedCommand, id ReplicaID, want ...InstanceRef) {
+	t.Helper()
+	positions := make(map[InstanceRef]int, len(app))
+	for i, c := range app {
+		if _, ok := positions[c.Ref]; !ok {
+			positions[c.Ref] = i
+		}
+	}
+	previous := -1
+	for _, ref := range want {
+		pos, ok := positions[ref]
+		if !ok {
+			t.Fatalf("node %d applied refs %v, missing %s", id, refs(app), ref)
+		}
+		if pos <= previous {
+			t.Fatalf("node %d applied refs %v, want ordered subsequence %v", id, refs(app), want)
+		}
+		previous = pos
+	}
+}
+
 func recoveryApplyReady(t *testing.T, store *MemoryStorage, rn *RawNode, rd Ready) {
 	t.Helper()
 	if err := store.ApplyReady(rd); err != nil {

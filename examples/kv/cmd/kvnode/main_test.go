@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1007,6 +1008,43 @@ func TestHandleKVLatestReadWithoutSelectorStillWaitsForConsensusBarrier(t *testi
 	}
 }
 
+func TestLatestReadBarrierAfterFailedLocalProposalCurrentCluster(t *testing.T) {
+	cluster := newTestKVNodeCluster(t)
+	first := cluster.services[1]
+	second := cluster.services[2]
+	failedKey := "current-canary-stalled"
+	key := "current-canary"
+
+	cluster.setInboundDrop(1, 2, true)
+	cluster.setInboundDrop(1, 3, true)
+	cluster.setInboundDrop(2, 1, true)
+	cluster.setInboundDrop(3, 1, true)
+	failedPut := httptest.NewRecorder()
+	first.handleKV(failedPut, httptest.NewRequest(http.MethodPut, "/kv/"+failedKey, bytes.NewReader([]byte("value-from-node-1"))))
+	if failedPut.Code != http.StatusServiceUnavailable || !strings.Contains(failedPut.Body.String(), "proposal outcome unknown after logical tick budget") {
+		t.Fatalf("first put status=%d body=%q, want 503 unknown outcome", failedPut.Code, failedPut.Body.String())
+	}
+
+	successfulPut := httptest.NewRecorder()
+	cluster.handleKVWithTicks(second, successfulPut, httptest.NewRequest(http.MethodPut, "/kv/"+key, bytes.NewReader([]byte("value-from-node-2"))))
+	if successfulPut.Code != http.StatusNoContent {
+		t.Fatalf("second put status=%d body=%q, want 204", successfulPut.Code, successfulPut.Body.String())
+	}
+
+	cluster.setInboundDrop(1, 2, false)
+	cluster.setInboundDrop(1, 3, false)
+	cluster.setInboundDrop(2, 1, false)
+	cluster.setInboundDrop(3, 1, false)
+	secondRef := epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	cluster.waitForExecuted(first, secondRef, 40)
+
+	latest := httptest.NewRecorder()
+	cluster.handleKVWithTicks(first, latest, httptest.NewRequest(http.MethodGet, "/kv/"+key, nil))
+	if latest.Code != http.StatusOK || latest.Body.String() != "value-from-node-2" {
+		t.Fatalf("latest get after transport heal and node2 execution status=%d body=%q, want 200 value-from-node-2", latest.Code, latest.Body.String())
+	}
+}
+
 func TestHandleScanLatestReadWithoutSelectorOrExplicitBarrierWaitsForScanBarrier(t *testing.T) {
 	s := newTestService(t)
 
@@ -1748,11 +1786,215 @@ func newTestService(t *testing.T) *service {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	store := db.EPaxosStorage()
-	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: []epaxos.ReplicaID{1}, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: []epaxos.ReplicaID{1}, Storage: store, RetryTicks: 2, RecoveryTicks: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &service{id: 1, node: node, ready: db, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
+}
+
+type testKVNodeCluster struct {
+	t        *testing.T
+	services map[epaxos.ReplicaID]*service
+	mu       sync.Mutex
+	messages []epaxos.Message
+}
+
+func newTestKVNodeCluster(t *testing.T) *testKVNodeCluster {
+	t.Helper()
+	voters := []epaxos.ReplicaID{1, 2, 3}
+	cluster := &testKVNodeCluster{
+		t:        t,
+		services: make(map[epaxos.ReplicaID]*service, len(voters)),
+	}
+	peerURLs := map[epaxos.ReplicaID]string{1: "http://peer-1", 2: "http://peer-2", 3: "http://peer-3"}
+	for _, id := range voters {
+		db, err := kv.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		node, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: voters, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		peers := make(map[epaxos.ReplicaID]string, len(voters))
+		for _, peer := range voters {
+			peers[peer] = peerURLs[peer]
+		}
+		cluster.services[id] = &service{id: id, node: node, ready: db, db: db, peers: peers, sendq: make(chan epaxos.Message, 1024), nextSeq: 1, transportDrops: make(map[transportLink]struct{})}
+	}
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+		var id epaxos.ReplicaID
+		switch r.URL.Host {
+		case "peer-1":
+			id = 1
+		case "peer-2":
+			id = 2
+		case "peer-3":
+			id = 3
+		default:
+			t.Fatalf("unexpected peer host %q", r.URL.Host)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var msg epaxos.Message
+		if err := epaxos.DecodeMessage(body, &msg); err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+		if msg.To != id {
+			http.Error(rr, "bad target", http.StatusBadRequest)
+			return rr.Result(), nil
+		}
+		if cluster.services[id].transportDropped(msg.From, id) {
+			http.Error(rr, "transport link dropped", http.StatusConflict)
+			return rr.Result(), nil
+		}
+		cluster.queueMessage(msg)
+		rr.WriteHeader(http.StatusNoContent)
+		return rr.Result(), nil
+	})
+	for _, svc := range cluster.services {
+		svc.client = &http.Client{Transport: transport}
+	}
+	return cluster
+}
+
+func (c *testKVNodeCluster) setInboundDrop(from, to epaxos.ReplicaID, drop bool) {
+	c.services[to].setTransportDrop(from, to, drop)
+}
+
+func (c *testKVNodeCluster) queueMessage(msg epaxos.Message) {
+	c.mu.Lock()
+	c.messages = append(c.messages, msg.Clone())
+	c.mu.Unlock()
+}
+
+func (c *testKVNodeCluster) takeMessages() []epaxos.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.messages
+	c.messages = nil
+	return out
+}
+
+func (c *testKVNodeCluster) tickAll(n int) {
+	c.t.Helper()
+	for range n {
+		c.deliverMessages(c.takeMessages())
+		var out []epaxos.Message
+		for _, id := range []epaxos.ReplicaID{1, 2, 3} {
+			svc := c.services[id]
+			svc.mu.Lock()
+			svc.node.Tick()
+			messages, err := svc.drainLocked()
+			svc.mu.Unlock()
+			if err != nil {
+				c.t.Fatal(err)
+			}
+			out = append(out, messages...)
+		}
+		c.deliverMessages(out)
+	}
+}
+
+func (c *testKVNodeCluster) deliverMessages(messages []epaxos.Message) {
+	c.t.Helper()
+	for delivered := 0; len(messages) != 0; delivered++ {
+		if delivered > 10000 {
+			c.t.Fatalf("message delivery did not quiesce; %d messages still pending", len(messages))
+		}
+		msg := messages[0]
+		messages = messages[1:]
+		target := c.services[msg.To]
+		if target == nil {
+			c.t.Fatalf("message to unknown replica %d: %#v", msg.To, msg)
+		}
+		if target.transportDropped(msg.From, msg.To) {
+			continue
+		}
+		target.mu.Lock()
+		err := target.node.Step(msg)
+		out, drainErr := target.drainLocked()
+		target.mu.Unlock()
+		if err != nil {
+			c.t.Fatalf("step %s %d->%d: %v", msg.Type, msg.From, msg.To, err)
+		}
+		if drainErr != nil {
+			c.t.Fatal(drainErr)
+		}
+		messages = append(messages, out...)
+	}
+}
+
+func (c *testKVNodeCluster) waitForExecuted(svc *service, ref epaxos.InstanceRef, ticks int) {
+	c.t.Helper()
+	for tick := 0; tick <= ticks; tick++ {
+		svc.mu.Lock()
+		executed := hasExecutedRef(svc.node.Status().Executed, ref)
+		svc.mu.Unlock()
+		if executed {
+			return
+		}
+		if tick < ticks {
+			c.tickAll(1)
+		}
+	}
+	svc.mu.Lock()
+	status := svc.node.Status()
+	svc.mu.Unlock()
+	c.t.Fatalf("node %d executed refs=%v, want %s after %d logical ticks", svc.id, status.Executed, ref, ticks)
+}
+
+func (c *testKVNodeCluster) handleKVWithTicks(svc *service, rr *httptest.ResponseRecorder, r *http.Request) {
+	c.t.Helper()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	r = r.WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		svc.handleKV(rr, r)
+		close(done)
+	}()
+	for range 1024 {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		c.tickAll(1)
+		runtime.Gosched()
+	}
+	cancel()
+	for range 16 {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		c.tickAll(1)
+		runtime.Gosched()
+	}
+	c.logStatus("handler timeout")
+	c.t.Fatalf("%s %s did not finish after logical tick budget", r.Method, r.URL.Path)
+}
+
+func (c *testKVNodeCluster) logStatus(label string) {
+	c.t.Helper()
+	for _, id := range []epaxos.ReplicaID{1, 2, 3} {
+		svc := c.services[id]
+		svc.mu.Lock()
+		status := svc.node.Status()
+		svc.mu.Unlock()
+		c.t.Logf("%s node=%d tick=%d executed=%v", label, id, status.Tick, status.Executed)
+		for _, rec := range status.Instances {
+			c.t.Logf("%s node=%d ref=%s status=%s seq=%d deps=%v keys=%q", label, id, rec.Ref, rec.Status, rec.Seq, rec.Deps, rec.Command.ConflictKeys)
+		}
+	}
 }
 
 func newTestClusterService(t *testing.T, voters []epaxos.ReplicaID) *service {
@@ -1763,7 +2005,7 @@ func newTestClusterService(t *testing.T, voters []epaxos.ReplicaID) *service {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	store := db.EPaxosStorage()
-	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -985,7 +985,7 @@ func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error 
 			return nil
 		}
 	}
-	return fmt.Errorf("proposal was not applied after logical tick budget")
+	return fmt.Errorf("proposal outcome unknown after logical tick budget")
 }
 
 func (s *service) executedLocked(ref epaxos.InstanceRef) bool {
