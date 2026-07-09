@@ -374,6 +374,69 @@ func TestTryPreAcceptTimerRebroadcastsOnlyWhileInTryPhase(t *testing.T) {
 	}
 }
 
+func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
+	rn, inst, ref := protocolTryInstance(t, 3, 3)
+	staleTargetKey := tryEvidenceKey{
+		target:   ref,
+		conflict: InstanceRef{Replica: 2, Instance: 11, Conf: 1},
+		ballot:   Ballot{Number: inst.rec.Ballot.Number - 1, Replica: inst.rec.Ballot.Replica},
+	}
+	unrelatedTargetKey := tryEvidenceKey{
+		target:   InstanceRef{Replica: 3, Instance: 99, Conf: 1},
+		conflict: InstanceRef{Replica: 2, Instance: 12, Conf: 1},
+		ballot:   inst.rec.Ballot,
+	}
+	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{
+		staleTargetKey:     {},
+		unrelatedTargetKey: {},
+	}
+
+	rn.onTimer(inst, timerTryPreAccept)
+	if _, ok := rn.tryEvidenceChecks[staleTargetKey]; ok {
+		t.Fatalf("TryPreAccept timer left stale evidence check for target: %#v", rn.tryEvidenceChecks)
+	}
+	if _, ok := rn.tryEvidenceChecks[unrelatedTargetKey]; !ok {
+		t.Fatalf("TryPreAccept timer removed unrelated current-ballot evidence check: %#v", rn.tryEvidenceChecks)
+	}
+	if inst.phase != phaseTryPreAccept || inst.rec.Status != StatusPreAccepted {
+		t.Fatalf("TryPreAccept timer phase/status = %d/%s, want try-pre-accept/%s", inst.phase, inst.rec.Status, StatusPreAccepted)
+	}
+	rd := rn.Ready()
+	for _, to := range []ReplicaID{2, 3} {
+		msg := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, to)
+		if msg.Ref != ref || msg.RecordStatus != StatusPreAccepted || msg.FastPathEligible {
+			t.Fatalf("TryPreAccept timer retry message to %d = %#v, want target preaccepted recovery record", to, msg)
+		}
+	}
+	optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
+	if len(rd.Records) != 0 || len(rd.Committed) != 0 || rd.MustSync {
+		t.Fatalf("TryPreAccept timer retry emitted durable/application effects: %#v", rd)
+	}
+	advanceOK(t, rn, rd)
+	if rn.HasReady() {
+		t.Fatalf("accepted first TryPreAccept retry Ready left outstanding work: %#v", rn.Ready())
+	}
+	for tick := uint64(1); tick < rn.retryTicks; tick++ {
+		rn.Tick()
+		if rn.HasReady() {
+			t.Fatalf("rescheduled TryPreAccept retry fired after %d ticks, before deadline: %#v", tick, rn.Ready())
+		}
+	}
+
+	rn.Tick()
+	retry := rn.Ready()
+	for _, to := range []ReplicaID{2, 3} {
+		msg := optimizedRequireMessage(t, retry.Messages, MsgTryPreAccept, to)
+		if msg.Ref != ref || msg.RecordStatus != StatusPreAccepted || msg.FastPathEligible {
+			t.Fatalf("rescheduled TryPreAccept retry message to %d = %#v, want target preaccepted recovery record", to, msg)
+		}
+	}
+	optimizedRequireNoMessageType(t, retry.Messages, MsgAccept)
+	if len(retry.Records) != 0 || len(retry.Committed) != 0 || retry.MustSync {
+		t.Fatalf("rescheduled TryPreAccept retry emitted durable/application effects: %#v", retry)
+	}
+}
+
 func TestEnsureDependencyRecoveryNoopsForAlreadyResolvedOrInFlightWork(t *testing.T) {
 	rn := optimizedNewRawNode(t, 1, 3)
 	rn.ensureDependencyRecovery(InstanceRef{})
