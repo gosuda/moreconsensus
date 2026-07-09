@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 scope="RELEASE_SCOPE.md"
+release_evidence="release/EPAXOS_READINESS_EVIDENCE.md"
 
 require_text() {
   local text="$1"
@@ -27,6 +28,19 @@ require_scope_row_text() {
   exit 1
 }
 
+require_release_evidence_line_text() {
+  local anchor="$1"
+  local text="$2"
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" == *"$anchor"* && "$line" == *"$text"* ]]; then
+      return
+    fi
+  done < "$release_evidence"
+  echo "missing release evidence line text: $anchor -> $text" >&2
+  exit 1
+}
+
 require_path() {
   local path="$1"
   if [[ ! -e "$path" ]]; then
@@ -37,6 +51,11 @@ require_path() {
 
 if [[ ! -f "$scope" ]]; then
   echo "missing $scope" >&2
+  exit 1
+fi
+
+if [[ ! -f "$release_evidence" ]]; then
+  echo "missing $release_evidence" >&2
   exit 1
 fi
 
@@ -405,6 +424,18 @@ require_scope_row_text "| Capacity envelope |" 'the default adds `capacity/capac
 require_scope_row_text "| Capacity envelope |" 'external or relative overrides remain recorded by `capacity_report=...`'
 require_scope_row_text "| Capacity envelope |" "release_claim=none-target-environment-capacity-results-still-required"
 require_scope_row_text "| Capacity envelope |" "target-environment capacity measurement remains open"
+require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "KVNODE_LOCAL_CAPACITY_BASE_PORT=44080"
+require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "KVNODE_LOCAL_CAPACITY_OUT_DIR=/tmp/kvnode-capacity-dynamic-default-20260710"
+require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "passed as a local verification sample, not target-environment capacity evidence"
+require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" 'the default wrapper summary included `capacity/capacity-report.env` in `evidence_files`'
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "KVNODE_LOCAL_CAPACITY_BASE_PORT=45080"
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "KVNODE_CAPACITY_REPORT=/tmp/kvnode-capacity-dynamic-override-report-20260710.env"
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "passed as a local verification sample, not target-environment capacity evidence"
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'capacity_report=/tmp/kvnode-capacity-dynamic-override-report-20260710.env'
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'omitted that external path from wrapper `evidence_files`'
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'external report contained `target_environment=not-measured`'
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'raw `evidence_files=metadata.env,summary.md,latency.csv,resources.csv`'
+require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'mode `600`'
 require_text 'custom Go runner capacity labels document `KVNODE_GO_RUNNER_ENVIRONMENT_LABEL` and `KVNODE_GO_RUNNER_WORKLOAD_LABEL`'
 require_text 'defaulting custom Go runner provenance to `environment_label=local-loopback` and `workload_label=local-go-runner`'
 require_text 'custom Go runner validates label values as non-empty, single-line, without `=`, and at most 128 characters'
