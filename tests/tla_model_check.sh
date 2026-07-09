@@ -85,6 +85,10 @@ for cfg in tla/EPaxosEvidenceQuery.cfg tla/EPaxosEvidenceQueryFive.cfg tla/EPaxo
   run_tlc tla/EPaxosEvidenceQuery.tla "$cfg"
 done
 
+for cfg in tla/EPaxosEvidenceStaleness.cfg; do
+  run_tlc tla/EPaxosEvidenceStaleness.tla "$cfg"
+done
+
 for cfg in tla/EPaxosConfigBarrier.cfg; do
   run_tlc tla/EPaxosConfigBarrier.tla "$cfg"
 done

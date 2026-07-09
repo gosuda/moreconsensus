@@ -701,11 +701,15 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 	rn := optimizedNewRawNode(t, 1, 5)
 	target := InstanceRef{Replica: 1, Instance: 30, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 7, Conf: 1}
-	key := tryEvidenceKey{target: target, conflict: conflict}
+	deps := rn.q.deps()
+	deps[1] = conflict.Instance
+	ballot := Ballot{Number: 1, Replica: 1}
+	rn.instances[target] = &instance{rec: checkedRecord(InstanceRecord{Ref: target, Ballot: ballot, Status: StatusPreAccepted, Seq: 2, Deps: deps, Command: optimizedTestCommand("evidence-response-target", "evidence-response-key")}), phase: phaseTryPreAccept}
+	key := tryEvidenceKey{target: target, conflict: conflict, ballot: ballot}
 	records := make(map[ReplicaID]InstanceRecord)
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: records}
 
-	mismatched := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: InstanceRef{Replica: 3, Instance: 7, Conf: 1}, ConflictRef: target, Deps: rn.q.deps(), RecordStatus: StatusNone}
+	mismatched := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: InstanceRef{Replica: 3, Instance: 7, Conf: 1}, ConflictRef: target, Ballot: ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
 	if err := rn.Step(mismatched); err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +717,7 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 		t.Fatalf("mismatched evidence response was recorded: %#v", records)
 	}
 
-	valid := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Deps: rn.q.deps(), RecordStatus: StatusNone}
+	valid := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Ballot: ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
 	if err := rn.Step(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -733,9 +737,121 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 	}
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: records}
 	records[3] = InstanceRecord{Ref: conflict, Status: StatusNone}
-	rn.handleEvidenceResp(Message{From: 3, Ref: conflict, ConflictRef: target, Seq: 123, RecordStatus: StatusCommitted})
+	rn.handleEvidenceResp(Message{From: 3, Ref: conflict, ConflictRef: target, Ballot: ballot, Seq: 123, RecordStatus: StatusCommitted})
 	if got := records[3]; got.Seq != 0 || got.Status != StatusNone {
 		t.Fatalf("direct duplicate evidence response overwrote first sender record: %#v", got)
+	}
+}
+
+func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T) {
+	rn := optimizedNewRawNode(t, 1, 3)
+	target := InstanceRef{Replica: 1, Instance: 31, Conf: 1}
+	conflict := InstanceRef{Replica: 2, Instance: 8, Conf: 1}
+	deps := rn.q.deps()
+	deps[1] = conflict.Instance
+	inst := &instance{
+		rec: checkedRecord(InstanceRecord{
+			Ref:     target,
+			Ballot:  Ballot{Number: 1, Replica: 1},
+			Status:  StatusPreAccepted,
+			Seq:     2,
+			Deps:    deps,
+			Command: optimizedTestCommand("stale-duplicate-target", "stale-duplicate-key"),
+		}),
+		phase: phaseTryPreAccept,
+		tryOK: map[ReplicaID]struct{}{
+			1: {},
+		},
+	}
+	rn.instances[target] = inst
+	key := tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}
+	records := make(map[ReplicaID]InstanceRecord)
+	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: records}
+
+	tupleDeps := rn.q.deps()
+	tupleDeps[1] = conflict.Instance
+	evidenceDeps := rn.q.deps()
+	evidenceDeps[0] = target.Instance
+	oldBallot := Message{
+		Type:           MsgEvidenceResp,
+		From:           2,
+		To:             1,
+		Ref:            conflict,
+		ConflictRef:    target,
+		Ballot:         Ballot{Replica: inst.rec.Ballot.Replica},
+		RecordBallot:   Ballot{Number: 1, Replica: 2},
+		RecordStatus:   StatusCommitted,
+		Seq:            4,
+		Deps:           tupleDeps,
+		Command:        optimizedTestCommand("old-ballot-conflict", "stale-duplicate-conflict-key"),
+		AcceptSeq:      5,
+		AcceptDeps:     evidenceDeps,
+		AcceptEvidence: []AcceptEvidence{{Sender: 2, Seq: 5, Deps: evidenceDeps}},
+	}
+	oldKey := tryEvidenceKey{target: target, conflict: conflict, ballot: oldBallot.Ballot}
+	oldRecords := make(map[ReplicaID]InstanceRecord)
+	rn.tryEvidenceChecks[oldKey] = oldRecords
+	if err := rn.Step(oldBallot); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 || len(oldRecords) != 0 || inst.phase != phaseTryPreAccept {
+		t.Fatalf("old-ballot evidence response affected live check: current=%#v old=%#v phase=%d", records, oldRecords, inst.phase)
+	}
+	if _, ok := rn.tryEvidenceChecks[oldKey]; ok {
+		t.Fatalf("old-ballot evidence check was not deleted: %#v", rn.tryEvidenceChecks)
+	}
+	if _, ok := rn.tryEvidenceChecks[key]; !ok {
+		t.Fatalf("old-ballot evidence response deleted current check: %#v", rn.tryEvidenceChecks)
+	}
+
+	stale := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Ballot: inst.rec.Ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
+	if err := rn.Step(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := stale.Clone()
+	fresh.RecordBallot = oldBallot.RecordBallot
+	fresh.RecordStatus = StatusCommitted
+	fresh.Seq = oldBallot.Seq
+	fresh.Deps = tupleDeps
+	fresh.Command = optimizedTestCommand("stale-duplicate-conflict", "stale-duplicate-conflict-key")
+	fresh.AcceptSeq = oldBallot.AcceptSeq
+	fresh.AcceptDeps = evidenceDeps
+	fresh.AcceptEvidence = []AcceptEvidence{{Sender: 2, Seq: 5, Deps: evidenceDeps}}
+	if err := rn.Step(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := records[2]; got.Status != StatusNone || got.Seq != 0 {
+		t.Fatalf("stale duplicate evidence response overwrote first sender record: %#v", got)
+	}
+
+	empty := Message{Type: MsgEvidenceResp, From: 3, To: 1, Ref: conflict, ConflictRef: target, Ballot: inst.rec.Ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
+	if err := rn.Step(empty); err != nil {
+		t.Fatal(err)
+	}
+	if got := records[2]; got.Status != StatusNone || got.Seq != 0 {
+		t.Fatalf("resolved stale duplicate evidence response overwrote first sender record: %#v", got)
+	}
+	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
+		t.Fatalf("stale duplicate evidence decision phase/status = %d/%s, want slow accept/%s", inst.phase, inst.rec.Status, StatusAccepted)
+	}
+	if inst.rec.Deps[1] != conflict.Instance {
+		t.Fatalf("accepted target deps = %v, want dependency on stale conflict %s", inst.rec.Deps, conflict)
+	}
+	if len(inst.tryIgnored) != 0 {
+		t.Fatalf("stale duplicate evidence authorized ignore resend: %#v", inst.tryIgnored)
+	}
+
+	rd := rn.Ready()
+	rec := optimizedRequireRecord(t, rd, target)
+	if rec.Status != StatusAccepted || rec.Deps[1] != conflict.Instance {
+		t.Fatalf("stale duplicate evidence accepted record = %#v, want accepted record retaining conflict %s", rec, conflict)
+	}
+	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
+	optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
+	if rn.tryEvidenceChecks != nil {
+		t.Fatalf("stale duplicate evidence left stale checks: %#v", rn.tryEvidenceChecks)
 	}
 }
 
@@ -758,7 +874,7 @@ func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
 		tryOK: map[ReplicaID]struct{}{1: {}},
 	}
 	rn.instances[target] = inst
-	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: target, conflict: conflict}: {}}
+	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: target, conflict: conflict, ballot: inst.rec.Ballot}: {}}
 
 	rn.onTimer(inst, timerTryPreAccept)
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
@@ -812,7 +928,7 @@ func TestTryEvidenceHelperBranchesFailClosedConservatively(t *testing.T) {
 		t.Fatal("single-voter configuration with f=0 started evidence check")
 	}
 
-	key := tryEvidenceKey{target: target, conflict: conflict}
+	key := tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: {}}
 	if !rn.maybeStartTryEvidenceCheck(inst, conflict) {
 		t.Fatal("existing evidence check was not treated as in-flight")
@@ -832,7 +948,7 @@ func TestTryEvidenceHelperBranchesFailClosedConservatively(t *testing.T) {
 	failDeps[1] = conflict.Instance
 	failInst := &instance{rec: checkedRecord(InstanceRecord{Ref: failClosedTarget, Ballot: Ballot{Number: 2, Replica: 1}, Status: StatusPreAccepted, Seq: 2, Deps: failDeps, Command: optimizedTestCommand("fail-closed", "helper-key")}), phase: phaseTryPreAccept}
 	rn.instances[failClosedTarget] = failInst
-	failKey := tryEvidenceKey{target: failClosedTarget, conflict: conflict}
+	failKey := tryEvidenceKey{target: failClosedTarget, conflict: conflict, ballot: failInst.rec.Ballot}
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{failKey: {2: {Ref: conflict, Status: StatusNone}, 3: {Ref: conflict, Status: StatusNone}}}
 	rn.resolveTryEvidenceCheck(failKey)
 	if failInst.phase != phaseAccept || failInst.rec.Status != StatusAccepted {
@@ -848,7 +964,7 @@ func TestTryEvidenceDecisionAndRecordValidationBranches(t *testing.T) {
 	targetDeps[1] = conflict.Instance
 	inst := &instance{rec: checkedRecord(InstanceRecord{Ref: target, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusPreAccepted, Seq: 2, Deps: targetDeps, Command: optimizedTestCommand("decision-target", "decision-key")}), phase: phaseTryPreAccept}
 	rn.instances[target] = inst
-	key := tryEvidenceKey{target: target, conflict: conflict}
+	key := tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}
 	if authorized, failClosed := rn.tryEvidenceDecision(inst, key, map[ReplicaID]InstanceRecord{2: {Ref: conflict, Status: StatusNone}}); authorized || failClosed {
 		t.Fatalf("partial evidence without committed tuple decision = authorized %v failClosed %v, want wait", authorized, failClosed)
 	}
@@ -1044,13 +1160,21 @@ func TestFailPendingEvidenceCheckSortsAndDropsByTarget(t *testing.T) {
 		target := InstanceRef{Replica: 1, Instance: 80, Conf: 1}
 		inst := &instance{rec: checkedRecord(InstanceRecord{Ref: target, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusPreAccepted, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("fail-pending", "fail-pending-key")}), phase: phaseTryPreAccept}
 		rn.instances[target] = inst
+		staleBallotKey := tryEvidenceKey{target: target, conflict: conflicts[0], ballot: Ballot{Number: inst.rec.Ballot.Number + 1, Replica: inst.rec.Ballot.Replica}}
+		rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{staleBallotKey: {}}
+		if rn.failPendingTryEvidenceCheck(inst) {
+			t.Fatal("stale-ballot evidence check for target failed this recovery")
+		}
+		if rn.tryEvidenceChecks != nil {
+			t.Fatalf("stale-ballot evidence check was not cleaned up: %#v", rn.tryEvidenceChecks)
+		}
 		otherTarget := InstanceRef{Replica: 1, Instance: 81, Conf: 1}
-		rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: otherTarget, conflict: conflicts[0]}: {}}
+		rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: otherTarget, conflict: conflicts[0], ballot: inst.rec.Ballot}: {}}
 		if rn.failPendingTryEvidenceCheck(inst) {
 			t.Fatal("evidence checks for another target failed this recovery")
 		}
 		for _, conflict := range conflicts {
-			rn.tryEvidenceChecks[tryEvidenceKey{target: target, conflict: conflict}] = map[ReplicaID]InstanceRecord{}
+			rn.tryEvidenceChecks[tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}] = map[ReplicaID]InstanceRecord{}
 		}
 		if !rn.failPendingTryEvidenceCheck(inst) {
 			t.Fatal("pending evidence checks for target did not fail closed")
@@ -1069,8 +1193,8 @@ func TestFailPendingEvidenceCheckSortsAndDropsByTarget(t *testing.T) {
 
 	rn := optimizedNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 82, Conf: 1}
-	keep := tryEvidenceKey{target: InstanceRef{Replica: 1, Instance: 83, Conf: 1}, conflict: InstanceRef{Replica: 2, Instance: 1, Conf: 1}}
-	drop := tryEvidenceKey{target: target, conflict: InstanceRef{Replica: 2, Instance: 2, Conf: 1}}
+	keep := tryEvidenceKey{target: InstanceRef{Replica: 1, Instance: 83, Conf: 1}, conflict: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, ballot: Ballot{Number: 1, Replica: 1}}
+	drop := tryEvidenceKey{target: target, conflict: InstanceRef{Replica: 2, Instance: 2, Conf: 1}, ballot: Ballot{Number: 1, Replica: 1}}
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{keep: {}, drop: {}}
 	rn.dropTryEvidenceChecksForTarget(target)
 	if _, ok := rn.tryEvidenceChecks[drop]; ok {

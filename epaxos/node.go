@@ -34,6 +34,7 @@ type tryCandidate struct {
 type tryEvidenceKey struct {
 	target   InstanceRef
 	conflict InstanceRef
+	ballot   Ballot
 }
 
 type instance struct {
@@ -1260,9 +1261,14 @@ func (n *RawNode) handleEvidence(m Message) {
 }
 
 func (n *RawNode) handleEvidenceResp(m Message) {
-	key := tryEvidenceKey{target: m.ConflictRef, conflict: m.Ref}
+	key := tryEvidenceKey{target: m.ConflictRef, conflict: m.Ref, ballot: m.Ballot}
 	records, ok := n.tryEvidenceChecks[key]
 	if !ok {
+		return
+	}
+	inst := n.instances[key.target]
+	if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) || inst.rec.Ballot != key.ballot {
+		n.deleteTryEvidenceCheck(key)
 		return
 	}
 	if _, duplicate := records[m.From]; duplicate {
@@ -1624,7 +1630,7 @@ func (n *RawNode) maybeStartTryEvidenceCheck(inst *instance, conflictRef Instanc
 	if n.faultTolerance(inst.rec.Ref.Conf) <= 0 {
 		return false
 	}
-	key := tryEvidenceKey{target: inst.rec.Ref, conflict: conflictRef}
+	key := tryEvidenceKey{target: inst.rec.Ref, conflict: conflictRef, ballot: inst.rec.Ballot}
 	if n.tryEvidenceChecks == nil {
 		n.tryEvidenceChecks = make(map[tryEvidenceKey]map[ReplicaID]InstanceRecord, 1)
 	}
@@ -1646,24 +1652,28 @@ func (n *RawNode) broadcastTryEvidenceCheck(inst *instance, conflictRef Instance
 	}
 }
 
+func (n *RawNode) deleteTryEvidenceCheck(key tryEvidenceKey) {
+	delete(n.tryEvidenceChecks, key)
+	if len(n.tryEvidenceChecks) == 0 {
+		n.tryEvidenceChecks = nil
+	}
+}
+
 func (n *RawNode) resolveTryEvidenceCheck(key tryEvidenceKey) {
 	records, ok := n.tryEvidenceChecks[key]
 	if !ok {
 		return
 	}
 	inst := n.instances[key.target]
-	if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) {
-		delete(n.tryEvidenceChecks, key)
+	if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) || inst.rec.Ballot != key.ballot {
+		n.deleteTryEvidenceCheck(key)
 		return
 	}
 	authorized, failClosed := n.tryEvidenceDecision(inst, key, records)
 	if !authorized && !failClosed {
 		return
 	}
-	delete(n.tryEvidenceChecks, key)
-	if len(n.tryEvidenceChecks) == 0 {
-		n.tryEvidenceChecks = nil
-	}
+	n.deleteTryEvidenceCheck(key)
 	if failClosed {
 		if tuple, ok := n.committedConflictTuple(key.conflict, records); ok {
 			n.startAcceptAfterTryCommittedConflictTuple(inst, tuple)
@@ -1788,9 +1798,17 @@ func (n *RawNode) failPendingTryEvidenceCheck(inst *instance) bool {
 	}
 	keys := make([]tryEvidenceKey, 0, len(n.tryEvidenceChecks))
 	for key := range n.tryEvidenceChecks {
-		if key.target == inst.rec.Ref {
-			keys = append(keys, key)
+		if key.target != inst.rec.Ref {
+			continue
 		}
+		if key.ballot != inst.rec.Ballot {
+			delete(n.tryEvidenceChecks, key)
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(n.tryEvidenceChecks) == 0 {
+		n.tryEvidenceChecks = nil
 	}
 	if len(keys) == 0 {
 		return false
