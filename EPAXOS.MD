@@ -111,7 +111,7 @@ On restart, `NewRawNode` loads durable records, remembers any stored historical 
 When TOQ is enabled, default `TOQSyncGroup` selection and one-way-delay validation run after executed configuration replay, so an omitted sync group defaults to the replayed current voters and an explicit stale sync group containing a removed voter is rejected.
 Recovery, retry, and broadcast paths select voter sets and slow-quorum thresholds by the instance `Ref.Conf`, so an old instance can still use a removed voter for its old pinned quorum, newly added voters cannot count for pre-addition instances, and current-configuration proposals from a removed local replica remain rejected.
 
-The finite configuration evidence currently covers an executed add/remove durable replay slice plus staged old-instance recovery-after-removal and recovery-after-addition slices. Arbitrary durable histories, arbitrary recovery under reconfiguration, joint consensus, and unbounded membership changes remain outside the current claim.
+The finite configuration evidence currently covers an executed add/remove durable replay slice plus staged old-instance recovery-after-removal, lost+duplicate recovery response de-duplication, and recovery-after-addition slices. Arbitrary durable histories, arbitrary recovery under reconfiguration, retries/timer rebroadcast, arbitrary message loss, joint consensus, and unbounded membership changes remain outside the current claim.
 
 ## Ready contract
 

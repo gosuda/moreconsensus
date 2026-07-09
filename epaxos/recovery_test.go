@@ -207,6 +207,12 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery reached slow quorum without removed voter 4: %#v", restarted.Ready())
 	}
+	if err := restarted.Step(prepareResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery counted duplicate voter 3 prepare response as removed voter 4: %#v", restarted.Ready())
+	}
 	if err := restarted.Step(prepareResp(4)); err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +230,12 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery committed without removed voter 4 accept response: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(acceptResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery counted duplicate voter 3 accept response as removed voter 4: %#v", restarted.Ready())
 	}
 	if err := restarted.Step(acceptResp(4)); err != nil {
 		t.Fatal(err)
