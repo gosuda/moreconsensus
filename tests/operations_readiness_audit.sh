@@ -113,9 +113,14 @@ require_text "$checkpoint_helper" "Status: offline example/operator helper only"
 require_text "$checkpoint_helper" "restoreVerified"
 require_text "$checkpoint_helper" "kv.VerifyCheckpoint"
 require_text "$checkpoint_helper" "kv.RestoreCheckpoint"
+require_text "$checkpoint_helper" "KVNODE_CHECKPOINT_REPORT=/path/report.env writes a success report after a completed operation"
+require_text "$checkpoint_helper" "status=example-operator-report"
+require_text "$checkpoint_helper" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
 require_text "$checkpoint_helper_test" "TestRestoreRejectsCorruptCheckpointWithoutReplacingLiveData"
 require_text "$checkpoint_helper_test" "TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData"
 
+require_text "$checkpoint_helper_test" "TestRunWritesOperationReportsForSuccessfulCommands"
+require_text "$checkpoint_helper_test" "TestRunReportsBadReportPathOnlyAfterSuccessfulOperation"
 # Local incident tabletop harness: opt-in, loopback-only, and explicitly not a
 # target-environment/operator-review claim.
 require_text "$incident_drill" "kvnode incident tabletop drill (local loopback harness only)"
@@ -179,6 +184,10 @@ require_text "$runbook" "target-owned next-instance floor"
 require_text "$runbook" "## Evidence capture baseline"
 require_text "$runbook" "## One-time offline checkpoint/restore helper"
 require_text "$runbook" "examples/kv/cmd/kvcheckpoint"
+require_text "$runbook" "KVNODE_CHECKPOINT_REPORT=/path/report.env"
+require_text "$runbook" "status=example-operator-report"
+require_text "$runbook" "quoted data/checkpoint paths"
+require_text "$runbook" "each successful helper operation write a small report"
 require_text "$runbook" "verified restore"
 require_text "$runbook" "does not expose an unverified raw byte-copy restore path"
 require_text "$runbook" "choose exactly one recovery path"
@@ -207,6 +216,7 @@ require_text "$runbook" "go run -tags kvnode_local_runner ./tests/kvnode_local_r
 require_text "$runbook" "data-lifecycle-summary.txt"
 require_text "$runbook" 'stops node 2 before opening its Pebble directory, runs `kvcheckpoint checkpoint`, `kvcheckpoint verify`, `kvcheckpoint restore`, restarts node 2'
 require_text "$runbook" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+require_text "$runbook" "does not replace a reviewed target-environment backup/restore/disaster-recovery drill"
 require_text "$runbook" "operator review"
 require_text "$runbook" "No one performed automatic in-place repair, checksum recomputation, corrupt-record deletion, or synthesized reconstruction without a verified checkpoint under this runbook."
 

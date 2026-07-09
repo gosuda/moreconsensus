@@ -88,7 +88,7 @@ du -sh "${DATA_DIR}" > "${EVIDENCE_DIR}/data-dir-size.txt" 2>&1 || true
 
 ## One-time offline checkpoint/restore helper
 
-Use the maintained offline helper in `examples/kv/cmd/kvcheckpoint`. It imports `gosuda.org/moreconsensus/examples/kv` and exposes the same checkpoint, semantic verification, verified restore, and verified repair operations documented below; semantic live-source replacement remains covered by the in-process `Cluster` test harness, not this standalone `kvnode` helper.
+Use the maintained offline helper in `examples/kv/cmd/kvcheckpoint`. It imports `gosuda.org/moreconsensus/examples/kv` and exposes the same checkpoint, semantic verification, verified restore, and verified repair operations documented below; semantic live-source replacement remains covered by the in-process `Cluster` test harness, not this standalone `kvnode` helper. Set `KVNODE_CHECKPOINT_REPORT=/path/report.env` to make each successful helper operation write a small report with `status=example-operator-report`, the operation name, quoted data/checkpoint paths, and `release_claim=none-target-environment-data-lifecycle-drill-still-required`.
 
 Build it from the checkout that matches the deployed binary version you are drilling:
 
@@ -103,6 +103,7 @@ Preconditions:
 - `CHECKPOINT_DIR` is on storage with enough capacity for a complete Pebble checkpoint plus manifest files.
 - The checkpoint directory must be new or empty for backup. Do not overwrite an existing checkpoint.
 - Use the helper from the same repository version as the deployed `kvnode` binary and data format.
+- `KVNODE_CHECKPOINT_REPORT`, when set, points outside `DATA_DIR` and is unique for the helper operation being recorded.
 
 Commands:
 
@@ -110,20 +111,20 @@ Commands:
 export CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${STAMP}"
 test ! -e "${CHECKPOINT_DIR}"
 
-/opt/moreconsensus/bin/kvcheckpoint checkpoint "${DATA_DIR}" "${CHECKPOINT_DIR}"
-/opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}"
+KVNODE_CHECKPOINT_REPORT="${EVIDENCE_DIR}/kvcheckpoint-checkpoint-report.env" /opt/moreconsensus/bin/kvcheckpoint checkpoint "${DATA_DIR}" "${CHECKPOINT_DIR}"
+KVNODE_CHECKPOINT_REPORT="${EVIDENCE_DIR}/kvcheckpoint-verify-report.env" /opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}"
 ```
 
 After verification, choose exactly one recovery path. For checksum/corruption response, use the preferred repair path:
 
 ```sh
-/opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}"
+KVNODE_CHECKPOINT_REPORT="${EVIDENCE_DIR}/kvcheckpoint-repair-report.env" /opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}"
 ```
 
 For full-directory rollback instead, use the restore path:
 
 ```sh
-/opt/moreconsensus/bin/kvcheckpoint restore "${DATA_DIR}" "${CHECKPOINT_DIR}"
+KVNODE_CHECKPOINT_REPORT="${EVIDENCE_DIR}/kvcheckpoint-restore-report.env" /opt/moreconsensus/bin/kvcheckpoint restore "${DATA_DIR}" "${CHECKPOINT_DIR}"
 ```
 
 `repair` is the preferred operator command for checksum/corruption response because it calls semantic checkpoint verification before whole-directory replacement. `restore` is retained for full-directory rollback and also verifies the checkpoint before copying; the helper intentionally does not expose an unverified raw byte-copy restore path. Do not run both recovery commands for the same incident unless a reviewed rollback plan explicitly calls for a second replacement.
@@ -193,6 +194,7 @@ Evidence to retain:
 - Operator command transcript and UTC timestamps.
 - Pre/post `/readyz` and `/metrics` output.
 - `journalctl` around stop, checkpoint, and restart.
+- `kvcheckpoint` report files when `KVNODE_CHECKPOINT_REPORT` is set.
 - `CHECKPOINT_DIR`, `CHECKPOINT_DIR.sha256`, file listing, size, and off-host copy location.
 
 ## Offline whole-directory repair or restore from a checkpoint
@@ -222,8 +224,8 @@ mkdir -p "${RESTORE_EVIDENCE_DIR}"
 ) | tee "${RESTORE_EVIDENCE_DIR}/checkpoint-verify.txt"
 
 # Verify the checkpoint can be opened read-only and semantically matches its applied EPaxos commands.
-/opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
-cat "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
+KVNODE_CHECKPOINT_REPORT="${RESTORE_EVIDENCE_DIR}/kvcheckpoint-verify-report.env" /opt/moreconsensus/bin/kvcheckpoint verify "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt"
+cat "${RESTORE_EVIDENCE_DIR}/checkpoint-epaxos-verify.txt" "${RESTORE_EVIDENCE_DIR}/kvcheckpoint-verify-report.env"
 
 # Stop and preserve a separate quarantine copy if retention is required.
 sudo systemctl stop "${SERVICE}"
@@ -231,8 +233,8 @@ rsync -a --numeric-ids "${DATA_DIR}/" "${RESTORE_EVIDENCE_DIR}/live-data-before-
 find "${DATA_DIR}" -type f -print0 | sort -z | xargs -0 shasum -a 256 > "${RESTORE_EVIDENCE_DIR}/live-data-before-restore.sha256" 2>/dev/null || true
 
 # Repair from the whole checkpoint; this verifies again before byte-copy replacement.
-/opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
-cat "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
+KVNODE_CHECKPOINT_REPORT="${RESTORE_EVIDENCE_DIR}/kvcheckpoint-repair-report.env" /opt/moreconsensus/bin/kvcheckpoint repair "${DATA_DIR}" "${CHECKPOINT_DIR}" > "${RESTORE_EVIDENCE_DIR}/repair-helper.txt"
+cat "${RESTORE_EVIDENCE_DIR}/repair-helper.txt" "${RESTORE_EVIDENCE_DIR}/kvcheckpoint-repair-report.env"
 
 # Restart one restored node and check only its admin plane first.
 sudo systemctl start "${SERVICE}"

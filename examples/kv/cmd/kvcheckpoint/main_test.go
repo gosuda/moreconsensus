@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestRunUsagePathsReturnDocumentedExitCodes(t *testing.T) {
 			name:       "no args",
 			args:       nil,
 			wantExit:   2,
-			wantOutput: []string{"usage:", "kvcheckpoint checkpoint DATA_DIR CHECKPOINT_DIR", "offline example/operator helper only"},
+			wantOutput: []string{"usage:", "kvcheckpoint checkpoint DATA_DIR CHECKPOINT_DIR", "KVNODE_CHECKPOINT_REPORT=/path/report.env", "offline example/operator helper only"},
 		},
 		{
 			name:       "help",
@@ -167,6 +168,243 @@ func TestRunReportsCheckpointFailures(t *testing.T) {
 func TestRunReportsVerifyFailure(t *testing.T) {
 	missingCheckpoint := filepath.Join(t.TempDir(), "missing-checkpoint")
 	requireRun(t, []string{"verify", missingCheckpoint}, 1, "kvcheckpoint verify failed:", missingCheckpoint)
+}
+
+func TestRunWritesOperationReportsForSuccessfulCommands(t *testing.T) {
+	cases := []struct {
+		name         string
+		operation    string
+		setupCommand func(t *testing.T) (args []string, reportDataDir string, reportCheckpointDir string)
+	}{
+		{
+			name:      "checkpoint",
+			operation: "checkpoint",
+			setupCommand: func(t *testing.T) ([]string, string, string) {
+				dataDir := t.TempDir()
+				checkpointDir := filepath.Join(t.TempDir(), "checkpoint")
+				cluster := openTestCluster(t, dataDir)
+				if err := cluster.Put([]byte("checkpoint-report-key"), []byte("checkpoint-report-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				closeCluster(t, cluster)
+				return []string{"checkpoint", dataDir, checkpointDir}, dataDir, checkpointDir
+			},
+		},
+		{
+			name:      "verify",
+			operation: "verify",
+			setupCommand: func(t *testing.T) ([]string, string, string) {
+				_, checkpointDir := createCheckpointedDataDir(t, "verify-report-key", "verify-report-value")
+				return []string{"verify", checkpointDir}, "", checkpointDir
+			},
+		},
+		{
+			name:      "restore",
+			operation: "restore",
+			setupCommand: func(t *testing.T) ([]string, string, string) {
+				dataDir, checkpointDir := createCheckpointedDataDir(t, "restore-report-key", "restore-report-value")
+				cluster := openTestCluster(t, dataDir)
+				if err := cluster.Put([]byte("restore-report-key"), []byte("mutated-live-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				closeCluster(t, cluster)
+				return []string{"restore", dataDir, checkpointDir}, dataDir, checkpointDir
+			},
+		},
+		{
+			name:      "repair",
+			operation: "repair",
+			setupCommand: func(t *testing.T) ([]string, string, string) {
+				dataDir, checkpointDir := createCheckpointedDataDir(t, "repair-report-key", "repair-report-value")
+				cluster := openTestCluster(t, dataDir)
+				if err := cluster.Put([]byte("repair-report-key"), []byte("mutated-live-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				closeCluster(t, cluster)
+				return []string{"repair", dataDir, checkpointDir}, dataDir, checkpointDir
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", "")
+			args, reportDataDir, reportCheckpointDir := tc.setupCommand(t)
+
+			reportPath := filepath.Join(t.TempDir(), "report.env")
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", reportPath)
+
+			requireRun(t, args, 0, "")
+			requireOperationReport(t, reportPath, tc.operation, reportDataDir, reportCheckpointDir)
+		})
+	}
+}
+
+func TestRunReportsBadReportPathOnlyAfterSuccessfulOperation(t *testing.T) {
+	cases := []struct {
+		name         string
+		operation    string
+		setupCommand func(t *testing.T) (args []string, assertCompleted func(t *testing.T))
+	}{
+		{
+			name:      "checkpoint",
+			operation: "checkpoint",
+			setupCommand: func(t *testing.T) ([]string, func(t *testing.T)) {
+				dataDir, _ := createCheckpointedDataDir(t, "bad-checkpoint-report-key", "bad-checkpoint-report-value")
+				checkpointDir := filepath.Join(t.TempDir(), "checkpoint")
+				return []string{"checkpoint", dataDir, checkpointDir}, func(t *testing.T) {
+					if err := kv.VerifyCheckpoint(checkpointDir); err != nil {
+						t.Fatalf("checkpoint was not created before report failure: %v", err)
+					}
+				}
+			},
+		},
+		{
+			name:      "verify",
+			operation: "verify",
+			setupCommand: func(t *testing.T) ([]string, func(t *testing.T)) {
+				_, checkpointDir := createCheckpointedDataDir(t, "bad-verify-report-key", "bad-verify-report-value")
+				return []string{"verify", checkpointDir}, nil
+			},
+		},
+		{
+			name:      "restore",
+			operation: "restore",
+			setupCommand: func(t *testing.T) ([]string, func(t *testing.T)) {
+				dataDir, checkpointDir := createCheckpointedDataDir(t, "bad-restore-report-key", "checkpoint-value")
+				cluster := openTestCluster(t, dataDir)
+				if err := cluster.Put([]byte("bad-restore-report-key"), []byte("mutated-live-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				if err := cluster.Put([]byte("bad-restore-live-only-key"), []byte("live-only-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				closeCluster(t, cluster)
+				return []string{"restore", dataDir, checkpointDir}, func(t *testing.T) {
+					restored := openTestCluster(t, dataDir)
+					defer closeCluster(t, restored)
+					value, ok, err := restored.Get(1, []byte("bad-restore-report-key"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !ok || string(value) != "checkpoint-value" {
+						t.Fatalf("bad-restore-report-key after restore ok=%v value=%q, want checkpoint-value", ok, value)
+					}
+					_, ok, err = restored.Get(1, []byte("bad-restore-live-only-key"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if ok {
+						t.Fatal("restore with bad report path preserved live-only key; want data directory replaced by checkpoint")
+					}
+				}
+			},
+		},
+		{
+			name:      "repair",
+			operation: "repair",
+			setupCommand: func(t *testing.T) ([]string, func(t *testing.T)) {
+				dataDir, checkpointDir := createCheckpointedDataDir(t, "bad-repair-report-key", "checkpoint-value")
+				cluster := openTestCluster(t, dataDir)
+				if err := cluster.Put([]byte("bad-repair-report-key"), []byte("mutated-live-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				if err := cluster.Put([]byte("bad-repair-live-only-key"), []byte("live-only-value")); err != nil {
+					_ = cluster.Close()
+					t.Fatal(err)
+				}
+				closeCluster(t, cluster)
+				return []string{"repair", dataDir, checkpointDir}, func(t *testing.T) {
+					repaired := openTestCluster(t, dataDir)
+					defer closeCluster(t, repaired)
+					value, ok, err := repaired.Get(1, []byte("bad-repair-report-key"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !ok || string(value) != "checkpoint-value" {
+						t.Fatalf("bad-repair-report-key after repair ok=%v value=%q, want checkpoint-value", ok, value)
+					}
+					_, ok, err = repaired.Get(1, []byte("bad-repair-live-only-key"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if ok {
+						t.Fatal("repair with bad report path preserved live-only key; want data directory replaced by checkpoint")
+					}
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", "")
+			args, assertCompleted := tc.setupCommand(t)
+
+			root := t.TempDir()
+			reportParentFile := filepath.Join(root, "not-a-directory")
+			writeTestFile(t, reportParentFile, "not a directory")
+			badReportPath := filepath.Join(reportParentFile, "report.env")
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", badReportPath)
+
+			stderr := requireRunOutput(t, args, 1, "kvcheckpoint "+tc.operation+" report failed:", reportParentFile)
+			if strings.Contains(stderr, "kvcheckpoint "+tc.operation+" failed:") {
+				t.Fatalf("%s with bad report path stderr=%q, want report failure after successful operation", tc.operation, stderr)
+			}
+			if assertCompleted != nil {
+				assertCompleted(t)
+			}
+			if _, err := os.Stat(badReportPath); err == nil {
+				t.Fatalf("bad report path %q unexpectedly exists", badReportPath)
+			}
+		})
+	}
+}
+
+func TestRunRejectsReportPathsThatDoNotNameFiles(t *testing.T) {
+	cases := []struct {
+		name       string
+		reportPath string
+	}{
+		{name: "current directory", reportPath: "."},
+		{name: "platform root", reportPath: string(filepath.Separator)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", "")
+			_, checkpointDir := createCheckpointedDataDir(t, "non-file-report-key", "non-file-report-value")
+
+			t.Setenv("KVNODE_CHECKPOINT_REPORT", tc.reportPath)
+			stderr := requireRunOutput(t, []string{"verify", checkpointDir}, 1, "kvcheckpoint verify report failed:", "report path must name a file")
+			if strings.Contains(stderr, "kvcheckpoint verify failed:") {
+				t.Fatalf("verify with report path %q stderr=%q, want report path rejection after successful verify", tc.reportPath, stderr)
+			}
+		})
+	}
+}
+
+func TestRunDoesNotMaskCommandFailureWithReportErrors(t *testing.T) {
+	root := t.TempDir()
+	reportParentFile := filepath.Join(root, "not-a-directory")
+	writeTestFile(t, reportParentFile, "not a directory")
+	badReportPath := filepath.Join(reportParentFile, "report.env")
+	t.Setenv("KVNODE_CHECKPOINT_REPORT", badReportPath)
+
+	missingCheckpoint := filepath.Join(t.TempDir(), "missing-checkpoint")
+	stderr := requireRunOutput(t, []string{"verify", missingCheckpoint}, 1, "kvcheckpoint verify failed:", missingCheckpoint)
+	if strings.Contains(stderr, "report failed") {
+		t.Fatalf("verify failure stderr=%q, want command failure to take precedence over report failure", stderr)
+	}
+	if _, err := os.Stat(badReportPath); err == nil {
+		t.Fatalf("bad report path %q unexpectedly exists", badReportPath)
+	}
 }
 
 func TestRepairCommandRestoresVerifiedCheckpoint(t *testing.T) {
@@ -342,6 +580,11 @@ func TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData(t *testing.T) {
 
 func requireRun(t *testing.T, args []string, wantExit int, wantStderr ...string) {
 	t.Helper()
+	requireRunOutput(t, args, wantExit, wantStderr...)
+}
+
+func requireRunOutput(t *testing.T, args []string, wantExit int, wantStderr ...string) string {
+	t.Helper()
 	var stderr bytes.Buffer
 	gotExit := run(args, &stderr)
 	if gotExit != wantExit {
@@ -352,12 +595,44 @@ func requireRun(t *testing.T, args []string, wantExit int, wantStderr ...string)
 			t.Fatalf("run(%v) stderr=%q, want to contain %q", args, stderr.String(), want)
 		}
 	}
+	return stderr.String()
 }
 
 func writeTestFile(t *testing.T, path string, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func createCheckpointedDataDir(t *testing.T, key string, value string) (string, string) {
+	t.Helper()
+	dataDir := t.TempDir()
+	checkpointDir := filepath.Join(t.TempDir(), "checkpoint")
+	cluster := openTestCluster(t, dataDir)
+	if err := cluster.Put([]byte(key), []byte(value)); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	closeCluster(t, cluster)
+	requireRun(t, []string{"checkpoint", dataDir, checkpointDir}, 0, "")
+	return dataDir, checkpointDir
+}
+
+func requireOperationReport(t *testing.T, reportPath string, operation string, dataDir string, checkpointDir string) {
+	t.Helper()
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "status=example-operator-report\n" +
+		"operation=" + operation + "\n" +
+		"result=success\n" +
+		"data_dir=" + strconv.Quote(dataDir) + "\n" +
+		"checkpoint_dir=" + strconv.Quote(checkpointDir) + "\n" +
+		"release_claim=none-target-environment-data-lifecycle-drill-still-required\n"
+	if string(report) != want {
+		t.Fatalf("report %s = %q, want %q", reportPath, report, want)
 	}
 }
 
