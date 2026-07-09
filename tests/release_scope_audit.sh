@@ -268,6 +268,7 @@ require_text "also locally exercised \`/faults/storage\`, \`/faults/transport\`,
 require_text "three-node local wrapper sample"
 require_text "locally rehearses the storage-failure and network-partition"
 require_text "Operator-reviewed target-environment tabletop or live drill evidence remains open"
+require_text "release_claim=none-target-environment-operator-review-still-required"
 require_text "tests/kvnode_systemd_manifest_audit.sh"
 require_text "tests/kvnode_mixed_version_drill.sh"
 require_text "release_claim=none-target-environment-deployment-manifest-still-required"

@@ -124,6 +124,7 @@ require_text "$incident_drill" "Refusing to run without KVNODE_INCIDENT_TABLETOP
 require_text "$incident_drill" "status=local-tabletop-only"
 require_text "$incident_drill" "storage_fault=exercised-and-cleared"
 require_text "$incident_drill" "transport_fault=exercised-and-cleared"
+require_text "$incident_drill" "release_claim=none-target-environment-operator-review-still-required"
 bash -n "$incident_drill"
 
 # Local Go runner: build-tagged, opt-in, loopback-only evidence that exercises

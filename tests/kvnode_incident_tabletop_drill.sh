@@ -300,6 +300,7 @@ peer_base_port=$PEER_BASE_PORT
 admin_base_port=$ADMIN_BASE_PORT
 evidence_dir=$EVIDENCE_DIR
 non_claim=not_target_environment_not_operator_reviewed
+release_claim=none-target-environment-operator-review-still-required
 EOF
 
 echo "kvnode-incident-tabletop phase=build"
