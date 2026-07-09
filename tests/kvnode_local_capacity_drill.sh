@@ -25,6 +25,8 @@ Optional inputs:
   KVNODE_LOCAL_CAPACITY_READY_ATTEMPTS   Readiness polling attempts. Default: 120
   KVNODE_LOCAL_CAPACITY_CURL_TIMEOUT     curl timeout seconds. Default: 5
   KVNODE_LOCAL_CAPACITY_OUT_DIR          Run/evidence directory. Default: <tmp>/kvnode-local-capacity-<timestamp>
+  KVNODE_CAPACITY_REPORT                 Optional capacity report path passed through.
+                                          Default: <out-dir>/capacity/capacity-report.env
 
 Capacity harness defaults for this wrapper:
   KVNODE_CAPACITY_OPS_PER_PHASE          Default: 5
@@ -32,6 +34,7 @@ Capacity harness defaults for this wrapper:
   KVNODE_CAPACITY_SCAN_LIMITS            Default: 1,8
   KVNODE_CAPACITY_ENVIRONMENT_LABEL      Default: local-loopback
   KVNODE_CAPACITY_WORKLOAD_LABEL         Default: local-capacity-drill
+  KVNODE_CAPACITY_REPORT                 Default: capacity/capacity-report.env
 
 Example:
   KVNODE_LOCAL_CAPACITY_RUN=yes tests/kvnode_local_capacity_drill.sh
@@ -122,6 +125,7 @@ BIN_DIR="$RUN_DIR/bin"
 DATA_DIR="$RUN_DIR/data"
 LOG_DIR="$RUN_DIR/logs"
 CAPACITY_DIR="$RUN_DIR/capacity"
+CAPACITY_REPORT="${KVNODE_CAPACITY_REPORT:-$CAPACITY_DIR/capacity-report.env}"
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$LOG_DIR" "$CAPACITY_DIR"
 
 BIN="$BIN_DIR/kvnode"
@@ -278,12 +282,14 @@ KVNODE_CAPACITY_OPS_PER_PHASE="${KVNODE_CAPACITY_OPS_PER_PHASE:-5}" \
 KVNODE_CAPACITY_VALUE_BYTES="${KVNODE_CAPACITY_VALUE_BYTES:-64,1024}" \
 KVNODE_CAPACITY_SCAN_LIMITS="${KVNODE_CAPACITY_SCAN_LIMITS:-1,8}" \
 KVNODE_CAPACITY_OUT_DIR="$CAPACITY_DIR" \
+KVNODE_CAPACITY_REPORT="$CAPACITY_REPORT" \
 KVNODE_CAPACITY_TIMEOUT_SECONDS="$CURL_TIMEOUT_SECONDS" \
 bash tests/kvnode_capacity_envelope.sh
 
 cat > "$RUN_DIR/summary.txt" <<EOF
 status=local-loopback-only
 capacity_dir=$CAPACITY_DIR
+capacity_report=$CAPACITY_REPORT
 peer_count=3
 environment_label=$ENVIRONMENT_LABEL
 workload_label=$WORKLOAD_LABEL

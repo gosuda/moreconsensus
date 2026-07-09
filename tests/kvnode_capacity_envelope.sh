@@ -34,6 +34,8 @@ Common inputs:
   KVNODE_CAPACITY_ENVIRONMENT_LABEL
                                   Single-line environment label. Default: unspecified
   KVNODE_CAPACITY_WORKLOAD_LABEL  Single-line workload label. Default: unspecified
+  KVNODE_CAPACITY_REPORT         Optional success report path. When set,
+                                  writes a 0600 example/operator report.
 
 Optional resource inputs:
   KVNODE_PIDS                     Comma-separated kvnode PIDs for RSS samples.
@@ -46,6 +48,7 @@ Output:
   latency.csv                     operation,http_status,seconds rows.
   resources.csv                   before/after RSS, disk, queue-depth samples.
   summary.md                      Machine-generated sample summary with no readiness claim.
+  report.env                     Optional 0600 report when KVNODE_CAPACITY_REPORT is set.
 
 Example:
   KVNODE_CAPACITY_RUN=yes \
@@ -85,6 +88,8 @@ require_command ps
 require_command sed
 require_command tr
 
+require_command dirname
+require_command chmod
 positive_int() {
   local name="$1"
   local value="$2"
@@ -127,6 +132,16 @@ label_value() {
   printf '%s' "$value"
 }
 
+validate_report_path() {
+  local name="$1"
+  local value="$2"
+  [[ -n "$value" ]] || return 0
+  if [[ "$value" == "." || "$value" == "/" ]]; then
+    echo "$name must name a file" >&2
+    exit 2
+  fi
+}
+
 trim_trailing_slash() {
   local raw="$1"
   raw="${raw%/}"
@@ -143,6 +158,8 @@ max_value_bytes="${KVNODE_CAPACITY_MAX_VALUE_BYTES:-65536}"
 max_scan_limit="${KVNODE_CAPACITY_MAX_SCAN_LIMIT:-10000}"
 environment_label="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-unspecified}")"
 workload_label="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-unspecified}")"
+capacity_report="${KVNODE_CAPACITY_REPORT:-}"
+validate_report_path KVNODE_CAPACITY_REPORT "$capacity_report"
 
 bounded_int KVNODE_CAPACITY_OPS_PER_PHASE "$ops_per_phase" 1000
 bounded_int KVNODE_CAPACITY_TIMEOUT_SECONDS "$timeout_seconds" 300
@@ -335,6 +352,31 @@ if (( elapsed_seconds <= 0 )); then
 fi
 throughput="$(awk -v ops="$operation_count" -v seconds="$elapsed_seconds" 'BEGIN { printf "%.3f", ops / seconds }')"
 
+write_report() {
+  local report_path="$capacity_report"
+  [[ -n "$report_path" ]] || return 0
+  mkdir -p "$(dirname "$report_path")"
+  {
+    echo "status=example-operator-report"
+    echo "artifact=capacity-envelope-sample"
+    echo "environment_label=$environment_label"
+    echo "workload_label=$workload_label"
+    echo "peer_count=$peer_count"
+    echo "operation_count=$operation_count"
+    echo "throughput_ops_per_second=$throughput"
+    echo "elapsed_seconds=$elapsed_seconds"
+    echo "ops_per_phase=$ops_per_phase"
+    echo "value_bytes=$value_sizes_raw"
+    echo "scan_limits=$scan_limits_raw"
+    printf 'out_dir=%q\n' "$out_dir"
+    echo "latency_file=latency.csv"
+    echo "resources_file=resources.csv"
+    echo "release_claim=none-target-environment-capacity-results-still-required"
+  } > "$report_path"
+  chmod 0600 "$report_path"
+  printf 'report=%q\n' "$report_path"
+}
+
 cat > "$SUMMARY_MD" <<EOF
 # kvnode capacity-envelope harness sample
 
@@ -372,5 +414,7 @@ $(printf '%s\n' "$latency_summary" | sed 's/^/- /')
 - resources.csv
 - metrics-before-*.txt and metrics-after-*.txt when admin metrics were reachable
 EOF
+
+write_report
 
 printf 'kvnode capacity-envelope harness output: %s\n' "$out_dir"

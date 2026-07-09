@@ -297,6 +297,16 @@ require_text "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --
 require_text "measured target-environment capacity results remain open"
 require_text "release_claim=none-target-environment-capacity-results-still-required"
 require_text "target-environment capacity measurement remains open"
+require_scope_row_text "| Capacity envelope |" "KVNODE_CAPACITY_REPORT=/path/report.env"
+require_scope_row_text "| Capacity envelope |" "machine-readable example/operator capacity report"
+require_scope_row_text "| Capacity envelope |" "status=example-operator-report"
+require_scope_row_text "| Capacity envelope |" "artifact=capacity-envelope-sample"
+require_scope_row_text "| Capacity envelope |" "throughput_ops_per_second=..."
+require_scope_row_text "| Capacity envelope |" "operation_count=..."
+require_scope_row_text "| Capacity envelope |" "latency_file=latency.csv"
+require_scope_row_text "| Capacity envelope |" "resources_file=resources.csv"
+require_scope_row_text "| Capacity envelope |" "release_claim=none-target-environment-capacity-results-still-required"
+require_scope_row_text "| Capacity envelope |" "target-environment capacity measurement remains open"
 require_text 'custom Go runner capacity labels document `KVNODE_GO_RUNNER_ENVIRONMENT_LABEL` and `KVNODE_GO_RUNNER_WORKLOAD_LABEL`'
 require_text 'defaulting custom Go runner provenance to `environment_label=local-loopback` and `workload_label=local-go-runner`'
 require_text 'custom Go runner validates label values as non-empty, single-line, without `=`, and at most 128 characters'
