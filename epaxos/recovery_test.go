@@ -164,6 +164,78 @@ func TestRestartResumesForeignRecoveryBallot(t *testing.T) {
 	}
 }
 
+func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
+	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0, 0},
+		Command: Command{Kind: CommandNoop},
+	})
+
+	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3}})
+	if restarted.HasReady() {
+		t.Fatalf("restart emitted work before old-config recovery deadline: %#v", restarted.Ready())
+	}
+	for tick := 1; tick < 4; tick++ {
+		restarted.Tick()
+		if restarted.HasReady() {
+			t.Fatalf("old-config recovery fired after %d ticks, before deadline", tick)
+		}
+	}
+
+	restarted.Tick()
+	rd := restarted.Ready()
+	prepareBallot := recoveryRequireMessageTargets(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4})
+	recoveryApplyReady(t, store, restarted, rd)
+
+	prepareResp := func(from ReplicaID) Message {
+		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
+	}
+	if err := restarted.Step(prepareResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery reached slow quorum without removed voter 4: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(prepareResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	acceptBallot := recoveryRequireMessageTargets(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4})
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
+	acceptResp := func(from ReplicaID) Message {
+		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
+	}
+	if err := restarted.Step(acceptResp(3)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("old-config recovery committed without removed voter 4 accept response: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(acceptResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	recoveryRequireMessageTargets(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4})
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	}
+	recoveryApplyReady(t, store, restarted, rd)
+}
+
 func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	first := Command{ID: CommandID{Client: 30, Sequence: 1}, Payload: []byte("owner-command"), ConflictKeys: [][]byte{[]byte("shared")}}
@@ -378,6 +450,58 @@ func recoveryRequirePrepareRefs(t *testing.T, messages []Message, want []Instanc
 			t.Fatalf("prepare messages for %s = %d, want 2; messages=%#v", ref, count, messages)
 		}
 	}
+}
+
+func recoveryRequireMessageTargets(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, want []ReplicaID) Ballot {
+	t.Helper()
+	seen := make(map[ReplicaID]Message, len(want))
+	for _, m := range messages {
+		if m.Type != typ || m.Ref != ref {
+			continue
+		}
+		if m.From == m.To {
+			t.Fatalf("%s for %s sent to self: %#v", typ, ref, m)
+		}
+		seen[m.To] = m
+		if m.Command.Kind != CommandNoop {
+			t.Fatalf("%s for %s command kind = %v, want %v: %#v", typ, ref, m.Command.Kind, CommandNoop, m)
+		}
+		if len(m.Deps) != 4 {
+			t.Fatalf("%s for %s deps width = %d, want old config width 4: %#v", typ, ref, len(m.Deps), m)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("%s messages for %s targets = %v, want %v; messages=%#v", typ, ref, messageTargets(seen), want, messages)
+	}
+	var ballot Ballot
+	for _, to := range want {
+		m, ok := seen[to]
+		if !ok {
+			t.Fatalf("%s messages for %s targets = %v, want %v; messages=%#v", typ, ref, messageTargets(seen), want, messages)
+		}
+		if m.Ballot.Number == 0 || m.Ballot.Replica == 0 {
+			t.Fatalf("%s for %s has no recovery ballot: %#v", typ, ref, m)
+		}
+		if ballot == (Ballot{}) {
+			ballot = m.Ballot
+		} else if m.Ballot != ballot {
+			t.Fatalf("%s messages for %s used different ballots: %#v", typ, ref, messages)
+		}
+	}
+	return ballot
+}
+
+func messageTargets(messages map[ReplicaID]Message) []ReplicaID {
+	targets := make([]ReplicaID, 0, len(messages))
+	for to := range messages {
+		targets = append(targets, to)
+	}
+	for i := 1; i < len(targets); i++ {
+		for j := i; j > 0 && targets[j] < targets[j-1]; j-- {
+			targets[j], targets[j-1] = targets[j-1], targets[j]
+		}
+	}
+	return targets
 }
 
 func recoveryRequireDependencyRefs(t *testing.T, got []InstanceRef, want []InstanceRef) {
