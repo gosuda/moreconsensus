@@ -89,6 +89,10 @@ for cfg in tla/EPaxosEvidenceStaleness.cfg; do
   run_tlc tla/EPaxosEvidenceStaleness.tla "$cfg"
 done
 
+for cfg in tla/EPaxosAcceptEvidenceMerge.cfg; do
+  run_tlc tla/EPaxosAcceptEvidenceMerge.tla "$cfg"
+done
+
 for cfg in tla/EPaxosTryPreAcceptRetry.cfg; do
   run_tlc tla/EPaxosTryPreAcceptRetry.tla "$cfg"
 done
