@@ -1400,6 +1400,189 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 	}
 }
 
+func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		status       Status
+		retryType    MessageType
+		responseType MessageType
+		ref          InstanceRef
+		seq          uint64
+		deps         []InstanceNum
+		acceptSeq    uint64
+		acceptDeps   []InstanceNum
+		preRetryFrom ReplicaID
+		preRetryErr  error
+		lostFrom     ReplicaID
+		retryTargets []ReplicaID
+	}{
+		{
+			name:         "conf1/preaccepted",
+			status:       StatusPreAccepted,
+			retryType:    MsgPreAccept,
+			responseType: MsgPreAcceptResp,
+			ref:          InstanceRef{Replica: 1, Instance: 15, Conf: 1},
+			seq:          11,
+			deps:         []InstanceNum{0, 2, 3},
+			preRetryFrom: 4,
+			preRetryErr:  ErrMessageRejected,
+			lostFrom:     2,
+			retryTargets: []ReplicaID{2, 3},
+		},
+		{
+			name:         "conf1/accepted",
+			status:       StatusAccepted,
+			retryType:    MsgAccept,
+			responseType: MsgAcceptResp,
+			ref:          InstanceRef{Replica: 1, Instance: 16, Conf: 1},
+			seq:          12,
+			deps:         []InstanceNum{0, 0, 0},
+			acceptSeq:    13,
+			acceptDeps:   []InstanceNum{0, 5, 6},
+			preRetryFrom: 4,
+			preRetryErr:  ErrMessageRejected,
+			lostFrom:     2,
+			retryTargets: []ReplicaID{2, 3},
+		},
+		{
+			name:         "conf2/preaccepted",
+			status:       StatusPreAccepted,
+			retryType:    MsgPreAccept,
+			responseType: MsgPreAcceptResp,
+			ref:          InstanceRef{Replica: 1, Instance: 17, Conf: 2},
+			seq:          14,
+			deps:         []InstanceNum{0, 2, 3, 4},
+			preRetryFrom: 4,
+			lostFrom:     2,
+			retryTargets: []ReplicaID{2, 3, 4},
+		},
+		{
+			name:         "conf2/accepted",
+			status:       StatusAccepted,
+			retryType:    MsgAccept,
+			responseType: MsgAcceptResp,
+			ref:          InstanceRef{Replica: 1, Instance: 18, Conf: 2},
+			seq:          15,
+			deps:         []InstanceNum{0, 0, 0, 0},
+			acceptSeq:    16,
+			acceptDeps:   []InstanceNum{0, 7, 6, 5},
+			preRetryFrom: 4,
+			lostFrom:     2,
+			retryTargets: []ReplicaID{2, 3, 4},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			store.Configs = []ConfState{
+				{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}},
+				{ID: 3, Voters: []ReplicaID{1, 3, 4}},
+			}
+			ballot := Ballot{Replica: 1}
+			cmd := Command{ID: CommandID{Client: 99, Sequence: 1}, Payload: []byte("old-config-chain-transition-lost-pre-retry-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-chain-transition-lost-pre-retry-key")}}
+			store.Records[tt.ref] = checkedRecord(InstanceRecord{
+				Ref:              tt.ref,
+				Ballot:           ballot,
+				RecordBallot:     ballot,
+				Status:           tt.status,
+				Seq:              tt.seq,
+				Deps:             append([]InstanceNum(nil), tt.deps...),
+				AcceptSeq:        tt.acceptSeq,
+				AcceptDeps:       append([]InstanceNum(nil), tt.acceptDeps...),
+				Command:          cmd,
+				FastPathEligible: tt.status == StatusPreAccepted,
+			})
+
+			response := func(from ReplicaID, ballot Ballot) Message {
+				switch tt.status {
+				case StatusPreAccepted:
+					return Message{Type: tt.responseType, From: from, To: 1, Ref: tt.ref, Ballot: ballot, Seq: tt.seq, Deps: append([]InstanceNum(nil), tt.deps...), RecordStatus: StatusPreAccepted, FastPathEligible: true}
+				case StatusAccepted:
+					return Message{Type: tt.responseType, From: from, To: 1, Ref: tt.ref, Ballot: ballot, RecordBallot: ballot, Seq: tt.seq, Deps: append([]InstanceNum(nil), tt.deps...), AcceptSeq: tt.acceptSeq, AcceptDeps: append([]InstanceNum(nil), tt.acceptDeps...), RecordStatus: StatusAccepted}
+				default:
+					t.Fatalf("unhandled status %s", tt.status)
+					return Message{}
+				}
+			}
+
+			const retryTicks = 2
+			restarted, err := NewRawNode(Config{ID: 1, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: retryTicks, RecoveryTicks: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 3, 4}})
+			assertConfState(t, restarted.confFor(1), ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+			assertConfState(t, restarted.confFor(2), ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}})
+			recoveryRequireNoReady(t, restarted, "restart before old-config chain transition lost-response retry deadline")
+
+			preRetryResponse := response(tt.preRetryFrom, ballot)
+			if preRetryResponse.Type != tt.responseType || preRetryResponse.From != tt.preRetryFrom || preRetryResponse.To != 1 {
+				t.Fatalf("pre-retry response fixture = %#v", preRetryResponse)
+			}
+			err = restarted.Step(preRetryResponse)
+			if tt.preRetryErr == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, tt.preRetryErr) {
+				t.Fatalf("pre-retry response err=%v, want %v", err, tt.preRetryErr)
+			}
+			recoveryRequireNoReady(t, restarted, "old-config chain transition counted pre-retry response before lost old voter")
+			lostPreRetryResponse := response(tt.lostFrom, ballot)
+			if lostPreRetryResponse.Type != tt.responseType || lostPreRetryResponse.From != tt.lostFrom || lostPreRetryResponse.To != 1 {
+				t.Fatalf("lost pre-retry response fixture = %#v", lostPreRetryResponse)
+			}
+
+			for tick := uint64(1); tick < retryTicks; tick++ {
+				restarted.Tick()
+				recoveryRequireNoReady(t, restarted, "old-config chain transition retry before deadline after lost response")
+			}
+			restarted.Tick()
+			rd := restarted.Ready()
+			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.retryType, tt.ref, tt.retryTargets, cmd, tt.deps)
+			if retry.Ballot != ballot || retry.RecordStatus != tt.status {
+				t.Fatalf("old-config chain transition retry tuple = ballot %v status %s, want ballot %v status %s: %#v", retry.Ballot, retry.RecordStatus, ballot, tt.status, retry)
+			}
+			if retry.Seq != tt.seq {
+				t.Fatalf("old-config chain transition retry seq = %d, want %d: %#v", retry.Seq, tt.seq, retry)
+			}
+			if tt.status == StatusAccepted && (retry.RecordBallot != ballot || retry.AcceptSeq != tt.acceptSeq || !instanceNumsEqual(retry.AcceptDeps, tt.acceptDeps)) {
+				t.Fatalf("old-config chain transition accepted retry attrs = record ballot %v accept seq %d deps %v, want record ballot %v accept seq %d deps %v: %#v", retry.RecordBallot, retry.AcceptSeq, retry.AcceptDeps, ballot, tt.acceptSeq, tt.acceptDeps, retry)
+			}
+			if len(rd.Records) != 0 || len(rd.Committed) != 0 || rd.MustSync {
+				t.Fatalf("old-config chain transition retry emitted durable/application effects: %#v", rd)
+			}
+			recoveryApplyReady(t, store, restarted, rd)
+			recoveryRequireNoReady(t, restarted, "old-config chain transition retry left immediate work before replacement response")
+
+			if err := restarted.Step(response(tt.lostFrom, retry.Ballot)); err != nil {
+				t.Fatal(err)
+			}
+			rd = restarted.Ready()
+			switch tt.status {
+			case StatusPreAccepted:
+				accept := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgAccept, tt.ref, tt.retryTargets, cmd, tt.deps)
+				if accept.Seq != tt.seq {
+					t.Fatalf("old-config chain transition preaccepted accept seq = %d, want %d: %#v", accept.Seq, tt.seq, accept)
+				}
+				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusAccepted, cmd, tt.seq, tt.deps)
+				if len(rd.Committed) != 0 {
+					t.Fatalf("old-config chain transition preaccepted emitted application commands before accept quorum: %#v", rd.Committed)
+				}
+			case StatusAccepted:
+				commit := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgCommit, tt.ref, tt.retryTargets, cmd, tt.deps)
+				if commit.Seq != tt.seq || commit.AcceptSeq != tt.acceptSeq || !instanceNumsEqual(commit.AcceptDeps, tt.acceptDeps) {
+					t.Fatalf("old-config chain transition accepted commit attrs = seq %d accept seq %d deps %v/%v, want seq %d accept seq %d deps %v/%v: %#v", commit.Seq, commit.AcceptSeq, commit.Deps, commit.AcceptDeps, tt.seq, tt.acceptSeq, tt.deps, tt.acceptDeps, commit)
+				}
+				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusCommitted, cmd, tt.seq, tt.deps)
+				recoveryRequireCommittedCommand(t, rd.Committed, tt.ref, cmd, tt.seq, tt.deps)
+			default:
+				t.Fatalf("unhandled status %s", tt.status)
+			}
+			recoveryApplyReady(t, store, restarted, rd)
+		})
+	}
+}
+
 func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
