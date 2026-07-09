@@ -118,9 +118,61 @@ require_local_runner_lifecycle_reports() {
     echo "local runner data-lifecycle report list drifted: $observed_report_list" >&2
     exit 1
   fi
-  require_text_before "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"' 'summary := strings.Join([]string{'
+  require_text_before "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"' 'lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, reports)'
   require_text_before "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {' 'return reportPath, nil'
 }
+
+require_local_runner_consolidated_data_lifecycle_report() {
+  local runner_help_output="$1"
+  local bad_report_path
+  local bad_runner_report_output
+  local text
+
+  require_text "$local_runner" "KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT"
+  require_text "$local_runner" "Optional 0600 data-lifecycle report path"
+  require_text "$local_runner" "optional data lifecycle report when KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT is set"
+  require_text "$local_runner" 'validateOptionalReportPath("KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT", dataLifecycleReport)'
+  require_text "$local_runner" 'return fmt.Errorf("%s must name a file", name)'
+  require_text "$local_runner" "writeDataLifecycleReport"
+  require_text "$local_runner" "status=example-operator-report"
+  require_text "$local_runner" "artifact=data-lifecycle-drill"
+  require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
+  require_text "$local_runner" "checkpoint=verified"
+  require_text "$local_runner" '"reports=" + strings.Join(reports, ",")'
+  require_text "$local_runner" 'dataLifecycleEvidenceLines("status=example-operator-report", reports)'
+  require_text "$local_runner" "restore=stopped-node-restored-and-restarted"
+  require_text "$local_runner" "repair=stopped-node-repaired-from-verified-checkpoint-and-restarted"
+  require_text "$local_runner" "canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair"
+  require_text "$local_runner" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+  require_text "$local_runner" 'os.WriteFile(reportPath, []byte(content), 0o600)'
+  require_text "$local_runner" 'os.Chmod(reportPath, 0o600)'
+
+  for text in \
+    "KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT" \
+    "Optional 0600 data-lifecycle report path" \
+    "optional data lifecycle report when KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT is set"; do
+    if [[ "$runner_help_output" != *"$text"* ]]; then
+      echo "missing kvnode local Go runner help output: $text" >&2
+      exit 1
+    fi
+  done
+
+  for bad_report_path in . /; do
+    if bad_runner_report_output="$(KVNODE_GO_RUNNER_RUN= KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT="$bad_report_path" go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode data 2>&1 >/dev/null)"; then
+      echo "kvnode local Go runner must reject KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT=$bad_report_path" >&2
+      exit 1
+    fi
+    if [[ "$bad_runner_report_output" != *"KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT must name a file"* ]]; then
+      echo "missing operations-readiness output from $local_runner: KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT must name a file" >&2
+      exit 1
+    fi
+    if [[ "$bad_runner_report_output" == *"Refusing to run without KVNODE_GO_RUNNER_RUN=yes."* ]]; then
+      echo "kvnode local Go runner must validate KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT before opt-in refusal" >&2
+      exit 1
+    fi
+  done
+}
+
 
 require_local_runner_deployment_manifest() {
   local runner_help_output="$1"
@@ -446,6 +498,7 @@ require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "verify"'
 require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "restore"'
 require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"'
 require_local_runner_lifecycle_reports
+require_local_runner_consolidated_data_lifecycle_report "$runner_help_output"
 require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
 require_text "$local_runner" "restore=stopped-node-restored-and-restarted"
 require_text "$local_runner" "repair=stopped-node-repaired-from-verified-checkpoint-and-restarted"

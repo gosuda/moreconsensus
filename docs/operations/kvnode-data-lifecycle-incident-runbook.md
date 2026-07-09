@@ -325,16 +325,18 @@ The build-tagged Go runner includes a local loopback data-lifecycle drill for th
 Local data lifecycle command:
 
 ```sh
-KVNODE_GO_RUNNER_RUN=yes KVNODE_GO_RUNNER_MODE=data \
+KVNODE_GO_RUNNER_RUN=yes \
+  KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT="${EVIDENCE_DIR}/go-runner-data-lifecycle-report.env" \
+  KVNODE_GO_RUNNER_MODE=data \
   go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode data \
   2>&1 | tee "${EVIDENCE_DIR}/go-runner-data-lifecycle-local.txt"
 ```
 
-This is local loopback evidence only. The generated `data-lifecycle-summary.txt`, `checkpoint.log`, `verify.log`, `restore.log`, `repair.log`, distinct `checkpoint-report.env`, `verify-report.env`, `restore-report.env`, `repair-report.env`, and final `summary.txt` should be retained with the transcript. The runner sets a unique `KVNODE_CHECKPOINT_REPORT` path for each helper operation, validates each report's `status=example-operator-report`, `operation`, and `release_claim` fields before writing the data-lifecycle summary, and records `reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env`. The summary includes `status=local-go-runner-only`, `data_lifecycle=offline-checkpoint-verify-restore-repair`, and `release_claim=none-target-environment-data-lifecycle-drill-still-required`; it does not replace a reviewed target-environment backup/restore/disaster-recovery drill.
+This is local loopback evidence only. The generated `data-lifecycle-summary.txt`, `checkpoint.log`, `verify.log`, `restore.log`, `repair.log`, distinct `checkpoint-report.env`, `verify-report.env`, `restore-report.env`, `repair-report.env`, optional `go-runner-data-lifecycle-report.env`, and final `summary.txt` should be retained with the transcript. The runner sets a unique `KVNODE_CHECKPOINT_REPORT` path for each helper operation, validates each report's `status=example-operator-report`, `operation`, and `release_claim` fields before writing the data-lifecycle summary, and, when `KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT` is set, writes a 0600 consolidated example/operator report with `status=example-operator-report`, `artifact=data-lifecycle-drill`, `data_lifecycle=offline-checkpoint-verify-restore-repair`, `reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env`, restore/repair/canary results, and `release_claim=none-target-environment-data-lifecycle-drill-still-required`. The summary includes `status=local-go-runner-only`, `data_lifecycle=offline-checkpoint-verify-restore-repair`, and the same non-claim; it does not replace a reviewed target-environment backup/restore/disaster-recovery drill.
 
 Evidence to retain:
 
-- `metadata.env`, `data-lifecycle-summary.txt`, `summary.txt`, the four helper logs, and the four helper report files from the script evidence directory.
+- `metadata.env`, `data-lifecycle-summary.txt`, `summary.txt`, the four helper logs, the four helper report files, and optional `go-runner-data-lifecycle-report.env` from the script evidence directory.
 - The full runner transcript, including the preserved `run_dir`.
 - Confirmation that the drill used the disposable runner data directory only and stopped the selected node before each offline `kvcheckpoint` operation.
 

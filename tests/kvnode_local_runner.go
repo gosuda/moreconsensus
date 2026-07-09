@@ -81,6 +81,7 @@ Environment:
   KVNODE_GO_RUNNER_SCAN_LIMITS          Comma-separated scan limits. Default: 1,8; max item: 100000.
   KVNODE_GO_RUNNER_ENVIRONMENT_LABEL   Single-line environment label. Default: local-loopback.
   KVNODE_GO_RUNNER_WORKLOAD_LABEL      Single-line workload label. Default: local-go-runner.
+  KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT Optional 0600 data-lifecycle report path. Writes only after a successful local data drill.
 
 Outputs:
   metadata.env
@@ -93,6 +94,7 @@ Outputs:
   capacity-resources.csv
   data-lifecycle-summary.txt
   data-lifecycle/*-report.env
+  optional data lifecycle report when KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT is set
   summary.txt
 
 Non-claims:
@@ -104,18 +106,19 @@ Non-claims:
 `
 
 type runnerConfig struct {
-	mode             string
-	basePort         int
-	peerBasePort     int
-	adminBasePort    int
-	readyAttempts    int
-	timeout          time.Duration
-	outDir           string
-	opsPerPhase      int
-	valueBytes       []int
-	scanLimits       []int
-	environmentLabel string
-	workloadLabel    string
+	mode                string
+	basePort            int
+	peerBasePort        int
+	adminBasePort       int
+	readyAttempts       int
+	timeout             time.Duration
+	outDir              string
+	opsPerPhase         int
+	valueBytes          []int
+	scanLimits          []int
+	environmentLabel    string
+	workloadLabel       string
+	dataLifecycleReport string
 }
 
 type nodeProcess struct {
@@ -233,6 +236,10 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
+	dataLifecycleReport := os.Getenv("KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT")
+	if err := validateOptionalReportPath("KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT", dataLifecycleReport); err != nil {
+		return cfg, err
+	}
 	cfg.basePort = basePort
 	cfg.peerBasePort = peerBasePort
 	cfg.adminBasePort = adminBasePort
@@ -243,6 +250,7 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg.scanLimits = scanLimits
 	cfg.environmentLabel = environmentLabel
 	cfg.workloadLabel = workloadLabel
+	cfg.dataLifecycleReport = dataLifecycleReport
 	return cfg, nil
 }
 
@@ -305,6 +313,24 @@ func envLabel(name, def string) (string, error) {
 		return "", fmt.Errorf("%s must be <= 128 characters", name)
 	}
 	return value, nil
+}
+
+func validateOptionalReportPath(name, value string) error {
+	if value == "" {
+		return nil
+	}
+	if value == "." || value == string(filepath.Separator) {
+		return fmt.Errorf("%s must name a file", name)
+	}
+	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "=") {
+		return fmt.Errorf("%s must be a single line without =", name)
+	}
+	if info, err := os.Stat(value); err == nil && info.IsDir() {
+		return fmt.Errorf("%s must name a file", name)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", name, err)
+	}
+	return nil
 }
 
 func validatePortSet(base, peerBase, adminBase int) error {
@@ -701,8 +727,21 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 		return err
 	}
 
-	summary := strings.Join([]string{
-		statusLocalGoRunnerOnly,
+	lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, reports)
+	if err := os.WriteFile(filepath.Join(runDir, "data-lifecycle-summary.txt"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		return err
+	}
+	if cfg.dataLifecycleReport != "" {
+		if err := writeDataLifecycleReport(cfg.dataLifecycleReport, reports); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func dataLifecycleEvidenceLines(status string, reports []string) []string {
+	return []string{
+		status,
 		"data_lifecycle=offline-checkpoint-verify-restore-repair",
 		"checkpoint=verified",
 		"reports=" + strings.Join(reports, ","),
@@ -711,8 +750,20 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 		"canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair",
 		dataLifecycleNonClaim,
 		"",
-	}, "\n")
-	return os.WriteFile(filepath.Join(runDir, "data-lifecycle-summary.txt"), []byte(summary), 0o644)
+	}
+}
+
+func writeDataLifecycleReport(reportPath string, reports []string) error {
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		return err
+	}
+	lines := dataLifecycleEvidenceLines("status=example-operator-report", reports)
+	lines = append(lines[:1], append([]string{"artifact=data-lifecycle-drill"}, lines[1:]...)...)
+	content := strings.Join(lines, "\n")
+	if err := os.WriteFile(reportPath, []byte(content), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(reportPath, 0o600)
 }
 
 func runDataLifecycleCommand(dir, label, bin string, args ...string) (string, error) {
@@ -1074,6 +1125,9 @@ func writeFinalSummary(runDir string, cfg runnerConfig, deploymentRan, incidentR
 	}
 	if dataRan {
 		lines = append(lines, dataLifecycleNonClaim)
+		if cfg.dataLifecycleReport != "" {
+			lines = append(lines, "data_lifecycle_report="+cfg.dataLifecycleReport)
+		}
 	}
 	lines = append(lines, "")
 	return os.WriteFile(filepath.Join(runDir, "summary.txt"), []byte(strings.Join(lines, "\n")), 0o644)
