@@ -420,6 +420,23 @@ require_text "$incident_drill" "transport_fault=exercised-and-cleared"
 require_text "$incident_drill" "canaries=baseline-and-after-clear-visible-on-all-nodes"
 require_text "$incident_drill" "non_claim=not_target_environment_not_operator_reviewed"
 require_text "$incident_drill" "release_claim=none-target-environment-operator-review-still-required"
+require_text "$incident_drill" "run_id="
+require_text "$incident_drill" "peer_count=3"
+require_text "$incident_drill" "storage_fault_readyz=503-then-200"
+require_text "$incident_drill" "storage_fault_metric=1-then-0"
+require_text "$incident_drill" "transport_fault_dropped_links=2-then-0"
+require_text "$incident_drill" "baseline_canary=tabletop-baseline-visible-on-all-nodes"
+require_text "$incident_drill" "post_clear_canary=tabletop-after-clear-visible-on-all-nodes"
+require_text "$incident_drill" "evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*"
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "storage_fault=exercised-and-cleared" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "transport_fault=exercised-and-cleared" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "canaries=baseline-and-after-clear-visible-on-all-nodes" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "storage_fault_readyz=503-then-200" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "storage_fault_metric=1-then-0" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "transport_fault_dropped_links=2-then-0" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "baseline_canary=tabletop-baseline-visible-on-all-nodes" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "post_clear_canary=tabletop-after-clear-visible-on-all-nodes" 'cat "$EVIDENCE_DIR/summary.txt"'
+require_text_between "$incident_drill" 'cat > "$EVIDENCE_DIR/summary.txt" <<EOF' "evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*" 'cat "$EVIDENCE_DIR/summary.txt"'
 require_text "$incident_drill" "write_report()"
 require_text "$incident_drill" '[[ "$report_path" != "." && "$report_path" != "/" ]] || fail "KVNODE_INCIDENT_TABLETOP_REPORT-must-name-a-file"'
 require_text "$incident_drill" "status=example-operator-report"
@@ -440,6 +457,7 @@ fail() {
   exit 1
 }
 : "${EVIDENCE_DIR:?}"
+run_id=incident-readiness-audit-probe
 EOF
   LC_ALL=C sed -n '/^write_report() {/,/^}/p' "$incident_drill"
   printf '%s\n' 'write_report'
@@ -461,9 +479,17 @@ EVIDENCE_DIR="$incident_report_probe_dir/evidence" KVNODE_INCIDENT_TABLETOP_REPO
 require_text "$incident_report" "status=example-operator-report"
 require_text "$incident_report" "artifact=incident-tabletop-drill"
 require_text "$incident_report" "evidence_dir="
+require_text "$incident_report" "run_id=incident-readiness-audit-probe"
+require_text "$incident_report" "peer_count=3"
 require_text "$incident_report" "storage_fault=exercised-and-cleared"
 require_text "$incident_report" "transport_fault=exercised-and-cleared"
 require_text "$incident_report" "canaries=baseline-and-after-clear-visible-on-all-nodes"
+require_text "$incident_report" "storage_fault_readyz=503-then-200"
+require_text "$incident_report" "storage_fault_metric=1-then-0"
+require_text "$incident_report" "transport_fault_dropped_links=2-then-0"
+require_text "$incident_report" "baseline_canary=tabletop-baseline-visible-on-all-nodes"
+require_text "$incident_report" "post_clear_canary=tabletop-after-clear-visible-on-all-nodes"
+require_text "$incident_report" "evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*"
 require_text "$incident_report" "operator_review=not-performed"
 require_text "$incident_report" "release_claim=none-target-environment-operator-review-still-required"
 if incident_report_mode="$(stat -c '%a' "$incident_report" 2>/dev/null)"; then

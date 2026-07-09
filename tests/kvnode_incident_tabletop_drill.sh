@@ -28,7 +28,7 @@ Optional inputs:
   KVNODE_INCIDENT_CURL_TIMEOUT     curl per-request timeout seconds. Default: 5
   KVNODE_INCIDENT_OUT_DIR          Evidence/run directory. Default: <tmp>/kvnode-incident-tabletop-<timestamp>
   KVNODE_INCIDENT_TABLETOP_REPORT   Optional success report path. When set,
-                                   writes a 0600 example/operator report.
+                                   writes a 0600 example/operator report with fault markers and evidence summary fields.
 
 Example:
   KVNODE_INCIDENT_TABLETOP_RUN=yes tests/kvnode_incident_tabletop_drill.sh
@@ -305,9 +305,17 @@ write_report() {
     echo "status=example-operator-report"
     echo "artifact=incident-tabletop-drill"
     printf 'evidence_dir=%q\n' "$EVIDENCE_DIR"
+    echo "run_id=$run_id"
+    echo "peer_count=3"
     echo "storage_fault=exercised-and-cleared"
     echo "transport_fault=exercised-and-cleared"
     echo "canaries=baseline-and-after-clear-visible-on-all-nodes"
+    echo "storage_fault_readyz=503-then-200"
+    echo "storage_fault_metric=1-then-0"
+    echo "transport_fault_dropped_links=2-then-0"
+    echo "baseline_canary=tabletop-baseline-visible-on-all-nodes"
+    echo "post_clear_canary=tabletop-after-clear-visible-on-all-nodes"
+    echo "evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*"
     echo "operator_review=not-performed"
     echo "release_claim=none-target-environment-operator-review-still-required"
   } > "$report_path"
@@ -380,6 +388,12 @@ status=local-tabletop-only
 storage_fault=exercised-and-cleared
 transport_fault=exercised-and-cleared
 canaries=baseline-and-after-clear-visible-on-all-nodes
+storage_fault_readyz=503-then-200
+storage_fault_metric=1-then-0
+transport_fault_dropped_links=2-then-0
+baseline_canary=tabletop-baseline-visible-on-all-nodes
+post_clear_canary=tabletop-after-clear-visible-on-all-nodes
+evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*
 release_claim=none-target-environment-operator-review-still-required
 EOF
 
