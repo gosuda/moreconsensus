@@ -750,6 +750,33 @@
 (defn indeterminate-status? [status]
   (and (integer? status) (<= 500 status)))
 
+;; KV HTTP requests disable Apache retries below, so a refused TCP connect did
+;; not reach the cluster. Other IOExceptions during mutations can still happen
+;; after the request was sent; observations with no response have no read result.
+;; Only those non-refused mutation IOExceptions are indeterminate.
+(def mutation-ops #{:write
+                    :delete
+                    :txn-write
+                    :txn-delete
+                    :scan-write
+                    :scan-delete})
+
+(defn mutation-op? [op]
+  (contains? mutation-ops (:f op)))
+
+(defn exception-message [e]
+  (or (.getMessage e) (str e)))
+
+(defn connection-refused-exception? [e]
+  (or (instance? java.net.ConnectException e)
+      (str/includes? (str/lower-case (exception-message e))
+                     "connection refused")))
+
+(defn indeterminate-mutation-exception? [op e]
+  (and (mutation-op? op)
+       (instance? java.io.IOException e)
+       (not (connection-refused-exception? e))))
+
 (defn mutation-result [op resp]
   (let [status (:status resp)]
     (cond
@@ -810,12 +837,19 @@
                       [(:key row) value]))
                   rows))))
 
+(defn no-http-retry [_ _ _]
+  false)
+
+(def no-retry-request-options
+  {:throw-exceptions false
+   :retry-handler no-http-retry})
+
 (defn scan-rows [base params]
   (try
     (let [query-params (into {} (remove (comp nil? val)) params)
           resp (http/get (str base "/scan")
-                         {:query-params query-params
-                          :throw-exceptions false})]
+                         (assoc no-retry-request-options
+                                :query-params query-params))]
       (if (= 200 (:status resp))
         (try
           [:ok (parse-rows (:body resp))]
@@ -919,44 +953,44 @@
         (case (:f op)
           :write
           (let [resp (http/put (str base "/kv/" k)
-                               {:body (pr-str (:value op))
-                                :throw-exceptions false})]
+                               (assoc no-retry-request-options
+                                      :body (pr-str (:value op))))]
             (mutation-result op resp))
           :read
           (let [resp (http/get (str base "/kv/" k)
-                               {:throw-exceptions false})]
+                               no-retry-request-options)]
             (cond
               (= 200 (:status resp)) (assoc op :type :ok :value (edn/read-string (:body resp)))
               (= 404 (:status resp)) (assoc op :type :ok :value nil)
               :else (assoc op :type :fail :error (:status resp))))
           :delete
           (let [resp (http/delete (str base "/kv/" k)
-                                  {:throw-exceptions false})]
+                                  no-retry-request-options)]
             (mutation-result op resp))
           :txn-write
           (let [{:keys [group value]} (:value op)
                 resp (http/post (str base "/txn")
-                                {:body (txn-body group value)
-                                 :content-type :json
-                                 :throw-exceptions false})]
+                                (assoc no-retry-request-options
+                                       :body (txn-body group value)
+                                       :content-type :json))]
             (mutation-result op resp))
           :txn-delete
           (let [{:keys [group]} (:value op)
                 resp (http/post (str base "/txn")
-                                {:body (txn-delete-body group)
-                                 :content-type :json
-                                 :throw-exceptions false})]
+                                (assoc no-retry-request-options
+                                       :body (txn-delete-body group)
+                                       :content-type :json))]
             (mutation-result op resp))
           :scan-write
           (let [{:keys [key value]} (:value op)
                 resp (http/put (str base "/kv/" key)
-                               {:body (pr-str value)
-                                :throw-exceptions false})]
+                               (assoc no-retry-request-options
+                                      :body (pr-str value)))]
             (mutation-result op resp))
           :scan-delete
           (let [{:keys [key]} (:value op)
                 resp (http/delete (str base "/kv/" key)
-                                  {:throw-exceptions false})]
+                                  no-retry-request-options)]
             (mutation-result op resp))
           :scan-forward
           (let [[status rows] (advanced-scan base false)]
@@ -995,7 +1029,10 @@
           (assoc op :type :fail :error :unknown-operation))
         (catch Exception e
           (warn e "operation failed")
-          (assoc op :type :fail :error (.getMessage e))))))
+          (let [error (exception-message e)]
+            (assoc op
+                   :type (if (indeterminate-mutation-exception? op e) :info :fail)
+                   :error error))))))
   (teardown! [this test])
   (close! [this test]))
 
@@ -1118,6 +1155,8 @@
 
 (def scan-mutation-ops #{:scan-write :scan-delete})
 
+(def indeterminate-scan-end-index Long/MAX_VALUE)
+
 (defn op-invoke-index [history op]
   (some (fn [candidate]
           (when (and (= :invoke (:type candidate))
@@ -1129,14 +1168,18 @@
 
 (defn completed-scan-mutations [history]
   (vec (keep (fn [op]
-               (when (and (= :ok (:type op)) (contains? scan-mutation-ops (:f op)))
+               (when (and (contains? #{:ok :info} (:type op))
+                          (contains? scan-mutation-ops (:f op)))
                  (let [{:keys [key value]} (:value op)]
                    (when (string? key)
-                     {:f (:f op)
+                     {:type (:type op)
+                      :f (:f op)
                       :key key
                       :value value
                       :invoke-index (or (op-invoke-index history op) (:index op))
-                      :ok-index (:index op)}))))
+                      :ok-index (if (= :info (:type op))
+                                  indeterminate-scan-end-index
+                                  (:index op))}))))
              history)))
 
 (defn scan-mutation-overlaps? [mutation scan-start scan-end]

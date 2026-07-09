@@ -1230,6 +1230,89 @@
                                           {:type :invoke :f :read :value :stale})
                           [:type :f :value]))))))
 
+(deftest kv-client-disables-apache-retries
+  (testing "KV client requests install a retry handler that refuses Apache HttpClient retries"
+    (let [requests (atom [])]
+      (with-redefs [http/get (fn [url opts]
+                               (swap! requests conj [:get url opts])
+                               {:status 404 :body "missing"})
+                    http/delete (fn [url opts]
+                                  (swap! requests conj [:delete url opts])
+                                  {:status 204})]
+        (is (= {:type :ok :f :read :value nil}
+               (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                            {}
+                                            {:type :invoke :f :read})
+                            [:type :f :value])))
+        (is (= {:type :ok :f :scan-delete :value {:key "scan-b"}}
+               (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                            {}
+                                            {:type :invoke
+                                             :f :scan-delete
+                                             :value {:key "scan-b"}})
+                            [:type :f :value]))))
+      (is (= [[:get "http://node/kv/k0"]
+              [:delete "http://node/kv/scan-b"]]
+             (mapv (fn [[method url _]] [method url]) @requests)))
+      (is (every? false?
+                  (map (fn [[_ _ opts]]
+                         ((:retry-handler opts) (java.io.IOException. "retry") 1 nil))
+                       @requests)))
+      (is (every? #(false? (get-in % [2 :throw-exceptions])) @requests)))))
+
+(deftest kv-client-classifies-client-exceptions-by-operation-certainty
+  (testing "a refused connection while submitting a scan mutation is a definite failure"
+    (with-redefs [http/delete (fn [_ _]
+                                (throw (java.net.ConnectException. "Connection refused")))]
+      (is (= {:type :fail
+              :f :scan-delete
+              :value {:key "scan-b"}
+              :error "Connection refused"}
+             (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                          {}
+                                          {:type :invoke
+                                           :f :scan-delete
+                                           :value {:key "scan-b"}})
+                          [:type :f :value :error])))))
+  (testing "a non-refused IOException while submitting a scan mutation is indeterminate"
+    (with-redefs [http/delete (fn [_ _]
+                                (throw (java.net.SocketTimeoutException. "socket timeout after send")))]
+      (is (= {:type :info
+              :f :scan-delete
+              :value {:key "scan-b"}
+              :error "socket timeout after send"}
+             (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                          {}
+                                          {:type :invoke
+                                           :f :scan-delete
+                                           :value {:key "scan-b"}})
+                          [:type :f :value :error])))))
+  (testing "non-IO mutation exceptions remain definite failures"
+    (with-redefs [http/delete (fn [_ _]
+                                (throw (RuntimeException. "bad request construction")))]
+      (is (= {:type :fail
+              :f :scan-delete
+              :value {:key "scan-b"}
+              :error "bad request construction"}
+             (select-keys (client/invoke! (epaxos/->KVClient "http://node")
+                                          {}
+                                          {:type :invoke
+                                           :f :scan-delete
+                                           :value {:key "scan-b"}})
+                          [:type :f :value :error])))))
+  (testing "client-side exceptions while observing state remain definite failed reads"
+    (doseq [[f op] [[:read {:type :invoke :f :read}]
+                   [:scan-forward {:type :invoke :f :scan-forward :value nil}]]]
+      (with-redefs [http/get (fn [_ _]
+                               (throw (java.net.ConnectException.
+                                       (str (name f) " connection refused"))))]
+        (is (= {:type :fail
+                :f f
+                :error (str (name f) " connection refused")}
+               (select-keys (client/invoke! (epaxos/->KVClient "http://node") {} op)
+                            [:type :f :error]))
+            (str f " exception should not become indeterminate"))))))
+
 (defn index-history [history]
   (mapv (fn [index op] (cond-> op (nil? (:index op)) (assoc :index index))) (range) history))
 
@@ -1396,10 +1479,10 @@
         (is (= [:ok rows]
                (epaxos/advanced-scan "http://node" false)))
         (is (= [["http://node/scan"
-                 {:query-params {"prefix" epaxos/scan-prefix
-                                 "limit" (str epaxos/scan-limit)
-                                 "barrier" epaxos/scan-barrier}
-                  :throw-exceptions false}]]
+                 (assoc epaxos/no-retry-request-options
+                        :query-params {"prefix" epaxos/scan-prefix
+                                       "limit" (str epaxos/scan-limit)
+                                       "barrier" epaxos/scan-barrier})]]
                @requests)))))
   (testing "reverse scans send the same scan shape params plus reverse true"
     (let [requests (atom [])
@@ -1410,11 +1493,11 @@
         (is (= [:ok rows]
                (epaxos/advanced-scan "http://node" true)))
         (is (= [["http://node/scan"
-                 {:query-params {"prefix" epaxos/scan-prefix
-                                 "limit" (str epaxos/scan-limit)
-                                 "reverse" "true"
-                                 "barrier" epaxos/scan-barrier}
-                  :throw-exceptions false}]]
+                 (assoc epaxos/no-retry-request-options
+                        :query-params {"prefix" epaxos/scan-prefix
+                                       "limit" (str epaxos/scan-limit)
+                                       "reverse" "true"
+                                       "barrier" epaxos/scan-barrier})]]
                @requests))))))
 
 (deftest advanced-scan-checker-accepts-sorted-scan-shapes
@@ -1592,6 +1675,85 @@
       (is (= [:scan-forward]
              (mapv :f (:bad result)))))))
 
+(deftest advanced-scan-checker-rejects-failed-scan-mutation-as-definite-absence
+  (testing "a failed scan delete does not permit a scan to omit a previously completed write"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-b" :value :old}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-b" :value :old}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-b"}}
+                   {:type :fail :process 1 :f :scan-delete :value {:key "scan-b"} :error "Connection refused"}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :ok :process 2 :f :scan-forward :value []}]
+          result (check-advanced-scan-history history)
+          bad (first (:bad result))]
+      (is (= {:valid? false :checked 1 :bad-count 1}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= {:f :scan-forward :bad-scan :missing-row :bad-key "scan-b"}
+             (select-keys bad [:f :bad-scan :bad-key]))))))
+
+(deftest advanced-scan-checker-accepts-indeterminate-scan-mutations
+  (testing "an indeterminate scan write may be observed by a later scan"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :maybe}}
+                   {:type :info :process 0 :f :scan-write :value {:key "scan-a" :value :maybe} :error 503}
+                   {:type :invoke :process 1 :f :scan-forward :value nil}
+                   {:type :ok :process 1 :f :scan-forward :value [(scan-row "scan-a" :maybe)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result))))))
+  (testing "an indeterminate scan write is not required to be visible"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :maybe}}
+                   {:type :info :process 0 :f :scan-write :value {:key "scan-a" :value :maybe} :error 503}
+                   {:type :invoke :process 1 :f :scan-forward :value nil}
+                   {:type :ok :process 1 :f :scan-forward :value []}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result))))))
+  (testing "an indeterminate scan delete may remove a previously committed value"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-a"}}
+                   {:type :info :process 1 :f :scan-delete :value {:key "scan-a"} :error 503}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :ok :process 2 :f :scan-forward :value []}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result))))))
+  (testing "an indeterminate scan delete is not required to remove a previously committed value"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-a" :value :old}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-a"}}
+                   {:type :info :process 1 :f :scan-delete :value {:key "scan-a"} :error 503}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :ok :process 2 :f :scan-forward :value [(scan-row "scan-a" :old)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result))))))
+  (testing "an indeterminate non-connect scan delete whose exception returns during a scan may allow that scan to omit the key"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-b" :value :old}}
+                   {:type :ok :process 0 :f :scan-write :value {:key "scan-b" :value :old}}
+                   {:type :invoke :process 1 :f :scan-delete :value {:key "scan-b"}}
+                   {:type :invoke :process 2 :f :scan-forward :value nil}
+                   {:type :info :process 1 :f :scan-delete :value {:key "scan-b"} :error "socket timeout after send"}
+                   {:type :ok :process 2 :f :scan-forward :value []}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result))))))
+  (testing "an indeterminate scan write may remain pending after a later completed write"
+    (let [history [{:type :invoke :process 0 :f :scan-write :value {:key "scan-d" :value 7}}
+                   {:type :info :process 0 :f :scan-write :value {:key "scan-d" :value 7} :error 503}
+                   {:type :invoke :process 1 :f :scan-write :value {:key "scan-d" :value 11}}
+                   {:type :ok :process 1 :f :scan-write :value {:key "scan-d" :value 11}}
+                   {:type :invoke :process 2 :f :scan-reverse :value nil}
+                   {:type :ok :process 2 :f :scan-reverse :value [(scan-row "scan-d" 7)]}]
+          result (check-advanced-scan-history history)]
+      (is (= {:valid? true :checked 1 :bad-count 0}
+             (select-keys result [:valid? :checked :bad-count])))
+      (is (= [] (vec (:bad result)))))))
+
 (deftest advanced-scan-checker-accepts-overlapping-scan-mutations
   (testing "overlapping writes may be omitted or observed at either old or new value"
     (doseq [[name rows] [["omitted key" []]
@@ -1704,8 +1866,8 @@
                               [:type :f :value]))
               (str f " should preserve stale scan query metadata and rows"))
           (is (= [["http://node/scan"
-                   {:query-params expected-params
-                    :throw-exceptions false}]]
+                   (assoc epaxos/no-retry-request-options
+                          :query-params expected-params)]]
                  @requests)
               (str f " should issue the expected /scan query")))))))
 
