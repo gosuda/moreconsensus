@@ -53,7 +53,7 @@ Modes:
   all       Build kvnode, start a disposable three-node cluster, run incident, capacity, and data-lifecycle drills.
   incident  Exercise /faults/storage, /faults/transport, /readyz, and /metrics locally.
   capacity  Run bounded local write/read/scan samples and write latency/resource evidence locally.
-  data      Stop one local node, checkpoint/verify/restore/repair its data offline, restart it, and verify catch-up.
+  data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.
 
 Required opt-in:
   KVNODE_GO_RUNNER_RUN=yes
@@ -76,6 +76,7 @@ Outputs:
   capacity-latency.csv
   capacity-resources.csv
   data-lifecycle-summary.txt
+  data-lifecycle/*-report.env
   summary.txt
 
 Non-claims:
@@ -587,16 +588,22 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 	if err := stopNode(target); err != nil {
 		return err
 	}
-	if err := runDataLifecycleCommand(lifecycleDir, "checkpoint", checkpointBin, "checkpoint", target.dataDir, checkpointDir); err != nil {
+	report, err := runDataLifecycleCommand(lifecycleDir, "checkpoint", checkpointBin, "checkpoint", target.dataDir, checkpointDir)
+	if err != nil {
 		return err
 	}
-	if err := runDataLifecycleCommand(lifecycleDir, "verify", checkpointBin, "verify", checkpointDir); err != nil {
+	reports := []string{filepath.Base(report)}
+	report, err = runDataLifecycleCommand(lifecycleDir, "verify", checkpointBin, "verify", checkpointDir)
+	if err != nil {
 		return err
 	}
+	reports = append(reports, filepath.Base(report))
 	peers := peerArg(cfg)
-	if err := runDataLifecycleCommand(lifecycleDir, "restore", checkpointBin, "restore", target.dataDir, checkpointDir); err != nil {
+	report, err = runDataLifecycleCommand(lifecycleDir, "restore", checkpointBin, "restore", target.dataDir, checkpointDir)
+	if err != nil {
 		return err
 	}
+	reports = append(reports, filepath.Base(report))
 	if err := startNodeProcess(cfg, target, kvnodeBin, peers); err != nil {
 		return err
 	}
@@ -619,9 +626,11 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 	if err := stopNode(target); err != nil {
 		return err
 	}
-	if err := runDataLifecycleCommand(lifecycleDir, "repair", checkpointBin, "repair", target.dataDir, checkpointDir); err != nil {
+	report, err = runDataLifecycleCommand(lifecycleDir, "repair", checkpointBin, "repair", target.dataDir, checkpointDir)
+	if err != nil {
 		return err
 	}
+	reports = append(reports, filepath.Base(report))
 	if err := startNodeProcess(cfg, target, kvnodeBin, peers); err != nil {
 		return err
 	}
@@ -639,6 +648,7 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 		statusLocalGoRunnerOnly,
 		"data_lifecycle=offline-checkpoint-verify-restore-repair",
 		"checkpoint=verified",
+		"reports=" + strings.Join(reports, ","),
 		"restore=stopped-node-restored-and-restarted",
 		"repair=stopped-node-repaired-from-verified-checkpoint-and-restarted",
 		"canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair",
@@ -648,18 +658,43 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 	return os.WriteFile(filepath.Join(runDir, "data-lifecycle-summary.txt"), []byte(summary), 0o644)
 }
 
-func runDataLifecycleCommand(dir, label, bin string, args ...string) error {
+func runDataLifecycleCommand(dir, label, bin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	reportPath := filepath.Join(dir, label+"-report.env")
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "KVNODE_CHECKPOINT_REPORT="+reportPath)
 	out, err := cmd.CombinedOutput()
-	log := bytes.NewBufferString("command=" + filepath.Base(bin) + " " + strings.Join(args, " ") + "\n")
+	log := bytes.NewBufferString("command=KVNODE_CHECKPOINT_REPORT=" + reportPath + " " + filepath.Base(bin) + " " + strings.Join(args, " ") + "\n")
 	log.Write(out)
 	if writeErr := os.WriteFile(filepath.Join(dir, label+".log"), log.Bytes(), 0o644); writeErr != nil {
-		return writeErr
+		return reportPath, writeErr
 	}
 	if err != nil {
-		return fmt.Errorf("kvcheckpoint %s failed: %w: %s", label, err, strings.TrimSpace(string(out)))
+		return reportPath, fmt.Errorf("kvcheckpoint %s failed: %w: %s", label, err, strings.TrimSpace(string(out)))
+	}
+	if err := requireDataLifecycleReport(reportPath, label); err != nil {
+		return reportPath, err
+	}
+	return reportPath, nil
+}
+
+func requireDataLifecycleReport(reportPath, operation string) error {
+	content, err := os.ReadFile(reportPath)
+	if err != nil {
+		return fmt.Errorf("read kvcheckpoint %s report: %w", operation, err)
+	}
+	text := string(content)
+	required := []string{
+		"status=example-operator-report\n",
+		"operation=" + operation + "\n",
+		"result=success\n",
+		dataLifecycleNonClaim + "\n",
+	}
+	for _, want := range required {
+		if !strings.Contains(text, want) {
+			return fmt.Errorf("kvcheckpoint %s report %s missing %q", operation, reportPath, strings.TrimSpace(want))
+		}
 	}
 	return nil
 }

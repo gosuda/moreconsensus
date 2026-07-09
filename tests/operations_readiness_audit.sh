@@ -21,6 +21,81 @@ require_text() {
   fi
 }
 
+require_occurrences() {
+  local file="$1"
+  local text="$2"
+  local expected="$3"
+  local count
+  count="$(LC_ALL=C grep -F -c -- "$text" "$file" || true)"
+  count="$(printf '%s' "$count" | tr -d '[:space:]')"
+  if [[ "$count" != "$expected" ]]; then
+    echo "expected $expected occurrences in $file, found $count: $text" >&2
+    exit 1
+  fi
+}
+
+line_number() {
+  local file="$1"
+  local text="$2"
+  local line
+  line="$(LC_ALL=C grep -Fnm1 -- "$text" "$file" | cut -d: -f1 || true)"
+  if [[ -z "$line" ]]; then
+    echo "missing operations-readiness text in $file: $text" >&2
+    exit 1
+  fi
+  printf '%s\n' "$line"
+}
+
+require_text_before() {
+  local file="$1"
+  local first="$2"
+  local second="$3"
+  local first_line
+  local second_line
+  first_line="$(line_number "$file" "$first")"
+  second_line="$(line_number "$file" "$second")"
+  if (( first_line >= second_line )); then
+    echo "expected text in $file before '$second': $first" >&2
+    exit 1
+  fi
+}
+
+require_local_runner_lifecycle_reports() {
+  local expected_report_list="reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env"
+  local observed_reports=()
+  local observed_report_list
+  local label
+
+  require_text "$local_runner" "data-lifecycle/*-report.env"
+  require_text "$local_runner" 'reportPath := filepath.Join(dir, label+"-report.env")'
+  require_text "$local_runner" '"KVNODE_CHECKPOINT_REPORT="+reportPath'
+  require_text "$local_runner" '"command=KVNODE_CHECKPOINT_REPORT=" + reportPath'
+  require_text "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {'
+  require_text "$local_runner" 'func requireDataLifecycleReport(reportPath, operation string) error {'
+  require_text "$local_runner" '"status=example-operator-report\n"'
+  require_text "$local_runner" '"operation=" + operation + "\n"'
+  require_text "$local_runner" '"result=success\n"'
+  require_text "$local_runner" 'dataLifecycleNonClaim + "\n"'
+  require_text "$local_runner" '"reports=" + strings.Join(reports, ",")'
+  require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
+  require_text "$local_runner" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+  require_occurrences "$local_runner" "reports = append(reports, filepath.Base(report))" 3
+  require_occurrences "$local_runner" "reports := []string{filepath.Base(report)}" 1
+
+  for label in checkpoint verify restore repair; do
+    require_text "$local_runner" "runDataLifecycleCommand(lifecycleDir, \"$label\""
+    observed_reports+=("$label-report.env")
+  done
+
+  observed_report_list="reports=$(IFS=,; printf '%s' "${observed_reports[*]}")"
+  if [[ "$observed_report_list" != "$expected_report_list" ]]; then
+    echo "local runner data-lifecycle report list drifted: $observed_report_list" >&2
+    exit 1
+  fi
+  require_text_before "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"' 'summary := strings.Join([]string{'
+  require_text_before "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {' 'return reportPath, nil'
+}
+
 unit="deploy/systemd/kvnode@.service"
 env_example="deploy/systemd/kvnode.env.example"
 runbook="docs/operations/kvnode-data-lifecycle-incident-runbook.md"
@@ -148,7 +223,7 @@ require_text "$local_runner" "status=local-go-runner-only"
 require_text "$local_runner" "none-target-environment-capacity-results-still-required"
 require_text "$local_runner" "none-target-environment-operator-review-still-required"
 require_text "$local_runner" "[--mode all|incident|capacity|data]"
-require_text "$local_runner" 'data      Stop one local node, checkpoint/verify/restore/repair its data offline, restart it, and verify catch-up.'
+require_text "$local_runner" 'data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.'
 require_text "$local_runner" "data-lifecycle-summary.txt"
 require_text "$local_runner" "buildKVCheckpoint"
 require_text "$local_runner" "./cmd/kvcheckpoint"
@@ -156,6 +231,7 @@ require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "checkpoint"
 require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "verify"'
 require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "restore"'
 require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"'
+require_local_runner_lifecycle_reports
 require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
 require_text "$local_runner" "restore=stopped-node-restored-and-restarted"
 require_text "$local_runner" "repair=stopped-node-repaired-from-verified-checkpoint-and-restarted"
