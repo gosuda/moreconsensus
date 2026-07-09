@@ -11,6 +11,8 @@ kvnode capacity-envelope harness (opt-in, bounded)
 Status: harness only. This script gathers small, operator-chosen samples from an
 already-running kvnode cluster. It does not start nodes, does not change release
 scope, and does not produce production capacity evidence by itself.
+It emits release_claim=none-target-environment-capacity-results-still-required
+in metadata and summary output.
 
 Required opt-in:
   KVNODE_CAPACITY_RUN=yes
@@ -179,6 +181,7 @@ printf 'sample,resource,target,value,unit\n' > "$RESOURCES_CSV"
 peer_count="${KVNODE_PEER_COUNT:-${#CLIENT_URLS[@]}}"
 cat > "$METADATA_ENV" <<EOF
 status=harness-only
+release_claim=none-target-environment-capacity-results-still-required
 run_id=$run_id
 client_urls=$client_urls_raw
 admin_urls=$admin_urls_raw
@@ -311,6 +314,7 @@ cat > "$SUMMARY_MD" <<EOF
 # kvnode capacity-envelope harness sample
 
 Status: harness output only. These numbers are samples from the requested run and are not production capacity evidence unless the environment, workload, peer count, and operator procedure have been separately approved and recorded.
+Release claim: release_claim=none-target-environment-capacity-results-still-required.
 
 ## Inputs
 

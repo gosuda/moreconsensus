@@ -13,6 +13,7 @@ kvnode cluster, then runs tests/kvnode_capacity_envelope.sh against all three
 client/admin listeners with PIDs and data directories supplied for resource
 sampling. It does not assert production capacity, target-environment coverage,
 or operator acceptance.
+The generated metadata and summary retain release_claim=none-target-environment-capacity-results-still-required.
 
 Required opt-in:
   KVNODE_LOCAL_CAPACITY_RUN=yes
@@ -226,6 +227,7 @@ run_id=$run_id
 run_dir=$RUN_DIR
 capacity_dir=$CAPACITY_DIR
 non_claim=not_target_environment_capacity_evidence
+release_claim=none-target-environment-capacity-results-still-required
 EOF
 
 echo "kvnode-local-capacity phase=build"
