@@ -385,6 +385,8 @@ require_scope_row_text "| Capacity envelope |" "KVNODE_CAPACITY_REPORT=/path/rep
 require_scope_row_text "| Capacity envelope |" "machine-readable example/operator capacity report"
 require_scope_row_text "| Capacity envelope |" "status=example-operator-report"
 require_scope_row_text "| Capacity envelope |" "artifact=capacity-envelope-sample"
+require_scope_row_text "| Capacity envelope |" "run_id=..."
+require_scope_row_text "| Capacity envelope |" "harness=tests/kvnode_capacity_envelope.sh"
 require_scope_row_text "| Capacity envelope |" "throughput_ops_per_second=..."
 require_scope_row_text "| Capacity envelope |" "operation_count=..."
 require_scope_row_text "| Capacity envelope |" "latency_samples="
@@ -394,6 +396,13 @@ require_scope_row_text "| Capacity envelope |" "latency_p95_seconds="
 require_scope_row_text "| Capacity envelope |" "latency_p99_seconds="
 require_scope_row_text "| Capacity envelope |" "latency_file=latency.csv"
 require_scope_row_text "| Capacity envelope |" "resources_file=resources.csv"
+require_scope_row_text "| Capacity envelope |" "evidence_files=metadata.env,summary.md,latency.csv,resources.csv"
+require_scope_row_text "| Capacity envelope |" "target_environment=not-measured"
+require_scope_row_text "| Capacity envelope |" "wrapper_run_id=..."
+require_scope_row_text "| Capacity envelope |" "evidence_files=metadata.env,summary.txt,capacity/metadata.env,capacity/summary.md,capacity/latency.csv,capacity/resources.csv"
+require_scope_row_text "| Capacity envelope |" "plus the report's run-directory-relative path only when the report path remains under the wrapper run directory"
+require_scope_row_text "| Capacity envelope |" 'the default adds `capacity/capacity-report.env`'
+require_scope_row_text "| Capacity envelope |" 'external or relative overrides remain recorded by `capacity_report=...`'
 require_scope_row_text "| Capacity envelope |" "release_claim=none-target-environment-capacity-results-still-required"
 require_scope_row_text "| Capacity envelope |" "target-environment capacity measurement remains open"
 require_text 'custom Go runner capacity labels document `KVNODE_GO_RUNNER_ENVIRONMENT_LABEL` and `KVNODE_GO_RUNNER_WORKLOAD_LABEL`'

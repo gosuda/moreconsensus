@@ -21,6 +21,34 @@ require_text() {
   fi
 }
 
+require_regex() {
+  local file="$1"
+  local pattern="$2"
+  if ! LC_ALL=C grep -Eq -- "$pattern" "$file"; then
+    echo "missing operations-readiness pattern in $file: $pattern" >&2
+    exit 1
+  fi
+}
+
+require_regex_between() {
+  local file="$1"
+  local start="$2"
+  local pattern="$3"
+  local end="$4"
+  local start_line
+  local end_line
+  local candidate_line
+  start_line="$(line_number_regex "$file" "$start")"
+  end_line="$(line_number_regex "$file" "$end")"
+  while IFS=: read -r candidate_line _; do
+    if (( candidate_line > start_line && candidate_line < end_line )); then
+      return
+    fi
+  done < <(LC_ALL=C grep -En -- "$pattern" "$file" || true)
+  echo "expected pattern in $file between '$start' and '$end': $pattern" >&2
+  exit 1
+}
+
 require_occurrences() {
   local file="$1"
   local text="$2"
@@ -778,6 +806,10 @@ require_text "$capacity" "Peer-count coverage:"
 require_text "$capacity" "write_report()"
 require_text "$capacity" "status=example-operator-report"
 require_text "$capacity" "artifact=capacity-envelope-sample"
+require_regex_between "$capacity" '^write_report[[:space:]]*\(\)[[:space:]]*\{' 'echo[[:space:]]+"run_id=\$run_id"' '^[[:space:]]*}[[:space:]]*>[[:space:]]*"\$report_path"'
+require_regex_between "$capacity" '^write_report[[:space:]]*\(\)[[:space:]]*\{' 'echo[[:space:]]+"harness=tests/kvnode_capacity_envelope\.sh"' '^[[:space:]]*}[[:space:]]*>[[:space:]]*"\$report_path"'
+require_regex_between "$capacity" '^write_report[[:space:]]*\(\)[[:space:]]*\{' 'echo[[:space:]]+"evidence_files=metadata\.env,summary\.md,latency\.csv,resources\.csv"' '^[[:space:]]*}[[:space:]]*>[[:space:]]*"\$report_path"'
+require_regex_between "$capacity" '^write_report[[:space:]]*\(\)[[:space:]]*\{' 'echo[[:space:]]+"target_environment=not-measured"' '^[[:space:]]*}[[:space:]]*>[[:space:]]*"\$report_path"'
 require_text "$capacity" "throughput_ops_per_second="
 require_text "$capacity" "operation_count="
 require_text "$capacity" "latency_samples="
@@ -800,6 +832,63 @@ for bad_report_path in . /; do
     exit 1
   fi
 done
+
+capacity_report_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kvnode-capacity-report-audit.XXXXXX")"
+trap 'rm -rf "$manifest_report_dir" "$incident_report_probe_dir" "$capacity_report_probe_dir"' EXIT
+capacity_report_probe="$capacity_report_probe_dir/write-report-probe.sh"
+{
+  cat <<'EOF'
+set -euo pipefail
+capacity_report="${KVNODE_CAPACITY_REPORT:?}"
+run_id=capacity-report-audit-probe
+environment_label=probe-env
+workload_label=probe-workload
+peer_count=3
+operation_count=3
+throughput=3.000
+latency_summary='latency_samples=3
+latency_avg_seconds=0.002000
+latency_p50_seconds=0.001000
+latency_p95_seconds=0.002000
+latency_p99_seconds=0.003000'
+elapsed_seconds=1
+ops_per_phase=1
+value_sizes_raw=16
+scan_limits_raw=1
+out_dir="$PWD"
+EOF
+  LC_ALL=C sed -n '/^write_report() {/,/^}/p' "$capacity"
+  printf '%s\n' 'write_report'
+} > "$capacity_report_probe"
+
+capacity_report="$capacity_report_probe_dir/report.env"
+KVNODE_CAPACITY_REPORT="$capacity_report" bash "$capacity_report_probe" >/dev/null
+require_text "$capacity_report" "status=example-operator-report"
+require_text "$capacity_report" "artifact=capacity-envelope-sample"
+require_text "$capacity_report" "run_id=capacity-report-audit-probe"
+require_text "$capacity_report" "harness=tests/kvnode_capacity_envelope.sh"
+require_text "$capacity_report" "operation_count=3"
+require_text "$capacity_report" "throughput_ops_per_second=3.000"
+require_text "$capacity_report" "latency_samples=3"
+require_text "$capacity_report" "latency_avg_seconds=0.002000"
+require_text "$capacity_report" "latency_p50_seconds=0.001000"
+require_text "$capacity_report" "latency_p95_seconds=0.002000"
+require_text "$capacity_report" "latency_p99_seconds=0.003000"
+require_text "$capacity_report" "latency_file=latency.csv"
+require_text "$capacity_report" "resources_file=resources.csv"
+require_text "$capacity_report" "evidence_files=metadata.env,summary.md,latency.csv,resources.csv"
+require_text "$capacity_report" "target_environment=not-measured"
+require_text "$capacity_report" "release_claim=none-target-environment-capacity-results-still-required"
+if capacity_report_mode="$(stat -c '%a' "$capacity_report" 2>/dev/null)"; then
+  :
+else
+  capacity_report_mode="$(stat -f '%Lp' "$capacity_report")"
+fi
+if [[ "$capacity_report_mode" != "600" ]]; then
+  echo "capacity report mode must be 0600, got $capacity_report_mode" >&2
+  exit 1
+fi
+
 
 # Local capacity wrapper: starts a disposable loopback cluster and delegates to
 # the bounded capacity harness without making a target-environment claim.
@@ -825,6 +914,22 @@ require_text "$local_capacity" "KVNODE_PEER_COUNT=3"
 require_text "$local_capacity" 'capacity_report=$CAPACITY_REPORT'
 require_text_before "$local_capacity" 'KVNODE_CAPACITY_REPORT="$CAPACITY_REPORT" \' 'capacity_report=$CAPACITY_REPORT'
 require_text "$local_capacity" "status=local-loopback-only"
+require_text "$local_capacity" 'wrapper_run_id=$run_id'
+require_text "$local_capacity" 'CAPACITY_EVIDENCE_FILES="metadata.env,summary.txt,capacity/metadata.env,capacity/summary.md,capacity/latency.csv,capacity/resources.csv"'
+require_text "$local_capacity" 'if [[ "$CAPACITY_REPORT" == "$RUN_DIR"/* ]]; then'
+require_text "$local_capacity" 'CAPACITY_REPORT_RELATIVE="${CAPACITY_REPORT#"$RUN_DIR"/}"'
+require_text "$local_capacity" 'if [[ "$CAPACITY_REPORT_RELATIVE" != ".." && "$CAPACITY_REPORT_RELATIVE" != ../* && "$CAPACITY_REPORT_RELATIVE" != */.. && "$CAPACITY_REPORT_RELATIVE" != */../* ]]; then'
+require_text "$local_capacity" '"$CAPACITY_REPORT_RELATIVE" != ".."'
+require_text "$local_capacity" '"$CAPACITY_REPORT_RELATIVE" != ../*'
+require_text "$local_capacity" '"$CAPACITY_REPORT_RELATIVE" != */..'
+require_text "$local_capacity" '"$CAPACITY_REPORT_RELATIVE" != */../*'
+require_text_before "$local_capacity" 'if [[ "$CAPACITY_REPORT_RELATIVE" != ".." && "$CAPACITY_REPORT_RELATIVE" != ../* && "$CAPACITY_REPORT_RELATIVE" != */.. && "$CAPACITY_REPORT_RELATIVE" != */../* ]]; then' 'CAPACITY_EVIDENCE_FILES="$CAPACITY_EVIDENCE_FILES,$CAPACITY_REPORT_RELATIVE"'
+require_text "$local_capacity" 'CAPACITY_EVIDENCE_FILES="$CAPACITY_EVIDENCE_FILES,$CAPACITY_REPORT_RELATIVE"'
+require_text_before "$local_capacity" 'CAPACITY_REPORT="${KVNODE_CAPACITY_REPORT:-$CAPACITY_DIR/capacity-report.env}"' 'CAPACITY_EVIDENCE_FILES="metadata.env,summary.txt,capacity/metadata.env,capacity/summary.md,capacity/latency.csv,capacity/resources.csv"'
+require_text_before "$local_capacity" 'CAPACITY_EVIDENCE_FILES="$CAPACITY_EVIDENCE_FILES,$CAPACITY_REPORT_RELATIVE"' 'KVNODE_CAPACITY_REPORT="$CAPACITY_REPORT" \'
+require_text "$local_capacity" 'evidence_files=$CAPACITY_EVIDENCE_FILES'
+require_text_between "$local_capacity" 'cat > "$RUN_DIR/summary.txt" <<EOF' 'wrapper_run_id=$run_id' 'cat "$RUN_DIR/summary.txt"'
+require_text_between "$local_capacity" 'cat > "$RUN_DIR/summary.txt" <<EOF' 'evidence_files=$CAPACITY_EVIDENCE_FILES' 'cat "$RUN_DIR/summary.txt"'
 require_text "$local_capacity" "not_target_environment_capacity_evidence"
 require_text "$local_capacity" "release_claim=none-target-environment-capacity-results-still-required"
 bash -n "$local_capacity"

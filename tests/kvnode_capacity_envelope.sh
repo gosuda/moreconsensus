@@ -359,6 +359,8 @@ write_report() {
   {
     echo "status=example-operator-report"
     echo "artifact=capacity-envelope-sample"
+    echo "run_id=$run_id"
+    echo "harness=tests/kvnode_capacity_envelope.sh"
     echo "environment_label=$environment_label"
     echo "workload_label=$workload_label"
     echo "peer_count=$peer_count"
@@ -372,6 +374,8 @@ write_report() {
     printf 'out_dir=%q\n' "$out_dir"
     echo "latency_file=latency.csv"
     echo "resources_file=resources.csv"
+    echo "evidence_files=metadata.env,summary.md,latency.csv,resources.csv"
+    echo "target_environment=not-measured"
     echo "release_claim=none-target-environment-capacity-results-still-required"
   } > "$report_path"
   chmod 0600 "$report_path"

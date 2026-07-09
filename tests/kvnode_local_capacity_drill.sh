@@ -126,6 +126,13 @@ DATA_DIR="$RUN_DIR/data"
 LOG_DIR="$RUN_DIR/logs"
 CAPACITY_DIR="$RUN_DIR/capacity"
 CAPACITY_REPORT="${KVNODE_CAPACITY_REPORT:-$CAPACITY_DIR/capacity-report.env}"
+CAPACITY_EVIDENCE_FILES="metadata.env,summary.txt,capacity/metadata.env,capacity/summary.md,capacity/latency.csv,capacity/resources.csv"
+if [[ "$CAPACITY_REPORT" == "$RUN_DIR"/* ]]; then
+  CAPACITY_REPORT_RELATIVE="${CAPACITY_REPORT#"$RUN_DIR"/}"
+  if [[ "$CAPACITY_REPORT_RELATIVE" != ".." && "$CAPACITY_REPORT_RELATIVE" != ../* && "$CAPACITY_REPORT_RELATIVE" != */.. && "$CAPACITY_REPORT_RELATIVE" != */../* ]]; then
+    CAPACITY_EVIDENCE_FILES="$CAPACITY_EVIDENCE_FILES,$CAPACITY_REPORT_RELATIVE"
+  fi
+fi
 mkdir -p "$BIN_DIR" "$DATA_DIR" "$LOG_DIR" "$CAPACITY_DIR"
 
 BIN="$BIN_DIR/kvnode"
@@ -288,12 +295,14 @@ bash tests/kvnode_capacity_envelope.sh
 
 cat > "$RUN_DIR/summary.txt" <<EOF
 status=local-loopback-only
+wrapper_run_id=$run_id
 capacity_dir=$CAPACITY_DIR
 capacity_report=$CAPACITY_REPORT
 peer_count=3
 environment_label=$ENVIRONMENT_LABEL
 workload_label=$WORKLOAD_LABEL
 release_claim=none-target-environment-capacity-results-still-required
+evidence_files=$CAPACITY_EVIDENCE_FILES
 EOF
 
 cat "$RUN_DIR/summary.txt"
