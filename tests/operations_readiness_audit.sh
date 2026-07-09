@@ -32,8 +32,9 @@ mixed_drill="tests/kvnode_mixed_version_drill.sh"
 checkpoint_helper="examples/kv/cmd/kvcheckpoint/main.go"
 checkpoint_helper_test="examples/kv/cmd/kvcheckpoint/main_test.go"
 incident_drill="tests/kvnode_incident_tabletop_drill.sh"
+local_runner="tests/kvnode_local_runner.go"
 
-for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$incident_drill" "$local_capacity" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
+for file in "$unit" "$env_example" "$checkpoint_helper" "$checkpoint_helper_test" "$incident_drill" "$local_capacity" "$local_runner" "$runbook" "$upgrade" "$capacity" "$manifest" "$mixed_drill"; do
   require_file "$file"
 done
 
@@ -123,6 +124,28 @@ require_text "$incident_drill" "status=local-tabletop-only"
 require_text "$incident_drill" "storage_fault=exercised-and-cleared"
 require_text "$incident_drill" "transport_fault=exercised-and-cleared"
 bash -n "$incident_drill"
+
+# Local Go runner: build-tagged, opt-in, loopback-only evidence that exercises
+# the admin fault/readiness/metrics endpoints without replacing shell drills.
+require_text "$local_runner" "kvnode local Go runner (opt-in, local loopback only)"
+require_text "$local_runner" "KVNODE_GO_RUNNER_RUN=yes"
+if runner_refusal_output="$(KVNODE_GO_RUNNER_RUN= go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode incident 2>&1 >/dev/null)"; then
+  echo "kvnode local Go runner must refuse without KVNODE_GO_RUNNER_RUN=yes" >&2
+  exit 1
+fi
+if [[ "$runner_refusal_output" != *"Refusing to run without KVNODE_GO_RUNNER_RUN=yes."* ]]; then
+  echo "missing operations-readiness output from $local_runner: Refusing to run without KVNODE_GO_RUNNER_RUN=yes." >&2
+  exit 1
+fi
+require_text "$local_runner" "status=local-go-runner-only"
+require_text "$local_runner" "none-target-environment-capacity-results-still-required"
+require_text "$local_runner" "none-target-environment-operator-review-still-required"
+require_text "$local_runner" "go build"
+require_text "$local_runner" "/faults/storage"
+require_text "$local_runner" "/faults/transport"
+require_text "$local_runner" "/readyz"
+require_text "$local_runner" "/metrics"
+go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --help >/dev/null
 
 # Data lifecycle/incident runbook: backup/verify/repair/restore boundaries,
 # confirmations, evidence capture, and named incident response procedures.
