@@ -30,6 +30,7 @@
 - [tla/EPaxosConfigRecoveryRetry.tla](tla/EPaxosConfigRecoveryRetry.tla) contains the finite configuration-recovery retry-timer model for old-config prepare/accept rebroadcasts after voter removal or addition.
 - [tla/EPaxosConfigTransitionRetry.tla](tla/EPaxosConfigTransitionRetry.tla) contains the finite configuration-transition retry-timer model for local-owner old-config PreAccept/Accept rebroadcasts after voter removal or addition.
 - [tla/EPaxosConfigTransitionDedup.tla](tla/EPaxosConfigTransitionDedup.tla) contains the finite configuration-transition response de-duplication model for local-owner old-config PreAccept/Accept responses, with remote responses modeled separately from the counted owner vote after voter removal or addition.
+- [tla/EPaxosConfigChainRecovery.tla](tla/EPaxosConfigChainRecovery.tla) contains the finite mid-chain configuration-recovery model for an add-then-remove history, proving current-conf quorums are insufficient for a `Ref.Conf=2` recovery until the old Conf2 quorum is reached.
 - [examples/kv](examples/kv) contains the Pebble/MyRocks-style key-value example.
 - [jepsen](jepsen) contains the Jepsen workload harness for external validation.
 - [tests](tests) contains the repository verification scripts used by CI.

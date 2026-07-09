@@ -249,6 +249,102 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	recoveryApplyReady(t, store, restarted, rd)
 }
 
+func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.T) {
+	store := NewMemoryStorage()
+	store.Configs = []ConfState{
+		{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}},
+		{ID: 3, Voters: []ReplicaID{1, 3, 4}},
+	}
+	ref := InstanceRef{Replica: 2, Instance: 7, Conf: 2}
+	store.Records[ref] = checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 2},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    []InstanceNum{0, 0, 0, 0},
+		Command: Command{Kind: CommandNoop},
+	})
+
+	restarted, err := NewRawNode(Config{ID: 1, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 3, 4}})
+	assertConfState(t, restarted.confFor(2), ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}})
+	if restarted.HasReady() {
+		t.Fatalf("restart emitted work before mid-chain old-config recovery deadline: %#v", restarted.Ready())
+	}
+	for tick := 1; tick < 4; tick++ {
+		restarted.Tick()
+		if restarted.HasReady() {
+			t.Fatalf("mid-chain old-config recovery fired after %d ticks, before deadline: %#v", tick, restarted.Ready())
+		}
+	}
+
+	restarted.Tick()
+	rd := restarted.Ready()
+	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{2, 3, 4}, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	requireNoopRecordWithDepsWidth := func(records []InstanceRecord, status Status) {
+		t.Helper()
+		for _, rec := range records {
+			if rec.Ref != ref || rec.Status != status {
+				continue
+			}
+			if rec.Command.Kind != CommandNoop {
+				t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Command.Kind, CommandNoop, rec)
+			}
+			if len(rec.Deps) != 4 {
+				t.Fatalf("record %s/%s deps width = %d, want pinned Conf2 width 4: %#v", ref, status, len(rec.Deps), rec)
+			}
+			return
+		}
+		t.Fatalf("missing %s record for %s with noop command and pinned Conf2 deps: %#v", status, ref, records)
+	}
+
+	prepareResp := func(from ReplicaID) Message {
+		return Message{Type: MsgPrepareResp, From: from, To: 1, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
+	}
+	if err := restarted.Step(prepareResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("mid-chain old-config recovery counted local 1 plus current voter 4 as Conf2 prepare quorum: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(prepareResp(2)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{2, 3, 4}, 4)
+	requireNoopRecordWithDepsWidth(rd.Records, StatusAccepted)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("mid-chain old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	}
+	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
+	recoveryApplyReady(t, store, restarted, rd)
+
+	acceptResp := func(from ReplicaID) Message {
+		return Message{Type: MsgAcceptResp, From: from, To: 1, Ref: ref, Ballot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
+	}
+	if err := restarted.Step(acceptResp(4)); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.HasReady() {
+		t.Fatalf("mid-chain old-config recovery counted local 1 plus current voter 4 as Conf2 accept quorum: %#v", restarted.Ready())
+	}
+	if err := restarted.Step(acceptResp(2)); err != nil {
+		t.Fatal(err)
+	}
+	rd = restarted.Ready()
+	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{2, 3, 4}, 4)
+	requireNoopRecordWithDepsWidth(rd.Records, StatusExecuted)
+	if len(rd.Committed) != 0 {
+		t.Fatalf("mid-chain old-config noop recovery emitted application commands: %#v", rd.Committed)
+	}
+	recoveryApplyReady(t, store, restarted, rd)
+}
+
 func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	store := NewMemoryStorage()
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
