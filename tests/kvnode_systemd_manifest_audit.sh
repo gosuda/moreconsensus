@@ -118,6 +118,7 @@ fi
 printf 'rendered_exec='
 printf '%q ' "${rendered[@]}"
 printf '\n'
+echo "release_claim=none-target-environment-deployment-manifest-still-required"
 
 if [[ "${KVNODE_SYSTEMD_ANALYZE:-}" == "yes" ]]; then
   command -v systemd-analyze >/dev/null 2>&1 || fail "KVNODE_SYSTEMD_ANALYZE=yes requested but systemd-analyze is unavailable"

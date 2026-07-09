@@ -103,6 +103,7 @@ require_text "$manifest" "rendered_exec="
 require_text "$manifest" "systemd_analyze=skipped"
 require_text "$manifest" "KVNODE_SYSTEMD_ANALYZE=yes"
 require_text "$manifest" "systemd-analyze verify"
+require_text "$manifest" "release_claim=none-target-environment-deployment-manifest-still-required"
 bash "$manifest" >/dev/null
 
 # Offline checkpoint helper: example/operator command, verified restore boundary,
