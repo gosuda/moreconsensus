@@ -284,6 +284,10 @@ require_text "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --
 require_text "measured target-environment capacity results remain open"
 require_text "release_claim=none-target-environment-capacity-results-still-required"
 require_text "target-environment capacity measurement remains open"
+require_text 'custom Go runner capacity labels document `KVNODE_GO_RUNNER_ENVIRONMENT_LABEL` and `KVNODE_GO_RUNNER_WORKLOAD_LABEL`'
+require_text 'defaulting custom Go runner provenance to `environment_label=local-loopback` and `workload_label=local-go-runner`'
+require_text 'custom Go runner validates label values as non-empty, single-line, without `=`, and at most 128 characters'
+require_text 'custom Go runner writes `environment_label` and `workload_label` to `metadata.env`, `capacity-summary.txt`, and capacity `summary.txt` when `capacity_ran=true`'
 require_text 'bounded single-line `environment_label` and `workload_label` provenance fields'
 require_text 'defaulting provenance to `environment_label=local-loopback` and `workload_label=local-capacity-drill`'
 require_text "also locally exercised \`/faults/storage\`, \`/faults/transport\`, \`/readyz\`, \`/metrics\`"

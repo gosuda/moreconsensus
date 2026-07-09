@@ -29,14 +29,16 @@ import (
 const (
 	optInEnv = "KVNODE_GO_RUNNER_RUN"
 
-	defaultBasePort      = 26080
-	defaultPeerBasePort  = 26180
-	defaultAdminBasePort = 26280
-	defaultReadyAttempts = 120
-	defaultTimeout       = 5 * time.Second
-	defaultOpsPerPhase   = 5
-	defaultValueBytes    = "64,1024"
-	defaultScanLimits    = "1,8"
+	defaultBasePort         = 26080
+	defaultPeerBasePort     = 26180
+	defaultAdminBasePort    = 26280
+	defaultReadyAttempts    = 120
+	defaultTimeout          = 5 * time.Second
+	defaultOpsPerPhase      = 5
+	defaultValueBytes       = "64,1024"
+	defaultScanLimits       = "1,8"
+	defaultEnvironmentLabel = "local-loopback"
+	defaultWorkloadLabel    = "local-go-runner"
 
 	statusLocalGoRunnerOnly = "status=local-go-runner-only"
 	capacityNonClaim        = "release_claim=none-target-environment-capacity-results-still-required"
@@ -68,6 +70,8 @@ Environment:
   KVNODE_GO_RUNNER_OPS_PER_PHASE        Capacity samples per value-size phase. Default: 5, max: 1000.
   KVNODE_GO_RUNNER_VALUE_BYTES          Comma-separated value sizes. Default: 64,1024; max item: 1048576.
   KVNODE_GO_RUNNER_SCAN_LIMITS          Comma-separated scan limits. Default: 1,8; max item: 100000.
+  KVNODE_GO_RUNNER_ENVIRONMENT_LABEL   Single-line environment label. Default: local-loopback.
+  KVNODE_GO_RUNNER_WORKLOAD_LABEL      Single-line workload label. Default: local-go-runner.
 
 Outputs:
   metadata.env
@@ -87,16 +91,18 @@ Non-claims:
 `
 
 type runnerConfig struct {
-	mode          string
-	basePort      int
-	peerBasePort  int
-	adminBasePort int
-	readyAttempts int
-	timeout       time.Duration
-	outDir        string
-	opsPerPhase   int
-	valueBytes    []int
-	scanLimits    []int
+	mode             string
+	basePort         int
+	peerBasePort     int
+	adminBasePort    int
+	readyAttempts    int
+	timeout          time.Duration
+	outDir           string
+	opsPerPhase      int
+	valueBytes       []int
+	scanLimits       []int
+	environmentLabel string
+	workloadLabel    string
 }
 
 type nodeProcess struct {
@@ -206,6 +212,14 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
+	environmentLabel, err := envLabel("KVNODE_GO_RUNNER_ENVIRONMENT_LABEL", defaultEnvironmentLabel)
+	if err != nil {
+		return cfg, err
+	}
+	workloadLabel, err := envLabel("KVNODE_GO_RUNNER_WORKLOAD_LABEL", defaultWorkloadLabel)
+	if err != nil {
+		return cfg, err
+	}
 	cfg.basePort = basePort
 	cfg.peerBasePort = peerBasePort
 	cfg.adminBasePort = adminBasePort
@@ -214,6 +228,8 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg.opsPerPhase = opsPerPhase
 	cfg.valueBytes = valueBytes
 	cfg.scanLimits = scanLimits
+	cfg.environmentLabel = environmentLabel
+	cfg.workloadLabel = workloadLabel
 	return cfg, nil
 }
 
@@ -262,6 +278,20 @@ func envCSVInts(name, def string, min, max int) ([]int, error) {
 	}
 	sort.Ints(values)
 	return values, nil
+}
+
+func envLabel(name, def string) (string, error) {
+	value := getenv(name, def)
+	if value == "" {
+		return "", fmt.Errorf("%s must not be empty", name)
+	}
+	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "=") {
+		return "", fmt.Errorf("%s must be a single line without =", name)
+	}
+	if len(value) > 128 {
+		return "", fmt.Errorf("%s must be <= 128 characters", name)
+	}
+	return value, nil
 }
 
 func validatePortSet(base, peerBase, adminBase int) error {
@@ -374,6 +404,8 @@ func writeMetadata(runDir string, cfg runnerConfig) error {
 		"ops_per_phase=" + strconv.Itoa(cfg.opsPerPhase),
 		"value_bytes=" + joinInts(cfg.valueBytes),
 		"scan_limits=" + joinInts(cfg.scanLimits),
+		"environment_label=" + cfg.environmentLabel,
+		"workload_label=" + cfg.workloadLabel,
 		"non_claim=not_target_environment_local_loopback_only",
 		capacityNonClaim,
 		incidentNonClaim,
@@ -921,6 +953,8 @@ func writeCapacitySummary(runDir string, cfg runnerConfig, samples []httpSample)
 		"ops_per_phase=" + strconv.Itoa(cfg.opsPerPhase),
 		"value_bytes=" + joinInts(cfg.valueBytes),
 		"scan_limits=" + joinInts(cfg.scanLimits),
+		"environment_label=" + cfg.environmentLabel,
+		"workload_label=" + cfg.workloadLabel,
 		"latency_rows=" + strconv.Itoa(len(samples)),
 		fmt.Sprintf("latency_summary=p50=%.9fs,p95=%.9fs,p99=%.9fs", p50, p95, p99),
 		capacityNonClaim,
@@ -955,6 +989,7 @@ func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan
 	}
 	if capacityRan {
 		lines = append(lines, capacityNonClaim)
+		lines = append(lines, "environment_label="+cfg.environmentLabel, "workload_label="+cfg.workloadLabel)
 	}
 	if incidentRan {
 		lines = append(lines, incidentNonClaim)

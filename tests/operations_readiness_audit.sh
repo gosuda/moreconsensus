@@ -96,6 +96,28 @@ require_local_runner_lifecycle_reports() {
   require_text_before "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {' 'return reportPath, nil'
 }
 
+require_local_runner_capacity_labels() {
+  require_text "$local_runner" "KVNODE_GO_RUNNER_ENVIRONMENT_LABEL   Single-line environment label. Default: local-loopback."
+  require_text "$local_runner" "KVNODE_GO_RUNNER_WORKLOAD_LABEL      Single-line workload label. Default: local-go-runner."
+  require_text "$local_runner" 'defaultEnvironmentLabel = "local-loopback"'
+  require_text "$local_runner" 'defaultWorkloadLabel    = "local-go-runner"'
+  require_text "$local_runner" 'environmentLabel, err := envLabel("KVNODE_GO_RUNNER_ENVIRONMENT_LABEL", defaultEnvironmentLabel)'
+  require_text "$local_runner" 'workloadLabel, err := envLabel("KVNODE_GO_RUNNER_WORKLOAD_LABEL", defaultWorkloadLabel)'
+  require_text "$local_runner" 'func envLabel(name, def string) (string, error) {'
+  require_text "$local_runner" 'return "", fmt.Errorf("%s must not be empty", name)'
+  require_text "$local_runner" 'strings.ContainsAny(value, "\r\n") || strings.Contains(value, "=")'
+  require_text "$local_runner" 'return "", fmt.Errorf("%s must be a single line without =", name)'
+  require_text "$local_runner" 'if len(value) > 128 {'
+  require_text "$local_runner" 'return "", fmt.Errorf("%s must be <= 128 characters", name)'
+  require_text "$local_runner" 'return os.WriteFile(filepath.Join(runDir, "metadata.env"), []byte(content), 0o644)'
+  require_text "$local_runner" 'return os.WriteFile(filepath.Join(runDir, "capacity-summary.txt"), []byte(summary), 0o644)'
+  require_text "$local_runner" 'return os.WriteFile(filepath.Join(runDir, "summary.txt"), []byte(strings.Join(lines, "\n")), 0o644)'
+  require_occurrences "$local_runner" '"environment_label=" + cfg.environmentLabel' 2
+  require_occurrences "$local_runner" '"workload_label=" + cfg.workloadLabel' 2
+  require_text "$local_runner" 'lines = append(lines, "environment_label="+cfg.environmentLabel, "workload_label="+cfg.workloadLabel)'
+  require_text_before "$local_runner" 'if capacityRan {' 'lines = append(lines, "environment_label="+cfg.environmentLabel, "workload_label="+cfg.workloadLabel)'
+}
+
 unit="deploy/systemd/kvnode@.service"
 env_example="deploy/systemd/kvnode.env.example"
 runbook="docs/operations/kvnode-data-lifecycle-incident-runbook.md"
@@ -219,8 +241,25 @@ if [[ "$runner_refusal_output" != *"Refusing to run without KVNODE_GO_RUNNER_RUN
   echo "missing operations-readiness output from $local_runner: Refusing to run without KVNODE_GO_RUNNER_RUN=yes." >&2
   exit 1
 fi
+if bad_environment_label_output="$(KVNODE_GO_RUNNER_RUN=yes KVNODE_GO_RUNNER_ENVIRONMENT_LABEL=bad=label go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode capacity 2>&1)"; then
+  echo "kvnode local Go runner must reject KVNODE_GO_RUNNER_ENVIRONMENT_LABEL containing =" >&2
+  exit 1
+fi
+if [[ "$bad_environment_label_output" != *"KVNODE_GO_RUNNER_ENVIRONMENT_LABEL must be a single line without ="* ]]; then
+  echo "missing operations-readiness output from $local_runner: KVNODE_GO_RUNNER_ENVIRONMENT_LABEL must be a single line without =" >&2
+  exit 1
+fi
+if bad_workload_label_output="$(KVNODE_GO_RUNNER_RUN=yes KVNODE_GO_RUNNER_WORKLOAD_LABEL=bad=label go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode capacity 2>&1)"; then
+  echo "kvnode local Go runner must reject KVNODE_GO_RUNNER_WORKLOAD_LABEL containing =" >&2
+  exit 1
+fi
+if [[ "$bad_workload_label_output" != *"KVNODE_GO_RUNNER_WORKLOAD_LABEL must be a single line without ="* ]]; then
+  echo "missing operations-readiness output from $local_runner: KVNODE_GO_RUNNER_WORKLOAD_LABEL must be a single line without =" >&2
+  exit 1
+fi
 require_text "$local_runner" "status=local-go-runner-only"
 require_text "$local_runner" "none-target-environment-capacity-results-still-required"
+require_local_runner_capacity_labels
 require_text "$local_runner" "none-target-environment-operator-review-still-required"
 require_text "$local_runner" "[--mode all|incident|capacity|data]"
 require_text "$local_runner" 'data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.'
