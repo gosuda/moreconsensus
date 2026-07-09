@@ -60,6 +60,25 @@ require_text_before() {
   fi
 }
 
+require_text_between() {
+  local file="$1"
+  local start="$2"
+  local text="$3"
+  local end="$4"
+  local start_line
+  local end_line
+  local candidate_line
+  start_line="$(line_number "$file" "$start")"
+  end_line="$(line_number "$file" "$end")"
+  while IFS=: read -r candidate_line _; do
+    if (( candidate_line > start_line && candidate_line < end_line )); then
+      return
+    fi
+  done < <(LC_ALL=C grep -Fn -- "$text" "$file" || true)
+  echo "expected text in $file between '$start' and '$end': $text" >&2
+  exit 1
+}
+
 last_line_number() {
   local file="$1"
   local text="$2"
@@ -611,7 +630,8 @@ require_text "$capacity" "KVNODE_CAPACITY_WORKLOAD_LABEL"
 require_text "$capacity" "Single-line workload label. Default: unspecified"
 require_text "$capacity" "KVNODE_CAPACITY_REPORT"
 require_text "$capacity" "Optional success report path"
-require_text "$capacity" "report.env                     Optional 0600 report when KVNODE_CAPACITY_REPORT is set."
+require_text "$capacity" "report.env                     Optional 0600 report with throughput and latency summary fields."
+require_text "$capacity" "writes a 0600 example/operator report with throughput and latency summary fields."
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_OPS_PER_PHASE "$ops_per_phase" 1000'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_TIMEOUT_SECONDS "$timeout_seconds" 300'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_MAX_VALUE_BYTES "$max_value_bytes" 1048576'
@@ -649,6 +669,13 @@ require_text "$capacity" "write_report()"
 require_text "$capacity" "status=example-operator-report"
 require_text "$capacity" "artifact=capacity-envelope-sample"
 require_text "$capacity" "throughput_ops_per_second="
+require_text "$capacity" "operation_count="
+require_text "$capacity" "latency_samples="
+require_text "$capacity" "latency_avg_seconds="
+require_text "$capacity" "latency_p50_seconds="
+require_text "$capacity" "latency_p95_seconds="
+require_text "$capacity" "latency_p99_seconds="
+require_text_between "$capacity" "write_report()" 'printf '\''%s\n'\'' "$latency_summary"' '} > "$report_path"'
 require_text "$capacity" "latency_file=latency.csv"
 require_text "$capacity" "resources_file=resources.csv"
 require_text "$capacity" "chmod 0600"

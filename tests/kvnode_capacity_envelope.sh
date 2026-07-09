@@ -35,7 +35,7 @@ Common inputs:
                                   Single-line environment label. Default: unspecified
   KVNODE_CAPACITY_WORKLOAD_LABEL  Single-line workload label. Default: unspecified
   KVNODE_CAPACITY_REPORT         Optional success report path. When set,
-                                  writes a 0600 example/operator report.
+                                  writes a 0600 example/operator report with throughput and latency summary fields.
 
 Optional resource inputs:
   KVNODE_PIDS                     Comma-separated kvnode PIDs for RSS samples.
@@ -48,7 +48,7 @@ Output:
   latency.csv                     operation,http_status,seconds rows.
   resources.csv                   before/after RSS, disk, queue-depth samples.
   summary.md                      Machine-generated sample summary with no readiness claim.
-  report.env                     Optional 0600 report when KVNODE_CAPACITY_REPORT is set.
+  report.env                     Optional 0600 report with throughput and latency summary fields.
 
 Example:
   KVNODE_CAPACITY_RUN=yes \
@@ -364,6 +364,7 @@ write_report() {
     echo "peer_count=$peer_count"
     echo "operation_count=$operation_count"
     echo "throughput_ops_per_second=$throughput"
+    printf '%s\n' "$latency_summary"
     echo "elapsed_seconds=$elapsed_seconds"
     echo "ops_per_phase=$ops_per_phase"
     echo "value_bytes=$value_sizes_raw"
