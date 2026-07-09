@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +76,140 @@ func TestRunUsagePathsReturnDocumentedExitCodes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+func TestMainUsesRunExitCodeForHelp(t *testing.T) {
+	oldArgs := os.Args
+	oldStderr := os.Stderr
+	oldExitProcess := exitProcess
+	t.Cleanup(func() {
+		os.Args = oldArgs
+		os.Stderr = oldStderr
+		exitProcess = oldExitProcess
+	})
+
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readPipe.Close() }()
+	defer func() { _ = writePipe.Close() }()
+
+	os.Args = []string{"kvcheckpoint", "--help"}
+	os.Stderr = writePipe
+
+	exitCalls := 0
+	gotExit := -1
+	exitProcess = func(code int) {
+		exitCalls++
+		gotExit = code
+	}
+
+	main()
+
+	if err := writePipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exitCalls != 1 {
+		t.Fatalf("main called exit %d times, want 1", exitCalls)
+	}
+	if gotExit != 0 {
+		t.Fatalf("main help exit=%d, want 0; stderr=%q", gotExit, stderr)
+	}
+	if !strings.Contains(string(stderr), "kvcheckpoint verify CHECKPOINT_DIR") {
+		t.Fatalf("main help stderr=%q, want usage text", stderr)
+	}
+}
+
+func TestRunReportsCheckpointFailures(t *testing.T) {
+	root := t.TempDir()
+	dataDir := t.TempDir()
+
+	parentFile := filepath.Join(root, "not-a-directory")
+	writeTestFile(t, parentFile, "not a directory")
+
+	dataFile := filepath.Join(root, "data-file")
+	writeTestFile(t, dataFile, "not a pebble directory")
+
+	cases := []struct {
+		name       string
+		args       []string
+		wantStderr []string
+	}{
+		{
+			name:       "empty checkpoint path",
+			args:       []string{"checkpoint", dataDir, ""},
+			wantStderr: []string{"kvcheckpoint checkpoint failed:", "checkpoint path must be non-empty"},
+		},
+		{
+			name:       "checkpoint parent is file",
+			args:       []string{"checkpoint", dataDir, filepath.Join(parentFile, "checkpoint")},
+			wantStderr: []string{"kvcheckpoint checkpoint failed:", parentFile},
+		},
+		{
+			name:       "data path is file",
+			args:       []string{"checkpoint", dataFile, filepath.Join(root, "checkpoint-from-file")},
+			wantStderr: []string{"kvcheckpoint checkpoint failed:", dataFile},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireRun(t, tc.args, 1, tc.wantStderr...)
+		})
+	}
+}
+
+func TestRunReportsVerifyFailure(t *testing.T) {
+	missingCheckpoint := filepath.Join(t.TempDir(), "missing-checkpoint")
+	requireRun(t, []string{"verify", missingCheckpoint}, 1, "kvcheckpoint verify failed:", missingCheckpoint)
+}
+
+func TestRepairCommandRestoresVerifiedCheckpoint(t *testing.T) {
+	dataDir := t.TempDir()
+	checkpointDir := filepath.Join(t.TempDir(), "checkpoint")
+
+	cluster := openTestCluster(t, dataDir)
+	if err := cluster.Put([]byte("repair-key"), []byte("checkpoint-value")); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	closeCluster(t, cluster)
+
+	requireRun(t, []string{"checkpoint", dataDir, checkpointDir}, 0, "")
+
+	cluster = openTestCluster(t, dataDir)
+	if err := cluster.Put([]byte("repair-key"), []byte("mutated-live-value")); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	if err := cluster.Put([]byte("live-only-key"), []byte("live-only-value")); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	closeCluster(t, cluster)
+
+	requireRun(t, []string{"repair", dataDir, checkpointDir}, 0, "")
+
+	repaired := openTestCluster(t, dataDir)
+	defer closeCluster(t, repaired)
+	value, ok, err := repaired.Get(1, []byte("repair-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(value) != "checkpoint-value" {
+		t.Fatalf("repair-key after repair ok=%v value=%q, want checkpoint-value", ok, value)
+	}
+	_, ok, err = repaired.Get(1, []byte("live-only-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("repair preserved live-only-key; want data directory replaced by checkpoint")
 	}
 }
 
@@ -204,15 +340,24 @@ func TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData(t *testing.T) {
 	}
 }
 
-func requireRun(t *testing.T, args []string, wantExit int, wantStderr string) {
+func requireRun(t *testing.T, args []string, wantExit int, wantStderr ...string) {
 	t.Helper()
 	var stderr bytes.Buffer
 	gotExit := run(args, &stderr)
 	if gotExit != wantExit {
 		t.Fatalf("run(%v) exit=%d, want %d; stderr=%q", args, gotExit, wantExit, stderr.String())
 	}
-	if wantStderr != "" && !strings.Contains(stderr.String(), wantStderr) {
-		t.Fatalf("run(%v) stderr=%q, want to contain %q", args, stderr.String(), wantStderr)
+	for _, want := range wantStderr {
+		if want != "" && !strings.Contains(stderr.String(), want) {
+			t.Fatalf("run(%v) stderr=%q, want to contain %q", args, stderr.String(), want)
+		}
+	}
+}
+
+func writeTestFile(t *testing.T, path string, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

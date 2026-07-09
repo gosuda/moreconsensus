@@ -11,8 +11,10 @@ import (
 	kv "gosuda.org/moreconsensus/examples/kv"
 )
 
+var exitProcess = os.Exit
+
 func main() {
-	os.Exit(run(os.Args[1:], os.Stderr))
+	exitProcess(run(os.Args[1:], os.Stderr))
 }
 
 func usage(w io.Writer) {

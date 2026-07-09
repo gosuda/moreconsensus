@@ -169,6 +169,33 @@ func TestValidProposeConfChangeSetsPending(t *testing.T) {
 	}
 }
 
+func TestProposeSkipsOccupiedLocalNextInstance(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupied := InstanceRef{Replica: rn.id, Instance: rn.nextInstance, Conf: rn.q.conf.ID}
+	rn.instances[occupied] = &instance{rec: InstanceRecord{Ref: occupied}}
+
+	first, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 1}, Payload: []byte("after-occupied"), ConflictKeys: [][]byte{[]byte("skip-local-instance")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFirst := InstanceRef{Replica: occupied.Replica, Instance: occupied.Instance + 1, Conf: occupied.Conf}
+	if first != wantFirst {
+		t.Fatalf("Propose with occupied local nextInstance returned %s, want %s", first, wantFirst)
+	}
+
+	second, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 2}, Payload: []byte("after-skip"), ConflictKeys: [][]byte{[]byte("skip-local-instance-2")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecond := InstanceRef{Replica: occupied.Replica, Instance: occupied.Instance + 2, Conf: occupied.Conf}
+	if second != wantSecond {
+		t.Fatalf("Propose after skipped occupied local instance returned %s, want %s", second, wantSecond)
+	}
+}
+
 func TestProposalOwnershipCopiesCallerSlicesByDefault(t *testing.T) {
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
 	if err != nil {
