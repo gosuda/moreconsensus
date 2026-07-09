@@ -41,17 +41,19 @@ const (
 	statusLocalGoRunnerOnly = "status=local-go-runner-only"
 	capacityNonClaim        = "release_claim=none-target-environment-capacity-results-still-required"
 	incidentNonClaim        = "release_claim=none-target-environment-operator-review-still-required"
+	dataLifecycleNonClaim   = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
 )
 
 const usageText = `kvnode local Go runner (opt-in, local loopback only)
 
 Usage:
-  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|incident|capacity]
+  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|incident|capacity|data]
 
 Modes:
-  all       Build kvnode, start a disposable three-node cluster, run incident and capacity drills.
+  all       Build kvnode, start a disposable three-node cluster, run incident, capacity, and data-lifecycle drills.
   incident  Exercise /faults/storage, /faults/transport, /readyz, and /metrics locally.
   capacity  Run bounded local write/read/scan samples and write latency/resource evidence locally.
+  data      Stop one local node, checkpoint/verify/restore/repair its data offline, restart it, and verify catch-up.
 
 Required opt-in:
   KVNODE_GO_RUNNER_RUN=yes
@@ -73,12 +75,14 @@ Outputs:
   capacity-summary.txt
   capacity-latency.csv
   capacity-resources.csv
+  data-lifecycle-summary.txt
   summary.txt
 
 Non-claims:
   local loopback evidence only; not_target_environment evidence.
   ` + capacityNonClaim + `
   ` + incidentNonClaim + `
+  ` + dataLifecycleNonClaim + `
 `
 
 type runnerConfig struct {
@@ -158,13 +162,13 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg := runnerConfig{}
 	fs := flag.NewFlagSet("kvnode-local-go-runner", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all, incident, or capacity")
+	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all, incident, capacity, or data")
 	fs.StringVar(&cfg.outDir, "out-dir", os.Getenv("KVNODE_GO_RUNNER_OUT_DIR"), "evidence output directory")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
-	if cfg.mode != "all" && cfg.mode != "incident" && cfg.mode != "capacity" {
-		return cfg, fmt.Errorf("bad --mode %q: want all, incident, or capacity", cfg.mode)
+	if cfg.mode != "all" && cfg.mode != "incident" && cfg.mode != "capacity" && cfg.mode != "data" {
+		return cfg, fmt.Errorf("bad --mode %q: want all, incident, capacity, or data", cfg.mode)
 	}
 	basePort, err := envInt("KVNODE_GO_RUNNER_BASE_PORT", defaultBasePort, 1, 65000)
 	if err != nil {
@@ -297,6 +301,14 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "kvnode-local-go-runner phase=build binary=%s\n", bin)
+	var checkpointBin string
+	if cfg.mode == "all" || cfg.mode == "data" {
+		checkpointBin, err = buildKVCheckpoint(buildCtx, runDir)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "kvnode-local-go-runner phase=build checkpoint_binary=%s\n", checkpointBin)
+	}
 
 	nodes, err := startCluster(cfg, runDir, bin)
 	if err != nil {
@@ -309,7 +321,7 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 	}
 
 	client := &http.Client{Timeout: cfg.timeout}
-	var incidentRan, capacityRan bool
+	var incidentRan, capacityRan, dataRan bool
 	if cfg.mode == "all" || cfg.mode == "incident" {
 		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=incident")
 		if err := runIncidentDrill(client, cfg, runDir, nodes); err != nil {
@@ -324,7 +336,14 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 		}
 		capacityRan = true
 	}
-	if err := writeFinalSummary(runDir, cfg, incidentRan, capacityRan); err != nil {
+	if cfg.mode == "all" || cfg.mode == "data" {
+		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=data-lifecycle")
+		if err := runDataLifecycleDrill(client, cfg, runDir, nodes, bin, checkpointBin); err != nil {
+			return err
+		}
+		dataRan = true
+	}
+	if err := writeFinalSummary(runDir, cfg, incidentRan, capacityRan, dataRan); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "kvnode-local-go-runner status=pass %s run_dir=%s\n", statusLocalGoRunnerOnly, runDir)
@@ -357,6 +376,7 @@ func writeMetadata(runDir string, cfg runnerConfig) error {
 		"non_claim=not_target_environment_local_loopback_only",
 		capacityNonClaim,
 		incidentNonClaim,
+		dataLifecycleNonClaim,
 		"",
 	}, "\n")
 	return os.WriteFile(filepath.Join(runDir, "metadata.env"), []byte(content), 0o644)
@@ -376,6 +396,24 @@ func buildKVNode(ctx context.Context, runDir string) (string, error) {
 	_ = os.WriteFile(filepath.Join(runDir, "build.log"), log.Bytes(), 0o644)
 	if err != nil {
 		return "", fmt.Errorf("go build kvnode failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return bin, nil
+}
+
+func buildKVCheckpoint(ctx context.Context, runDir string) (string, error) {
+	binDir := filepath.Join(runDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return "", err
+	}
+	bin := filepath.Join(binDir, "kvcheckpoint")
+	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-buildvcs=false", "-o", bin, "./cmd/kvcheckpoint")
+	cmd.Dir = filepath.Join("examples", "kv")
+	out, err := cmd.CombinedOutput()
+	log := bytes.NewBufferString("command=go build -trimpath -buildvcs=false -o <run-dir>/bin/kvcheckpoint ./cmd/kvcheckpoint\n")
+	log.Write(out)
+	_ = os.WriteFile(filepath.Join(runDir, "build-kvcheckpoint.log"), log.Bytes(), 0o644)
+	if err != nil {
+		return "", fmt.Errorf("go build kvcheckpoint failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return bin, nil
 }
@@ -404,25 +442,7 @@ func startCluster(cfg runnerConfig, runDir, bin string) ([]*nodeProcess, error) 
 			stopCluster(nodes)
 			return nil, err
 		}
-		logFile, err := os.Create(node.logPath)
-		if err != nil {
-			stopCluster(nodes)
-			return nil, err
-		}
-		node.logFile = logFile
-		node.cmd = exec.Command(bin,
-			"-id", strconv.Itoa(id),
-			"-listen", fmt.Sprintf("127.0.0.1:%d", cfg.basePort+id),
-			"-peer-listen", fmt.Sprintf("127.0.0.1:%d", cfg.peerBasePort+id),
-			"-admin-listen", fmt.Sprintf("127.0.0.1:%d", cfg.adminBasePort+id),
-			"-data", node.dataDir,
-			"-peers", peers,
-			"-request-deadline-ms", strconv.Itoa(int(cfg.timeout/time.Millisecond)),
-			"-peer-deadline-ms", strconv.Itoa(int((cfg.timeout/2)/time.Millisecond)),
-		)
-		node.cmd.Stdout = logFile
-		node.cmd.Stderr = logFile
-		if err := node.cmd.Start(); err != nil {
+		if err := startNodeProcess(cfg, node, bin, peers); err != nil {
 			stopCluster(nodes)
 			return nil, err
 		}
@@ -439,20 +459,54 @@ func peerArg(cfg runnerConfig) string {
 	return strings.Join(parts, ",")
 }
 
+func startNodeProcess(cfg runnerConfig, node *nodeProcess, bin, peers string) error {
+	logFile, err := os.OpenFile(node.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	node.logFile = logFile
+	node.cmd = exec.Command(bin,
+		"-id", strconv.Itoa(node.id),
+		"-listen", strings.TrimPrefix(node.clientURL, "http://"),
+		"-peer-listen", strings.TrimPrefix(node.peerURL, "http://"),
+		"-admin-listen", strings.TrimPrefix(node.adminURL, "http://"),
+		"-data", node.dataDir,
+		"-peers", peers,
+		"-request-deadline-ms", strconv.Itoa(int(cfg.timeout/time.Millisecond)),
+		"-peer-deadline-ms", strconv.Itoa(int((cfg.timeout/2)/time.Millisecond)),
+	)
+	node.cmd.Stdout = logFile
+	node.cmd.Stderr = logFile
+	if err := node.cmd.Start(); err != nil {
+		_ = logFile.Close()
+		node.logFile = nil
+		node.cmd = nil
+		return err
+	}
+	return nil
+}
+
 func waitClusterReady(cfg runnerConfig, nodes []*nodeProcess) error {
-	client := &http.Client{Timeout: cfg.timeout}
 	for _, node := range nodes {
-		if err := eventually(cfg.readyAttempts, 100*time.Millisecond, func() error {
-			if processExited(node) {
-				return fmt.Errorf("node %d exited before ready; see %s", node.id, node.logPath)
-			}
-			if err := expectStatus(client, http.MethodGet, node.adminURL+"/health", nil, http.StatusOK); err != nil {
-				return err
-			}
-			return expectStatus(client, http.MethodGet, node.adminURL+"/readyz", nil, http.StatusOK)
-		}); err != nil {
-			return fmt.Errorf("node %d readiness timeout: %w", node.id, err)
+		if err := waitNodeReady(cfg, node); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func waitNodeReady(cfg runnerConfig, node *nodeProcess) error {
+	client := &http.Client{Timeout: cfg.timeout}
+	if err := eventually(cfg.readyAttempts, 100*time.Millisecond, func() error {
+		if processExited(node) {
+			return fmt.Errorf("node %d exited before ready; see %s", node.id, node.logPath)
+		}
+		if err := expectStatus(client, http.MethodGet, node.adminURL+"/health", nil, http.StatusOK); err != nil {
+			return err
+		}
+		return expectStatus(client, http.MethodGet, node.adminURL+"/readyz", nil, http.StatusOK)
+	}); err != nil {
+		return fmt.Errorf("node %d readiness timeout: %w", node.id, err)
 	}
 	return nil
 }
@@ -466,30 +520,148 @@ func processExited(node *nodeProcess) bool {
 
 func stopCluster(nodes []*nodeProcess) {
 	for _, node := range nodes {
-		if node == nil || node.cmd == nil || node.cmd.Process == nil {
-			continue
-		}
-		_ = node.cmd.Process.Signal(os.Interrupt)
+		_ = stopNode(node)
 	}
-	for _, node := range nodes {
-		if node == nil || node.cmd == nil {
-			continue
-		}
-		done := make(chan error, 1)
-		go func(cmd *exec.Cmd) { done <- cmd.Wait() }(node.cmd)
-		waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		select {
-		case <-done:
-			cancel()
-		case <-waitCtx.Done():
-			cancel()
-			_ = node.cmd.Process.Kill()
-			<-done
-		}
-		if node.logFile != nil {
+}
+
+func stopNode(node *nodeProcess) error {
+	if node == nil || node.cmd == nil {
+		if node != nil && node.logFile != nil {
 			_ = node.logFile.Close()
+			node.logFile = nil
+		}
+		return nil
+	}
+	cmd := node.cmd
+	if cmd.Process != nil && cmd.ProcessState == nil {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			_ = cmd.Process.Kill()
 		}
 	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	select {
+	case err := <-done:
+		cancel()
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			// Deliberate stops can report a signal exit even after a clean
+			// interrupt path; accept ExitError here and reserve errors for wait
+			// failures that are not process exits.
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
+				break
+			}
+			return err
+		}
+	case <-waitCtx.Done():
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+	}
+	if node.logFile != nil {
+		_ = node.logFile.Close()
+		node.logFile = nil
+	}
+	node.cmd = nil
+	return nil
+}
+
+func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess, kvnodeBin, checkpointBin string) error {
+	lifecycleDir := filepath.Join(runDir, "data-lifecycle")
+	if err := os.MkdirAll(lifecycleDir, 0o755); err != nil {
+		return err
+	}
+	beforeKey := "go-runner-data-before"
+	beforeValue := []byte("data-lifecycle-before")
+	if err := putValue(client, nodes[0], beforeKey, beforeValue); err != nil {
+		return err
+	}
+	if err := assertValueOnAll(client, cfg, nodes, beforeKey, beforeValue); err != nil {
+		return err
+	}
+
+	target := nodes[1]
+	checkpointDir := filepath.Join(lifecycleDir, "node-2-checkpoint")
+	if err := stopNode(target); err != nil {
+		return err
+	}
+	if err := runDataLifecycleCommand(lifecycleDir, "checkpoint", checkpointBin, "checkpoint", target.dataDir, checkpointDir); err != nil {
+		return err
+	}
+	if err := runDataLifecycleCommand(lifecycleDir, "verify", checkpointBin, "verify", checkpointDir); err != nil {
+		return err
+	}
+	peers := peerArg(cfg)
+	if err := runDataLifecycleCommand(lifecycleDir, "restore", checkpointBin, "restore", target.dataDir, checkpointDir); err != nil {
+		return err
+	}
+	if err := startNodeProcess(cfg, target, kvnodeBin, peers); err != nil {
+		return err
+	}
+	if err := waitNodeReady(cfg, target); err != nil {
+		return err
+	}
+	if err := assertValueOnAll(client, cfg, nodes, beforeKey, beforeValue); err != nil {
+		return err
+	}
+
+	afterKey := "go-runner-data-after-restore"
+	afterValue := []byte("data-lifecycle-after-restore")
+	if err := putValue(client, nodes[2], afterKey, afterValue); err != nil {
+		return err
+	}
+	if err := assertValueOnAll(client, cfg, nodes, afterKey, afterValue); err != nil {
+		return err
+	}
+
+	if err := stopNode(target); err != nil {
+		return err
+	}
+	if err := runDataLifecycleCommand(lifecycleDir, "repair", checkpointBin, "repair", target.dataDir, checkpointDir); err != nil {
+		return err
+	}
+	if err := startNodeProcess(cfg, target, kvnodeBin, peers); err != nil {
+		return err
+	}
+	if err := waitNodeReady(cfg, target); err != nil {
+		return err
+	}
+	if err := assertValueOnAll(client, cfg, nodes, beforeKey, beforeValue); err != nil {
+		return err
+	}
+	if err := assertValueOnAll(client, cfg, nodes, afterKey, afterValue); err != nil {
+		return err
+	}
+
+	summary := strings.Join([]string{
+		statusLocalGoRunnerOnly,
+		"data_lifecycle=offline-checkpoint-verify-restore-repair",
+		"checkpoint=verified",
+		"restore=stopped-node-restored-and-restarted",
+		"repair=stopped-node-repaired-from-verified-checkpoint-and-restarted",
+		"canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair",
+		dataLifecycleNonClaim,
+		"",
+	}, "\n")
+	return os.WriteFile(filepath.Join(runDir, "data-lifecycle-summary.txt"), []byte(summary), 0o644)
+}
+
+func runDataLifecycleCommand(dir, label, bin string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	out, err := cmd.CombinedOutput()
+	log := bytes.NewBufferString("command=" + filepath.Base(bin) + " " + strings.Join(args, " ") + "\n")
+	log.Write(out)
+	if writeErr := os.WriteFile(filepath.Join(dir, label+".log"), log.Bytes(), 0o644); writeErr != nil {
+		return writeErr
+	}
+	if err != nil {
+		return fmt.Errorf("kvcheckpoint %s failed: %w: %s", label, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func runIncidentDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess) error {
@@ -736,13 +908,14 @@ func percentile(sorted []float64, pct float64) float64 {
 	return sorted[idx]
 }
 
-func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan bool) error {
+func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan, dataRan bool) error {
 	lines := []string{
 		statusLocalGoRunnerOnly,
 		"mode=" + cfg.mode,
 		"peer_count=3",
 		"incident_ran=" + strconv.FormatBool(incidentRan),
 		"capacity_ran=" + strconv.FormatBool(capacityRan),
+		"data_lifecycle_ran=" + strconv.FormatBool(dataRan),
 		"non_claim=not_target_environment_local_loopback_only",
 	}
 	if capacityRan {
@@ -750,6 +923,9 @@ func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan
 	}
 	if incidentRan {
 		lines = append(lines, incidentNonClaim)
+	}
+	if dataRan {
+		lines = append(lines, dataLifecycleNonClaim)
 	}
 	lines = append(lines, "")
 	return os.WriteFile(filepath.Join(runDir, "summary.txt"), []byte(strings.Join(lines, "\n")), 0o644)

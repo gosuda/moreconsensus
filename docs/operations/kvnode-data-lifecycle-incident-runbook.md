@@ -316,6 +316,26 @@ Evidence to retain:
 - Per-process `kvnode` logs showing stop, storage remove, restore, restart, and health check.
 
 
+## Local data lifecycle drill
+
+The build-tagged Go runner includes a local loopback data-lifecycle drill for the offline helper path. It starts a disposable three-node `kvnode` cluster, writes a pre-checkpoint canary, stops node 2 before opening its Pebble directory, runs `kvcheckpoint checkpoint`, `kvcheckpoint verify`, `kvcheckpoint restore`, restarts node 2, writes a post-restore canary, stops node 2 again, runs `kvcheckpoint repair`, restarts node 2, and verifies both canaries from all three client listeners.
+
+Local data lifecycle command:
+
+```sh
+KVNODE_GO_RUNNER_RUN=yes KVNODE_GO_RUNNER_MODE=data \
+  go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode data \
+  2>&1 | tee "${EVIDENCE_DIR}/go-runner-data-lifecycle-local.txt"
+```
+
+This is local loopback evidence only. The generated `data-lifecycle-summary.txt`, `checkpoint.log`, `verify.log`, `restore.log`, `repair.log`, and final `summary.txt` should be retained with the transcript. The summary includes `status=local-go-runner-only`, `data_lifecycle=offline-checkpoint-verify-restore-repair`, and `release_claim=none-target-environment-data-lifecycle-drill-still-required`; it does not replace a reviewed target-environment backup/restore/disaster-recovery drill.
+
+Evidence to retain:
+
+- `metadata.env`, `data-lifecycle-summary.txt`, `summary.txt`, and the four helper logs from the script evidence directory.
+- The full runner transcript, including the preserved `run_dir`.
+- Confirmation that the drill used the disposable runner data directory only and stopped the selected node before each offline `kvcheckpoint` operation.
+
 ## Local incident tabletop drill
 
 The repository includes a local loopback tabletop harness for the test-fault branches of the storage-failure and network-partition procedures. It starts a disposable three-node `kvnode` cluster, captures admin evidence files, injects and clears one storage fault plus bidirectional transport drops around one node, and verifies post-clear client canaries on all nodes.

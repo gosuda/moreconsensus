@@ -140,6 +140,20 @@ fi
 require_text "$local_runner" "status=local-go-runner-only"
 require_text "$local_runner" "none-target-environment-capacity-results-still-required"
 require_text "$local_runner" "none-target-environment-operator-review-still-required"
+require_text "$local_runner" "[--mode all|incident|capacity|data]"
+require_text "$local_runner" 'data      Stop one local node, checkpoint/verify/restore/repair its data offline, restart it, and verify catch-up.'
+require_text "$local_runner" "data-lifecycle-summary.txt"
+require_text "$local_runner" "buildKVCheckpoint"
+require_text "$local_runner" "./cmd/kvcheckpoint"
+require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "checkpoint"'
+require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "verify"'
+require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "restore"'
+require_text "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"'
+require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
+require_text "$local_runner" "restore=stopped-node-restored-and-restarted"
+require_text "$local_runner" "repair=stopped-node-repaired-from-verified-checkpoint-and-restarted"
+require_text "$local_runner" "canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair"
+require_text "$local_runner" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
 require_text "$local_runner" "go build"
 require_text "$local_runner" "/faults/storage"
 require_text "$local_runner" "/faults/transport"
@@ -187,6 +201,10 @@ require_text "$runbook" "## Incident response: recovery stalls"
 require_text "$runbook" "## Local incident tabletop drill"
 require_text "$runbook" "tests/kvnode_incident_tabletop_drill.sh"
 require_text "$runbook" "status=local-tabletop-only"
+require_text "$runbook" "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode data"
+require_text "$runbook" "data-lifecycle-summary.txt"
+require_text "$runbook" 'stops node 2 before opening its Pebble directory, runs `kvcheckpoint checkpoint`, `kvcheckpoint verify`, `kvcheckpoint restore`, restarts node 2'
+require_text "$runbook" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
 require_text "$runbook" "operator review"
 require_text "$runbook" "No one performed automatic in-place repair, checksum recomputation, corrupt-record deletion, or synthesized reconstruction without a verified checkpoint under this runbook."
 
