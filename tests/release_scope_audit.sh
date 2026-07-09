@@ -271,6 +271,8 @@ require_text "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --
 require_text "measured target-environment capacity results remain open"
 require_text "release_claim=none-target-environment-capacity-results-still-required"
 require_text "target-environment capacity measurement remains open"
+require_text 'bounded single-line `environment_label` and `workload_label` provenance fields'
+require_text 'defaulting provenance to `environment_label=local-loopback` and `workload_label=local-capacity-drill`'
 require_text "also locally exercised \`/faults/storage\`, \`/faults/transport\`, \`/readyz\`, \`/metrics\`"
 require_text "three-node local wrapper sample"
 require_text "locally rehearses the storage-failure and network-partition"

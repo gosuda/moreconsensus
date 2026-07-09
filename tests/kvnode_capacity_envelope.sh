@@ -31,6 +31,9 @@ Common inputs:
   KVNODE_CAPACITY_OUT_DIR         Output directory.
                                   Default: <tmp>/kvnode-capacity-envelope-<timestamp>
   KVNODE_CAPACITY_TIMEOUT_SECONDS curl per-request timeout. Default: 5
+  KVNODE_CAPACITY_ENVIRONMENT_LABEL
+                                  Single-line environment label. Default: unspecified
+  KVNODE_CAPACITY_WORKLOAD_LABEL  Single-line workload label. Default: unspecified
 
 Optional resource inputs:
   KVNODE_PIDS                     Comma-separated kvnode PIDs for RSS samples.
@@ -106,6 +109,24 @@ bounded_int() {
   fi
 }
 
+label_value() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    echo "$name must not be empty" >&2
+    exit 2
+  fi
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *"="* ]]; then
+    echo "$name must be a single line without =" >&2
+    exit 2
+  fi
+  if (( ${#value} > 128 )); then
+    echo "$name must be <= 128 characters" >&2
+    exit 2
+  fi
+  printf '%s' "$value"
+}
+
 trim_trailing_slash() {
   local raw="$1"
   raw="${raw%/}"
@@ -120,6 +141,8 @@ ops_per_phase="${KVNODE_CAPACITY_OPS_PER_PHASE:-30}"
 timeout_seconds="${KVNODE_CAPACITY_TIMEOUT_SECONDS:-5}"
 max_value_bytes="${KVNODE_CAPACITY_MAX_VALUE_BYTES:-65536}"
 max_scan_limit="${KVNODE_CAPACITY_MAX_SCAN_LIMIT:-10000}"
+environment_label="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-unspecified}")"
+workload_label="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-unspecified}")"
 
 bounded_int KVNODE_CAPACITY_OPS_PER_PHASE "$ops_per_phase" 1000
 bounded_int KVNODE_CAPACITY_TIMEOUT_SECONDS "$timeout_seconds" 300
@@ -182,6 +205,8 @@ peer_count="${KVNODE_PEER_COUNT:-${#CLIENT_URLS[@]}}"
 cat > "$METADATA_ENV" <<EOF
 status=harness-only
 release_claim=none-target-environment-capacity-results-still-required
+environment_label=$environment_label
+workload_label=$workload_label
 run_id=$run_id
 client_urls=$client_urls_raw
 admin_urls=$admin_urls_raw
@@ -321,6 +346,8 @@ Release claim: release_claim=none-target-environment-capacity-results-still-requ
 - Run ID: $run_id
 - Client URLs: $client_urls_raw
 - Admin URLs: $admin_urls_raw
+- Environment label: $environment_label
+- Workload label: $workload_label
 - Peer-count label: $peer_count
 - Operations per value-size phase: $ops_per_phase
 - Value sizes requested: $value_sizes_raw bytes

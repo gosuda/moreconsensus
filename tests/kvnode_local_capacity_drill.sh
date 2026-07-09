@@ -30,6 +30,8 @@ Capacity harness defaults for this wrapper:
   KVNODE_CAPACITY_OPS_PER_PHASE          Default: 5
   KVNODE_CAPACITY_VALUE_BYTES            Default: 64,1024
   KVNODE_CAPACITY_SCAN_LIMITS            Default: 1,8
+  KVNODE_CAPACITY_ENVIRONMENT_LABEL      Default: local-loopback
+  KVNODE_CAPACITY_WORKLOAD_LABEL         Default: local-capacity-drill
 
 Example:
   KVNODE_LOCAL_CAPACITY_RUN=yes tests/kvnode_local_capacity_drill.sh
@@ -67,6 +69,21 @@ port_base() {
   fi
 }
 
+label_value() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    fail "$name-must-not-be-empty"
+  fi
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *"="* ]]; then
+    fail "$name-must-be-single-line-without-equals"
+  fi
+  if (( ${#value} > 128 )); then
+    fail "$name-too-long"
+  fi
+  printf '%s' "$value"
+}
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   usage
   exit 0
@@ -90,6 +107,8 @@ PEER_BASE_PORT="${KVNODE_LOCAL_CAPACITY_PEER_BASE_PORT:-25180}"
 ADMIN_BASE_PORT="${KVNODE_LOCAL_CAPACITY_ADMIN_BASE_PORT:-25280}"
 READY_ATTEMPTS="${KVNODE_LOCAL_CAPACITY_READY_ATTEMPTS:-120}"
 CURL_TIMEOUT_SECONDS="${KVNODE_LOCAL_CAPACITY_CURL_TIMEOUT:-5}"
+ENVIRONMENT_LABEL="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-local-loopback}")"
+WORKLOAD_LABEL="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-local-capacity-drill}")"
 
 port_base KVNODE_LOCAL_CAPACITY_BASE_PORT "$BASE_PORT"
 port_base KVNODE_LOCAL_CAPACITY_PEER_BASE_PORT "$PEER_BASE_PORT"
@@ -228,6 +247,8 @@ run_dir=$RUN_DIR
 capacity_dir=$CAPACITY_DIR
 non_claim=not_target_environment_capacity_evidence
 release_claim=none-target-environment-capacity-results-still-required
+environment_label=$ENVIRONMENT_LABEL
+workload_label=$WORKLOAD_LABEL
 EOF
 
 echo "kvnode-local-capacity phase=build"
@@ -251,6 +272,8 @@ KVNODE_ADMIN_URLS="$(admin_urls)" \
 KVNODE_DATA_DIRS="$(data_dirs)" \
 KVNODE_PIDS="$(pids_csv)" \
 KVNODE_PEER_COUNT=3 \
+KVNODE_CAPACITY_ENVIRONMENT_LABEL="$ENVIRONMENT_LABEL" \
+KVNODE_CAPACITY_WORKLOAD_LABEL="$WORKLOAD_LABEL" \
 KVNODE_CAPACITY_OPS_PER_PHASE="${KVNODE_CAPACITY_OPS_PER_PHASE:-5}" \
 KVNODE_CAPACITY_VALUE_BYTES="${KVNODE_CAPACITY_VALUE_BYTES:-64,1024}" \
 KVNODE_CAPACITY_SCAN_LIMITS="${KVNODE_CAPACITY_SCAN_LIMITS:-1,8}" \
@@ -262,6 +285,8 @@ cat > "$RUN_DIR/summary.txt" <<EOF
 status=local-loopback-only
 capacity_dir=$CAPACITY_DIR
 peer_count=3
+environment_label=$ENVIRONMENT_LABEL
+workload_label=$WORKLOAD_LABEL
 release_claim=none-target-environment-capacity-results-still-required
 EOF
 

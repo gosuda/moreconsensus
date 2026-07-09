@@ -247,10 +247,20 @@ require_text "$capacity" "Refusing to run without KVNODE_CAPACITY_RUN=yes."
 require_text "$capacity" "Default: 30, max: 1000"
 require_text "$capacity" "Default: 64,1024,4096"
 require_text "$capacity" "Default: 1,16,128"
+require_text "$capacity" "KVNODE_CAPACITY_ENVIRONMENT_LABEL"
+require_text "$capacity" "Single-line environment label. Default: unspecified"
+require_text "$capacity" "KVNODE_CAPACITY_WORKLOAD_LABEL"
+require_text "$capacity" "Single-line workload label. Default: unspecified"
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_OPS_PER_PHASE "$ops_per_phase" 1000'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_TIMEOUT_SECONDS "$timeout_seconds" 300'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_MAX_VALUE_BYTES "$max_value_bytes" 1048576'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_MAX_SCAN_LIMIT "$max_scan_limit" 100000'
+require_text "$capacity" "label_value()"
+require_text "$capacity" 'environment_label="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-unspecified}")"'
+require_text "$capacity" 'workload_label="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-unspecified}")"'
+require_text "$capacity" '$name must not be empty'
+require_text "$capacity" '$name must be a single line without ='
+require_text "$capacity" '$name must be <= 128 characters'
 require_text "$capacity" "metadata.env                    Harness inputs and peer-count label."
 require_text "$capacity" "latency.csv                     operation,http_status,seconds rows."
 require_text "$capacity" "resources.csv                   before/after RSS, disk, queue-depth samples."
@@ -258,8 +268,12 @@ require_text "$capacity" "summary.md                      Machine-generated samp
 require_text "$capacity" "not production capacity evidence"
 require_text "$capacity" "status=harness-only"
 require_text "$capacity" "release_claim=none-target-environment-capacity-results-still-required"
+require_text "$capacity" 'environment_label=$environment_label'
+require_text "$capacity" 'workload_label=$workload_label'
 require_text "$capacity" "latency_summary="
 require_text "$capacity" "Throughput sample:"
+require_text "$capacity" '- Environment label: $environment_label'
+require_text "$capacity" '- Workload label: $workload_label'
 require_text "$capacity" "Memory RSS samples:"
 require_text "$capacity" "Disk growth samples:"
 require_text "$capacity" "Queue-depth samples:"
@@ -271,6 +285,14 @@ require_text "$local_capacity" "kvnode local capacity loopback drill (opt-in, bo
 require_text "$local_capacity" "KVNODE_LOCAL_CAPACITY_RUN=yes"
 require_text "$local_capacity" "Refusing to run without KVNODE_LOCAL_CAPACITY_RUN=yes."
 require_text "$local_capacity" "KVNODE_CAPACITY_RUN=yes"
+require_text "$local_capacity" "KVNODE_CAPACITY_ENVIRONMENT_LABEL      Default: local-loopback"
+require_text "$local_capacity" "KVNODE_CAPACITY_WORKLOAD_LABEL         Default: local-capacity-drill"
+require_text "$local_capacity" 'ENVIRONMENT_LABEL="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-local-loopback}")"'
+require_text "$local_capacity" 'WORKLOAD_LABEL="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-local-capacity-drill}")"'
+require_text "$local_capacity" 'KVNODE_CAPACITY_ENVIRONMENT_LABEL="$ENVIRONMENT_LABEL" \'
+require_text "$local_capacity" 'KVNODE_CAPACITY_WORKLOAD_LABEL="$WORKLOAD_LABEL" \'
+require_text "$local_capacity" 'environment_label=$ENVIRONMENT_LABEL'
+require_text "$local_capacity" 'workload_label=$WORKLOAD_LABEL'
 require_text "$local_capacity" "KVNODE_PEER_COUNT=3"
 require_text "$local_capacity" "status=local-loopback-only"
 require_text "$local_capacity" "not_target_environment_capacity_evidence"
