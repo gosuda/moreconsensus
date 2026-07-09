@@ -40,11 +40,15 @@ const (
 	defaultEnvironmentLabel = "local-loopback"
 	defaultWorkloadLabel    = "local-go-runner"
 
-	statusLocalGoRunnerOnly = "status=local-go-runner-only"
-	deploymentNonClaim      = "release_claim=none-target-environment-deployment-manifest-still-required"
-	capacityNonClaim        = "release_claim=none-target-environment-capacity-results-still-required"
-	incidentNonClaim        = "release_claim=none-target-environment-operator-review-still-required"
-	dataLifecycleNonClaim   = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+	statusLocalGoRunnerOnly    = "status=local-go-runner-only"
+	deploymentNonClaim         = "release_claim=none-target-environment-deployment-manifest-still-required"
+	capacityNonClaim           = "release_claim=none-target-environment-capacity-results-still-required"
+	incidentNonClaim           = "release_claim=none-target-environment-operator-review-still-required"
+	dataLifecycleNonClaim      = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+	dataLifecycleOperations    = "checkpoint,verify,restore,repair"
+	dataLifecycleEvidenceFiles = "metadata.env,summary.txt,data-lifecycle-summary.txt," +
+		"data-lifecycle/checkpoint.log,data-lifecycle/verify.log,data-lifecycle/restore.log,data-lifecycle/repair.log," +
+		"data-lifecycle/checkpoint-report.env,data-lifecycle/verify-report.env,data-lifecycle/restore-report.env,data-lifecycle/repair-report.env"
 
 	deploymentRequestDeadlineMS  = 5000
 	deploymentPeerDeadlineMS     = 2000
@@ -859,37 +863,50 @@ func runDataLifecycleDrill(client *http.Client, cfg runnerConfig, runDir string,
 		return err
 	}
 
-	lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, reports)
+	runID := filepath.Base(runDir)
+	lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, runID, target.id, reports)
 	if err := os.WriteFile(filepath.Join(runDir, "data-lifecycle-summary.txt"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
 		return err
 	}
 	if cfg.dataLifecycleReport != "" {
-		if err := writeDataLifecycleReport(cfg.dataLifecycleReport, reports); err != nil {
+		if err := writeDataLifecycleReport(cfg.dataLifecycleReport, runID, target.id, reports); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func dataLifecycleEvidenceLines(status string, reports []string) []string {
+func dataLifecycleEvidenceLines(status, runID string, stoppedNodeID int, reports []string) []string {
 	return []string{
 		status,
+		"run_id=" + runID,
+		"peer_count=3",
+		"stopped_node_id=" + strconv.Itoa(stoppedNodeID),
 		"data_lifecycle=offline-checkpoint-verify-restore-repair",
+		"helper_operations=" + dataLifecycleOperations,
 		"checkpoint=verified",
+		"checkpoint_report=checkpoint-report.env",
+		"verify_report=verify-report.env",
+		"restore_report=restore-report.env",
+		"repair_report=repair-report.env",
 		"reports=" + strings.Join(reports, ","),
 		"restore=stopped-node-restored-and-restarted",
 		"repair=stopped-node-repaired-from-verified-checkpoint-and-restarted",
+		"pre_checkpoint_canary=go-runner-data-before-visible-on-all-nodes",
+		"post_restore_canary=go-runner-data-after-restore-visible-on-all-nodes",
+		"post_repair_canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes",
 		"canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair",
+		"evidence_files=" + dataLifecycleEvidenceFiles,
 		dataLifecycleNonClaim,
 		"",
 	}
 }
 
-func writeDataLifecycleReport(reportPath string, reports []string) error {
+func writeDataLifecycleReport(reportPath, runID string, stoppedNodeID int, reports []string) error {
 	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
 		return err
 	}
-	lines := dataLifecycleEvidenceLines("status=example-operator-report", reports)
+	lines := dataLifecycleEvidenceLines("status=example-operator-report", runID, stoppedNodeID, reports)
 	lines = append(lines[:1], append([]string{"artifact=data-lifecycle-drill"}, lines[1:]...)...)
 	content := strings.Join(lines, "\n")
 	if err := os.WriteFile(reportPath, []byte(content), 0o600); err != nil {

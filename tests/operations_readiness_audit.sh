@@ -124,6 +124,26 @@ require_local_runner_lifecycle_reports() {
   require_text "$local_runner" '"reports=" + strings.Join(reports, ",")'
   require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
   require_text "$local_runner" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+  require_text "$local_runner" 'target := nodes[1]'
+  require_text "$local_runner" 'runID := filepath.Base(runDir)'
+  require_text "$local_runner" 'lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, runID, target.id, reports)'
+  require_text "$local_runner" 'func dataLifecycleEvidenceLines(status, runID string, stoppedNodeID int, reports []string) []string {'
+  require_text "$local_runner" '"run_id=" + runID'
+  require_text "$local_runner" '"peer_count=3"'
+  require_text "$local_runner" '"stopped_node_id=" + strconv.Itoa(stoppedNodeID)'
+  require_text "$local_runner" '"helper_operations=" + dataLifecycleOperations'
+  require_text "$local_runner" 'dataLifecycleOperations    = "checkpoint,verify,restore,repair"'
+  require_text "$local_runner" '"checkpoint_report=checkpoint-report.env"'
+  require_text "$local_runner" '"verify_report=verify-report.env"'
+  require_text "$local_runner" '"restore_report=restore-report.env"'
+  require_text "$local_runner" '"repair_report=repair-report.env"'
+  require_text "$local_runner" '"pre_checkpoint_canary=go-runner-data-before-visible-on-all-nodes"'
+  require_text "$local_runner" '"post_restore_canary=go-runner-data-after-restore-visible-on-all-nodes"'
+  require_text "$local_runner" '"post_repair_canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes"'
+  require_text "$local_runner" '"evidence_files=" + dataLifecycleEvidenceFiles'
+  require_text "$local_runner" '"metadata.env,summary.txt,data-lifecycle-summary.txt," +'
+  require_text "$local_runner" '"data-lifecycle/checkpoint.log,data-lifecycle/verify.log,data-lifecycle/restore.log,data-lifecycle/repair.log," +'
+  require_text "$local_runner" '"data-lifecycle/checkpoint-report.env,data-lifecycle/verify-report.env,data-lifecycle/restore-report.env,data-lifecycle/repair-report.env"'
   require_occurrences "$local_runner" "reports = append(reports, filepath.Base(report))" 3
   require_occurrences "$local_runner" "reports := []string{filepath.Base(report)}" 1
 
@@ -137,7 +157,7 @@ require_local_runner_lifecycle_reports() {
     echo "local runner data-lifecycle report list drifted: $observed_report_list" >&2
     exit 1
   fi
-  require_text_before "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"' 'lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, reports)'
+  require_text_before "$local_runner" 'runDataLifecycleCommand(lifecycleDir, "repair"' 'lines := dataLifecycleEvidenceLines(statusLocalGoRunnerOnly, runID, target.id, reports)'
   require_text_before "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {' 'return reportPath, nil'
 }
 
@@ -158,13 +178,21 @@ require_local_runner_consolidated_data_lifecycle_report() {
   require_text "$local_runner" "data_lifecycle=offline-checkpoint-verify-restore-repair"
   require_text "$local_runner" "checkpoint=verified"
   require_text "$local_runner" '"reports=" + strings.Join(reports, ",")'
-  require_text "$local_runner" 'dataLifecycleEvidenceLines("status=example-operator-report", reports)'
+  require_text "$local_runner" 'dataLifecycleEvidenceLines("status=example-operator-report", runID, stoppedNodeID, reports)'
+  require_text "$local_runner" 'lines = append(lines[:1], append([]string{"artifact=data-lifecycle-drill"}, lines[1:]...)...)'
+  require_text "$local_runner" 'content := strings.Join(lines, "\n")'
+  require_text_before "$local_runner" 'dataLifecycleEvidenceLines("status=example-operator-report", runID, stoppedNodeID, reports)' 'content := strings.Join(lines, "\n")'
   require_text "$local_runner" "restore=stopped-node-restored-and-restarted"
   require_text "$local_runner" "repair=stopped-node-repaired-from-verified-checkpoint-and-restarted"
   require_text "$local_runner" "canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair"
   require_text "$local_runner" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
   require_text "$local_runner" 'os.WriteFile(reportPath, []byte(content), 0o600)'
   require_text "$local_runner" 'os.Chmod(reportPath, 0o600)'
+  require_text "$local_runner" 'func writeDataLifecycleReport(reportPath, runID string, stoppedNodeID int, reports []string) error {'
+  require_text "$local_runner" 'writeDataLifecycleReport(cfg.dataLifecycleReport, runID, target.id, reports)'
+  require_text_between "$local_runner" 'if err := writeDataLifecycleReport(cfg.dataLifecycleReport, runID, target.id, reports); err != nil {' 'return err' 'func dataLifecycleEvidenceLines'
+  require_text "$local_runner" 'if err := os.WriteFile(reportPath, []byte(content), 0o600); err != nil {'
+  require_text_between "$local_runner" 'if err := os.WriteFile(reportPath, []byte(content), 0o600); err != nil {' 'return err' 'return os.Chmod(reportPath, 0o600)'
 
   for text in \
     "KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT" \
