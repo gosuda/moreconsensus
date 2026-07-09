@@ -96,6 +96,46 @@ require_local_runner_lifecycle_reports() {
   require_text_before "$local_runner" 'if err := requireDataLifecycleReport(reportPath, label); err != nil {' 'return reportPath, nil'
 }
 
+require_local_runner_deployment_manifest() {
+  local runner_help_output="$1"
+  local expected_launch_defaults="launch_defaults=request_deadline_ms=5000,peer_deadline_ms=2000,max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000"
+  local text
+
+  require_text "$local_runner" "deployment"
+  require_text "$local_runner" "[--mode all|deployment|incident|capacity|data]"
+  require_text "$local_runner" "deployment  Run the static systemd manifest audit, start a local direct-args cluster with manifest example defaults, and write deployment non-claim evidence."
+  require_text "$local_runner" "deployment-manifest-summary.txt"
+  require_text "$local_runner" "systemd-manifest-report.env"
+  require_text "$local_runner" "systemd-manifest-audit.log"
+  require_text "$local_runner" 'cmd := exec.Command("bash", "tests/kvnode_systemd_manifest_audit.sh")'
+  require_text "$local_runner" '"KVNODE_SYSTEMD_MANIFEST_REPORT="+reportPath'
+  require_text "$local_runner" "systemd_manifest_audit=passed"
+  require_text "$local_runner" "manifest_report=systemd-manifest-report.env"
+  require_text "$local_runner" "launch_path=direct-local-runner-args"
+  require_text "$local_runner" "$expected_launch_defaults"
+  require_text "$local_runner" "canary=deployment-manifest-value-visible-on-all-nodes"
+  require_text "$local_runner" "non_claim=local-static-render-plus-loopback-process-check-only"
+  require_text "$local_runner" "deployment_manifest_ran="
+  require_text "$local_runner" "release_claim=none-target-environment-deployment-manifest-still-required"
+
+  if LC_ALL=C grep -Eiq 'target[-_ ]environment[-_ ]deployment[-_ ](proof|proved|verified|passed|complete|ready)|production[-_ ]deployment[-_ ](proof|proved|verified|passed|complete|ready)|release_claim=target[-_ ]environment[-_ ]deployment|deployment[_-]proof' "$local_runner"; then
+    echo "kvnode local Go runner must not imply target-environment deployment proof" >&2
+    exit 1
+  fi
+
+  for text in \
+    "deployment" \
+    "deployment-manifest-summary.txt" \
+    "systemd-manifest-report.env" \
+    "systemd-manifest-audit.log" \
+    "release_claim=none-target-environment-deployment-manifest-still-required"; do
+    if [[ "$runner_help_output" != *"$text"* ]]; then
+      echo "missing kvnode local Go runner help output: $text" >&2
+      exit 1
+    fi
+  done
+}
+
 require_local_runner_capacity_labels() {
   require_text "$local_runner" "KVNODE_GO_RUNNER_ENVIRONMENT_LABEL   Single-line environment label. Default: local-loopback."
   require_text "$local_runner" "KVNODE_GO_RUNNER_WORKLOAD_LABEL      Single-line workload label. Default: local-go-runner."
@@ -275,9 +315,13 @@ require_text "$incident_drill" "release_claim=none-target-environment-operator-r
 bash -n "$incident_drill"
 
 # Local Go runner: build-tagged, opt-in, loopback-only evidence that exercises
-# the admin fault/readiness/metrics endpoints without replacing shell drills.
+# deployment manifest evidence plus admin fault/readiness/metrics endpoints.
 require_text "$local_runner" "kvnode local Go runner (opt-in, local loopback only)"
 require_text "$local_runner" "KVNODE_GO_RUNNER_RUN=yes"
+if ! runner_help_output="$(go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --help 2>&1)"; then
+  echo "$runner_help_output" >&2
+  exit 1
+fi
 if runner_refusal_output="$(KVNODE_GO_RUNNER_RUN= go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode incident 2>&1 >/dev/null)"; then
   echo "kvnode local Go runner must refuse without KVNODE_GO_RUNNER_RUN=yes" >&2
   exit 1
@@ -303,11 +347,12 @@ if [[ "$bad_workload_label_output" != *"KVNODE_GO_RUNNER_WORKLOAD_LABEL must be 
   exit 1
 fi
 require_text "$local_runner" "status=local-go-runner-only"
+require_local_runner_deployment_manifest "$runner_help_output"
 require_text "$local_runner" "none-target-environment-capacity-results-still-required"
 require_local_runner_capacity_labels
 require_text "$local_runner" "none-target-environment-operator-review-still-required"
-require_text "$local_runner" "[--mode all|incident|capacity|data]"
-require_text "$local_runner" 'data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.'
+require_text "$local_runner" "[--mode all|deployment|incident|capacity|data]"
+require_text "$local_runner" 'data        Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.'
 require_text "$local_runner" "data-lifecycle-summary.txt"
 require_text "$local_runner" "buildKVCheckpoint"
 require_text "$local_runner" "./cmd/kvcheckpoint"
@@ -326,7 +371,6 @@ require_text "$local_runner" "/faults/storage"
 require_text "$local_runner" "/faults/transport"
 require_text "$local_runner" "/readyz"
 require_text "$local_runner" "/metrics"
-go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --help >/dev/null
 
 # Data lifecycle/incident runbook: backup/verify/repair/restore boundaries,
 # confirmations, evidence capture, and named incident response procedures.
