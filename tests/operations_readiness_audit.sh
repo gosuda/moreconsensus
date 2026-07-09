@@ -46,6 +46,32 @@ line_number() {
   printf '%s\n' "$line"
 }
 
+line_number_regex() {
+  local file="$1"
+  local pattern="$2"
+  local line
+  line="$(LC_ALL=C grep -Enm1 -- "$pattern" "$file" | cut -d: -f1 || true)"
+  if [[ -z "$line" ]]; then
+    echo "missing operations-readiness pattern in $file: $pattern" >&2
+    exit 1
+  fi
+  printf '%s\n' "$line"
+}
+
+require_regex_before() {
+  local file="$1"
+  local first="$2"
+  local second="$3"
+  local first_line
+  local second_line
+  first_line="$(line_number_regex "$file" "$first")"
+  second_line="$(line_number_regex "$file" "$second")"
+  if (( first_line >= second_line )); then
+    echo "expected pattern in $file before '$second': $first" >&2
+    exit 1
+  fi
+}
+
 require_text_before() {
   local file="$1"
   local first="$2"
@@ -245,6 +271,12 @@ require_local_runner_deployment_manifest() {
   require_text "$local_runner" "systemd_exec_contract=rendered-then-substituted"
   require_text "$local_runner" "artifact=systemd-manifest-local-launch"
   require_text "$local_runner" "canary=deployment-manifest-value-visible-on-all-nodes"
+  require_text "$local_runner" "deployment_canary=deployment-manifest-value-visible-on-all-nodes"
+  require_text "$local_runner" '"evidence_files=" + deploymentLocalEvidenceFiles'
+  require_text "$local_runner" 'deploymentLocalEvidenceFiles = "metadata.env,summary.txt,deployment-manifest-summary.txt," +'
+  require_text "$local_runner" '"systemd-manifest-report.env,systemd-manifest-audit.log,deployment-manifest-local-launch.env," +'
+  require_text "$local_runner" '"manifest-env/node-*.env,logs/node-*.log"'
+  require_regex_before "$local_runner" 'assertValueOnAll[[:space:]]*\(client,[[:space:]]*cfg,[[:space:]]*nodes,[[:space:]]*"go-runner-deployment-manifest"' 'writeLocalManifestLaunchEvidence[[:space:]]*\(runDir,[[:space:]]*nodes\)'
   require_text "$local_runner" "non_claim=local-static-render-plus-manifest-derived-loopback-process-check-only"
   require_text "$local_runner" "deployment_manifest_ran="
   require_text "$local_runner" "release_claim=none-target-environment-deployment-manifest-still-required"
@@ -368,12 +400,27 @@ require_text "$env_example" "transport configuration only; it does not add appli
 # Cross-platform manifest exercise: renders the example EnvironmentFile into the
 # ExecStart contract, writes an explicit non-claim report when requested, and
 # runs systemd-analyze verify when the host provides it.
+manifest_required_env_vars="KVNODE_ID,KVNODE_CLIENT_LISTEN,KVNODE_PEER_LISTEN,KVNODE_ADMIN_LISTEN,KVNODE_DATA_DIR,KVNODE_PEERS,KVNODE_REQUEST_DEADLINE_MS,KVNODE_PEER_DEADLINE_MS,KVNODE_MAX_CLIENT_BODY_BYTES,KVNODE_MAX_PEER_BODY_BYTES,KVNODE_MAX_ADMIN_BODY_BYTES,KVNODE_MAX_SCAN_LIMIT,KVNODE_TLS_ARGS"
+manifest_deadline_defaults="deadline_defaults=request_deadline_ms=5000,peer_deadline_ms=2000"
+manifest_body_scan_limits="body_scan_limits=max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000"
+manifest_hardening="hardening=User,Group,StateDirectory,ProtectSystem,NoNewPrivileges"
+manifest_evidence_files="evidence_files=deploy/systemd/kvnode@.service,deploy/systemd/kvnode.env.example"
+
 require_text "$manifest" "KVNODE_SYSTEMD_MANIFEST_REPORT=/path/report.env"
 require_text "$manifest" "write_manifest_report()"
 require_text "$manifest" "KVNODE_SYSTEMD_MANIFEST_REPORT must name a file"
 require_text "$manifest" "status=example-operator-report"
 require_text "$manifest" "artifact=systemd-manifest-audit"
 require_text "$manifest" "rendered_exec="
+require_text "$manifest" "node_id="
+require_text "$manifest" "peer_count="
+require_text "$manifest" "required_env_vars="
+require_text "$manifest" "exec_contract=env-file-rendered"
+require_text "$manifest" "deadline_defaults=request_deadline_ms="
+require_text "$manifest" "body_scan_limits=max_client_body_bytes="
+require_text "$manifest" "$manifest_hardening"
+require_text "$manifest" "$manifest_evidence_files"
+require_text "$manifest" "operator_review=not-performed"
 require_text "$manifest" "systemd_analyze=skipped"
 require_text "$manifest" "systemd_analyze="
 require_text "$manifest" "KVNODE_SYSTEMD_ANALYZE=yes"
@@ -398,6 +445,15 @@ require_text "$manifest_report" "status=example-operator-report"
 require_text "$manifest_report" "artifact=systemd-manifest-audit"
 require_text "$manifest_report" "unit="
 require_text "$manifest_report" "environment_file="
+require_text "$manifest_report" "node_id=1"
+require_text "$manifest_report" "peer_count=3"
+require_text "$manifest_report" "required_env_vars=$manifest_required_env_vars"
+require_text "$manifest_report" "exec_contract=env-file-rendered"
+require_text "$manifest_report" "$manifest_deadline_defaults"
+require_text "$manifest_report" "$manifest_body_scan_limits"
+require_text "$manifest_report" "$manifest_hardening"
+require_text "$manifest_report" "$manifest_evidence_files"
+require_text "$manifest_report" "operator_review=not-performed"
 require_text "$manifest_report" "rendered_exec="
 if ! LC_ALL=C grep -Eq '^rendered_exec=/usr/local/bin/kvnode -id 1 -listen' "$manifest_report"; then
   echo "systemd manifest report must include unescaped rendered_exec command prefix" >&2

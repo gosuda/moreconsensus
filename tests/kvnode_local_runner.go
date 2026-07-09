@@ -40,8 +40,11 @@ const (
 	defaultEnvironmentLabel = "local-loopback"
 	defaultWorkloadLabel    = "local-go-runner"
 
-	statusLocalGoRunnerOnly    = "status=local-go-runner-only"
-	deploymentNonClaim         = "release_claim=none-target-environment-deployment-manifest-still-required"
+	statusLocalGoRunnerOnly      = "status=local-go-runner-only"
+	deploymentNonClaim           = "release_claim=none-target-environment-deployment-manifest-still-required"
+	deploymentLocalEvidenceFiles = "metadata.env,summary.txt,deployment-manifest-summary.txt," +
+		"systemd-manifest-report.env,systemd-manifest-audit.log,deployment-manifest-local-launch.env," +
+		"manifest-env/node-*.env,logs/node-*.log"
 	capacityNonClaim           = "release_claim=none-target-environment-capacity-results-still-required"
 	incidentNonClaim           = "release_claim=none-target-environment-operator-review-still-required"
 	dataLifecycleNonClaim      = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
@@ -975,6 +978,11 @@ func runDeploymentManifestDrill(client *http.Client, cfg runnerConfig, runDir st
 		"status=example-operator-report\n",
 		"artifact=systemd-manifest-audit\n",
 		"rendered_exec=/usr/local/bin/kvnode -id 1 -listen",
+		"peer_count=3\n",
+		"required_env_vars=KVNODE_ID,KVNODE_CLIENT_LISTEN,KVNODE_PEER_LISTEN,KVNODE_ADMIN_LISTEN,KVNODE_DATA_DIR,KVNODE_PEERS,KVNODE_REQUEST_DEADLINE_MS,KVNODE_PEER_DEADLINE_MS,KVNODE_MAX_CLIENT_BODY_BYTES,KVNODE_MAX_PEER_BODY_BYTES,KVNODE_MAX_ADMIN_BODY_BYTES,KVNODE_MAX_SCAN_LIMIT,KVNODE_TLS_ARGS\n",
+		"exec_contract=env-file-rendered\n",
+		"evidence_files=deploy/systemd/kvnode@.service,deploy/systemd/kvnode.env.example\n",
+		"operator_review=not-performed\n",
 		"systemd_analyze=skipped\n",
 		deploymentNonClaim + "\n",
 	} {
@@ -985,13 +993,13 @@ func runDeploymentManifestDrill(client *http.Client, cfg runnerConfig, runDir st
 	if bytes.Contains(report, []byte(`rendered_exec=/usr/local/bin/kvnode\ -id`)) {
 		return fmt.Errorf("systemd manifest report double-escaped rendered_exec command prefix")
 	}
-	if err := writeLocalManifestLaunchEvidence(runDir, nodes); err != nil {
-		return err
-	}
 	if err := putValue(client, nodes[0], "go-runner-deployment-manifest", []byte("deployment-manifest-value")); err != nil {
 		return err
 	}
 	if err := assertValueOnAll(client, cfg, nodes, "go-runner-deployment-manifest", []byte("deployment-manifest-value")); err != nil {
+		return err
+	}
+	if err := writeLocalManifestLaunchEvidence(runDir, nodes); err != nil {
 		return err
 	}
 	summary := strings.Join([]string{
@@ -1017,7 +1025,10 @@ func writeLocalManifestLaunchEvidence(runDir string, nodes []*nodeProcess) error
 		"manifest_unit=deploy/systemd/kvnode@.service",
 		"environment_template=deploy/systemd/kvnode.env.example",
 		"systemd_exec_contract=rendered-then-substituted",
+		"peer_count=3",
 		"local_substitution=temp-binary-temp-data-loopback-listeners",
+		"deployment_canary=deployment-manifest-value-visible-on-all-nodes",
+		"evidence_files=" + deploymentLocalEvidenceFiles,
 		"non_claim=local-loopback-rehearsal-only",
 		deploymentNonClaim,
 	}
