@@ -21,10 +21,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,6 +55,80 @@ func TestParsePeersRejectsMalformedEntries(t *testing.T) {
 		}
 	}
 }
+func TestKVNodeTransportLegacyProcessAtDomainParsingAndMetrics(t *testing.T) {
+	tests := []struct {
+		raw  string
+		mode string
+		want epaxos.TimingDomain
+	}{
+		{raw: "untimed", mode: "untimed", want: epaxos.TimingDomainUntimed},
+		{raw: "logical", mode: "logical", want: epaxos.TimingDomainLogical},
+		{raw: "toq", mode: "toq", want: epaxos.TimingDomainTOQ},
+	}
+	for _, test := range tests {
+		domain, mode, err := parseLegacyProcessAtDomain(test.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", test.raw, err)
+		}
+		if domain == nil || *domain != test.want || mode != test.mode {
+			t.Fatalf("parse %q domain=%v mode=%q, want %v %q", test.raw, domain, mode, test.want, test.mode)
+		}
+	}
+	domain, mode, err := parseLegacyProcessAtDomain("")
+	if err != nil || domain != nil || mode != "unset" {
+		t.Fatalf("parse empty domain=%v mode=%q err=%v", domain, mode, err)
+	}
+	for _, invalid := range []string{"UNTIMED", " logical", "toq ", "current", "auto"} {
+		if domain, mode, err := parseLegacyProcessAtDomain(invalid); err == nil || domain != nil || mode != "" {
+			t.Fatalf("parse invalid %q domain=%v mode=%q err=%v", invalid, domain, mode, err)
+		}
+	}
+
+	s := newTestService(t)
+	s.legacyProcessAtDomain = "logical"
+	response := httptest.NewRecorder()
+	s.handleMetrics(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, want := range []string{
+		"kvnode_legacy_process_at_domain_unset 0\n",
+		"kvnode_legacy_process_at_domain_untimed 0\n",
+		"kvnode_legacy_process_at_domain_logical 1\n",
+		"kvnode_legacy_process_at_domain_toq 0\n",
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Fatalf("legacy migration metrics missing %q in:\n%s", want, response.Body.String())
+		}
+	}
+}
+
+func TestKVNodeTransportEmptyLegacyProcessAtDomainFailsClosed(t *testing.T) {
+	domain, _, err := parseLegacyProcessAtDomain("")
+	if err != nil || domain != nil {
+		t.Fatalf("empty migration assertion domain=%v err=%v", domain, err)
+	}
+	store := epaxos.NewMemoryStorage()
+	ref := epaxos.InstanceRef{Conf: 1, Replica: 2, Instance: 1}
+	record := epaxos.InstanceRecord{
+		Ref:          ref,
+		Ballot:       epaxos.Ballot{Replica: 2},
+		RecordBallot: epaxos.Ballot{Replica: 2},
+		Status:       epaxos.StatusAccepted,
+		Seq:          1,
+		Deps:         make([]epaxos.InstanceNum, 3),
+		Command: epaxos.Command{
+			ID:           epaxos.CommandID{Client: 7, Sequence: 1},
+			Payload:      []byte("legacy"),
+			ConflictKeys: [][]byte{[]byte("legacy")},
+		},
+		ProcessAt: 17,
+	}
+	record.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(record)
+	store.Records[ref] = record
+	_, err = epaxos.NewRawNode(epaxos.Config{ID: 1, Voters: []epaxos.ReplicaID{1, 2, 3}, Storage: store, LegacyProcessAtDomain: domain})
+	if !errors.Is(err, epaxos.ErrInvalidConfig) || !strings.Contains(err.Error(), "ambiguous legacy timing domain") {
+		t.Fatalf("empty legacy migration assertion error=%v, want ambiguous ErrInvalidConfig", err)
+	}
+}
+
 
 func TestDurationFromMillisRejectsInvalidBudgetsAndScalesPositiveValues(t *testing.T) {
 	tests := []struct {
@@ -312,56 +389,33 @@ func TestHTTPServerTLSBranchServesConfiguredPeerClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
-	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("tls branch"))
 	})
-	srv := newHTTPServer(addr, handler, time.Second, serverTLS)
+	srv := newHTTPServer("127.0.0.1:0", handler, time.Second, serverTLS)
+	listenerc := make(chan net.Listener, 1)
+	listen := func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err == nil {
+			listenerc <- ln
+		}
+		return ln, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() {
-		errc <- serveHTTPServers(srv)
+		errc <- serveHTTPServersWithListener(ctx, time.Second, listen, srv)
 	}()
-	var serverErr error
-	serverReturned := false
-	t.Cleanup(func() {
-		_ = srv.Close()
-		if !serverReturned {
-			serverErr = <-errc
-			serverReturned = true
-		}
-		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) && !errors.Is(serverErr, net.ErrClosed) {
-			t.Errorf("serveHTTPServers returned %v", serverErr)
-		}
-	})
+	ln := receiveKVNodeTest(t, listenerc)
+	target := "https://" + ln.Addr().String()
 
-	target := "https://" + addr
 	trusted := newPeerClient(time.Second, clientTLS)
-	var resp *http.Response
-	for range 1000 {
-		select {
-		case serverErr = <-errc:
-			serverReturned = true
-			t.Fatalf("serveHTTPServers returned before accepting connections: %v", serverErr)
-		default:
-		}
-		resp, err = trusted.Get(target)
-		if err == nil {
-			break
-		}
-		runtime.Gosched()
-	}
+	resp, err := trusted.Get(target)
 	if err != nil {
 		t.Fatalf("configured peer client GET failed: %v", err)
 	}
-	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,6 +431,13 @@ func TestHTTPServerTLSBranchServesConfiguredPeerClient(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("unconfigured peer client failed with %v, want certificate verification failure", err)
+	}
+	trusted.CloseIdleConnections()
+	untrusted.CloseIdleConnections()
+	cancel()
+	cancel()
+	if err := receiveKVNodeTest(t, errc); err != nil {
+		t.Fatalf("serveHTTPServersWithListener returned %v", err)
 	}
 }
 
@@ -1577,7 +1638,7 @@ func TestHandleTransportFaultRejectsMalformedRequests(t *testing.T) {
 	}
 }
 
-func TestSendDropsConfiguredOutgoingTransportLinkWithoutPostingOrQueueing(t *testing.T) {
+func TestTransportFrameConfiguredDropIsTerminalAndAccounted(t *testing.T) {
 	s := newTestService(t)
 	s.peers[2] = "http://peer-2"
 	posts := 0
@@ -1587,14 +1648,14 @@ func TestSendDropsConfiguredOutgoingTransportLinkWithoutPostingOrQueueing(t *tes
 	})}
 	s.setTransportDrop(1, 2, true)
 
-	msg := epaxos.Message{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}}
-	s.send([]epaxos.Message{msg})
+	frame := mustOutboundFrame(t, s, epaxos.Message{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}})
+	s.deliverFrame(frame)
 
 	if posts != 0 {
 		t.Fatalf("posts=%d", posts)
 	}
-	if len(s.sendq) != 0 {
-		t.Fatalf("queued messages=%d", len(s.sendq))
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 1 {
+		t.Fatalf("terminal failed frames=%d, want 1", got)
 	}
 }
 
@@ -1790,8 +1851,55 @@ func newTestService(t *testing.T) *service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &service{id: 1, node: node, ready: db, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
+	return &service{id: 1, node: node, ready: db, db: db, peers: map[epaxos.ReplicaID]string{1: "http://127.0.0.1"}, client: &http.Client{}, sendq: make(chan *outboundFrame, 8), nextSeq: 1}
 }
+func mustOutboundFrame(t *testing.T, s *service, message epaxos.Message) *outboundFrame {
+	t.Helper()
+	frames, err := s.prepareOutboundFrames([]epaxos.Message{message})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("prepared frames=%d, want 1", len(frames))
+	}
+	return frames[0]
+}
+func admitOutboundFrameForTest(t *testing.T, s *service, frame *outboundFrame) {
+	t.Helper()
+	if err := s.admitOutboundFrames([]*outboundFrame{frame}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForTransportState(t *testing.T, s *service, retryDepth, outstanding int) {
+	t.Helper()
+	for range 10000 {
+		s.transportMu.RLock()
+		gotRetry := len(s.retryq)
+		gotOutstanding := s.outstandingFrames
+		s.transportMu.RUnlock()
+		if gotRetry == retryDepth && gotOutstanding == outstanding {
+			return
+		}
+		runtime.Gosched()
+	}
+	s.transportMu.RLock()
+	defer s.transportMu.RUnlock()
+	t.Fatalf("transport state retry=%d outstanding=%d, want retry=%d outstanding=%d", len(s.retryq), s.outstandingFrames, retryDepth, outstanding)
+}
+
+func waitForSchedulerTick(t *testing.T, s *service, tick uint64) {
+	t.Helper()
+	for range 10000 {
+		if s.schedulerTick.Load() >= tick {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("scheduler tick=%d, want at least %d", s.schedulerTick.Load(), tick)
+}
+
+
 
 type testKVNodeCluster struct {
 	t        *testing.T
@@ -1822,7 +1930,7 @@ func newTestKVNodeCluster(t *testing.T) *testKVNodeCluster {
 		for _, peer := range voters {
 			peers[peer] = peerURLs[peer]
 		}
-		cluster.services[id] = &service{id: id, node: node, ready: db, db: db, peers: peers, sendq: make(chan epaxos.Message, 1024), nextSeq: 1, transportDrops: make(map[transportLink]struct{})}
+		cluster.services[id] = &service{id: id, node: node, ready: db, db: db, peers: peers, sendq: make(chan *outboundFrame, 1024), nextSeq: 1, transportDrops: make(map[transportLink]struct{})}
 	}
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		t.Helper()
@@ -1881,6 +1989,29 @@ func (c *testKVNodeCluster) takeMessages() []epaxos.Message {
 	c.messages = nil
 	return out
 }
+func (c *testKVNodeCluster) takeOutboundMessages(s *service) []epaxos.Message {
+	c.t.Helper()
+	var messages []epaxos.Message
+	for {
+		select {
+		case frame := <-s.sendq:
+			scratch := epaxos.GetDecodeScratch()
+			var message epaxos.Message
+			err := epaxos.DecodeMessageWithScratch(frame.body, &message, scratch)
+			if err == nil {
+				messages = append(messages, message.Clone())
+			}
+			epaxos.PutDecodeScratch(scratch)
+			s.finishOutboundFrame(frame, false)
+			if err != nil {
+				c.t.Fatal(err)
+			}
+		default:
+			return messages
+		}
+	}
+}
+
 
 func (c *testKVNodeCluster) tickAll(n int) {
 	c.t.Helper()
@@ -1890,13 +2021,15 @@ func (c *testKVNodeCluster) tickAll(n int) {
 		for _, id := range []epaxos.ReplicaID{1, 2, 3} {
 			svc := c.services[id]
 			svc.mu.Lock()
-			svc.node.Tick()
-			messages, err := svc.drainLocked()
+			err := svc.tickLocked()
+			if err == nil {
+				err = svc.drainLocked()
+			}
 			svc.mu.Unlock()
 			if err != nil {
 				c.t.Fatal(err)
 			}
-			out = append(out, messages...)
+			out = append(out, c.takeOutboundMessages(svc)...)
 		}
 		c.deliverMessages(out)
 	}
@@ -1919,7 +2052,7 @@ func (c *testKVNodeCluster) deliverMessages(messages []epaxos.Message) {
 		}
 		target.mu.Lock()
 		err := target.node.Step(msg)
-		out, drainErr := target.drainLocked()
+		drainErr := target.drainLocked()
 		target.mu.Unlock()
 		if err != nil {
 			c.t.Fatalf("step %s %d->%d: %v", msg.Type, msg.From, msg.To, err)
@@ -1927,7 +2060,7 @@ func (c *testKVNodeCluster) deliverMessages(messages []epaxos.Message) {
 		if drainErr != nil {
 			c.t.Fatal(drainErr)
 		}
-		messages = append(messages, out...)
+		messages = append(messages, c.takeOutboundMessages(target)...)
 	}
 }
 
@@ -2013,10 +2146,10 @@ func newTestClusterService(t *testing.T, voters []epaxos.ReplicaID) *service {
 	for _, voter := range voters {
 		peers[voter] = "http://127.0.0.1"
 	}
-	return &service{id: 1, node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan epaxos.Message, 8), nextSeq: 1}
+	return &service{id: 1, node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan *outboundFrame, 8), nextSeq: 1}
 }
 
-func TestSendPostsOnlyConfiguredRemotePeers(t *testing.T) {
+func TestTransportFramePostsOnlyConfiguredRemotePeers(t *testing.T) {
 	s := newTestService(t)
 	s.peers[2] = "http://peer-2"
 	var posted []string
@@ -2024,31 +2157,619 @@ func TestSendPostsOnlyConfiguredRemotePeers(t *testing.T) {
 		posted = append(posted, r.URL.String())
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	})}
-	s.send([]epaxos.Message{{To: 1}, {Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}}, {To: 3}})
+	messages := []epaxos.Message{
+		{To: 1},
+		{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}},
+		{To: 3},
+	}
+	frames, err := s.prepareOutboundFrames(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frame := range frames {
+		s.deliverFrame(frame)
+	}
 	if len(posted) != 1 || posted[0] != "http://peer-2/epaxos/message" {
 		t.Fatalf("posted=%v", posted)
 	}
-	if len(s.sendq) != 0 {
-		t.Fatalf("queued messages=%d", len(s.sendq))
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 2 {
+		t.Fatalf("terminal failed frames=%d, want 2", got)
 	}
 }
 
-func TestSendQueuesFailedRemotePosts(t *testing.T) {
+func TestTransportFrameImmediateFailureWaitsForLogicalRetryTick(t *testing.T) {
 	s := newTestService(t)
 	s.peers[2] = "http://peer-2"
+	attempted := make(chan struct{}, 4)
 	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("down")
+		attempted <- struct{}{}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	})}
-	msg := epaxos.Message{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}}
-	s.send([]epaxos.Message{msg})
-	if len(s.sendq) != 1 {
-		t.Fatalf("queued messages=%d", len(s.sendq))
+	s.startTransportWorkers(1)
+	frame := mustOutboundFrame(t, s, transportTestMessage([]byte("tick-retry")))
+	admitOutboundFrameForTest(t, s, frame)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 1, 1)
+	select {
+	case <-attempted:
+		t.Fatal("retry spun without a logical tick")
+	default:
 	}
-	got := <-s.sendq
-	if got.To != 2 {
-		t.Fatalf("queued message to replica %d", got.To)
+	if err := s.advanceTransportTick(); err != nil {
+		t.Fatal(err)
+	}
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 1, 1)
+	if got := s.outboundMetrics.retried.Load(); got != 2 {
+		t.Fatalf("scheduled retries=%d, want 2", got)
+	}
+	s.closeTransport()
+}
+type recordingReadyApplier struct {
+	inner   readyApplier
+	applied []epaxos.Ready
+}
+
+func (a *recordingReadyApplier) ApplyReady(ready epaxos.Ready) error {
+	if err := a.inner.ApplyReady(ready); err != nil {
+		return err
+	}
+	a.applied = append(a.applied, ready.Clone())
+	return nil
+}
+
+func transportTestMessage(payload []byte) epaxos.Message {
+	return epaxos.Message{
+		Type:         epaxos.MsgCommit,
+		From:         1,
+		To:           2,
+		Ref:          epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Ballot:       epaxos.Ballot{Replica: 1},
+		RecordBallot: epaxos.Ballot{Replica: 1},
+		Seq:          1,
+		Deps:         []epaxos.InstanceNum{0, 0},
+		Command: epaxos.Command{
+			ID:           epaxos.CommandID{Client: 1, Sequence: 1},
+			Payload:      payload,
+			ConflictKeys: [][]byte{[]byte("transport-key")},
+		},
 	}
 }
+
+func TestSendQueueAtomicFullBatchBackpressureLeavesReadyUnadvanced(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2, 3})
+	recorder := &recordingReadyApplier{inner: s.ready}
+	s.ready = recorder
+
+	s.mu.Lock()
+	if _, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 44}, ConflictKeys: [][]byte{[]byte("atomic")}}); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	readyBefore := s.node.Ready()
+	if len(readyBefore.Messages) < 2 {
+		s.mu.Unlock()
+		t.Fatalf("ready messages=%d, want a multi-frame batch", len(readyBefore.Messages))
+	}
+	s.sendq = make(chan *outboundFrame, len(readyBefore.Messages))
+	sentinel := &outboundFrame{to: 99, body: []byte("occupied"), admitted: true}
+	s.transportMu.Lock()
+	s.outstandingFrames = 1
+	s.sendq <- sentinel
+	s.transportMu.Unlock()
+	drainErr := s.drainLocked()
+	readyAfter := s.node.Ready()
+	s.mu.Unlock()
+
+	var admissionErr *transportAdmissionError
+	if !errors.As(drainErr, &admissionErr) || !errors.Is(drainErr, errSendQueueBackpressure) {
+		t.Fatalf("drain error=%v, want typed send queue backpressure", drainErr)
+	}
+	if admissionErr.Attempted != len(readyBefore.Messages) || admissionErr.Available != len(readyBefore.Messages)-1 {
+		t.Fatalf("admission error=%+v", admissionErr)
+	}
+	if len(recorder.applied) == 0 || !reflect.DeepEqual(recorder.applied[len(recorder.applied)-1], readyBefore) {
+		t.Fatalf("backpressured Ready was not durably applied before admission: applied=%d", len(recorder.applied))
+	}
+	if !reflect.DeepEqual(readyAfter, readyBefore) {
+		t.Fatalf("Ready advanced on rejected batch:\nbefore=%+v\nafter=%+v", readyBefore, readyAfter)
+	}
+	if len(s.sendq) != 1 {
+		t.Fatalf("queue depth=%d, want only preexisting frame", len(s.sendq))
+	}
+	if got := <-s.sendq; got != sentinel {
+		t.Fatalf("queue head=%p, want sentinel %p", got, sentinel)
+	} else {
+		s.finishOutboundFrame(got, false)
+	}
+
+	s.mu.Lock()
+	drainErr = s.drainLocked()
+	s.mu.Unlock()
+	if drainErr != nil {
+		t.Fatalf("retry drain: %v", drainErr)
+	}
+	if len(s.sendq) != len(readyBefore.Messages) {
+		t.Fatalf("retry queue depth=%d, want %d", len(s.sendq), len(readyBefore.Messages))
+	}
+	for index, message := range readyBefore.Messages {
+		frame := <-s.sendq
+		want, err := epaxos.EncodeMessage(nil, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.to != message.To || !bytes.Equal(frame.body, want) {
+			t.Fatalf("frame %d destination/body mismatch: to=%d body=%x want-to=%d want=%x", index, frame.to, frame.body, message.To, want)
+		}
+		s.finishOutboundFrame(frame, false)
+	}
+	if got := s.outboundMetrics.attempted.Load(); got != uint64(2*len(readyBefore.Messages)) {
+		t.Fatalf("attempted=%d, want %d", got, 2*len(readyBefore.Messages))
+	}
+	if got := s.outboundMetrics.admitted.Load(); got != uint64(len(readyBefore.Messages)) {
+		t.Fatalf("admitted=%d, want %d", got, len(readyBefore.Messages))
+	}
+	if got := s.outboundMetrics.backpressured.Load(); got != uint64(len(readyBefore.Messages)) {
+		t.Fatalf("backpressured=%d, want %d", got, len(readyBefore.Messages))
+	}
+}
+
+func TestTransportFrameRetryPreservesExactBytesAndOwnership(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	attempted := make(chan struct{}, 2)
+	var bodies [][]byte
+	s.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		bodies = append(bodies, append([]byte(nil), body...))
+		if len(bodies) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			attempted <- struct{}{}
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		}
+		attempted <- struct{}{}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.startTransportWorkers(1)
+	frame := mustOutboundFrame(t, s, transportTestMessage([]byte("same-on-every-attempt")))
+	want := append([]byte(nil), frame.body...)
+	admitOutboundFrameForTest(t, s, frame)
+	receiveKVNodeTest(t, firstStarted)
+
+	probe := s.getOutboundFrame()
+	if probe == frame {
+		t.Fatal("in-flight frame returned to pool before terminal outcome")
+	}
+	s.releaseOutboundFrame(probe)
+	if !bytes.Equal(frame.body, want) {
+		t.Fatal("in-flight frame bytes changed while the HTTP request owned them")
+	}
+	close(releaseFirst)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 1, 1)
+	if !bytes.Equal(frame.body, want) {
+		t.Fatal("retry-heap frame bytes changed before the due tick")
+	}
+	if err := s.advanceTransportTick(); err != nil {
+		t.Fatal(err)
+	}
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 0, 0)
+
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], want) || !bytes.Equal(bodies[1], want) {
+		t.Fatalf("retry bodies=%x, want two copies of %x", bodies, want)
+	}
+	if got := s.outboundMetrics.retried.Load(); got != 1 {
+		t.Fatalf("retried=%d, want 1", got)
+	}
+	if len(frame.body) != 0 {
+		t.Fatalf("released frame retains length=%d", len(frame.body))
+	}
+	s.closeTransport()
+}
+
+func TestTransportFrameRetries429And5xxOnCappedLogicalTicks(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	statuses := []int{http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusNoContent}
+	attempted := make(chan int, len(statuses))
+	attempt := 0
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		status := statuses[attempt]
+		attempt++
+		attempted <- attempt
+		return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.startTransportWorkers(1)
+	admitOutboundFrameForTest(t, s, mustOutboundFrame(t, s, transportTestMessage([]byte("retryable"))))
+	if got := receiveKVNodeTest(t, attempted); got != 1 {
+		t.Fatalf("first attempt=%d", got)
+	}
+	waitForTransportState(t, s, 1, 1)
+	if err := s.advanceTransportTick(); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveKVNodeTest(t, attempted); got != 2 {
+		t.Fatalf("second attempt=%d", got)
+	}
+	waitForTransportState(t, s, 1, 1)
+	if err := s.advanceTransportTick(); err != nil {
+		t.Fatal(err)
+	}
+	waitForSchedulerTick(t, s, 2)
+	select {
+	case got := <-attempted:
+		t.Fatalf("exponential retry ran early at tick 2: attempt=%d", got)
+	default:
+	}
+	if err := s.advanceTransportTick(); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveKVNodeTest(t, attempted); got != 3 {
+		t.Fatalf("third attempt=%d", got)
+	}
+	waitForTransportState(t, s, 0, 0)
+	if got := s.outboundMetrics.retried.Load(); got != 2 {
+		t.Fatalf("retried=%d, want 2", got)
+	}
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 0 {
+		t.Fatalf("terminal failed=%d, want 0", got)
+	}
+	s.closeTransport()
+}
+func TestTransportFrameRetryDelayIsExponentiallyCapped(t *testing.T) {
+	tests := []struct {
+		attempt uint32
+		want    uint64
+	}{
+		{attempt: 0, want: 1},
+		{attempt: 1, want: 2},
+		{attempt: 5, want: 32},
+		{attempt: 6, want: maxRetryDelayTicks},
+		{attempt: 100, want: maxRetryDelayTicks},
+	}
+	for _, test := range tests {
+		if got := retryDelayTicks(test.attempt); got != test.want {
+			t.Fatalf("attempt %d delay=%d, want %d", test.attempt, got, test.want)
+		}
+	}
+}
+
+func TestTransportFrameFailedPeerDoesNotStarveHealthyDestination(t *testing.T) {
+	s := newTestService(t)
+	s.sendq = make(chan *outboundFrame, 9)
+	s.peers[2] = "http://peer-2"
+	s.peers[3] = "http://peer-3"
+	failed := make(chan struct{}, 8)
+	healthy := make(chan struct{}, 1)
+	s.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "peer-3" {
+			healthy <- struct{}{}
+			return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+		}
+		failed <- struct{}{}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.startTransportWorkers(8)
+	messages := make([]epaxos.Message, 0, 9)
+	for index := range 8 {
+		message := transportTestMessage([]byte{byte(index)})
+		message.Ref.Instance = epaxos.InstanceNum(index + 1)
+		messages = append(messages, message)
+	}
+	healthyMessage := transportTestMessage([]byte("healthy"))
+	healthyMessage.To = 3
+	healthyMessage.Ref.Instance = 9
+	messages = append(messages, healthyMessage)
+	frames, err := s.prepareOutboundFrames(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.admitOutboundFrames(frames); err != nil {
+		t.Fatal(err)
+	}
+	receiveKVNodeTest(t, healthy)
+	for range 8 {
+		receiveKVNodeTest(t, failed)
+	}
+	waitForTransportState(t, s, 8, 8)
+	select {
+	case <-failed:
+		t.Fatal("failed destination retried without a logical tick")
+	default:
+	}
+	s.closeTransport()
+}
+
+func TestSendQueueRetryHeapSaturationPreservesOutstandingBound(t *testing.T) {
+	s := newTestService(t)
+	s.sendq = make(chan *outboundFrame, 2)
+	s.peers[2] = "http://peer-2"
+	attempted := make(chan struct{}, 2)
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempted <- struct{}{}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.startTransportWorkers(1)
+	first := transportTestMessage([]byte("one"))
+	second := transportTestMessage([]byte("two"))
+	second.Ref.Instance = 2
+	frames, err := s.prepareOutboundFrames([]epaxos.Message{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.admitOutboundFrames(frames); err != nil {
+		t.Fatal(err)
+	}
+	receiveKVNodeTest(t, attempted)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 2, 2)
+
+	late := mustOutboundFrame(t, s, transportTestMessage([]byte("late")))
+	err = s.admitOutboundFrames([]*outboundFrame{late})
+	var admissionErr *transportAdmissionError
+	if !errors.As(err, &admissionErr) || !errors.Is(err, errSendQueueBackpressure) || admissionErr.Available != 0 {
+		t.Fatalf("saturated retry admission error=%v details=%+v", err, admissionErr)
+	}
+	waitForTransportState(t, s, 2, 2)
+	if got := s.outboundMetrics.backpressured.Load(); got != 1 {
+		t.Fatalf("backpressured=%d, want 1", got)
+	}
+	s.closeTransport()
+}
+
+func TestTransportFrameRetryTickOverflowFailsClosed(t *testing.T) {
+	s := newTestService(t)
+	s.sendq = make(chan *outboundFrame, 1)
+	s.peers[2] = "http://peer-2"
+	attempted := make(chan struct{}, 1)
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempted <- struct{}{}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.transportTick = ^uint64(0)
+	s.startTransportWorkers(1)
+	frame := mustOutboundFrame(t, s, transportTestMessage([]byte("overflow")))
+	admitOutboundFrameForTest(t, s, frame)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 0, 0)
+	if len(frame.body) != 0 {
+		t.Fatalf("overflowed retry retained frame length=%d", len(frame.body))
+	}
+	if got := s.outboundMetrics.retryOverflow.Load(); got != 1 {
+		t.Fatalf("retry overflow=%d, want 1", got)
+	}
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 1 {
+		t.Fatalf("terminal failed=%d, want 1", got)
+	}
+	if err := s.advanceTransportTick(); !errors.Is(err, errTransportTickOverflow) {
+		t.Fatalf("advance at max tick error=%v, want overflow", err)
+	}
+	s.closeTransport()
+}
+
+
+func TestKVNodeTransportTerminalRejectionMetrics(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	posts := 0
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		posts++
+		return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(bytes.NewReader([]byte("rejected")))}, nil
+	})}
+	frames, err := s.prepareOutboundFrames([]epaxos.Message{transportTestMessage([]byte("terminal"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.admitOutboundFrames(frames); err != nil {
+		t.Fatal(err)
+	}
+	s.deliverFrame(<-s.sendq)
+	if posts != 1 {
+		t.Fatalf("posts=%d, want 1", posts)
+	}
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 1 {
+		t.Fatalf("terminal failed=%d, want 1", got)
+	}
+	if got := s.outboundMetrics.retried.Load(); got != 0 {
+		t.Fatalf("retried=%d, want 0", got)
+	}
+	metrics := httptest.NewRecorder()
+	s.handleMetrics(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, want := range []string{
+		"kvnode_outbound_frames_attempted_total 1\n",
+		"kvnode_outbound_frames_admitted_total 1\n",
+		"kvnode_outbound_frames_retried_total 0\n",
+		"kvnode_outbound_frames_backpressured_total 0\n",
+		"kvnode_outbound_frames_terminal_failed_total 1\n",
+		"kvnode_send_queue_depth 0\n",
+	} {
+		if !strings.Contains(metrics.Body.String(), want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, metrics.Body.String())
+		}
+	}
+}
+
+func TestTransportFramePoolBoundsAndClearsBuffers(t *testing.T) {
+	s := &service{}
+	small := &outboundFrame{to: 2, endpoint: "http://peer-2", body: make([]byte, 17, 32)}
+	for index := range small.body[:cap(small.body)] {
+		small.body[:cap(small.body)][index] = 0xa5
+	}
+	s.releaseOutboundFrame(small)
+	if small.to != 0 || small.endpoint != "" || len(small.body) != 0 || cap(small.body) != 32 {
+		t.Fatalf("small released frame=%+v cap=%d", small, cap(small.body))
+	}
+	for index, value := range small.body[:cap(small.body)] {
+		if value != 0 {
+			t.Fatalf("small retained byte %d=%x, want zero", index, value)
+		}
+	}
+
+	oversizedBytes := make([]byte, maxRetainedTransportBufferCapacity+1)
+	for index := range oversizedBytes {
+		oversizedBytes[index] = 0x5a
+	}
+	oversized := &outboundFrame{to: 2, endpoint: "http://peer-2", body: oversizedBytes}
+	s.releaseOutboundFrame(oversized)
+	if oversized.body != nil {
+		t.Fatalf("oversized frame retained capacity=%d", cap(oversized.body))
+	}
+	for index, value := range oversizedBytes {
+		if value != 0 {
+			t.Fatalf("oversized released byte %d=%x, want zero", index, value)
+		}
+	}
+
+	bodyBuffer := &pooledTransportBuffer{bytes: make([]byte, maxRetainedTransportBufferCapacity+1)}
+	bodyAlias := bodyBuffer.bytes
+	for index := range bodyAlias {
+		bodyAlias[index] = 0x3c
+	}
+	s.releasePeerBodyBuffer(bodyBuffer)
+	if bodyBuffer.bytes != nil {
+		t.Fatalf("oversized inbound buffer retained capacity=%d", cap(bodyBuffer.bytes))
+	}
+	for index, value := range bodyAlias {
+		if value != 0 {
+			t.Fatalf("oversized inbound byte %d=%x, want zero", index, value)
+		}
+	}
+}
+
+func TestTransportFrameLimitRejectsBeforeAllocation(t *testing.T) {
+	s := newTestService(t)
+	s.maxPeerBodyBytes = 128
+	message := transportTestMessage(bytes.Repeat([]byte("x"), 256))
+	frames, err := s.prepareOutboundFrames([]epaxos.Message{message})
+	if frames != nil {
+		t.Fatalf("oversized frames=%d, want none", len(frames))
+	}
+	var admissionErr *transportAdmissionError
+	if !errors.As(err, &admissionErr) || !errors.Is(err, errOutboundFrameTooLarge) {
+		t.Fatalf("error=%v, want typed oversized admission failure", err)
+	}
+	if got := s.outboundMetrics.attempted.Load(); got != 1 {
+		t.Fatalf("attempted=%d, want 1", got)
+	}
+	if got := s.outboundMetrics.backpressured.Load(); got != 1 {
+		t.Fatalf("backpressured=%d, want 1", got)
+	}
+}
+
+func TestPeerDecodeScratchReuseMalformedSurvivalAndBodyBound(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
+	message := epaxos.Message{
+		Type:         epaxos.MsgCommit,
+		From:         2,
+		To:           1,
+		Ref:          epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:       epaxos.Ballot{Replica: 2},
+		RecordBallot: epaxos.Ballot{Replica: 2},
+		Seq:          1,
+		Deps:         []epaxos.InstanceNum{0, 0},
+		Command:      kv.CommandForPut(2, 1, []byte("scratch-reuse"), []byte("survived")),
+	}
+	valid, err := epaxos.EncodeMessage(nil, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 32 {
+		malformed := append([]byte(nil), valid...)
+		malformed[len(malformed)-1] ^= 0xff
+		response := httptest.NewRecorder()
+		s.handleMessage(response, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(malformed)))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("malformed status=%d body=%q", response.Code, response.Body.String())
+		}
+	}
+	s.maxPeerBodyBytes = int64(len(valid) - 1)
+	oversized := httptest.NewRecorder()
+	s.handleMessage(oversized, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(valid)))
+	if oversized.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%q", oversized.Code, oversized.Body.String())
+	}
+	s.maxPeerBodyBytes = int64(len(valid))
+	accepted := httptest.NewRecorder()
+	s.handleMessage(accepted, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(valid)))
+	if accepted.Code != http.StatusNoContent {
+		t.Fatalf("accepted status=%d body=%q", accepted.Code, accepted.Body.String())
+	}
+	got, ok, err := s.db.Get([]byte("scratch-reuse"))
+	if err != nil || !ok || string(got) != "survived" {
+		t.Fatalf("stored value=%q ok=%t err=%v", got, ok, err)
+	}
+	buffer := s.getPeerBodyBuffer()
+	for index, value := range buffer.bytes[:cap(buffer.bytes)] {
+		if value != 0 {
+			t.Fatalf("returned inbound buffer byte %d=%x, want zero", index, value)
+		}
+	}
+	s.releasePeerBodyBuffer(buffer)
+}
+
+func TestGracefulShutdownDisposesQueuedOwnedFramesAndRejectsAdmission(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	s.sendq = make(chan *outboundFrame, 2)
+	first := mustOutboundFrame(t, s, transportTestMessage([]byte("first")))
+	secondMessage := transportTestMessage([]byte("second"))
+	secondMessage.Ref.Instance = 2
+	second := mustOutboundFrame(t, s, secondMessage)
+	if err := s.admitOutboundFrames([]*outboundFrame{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.closeTransport()
+	if len(s.sendq) != 0 {
+		t.Fatalf("queue depth after close=%d", len(s.sendq))
+	}
+	if len(first.body) != 0 || len(second.body) != 0 {
+		t.Fatalf("shutdown retained frame bodies: first=%d second=%d", len(first.body), len(second.body))
+	}
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 2 {
+		t.Fatalf("terminal failed after disposal=%d, want 2", got)
+	}
+
+	late := mustOutboundFrame(t, s, transportTestMessage([]byte("late")))
+	err := s.admitOutboundFrames([]*outboundFrame{late})
+	if !errors.Is(err, errTransportClosed) {
+		t.Fatalf("late admission error=%v, want transport closed", err)
+	}
+	if len(late.body) != 0 {
+		t.Fatalf("rejected late frame retains length=%d", len(late.body))
+	}
+}
+func TestGracefulShutdownDisposesRetryHeapFrame(t *testing.T) {
+	s := newTestService(t)
+	s.peers[2] = "http://peer-2"
+	attempted := make(chan struct{}, 1)
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempted <- struct{}{}
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	s.startTransportWorkers(1)
+	frame := mustOutboundFrame(t, s, transportTestMessage([]byte("shutdown-retry")))
+	admitOutboundFrameForTest(t, s, frame)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 1, 1)
+	s.closeTransport()
+	waitForTransportState(t, s, 0, 0)
+	if len(frame.body) != 0 {
+		t.Fatalf("shutdown retry frame retains length=%d", len(frame.body))
+	}
+	if got := s.outboundMetrics.terminalFailed.Load(); got != 1 {
+		t.Fatalf("terminal failed=%d, want 1", got)
+	}
+}
+
+
 
 func TestHandleKVMapsUnreadablePutBodyToBadRequest(t *testing.T) {
 	s := newTestService(t)
@@ -2073,4 +2794,460 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type httpCallResult struct {
+	status int
+	body   string
+	err    error
+}
+
+type closeNotifyingListener struct {
+	net.Listener
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (l *closeNotifyingListener) Close() error {
+	err := l.Listener.Close()
+	l.once.Do(func() { close(l.closed) })
+	return err
+}
+
+func TestGracefulShutdownDrainsAllHTTPPlanesAndStopsAcceptance(t *testing.T) {
+	entered := [3]chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+	releaseClient := make(chan struct{})
+	servers := make([]*http.Server, len(entered))
+	for i := range servers {
+		index := i
+		servers[i] = newHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			close(entered[index])
+			if index == 0 {
+				<-releaseClient
+			}
+			_, _ = w.Write([]byte("plane"))
+		}), 5*time.Second, nil)
+	}
+	listenerc := make(chan *closeNotifyingListener, len(servers))
+	listen := func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		notifying := &closeNotifyingListener{Listener: ln, closed: make(chan struct{})}
+		listenerc <- notifying
+		return notifying, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		errc <- serveHTTPServersWithListener(ctx, 5*time.Second, listen, servers...)
+	}()
+	listeners := make([]*closeNotifyingListener, len(servers))
+	for i := range listeners {
+		listeners[i] = receiveKVNodeTest(t, listenerc)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+	responses := [3]chan httpCallResult{make(chan httpCallResult, 1), make(chan httpCallResult, 1), make(chan httpCallResult, 1)}
+	for i, ln := range listeners {
+		index := i
+		target := "http://" + ln.Addr().String()
+		go func() {
+			resp, err := client.Get(target)
+			if err != nil {
+				responses[index] <- httpCallResult{err: err}
+				return
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			responses[index] <- httpCallResult{status: resp.StatusCode, body: string(body), err: readErr}
+		}()
+	}
+	for i := range entered {
+		receiveKVNodeTest(t, entered[i])
+	}
+	for _, index := range []int{1, 2} {
+		result := receiveKVNodeTest(t, responses[index])
+		if result.err != nil || result.status != http.StatusOK || result.body != "plane" {
+			t.Fatalf("plane %d result=%+v, want 200 plane", index, result)
+		}
+	}
+
+	cancel()
+	cancel()
+	for _, ln := range listeners {
+		receiveKVNodeTest(t, ln.closed)
+	}
+	select {
+	case err := <-errc:
+		t.Fatalf("shutdown returned before the in-flight client request drained: %v", err)
+	default:
+	}
+	select {
+	case result := <-responses[0]:
+		t.Fatalf("in-flight client request returned before release: %+v", result)
+	default:
+	}
+	for i, ln := range listeners {
+		conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("plane %d accepted a new connection after shutdown began", i)
+		}
+	}
+
+	close(releaseClient)
+	result := receiveKVNodeTest(t, responses[0])
+	if result.err != nil || result.status != http.StatusOK || result.body != "plane" {
+		t.Fatalf("drained client result=%+v, want 200 plane", result)
+	}
+	if err := receiveKVNodeTest(t, errc); err != nil {
+		t.Fatalf("graceful shutdown returned %v", err)
+	}
+}
+
+func TestServeHTTPServersPreservesListenerStartError(t *testing.T) {
+	startErr := errors.New("listener start failed")
+	firstListener := make(chan *closeNotifyingListener, 1)
+	calls := 0
+	listen := func(network, address string) (net.Listener, error) {
+		calls++
+		if calls == 2 {
+			return nil, startErr
+		}
+		ln, err := net.Listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		notifying := &closeNotifyingListener{Listener: ln, closed: make(chan struct{})}
+		firstListener <- notifying
+		return notifying, nil
+	}
+	servers := []*http.Server{
+		newHTTPServer("127.0.0.1:0", http.NotFoundHandler(), time.Second, nil),
+		newHTTPServer("127.0.0.1:0", http.NotFoundHandler(), time.Second, nil),
+	}
+	err := serveHTTPServersWithListener(context.Background(), time.Second, listen, servers...)
+	if !errors.Is(err, startErr) {
+		t.Fatalf("serve error=%v, want listener start error", err)
+	}
+	receiveKVNodeTest(t, receiveKVNodeTest(t, firstListener).closed)
+}
+
+type lifecycleRoundTripper struct {
+	started chan struct{}
+	events  chan string
+}
+
+func (r *lifecycleRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(r.started)
+	<-req.Context().Done()
+	r.events <- "transport-worker-done"
+	return nil, req.Context().Err()
+}
+
+func (r *lifecycleRoundTripper) CloseIdleConnections() {
+	r.events <- "transport-closed"
+}
+
+type pebbleEventCloser struct {
+	db     *kv.DB
+	events chan string
+	closed bool
+}
+
+func (c *pebbleEventCloser) Close() error {
+	c.events <- "pebble-closed"
+	c.closed = true
+	return c.db.Close()
+}
+
+func TestApplicationCloseWaitsForTransportBeforeClosingPebbleAndIsIdempotent(t *testing.T) {
+	db, err := kv.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan string, 4)
+	roundTripper := &lifecycleRoundTripper{started: make(chan struct{}), events: events}
+	transportCtx, transportCancel := context.WithCancel(context.Background())
+	s := &service{
+		id:              1,
+		peers:           map[epaxos.ReplicaID]string{2: "http://peer-2"},
+		client:          &http.Client{Transport: roundTripper},
+		sendq:           make(chan *outboundFrame, 1),
+		transportCtx:    transportCtx,
+		transportCancel: transportCancel,
+	}
+	s.startTransportWorkers(1)
+	admitOutboundFrameForTest(t, s, mustOutboundFrame(t, s, epaxos.Message{
+		Type: epaxos.MsgCommit,
+		From: 1,
+		To:   2,
+		Ref:  epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Deps: []epaxos.InstanceNum{0},
+	}))
+	receiveKVNodeTest(t, roundTripper.started)
+	pebbleCloser := &pebbleEventCloser{db: db, events: events}
+	app := &application{service: s, storage: pebbleCloser}
+	closeErrs := make(chan error, 2)
+	go func() { closeErrs <- app.close() }()
+	go func() { closeErrs <- app.close() }()
+	for range 2 {
+		if err := receiveKVNodeTest(t, closeErrs); err != nil {
+			t.Fatalf("application close returned %v", err)
+		}
+	}
+	want := []string{"transport-closed", "transport-worker-done", "pebble-closed"}
+	for i, expected := range want {
+		if got := receiveKVNodeTest(t, events); got != expected {
+			t.Fatalf("close event %d=%q, want %q", i, got, expected)
+		}
+	}
+	if !pebbleCloser.closed {
+		t.Fatal("Pebble closer was not called")
+	}
+	if err := app.close(); err != nil {
+		t.Fatalf("repeated application close returned %v", err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("repeated close produced extra event %q", event)
+	default:
+	}
+}
+
+func TestKVNodeSignalsExitNormally(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		signal os.Signal
+	}{
+		{name: "SIGTERM", signal: syscall.SIGTERM},
+		{name: "SIGINT", signal: os.Interrupt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runKVNodeSignalChild(t, tc.signal)
+		})
+	}
+}
+
+func TestKVNodeSignalHelper(t *testing.T) {
+	if os.Getenv("KVNODE_SIGNAL_HELPER") != "1" {
+		return
+	}
+	var args []string
+	if err := json.Unmarshal([]byte(os.Getenv("KVNODE_SIGNAL_ARGS")), &args); err != nil {
+		t.Fatal(err)
+	}
+	ready := os.NewFile(uintptr(3), "kvnode-ready")
+	if ready == nil {
+		t.Fatal("ready pipe is unavailable")
+	}
+	listened := 0
+	listen := func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		listened++
+		if listened == 3 {
+			if _, err := ready.Write([]byte{1}); err != nil {
+				_ = ln.Close()
+				return nil, err
+			}
+			if err := ready.Close(); err != nil {
+				_ = ln.Close()
+				return nil, err
+			}
+		}
+		return ln, nil
+	}
+	if err := runWithSignals(args, listen); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runKVNodeSignalChild(t *testing.T, shutdownSignal os.Signal) {
+	t.Helper()
+	args := []string{
+		"-id", "1",
+		"-listen", "127.0.0.1:0",
+		"-peer-listen", "127.0.0.1:0",
+		"-admin-listen", "127.0.0.1:0",
+		"-data", filepath.Join(t.TempDir(), "data"),
+		"-peers", "1=http://127.0.0.1:1",
+		"-request-deadline-ms", "1000",
+		"-peer-deadline-ms", "1000",
+	}
+	encodedArgs, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyReader.Close()
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestKVNodeSignalHelper$")
+	command.Env = append(os.Environ(), "KVNODE_SIGNAL_HELPER=1", "KVNODE_SIGNAL_ARGS="+string(encodedArgs))
+	command.ExtraFiles = []*os.File{readyWriter}
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		_ = readyWriter.Close()
+		t.Fatal(err)
+	}
+	if err := readyWriter.Close(); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	if err := readyReader.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("child did not start all listeners: %v\n%s", err, output.String())
+	}
+	if err := command.Process.Signal(shutdownSignal); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	waitc := make(chan error, 1)
+	go func() { waitc <- command.Wait() }()
+	select {
+	case err := <-waitc:
+		if err != nil {
+			t.Fatalf("child exited after %v with %v\n%s", shutdownSignal, err, output.String())
+		}
+	case <-time.After(10 * time.Second):
+		_ = command.Process.Kill()
+		err := <-waitc
+		t.Fatalf("child did not exit after %v: %v\n%s", shutdownSignal, err, output.String())
+	}
+}
+
+func receiveKVNodeTest[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for kvnode test event")
+		var zero T
+		return zero
+	}
+}
+
+type acceptErrorListener struct {
+	*closeNotifyingListener
+	err error
+}
+
+func (l *acceptErrorListener) Accept() (net.Conn, error) {
+	return nil, l.err
+}
+
+type errorCountingCloser struct {
+	err   error
+	count int
+}
+
+func (c *errorCountingCloser) Close() error {
+	c.count++
+	return c.err
+}
+
+func TestApplicationRunPreservesServeAndStorageCloseErrors(t *testing.T) {
+	serveErr := errors.New("serve failed")
+	storageErr := errors.New("storage close failed")
+	closed := make(chan struct{})
+	listen := func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &acceptErrorListener{
+			closeNotifyingListener: &closeNotifyingListener{Listener: ln, closed: closed},
+			err:                    serveErr,
+		}, nil
+	}
+	storage := &errorCountingCloser{err: storageErr}
+	s := &service{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("unexpected request")
+	})}, sendq: make(chan *outboundFrame)}
+	app := &application{
+		service:         s,
+		servers:         []*http.Server{newHTTPServer("127.0.0.1:0", http.NotFoundHandler(), time.Second, nil)},
+		storage:         storage,
+		listen:          listen,
+		shutdownTimeout: time.Second,
+	}
+	err := app.run(context.Background())
+	if !errors.Is(err, serveErr) {
+		t.Fatalf("application error=%v, want serve error", err)
+	}
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("application error=%v, want storage close error", err)
+	}
+	receiveKVNodeTest(t, closed)
+	if storage.count != 1 {
+		t.Fatalf("storage close count=%d, want 1", storage.count)
+	}
+	if err := app.close(); !errors.Is(err, storageErr) {
+		t.Fatalf("repeated close error=%v, want storage close error", err)
+	}
+	if storage.count != 1 {
+		t.Fatalf("storage close count after repeated close=%d, want 1", storage.count)
+	}
+}
+
+func TestHTTPShutdownDeadlineIsBoundedAndObservable(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	srv := newHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		close(exited)
+		_, _ = w.Write([]byte("late"))
+	}), time.Second, nil)
+	listenerc := make(chan net.Listener, 1)
+	listen := func(network, address string) (net.Listener, error) {
+		ln, err := net.Listen(network, address)
+		if err == nil {
+			listenerc <- ln
+		}
+		return ln, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		errc <- serveHTTPServersWithListener(ctx, 25*time.Millisecond, listen, srv)
+	}()
+	ln := receiveKVNodeTest(t, listenerc)
+	requestc := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String())
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		requestc <- err
+	}()
+	receiveKVNodeTest(t, entered)
+	cancel()
+	err := receiveKVNodeTest(t, errc)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error=%v, want context deadline exceeded", err)
+	}
+	close(release)
+	receiveKVNodeTest(t, exited)
+	receiveKVNodeTest(t, requestc)
 }

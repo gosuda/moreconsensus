@@ -33,8 +33,9 @@ func TestValueHelpersAndStrings(t *testing.T) {
 	if !(Ballot{Epoch: 1}).Less(Ballot{Epoch: 2}) || !(Ballot{Epoch: 2, Number: 1}).Less(Ballot{Epoch: 2, Number: 2}) || !(Ballot{Epoch: 2, Number: 2, Replica: 1}).Less(Ballot{Epoch: 2, Number: 2, Replica: 2}) {
 		t.Fatal("ballot less failed")
 	}
-	if (Ballot{Number: 7}).Next(3) != (Ballot{Number: 8, Replica: 3}) {
-		t.Fatal("ballot next failed")
+	next, err := (Ballot{Number: 7}).Next(3)
+	if err != nil || next != (Ballot{Number: 8, Replica: 3}) {
+		t.Fatalf("ballot next = %#v, %v", next, err)
 	}
 	userA := Command{Payload: []byte("a"), ConflictKeys: [][]byte{[]byte("x")}}
 	userB := Command{Payload: []byte("b"), ConflictKeys: [][]byte{[]byte("x")}}
@@ -82,7 +83,7 @@ func TestConfigValidationAndMessageValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []InstanceNum{0, 0, 0}}
+	base := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}}
 	bad := base
 	bad.Type = 99
 	if err := rn.Step(bad); !errors.Is(err, ErrInvalidMessage) {
@@ -202,52 +203,50 @@ func TestMessageValidateRequiresAcceptEvidenceEnvelope(t *testing.T) {
 	}
 }
 
-func TestMessageValidateDependencyWidthExemptions(t *testing.T) {
+func TestMessageValidateRejectsNonCanonicalDependencyWidths(t *testing.T) {
 	conf := ConfState{ID: 1, Voters: makeIDs(3)}
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-
-	for _, tc := range []struct {
+	hint := Ballot{Number: 1, Replica: 1}
+	canonical := []struct {
 		name string
 		msg  Message
 	}{
 		{
-			name: "prepare short deps",
-			msg:  Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}},
+			name: "prepare",
+			msg:  Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Ballot: hint},
 		},
 		{
-			name: "prepare overwide deps",
-			msg:  Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}},
+			name: "accept response",
+			msg:  Message{Type: MsgAcceptResp, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 2}, RecordBallot: Ballot{Replica: 2}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, RecordStatus: StatusAccepted},
 		},
 		{
-			name: "accept response short deps",
-			msg:  Message{Type: MsgAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}},
+			name: "preaccept reject",
+			msg:  Message{Type: MsgPreAcceptResp, From: 1, To: 2, Ref: ref, Ballot: hint, Deps: []InstanceNum{0, 0, 0}, Reject: true, RejectHint: hint},
 		},
 		{
-			name: "accept response overwide deps",
-			msg:  Message{Type: MsgAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}},
+			name: "prepare reject",
+			msg:  Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Ballot: hint, Deps: []InstanceNum{0, 0, 0}, Reject: true, RejectHint: hint},
 		},
-		{
-			name: "preaccept reject short deps",
-			msg:  Message{Type: MsgPreAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}, Reject: true},
-		},
-		{
-			name: "preaccept reject overwide deps",
-			msg:  Message{Type: MsgPreAcceptResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}, Reject: true},
-		},
-		{
-			name: "prepare reject short deps",
-			msg:  Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0}, Reject: true},
-		},
-		{
-			name: "prepare reject overwide deps",
-			msg:  Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Deps: []InstanceNum{0, 0, 0, 0}, Reject: true},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.msg.Validate(conf); err != nil {
-				t.Fatalf("Validate err=%v, want nil", err)
-			}
-		})
+	}
+	for _, fixture := range canonical {
+		if err := fixture.msg.Validate(conf); err != nil {
+			t.Fatalf("canonical %s rejected: %v", fixture.name, err)
+		}
+		for _, tc := range []struct {
+			name string
+			deps []InstanceNum
+		}{
+			{name: "short", deps: []InstanceNum{0, 0}},
+			{name: "overwide", deps: []InstanceNum{0, 0, 0, 0}},
+		} {
+			t.Run(fixture.name+"/"+tc.name, func(t *testing.T) {
+				msg := fixture.msg.Clone()
+				msg.Deps = tc.deps
+				if err := msg.Validate(conf); !errors.Is(err, ErrInvalidMessage) {
+					t.Fatalf("Validate err=%v, want %v", err, ErrInvalidMessage)
+				}
+			})
+		}
 	}
 }
 
@@ -286,10 +285,14 @@ func TestStorageEdgeCases(t *testing.T) {
 	if err := nilMap.ApplyReady(Ready{Records: []InstanceRecord{rec}}); err != nil {
 		t.Fatal(err)
 	}
+	if !nilMap.Hard.Empty() || len(nilMap.Configs) != 0 {
+		t.Fatalf("record-only ApplyReady inferred hard-state configuration: Hard=%#v Configs=%#v", nilMap.Hard, nilMap.Configs)
+	}
 }
 
 func TestPrepareRecoveryPath(t *testing.T) {
 	s := newSimCluster(t, 3, false)
+	s.drain()
 	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
 	if err != nil {
 		t.Fatal(err)
@@ -304,6 +307,7 @@ func TestPrepareRecoveryPath(t *testing.T) {
 
 func TestRejectPathsAndTimers(t *testing.T) {
 	s := newSimCluster(t, 3, false)
+	s.drain()
 	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
 	if err != nil {
 		t.Fatal(err)

@@ -7,15 +7,22 @@ import (
 	"io"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/zeebo/blake3"
 	"gosuda.org/moreconsensus/epaxos"
 )
 
 const (
-	epaxosStorePrefix  byte = 'e'
-	epaxosRecordEntry  byte = 'r'
-	epaxosAppliedEntry byte = 'a'
-	epaxosRecordCodec  byte = 6
+	epaxosStorePrefix             byte = 'e'
+	epaxosRecordEntry             byte = 'r'
+	epaxosAppliedEntry            byte = 'a'
+	epaxosHardStateEntry          byte = 'h'
+	epaxosRecordCodec             byte = 8
+	epaxosHardStateCodec          byte = 1
+	epaxosHardStateChecksumSize        = 32
+	epaxosHardStateChecksumDomain      = "gosuda.org/moreconsensus/examples/kv/epaxos-hard-state/v1"
 )
+
+var epaxosHardStateKey = []byte{epaxosStorePrefix, epaxosHardStateEntry}
 
 // PebbleStorage persists EPaxOS instance records inside the example Pebble database.
 type PebbleStorage struct {
@@ -35,7 +42,8 @@ func (db *DB) EPaxosStorage() *PebbleStorage {
 
 // InitialState returns the stored hard state and configuration history.
 func (s *PebbleStorage) InitialState() (epaxos.HardState, []epaxos.ConfState, error) {
-	return epaxos.HardState{}, nil, nil
+	hardState, _, err := loadEPaxosHardState(s.pebble)
+	return hardState, nil, err
 }
 
 // LoadInstances loads persisted EPAXOS records in deterministic instance order.
@@ -67,21 +75,34 @@ func (s *PebbleStorage) LoadInstances(fn func(epaxos.InstanceRecord) error) erro
 
 // ApplyReady persists the durable records in rd without applying commands.
 func (s *PebbleStorage) ApplyReady(rd epaxos.Ready) error {
-	if len(rd.Records) == 0 {
+	if len(rd.Records) == 0 && rd.HardState.Empty() {
 		return nil
+	}
+	hardState, err := prepareEPaxosHardState(s.pebble, rd.HardState)
+	if err != nil {
+		return err
 	}
 	batch := s.pebble.NewBatch()
 	defer func() { _ = batch.Close() }()
 	if err := stageEPaxosRecords(batch, rd.Records); err != nil {
 		return err
 	}
+	if hardState != nil {
+		if err := batch.Set(epaxosHardStateKey, hardState, nil); err != nil {
+			return err
+		}
+	}
 	return batch.Commit(pebble.Sync)
 }
 
 // ApplyReady atomically persists EPAXOS records and applies committed KV commands.
 func (db *DB) ApplyReady(rd epaxos.Ready) error {
-	if len(rd.Records) == 0 && len(rd.Committed) == 0 {
+	if len(rd.Records) == 0 && len(rd.Committed) == 0 && rd.HardState.Empty() {
 		return nil
+	}
+	hardState, err := prepareEPaxosHardState(db.pebble, rd.HardState)
+	if err != nil {
+		return err
 	}
 	batch := db.newWriteBatch()
 	defer func() { _ = batch.Close() }()
@@ -104,11 +125,168 @@ func (db *DB) ApplyReady(rd epaxos.Ready) error {
 			return err
 		}
 	}
+	if hardState != nil {
+		if err := batch.Set(epaxosHardStateKey, hardState, nil); err != nil {
+			return err
+		}
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
 	db.nextTime = next
 	return nil
+}
+
+func prepareEPaxosHardState(pebbleDB *pebble.DB, next epaxos.HardState) ([]byte, error) {
+	if next.Empty() {
+		return nil, nil
+	}
+	if err := validateEPaxosHardState(next); err != nil {
+		return nil, err
+	}
+	current, found, err := loadEPaxosHardState(pebbleDB)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if next.Tick < current.Tick {
+			return nil, fmt.Errorf("%w: hard-state tick regression from %d to %d", epaxos.ErrInvalidConfig, current.Tick, next.Tick)
+		}
+		if next.Conf.ID < current.Conf.ID {
+			return nil, fmt.Errorf("%w: hard-state configuration regression from %d to %d", epaxos.ErrInvalidConfig, current.Conf.ID, next.Conf.ID)
+		}
+		if next.Conf.ID == current.Conf.ID && !sameEPaxosVoters(next.Conf.Voters, current.Conf.Voters) {
+			return nil, fmt.Errorf("%w: conflicting hard-state voters for configuration %d", epaxos.ErrInvalidConfig, next.Conf.ID)
+		}
+	}
+	return encodeEPaxosHardState(next), nil
+}
+
+func validateEPaxosHardState(hardState epaxos.HardState) error {
+	if hardState.Empty() {
+		return nil
+	}
+	if hardState.Conf.ID == 0 {
+		return fmt.Errorf("%w: hard state requires a nonzero configuration id", epaxos.ErrInvalidConfig)
+	}
+	if len(hardState.Conf.Voters) < 1 || len(hardState.Conf.Voters) > 7 {
+		return fmt.Errorf("%w: hard-state voter count must be 1..7", epaxos.ErrInvalidConfig)
+	}
+	var previous epaxos.ReplicaID
+	for _, voter := range hardState.Conf.Voters {
+		if voter == 0 {
+			return fmt.Errorf("%w: hard-state voter must be nonzero", epaxos.ErrInvalidConfig)
+		}
+		if voter <= previous {
+			return fmt.Errorf("%w: hard-state voters must be sorted and unique", epaxos.ErrInvalidConfig)
+		}
+		previous = voter
+	}
+	return nil
+}
+
+func sameEPaxosVoters(left, right []epaxos.ReplicaID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeEPaxosHardState(hardState epaxos.HardState) []byte {
+	voterCount := len(hardState.Conf.Voters)
+	payloadSize := 18 + voterCount*8
+	out := make([]byte, payloadSize+epaxosHardStateChecksumSize)
+	out[0] = epaxosHardStateCodec
+	binary.BigEndian.PutUint64(out[1:9], uint64(hardState.Conf.ID))
+	out[9] = byte(voterCount)
+	offset := 10
+	for _, voter := range hardState.Conf.Voters {
+		binary.BigEndian.PutUint64(out[offset:offset+8], uint64(voter))
+		offset += 8
+	}
+	binary.BigEndian.PutUint64(out[offset:offset+8], hardState.Tick)
+	checksum := checksumEPaxosHardState(out[:payloadSize])
+	copy(out[payloadSize:], checksum[:])
+	return out
+}
+
+func decodeEPaxosHardState(src []byte) (epaxos.HardState, error) {
+	if len(src) == 0 {
+		return epaxos.HardState{}, fmt.Errorf("kv: malformed epaxos hard state")
+	}
+	if src[0] != epaxosHardStateCodec {
+		return epaxos.HardState{}, fmt.Errorf("kv: bad epaxos hard-state version %d", src[0])
+	}
+	if len(src) < 10 {
+		return epaxos.HardState{}, fmt.Errorf("kv: malformed epaxos hard state")
+	}
+	voterCount := int(src[9])
+	if voterCount < 1 || voterCount > 7 {
+		return epaxos.HardState{}, fmt.Errorf("%w: hard-state voter count must be 1..7", epaxos.ErrInvalidConfig)
+	}
+	payloadSize := 18 + voterCount*8
+	encodedSize := payloadSize + epaxosHardStateChecksumSize
+	if len(src) < encodedSize {
+		return epaxos.HardState{}, fmt.Errorf("kv: malformed epaxos hard state")
+	}
+	if len(src) > encodedSize {
+		return epaxos.HardState{}, fmt.Errorf("kv: trailing bytes in epaxos hard state")
+	}
+	checksum := checksumEPaxosHardState(src[:payloadSize])
+	var storedChecksum [epaxosHardStateChecksumSize]byte
+	copy(storedChecksum[:], src[payloadSize:])
+	if checksum != storedChecksum {
+		return epaxos.HardState{}, epaxos.ErrChecksumMismatch
+	}
+	hardState := epaxos.HardState{
+		Conf: epaxos.ConfState{
+			ID:     epaxos.ConfID(binary.BigEndian.Uint64(src[1:9])),
+			Voters: make([]epaxos.ReplicaID, voterCount),
+		},
+	}
+	offset := 10
+	for i := range hardState.Conf.Voters {
+		hardState.Conf.Voters[i] = epaxos.ReplicaID(binary.BigEndian.Uint64(src[offset : offset+8]))
+		offset += 8
+	}
+	hardState.Tick = binary.BigEndian.Uint64(src[offset : offset+8])
+	if err := validateEPaxosHardState(hardState); err != nil {
+		return epaxos.HardState{}, err
+	}
+	return hardState, nil
+}
+
+func checksumEPaxosHardState(payload []byte) [epaxosHardStateChecksumSize]byte {
+	hasher := blake3.NewDeriveKey(epaxosHardStateChecksumDomain)
+	_, _ = hasher.Write(payload)
+	var out [epaxosHardStateChecksumSize]byte
+	sum := hasher.Sum(out[:0])
+	copy(out[:], sum)
+	return out
+}
+
+func loadEPaxosHardState(pebbleDB *pebble.DB) (epaxos.HardState, bool, error) {
+	value, closer, err := pebbleDB.Get(epaxosHardStateKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return epaxos.HardState{}, false, nil
+	}
+	if err != nil {
+		return epaxos.HardState{}, false, err
+	}
+	hardState, decodeErr := decodeEPaxosHardState(value)
+	closeErr := closer.Close()
+	if decodeErr != nil {
+		return epaxos.HardState{}, false, decodeErr
+	}
+	if closeErr != nil {
+		return epaxos.HardState{}, false, closeErr
+	}
+	return hardState, true, nil
 }
 
 func stageEPaxosRecords(batch txnBatch, records []epaxos.InstanceRecord) error {
@@ -230,6 +408,7 @@ func encodeEPaxosRecord(rec epaxos.InstanceRecord) []byte {
 		out = append(out, key...)
 	}
 	out = binary.AppendUvarint(out, rec.ProcessAt)
+	out = append(out, byte(rec.TimingDomain))
 	if rec.TOQPending {
 		out = append(out, 1)
 	} else {
@@ -240,13 +419,56 @@ func encodeEPaxosRecord(rec epaxos.InstanceRecord) []byte {
 	} else {
 		out = append(out, 0)
 	}
+	out = binary.AppendUvarint(out, uint64(rec.ConfChangeResult.Outcome))
+	out = binary.AppendUvarint(out, uint64(rec.ConfChangeResult.Conf.ID))
+	out = binary.AppendUvarint(out, uint64(len(rec.ConfChangeResult.Conf.Voters)))
+	for _, voter := range rec.ConfChangeResult.Conf.Voters {
+		out = binary.AppendUvarint(out, uint64(voter))
+	}
 	out = append(out, rec.Checksum[:]...)
 	return out
 }
 
+type epaxosRecordParser struct {
+	parser
+	canonical bool
+}
+
+func (p *epaxosRecordParser) uvarint() uint64 {
+	if p.err {
+		return 0
+	}
+	value, used := binary.Uvarint(p.b)
+	if used <= 0 {
+		p.err = true
+		return 0
+	}
+	if p.canonical {
+		var encoded [binary.MaxVarintLen64]byte
+		if binary.PutUvarint(encoded[:], value) != used {
+			p.err = true
+			return 0
+		}
+	}
+	p.b = p.b[used:]
+	return value
+}
+
+func (p *epaxosRecordParser) bytes() []byte {
+	length := p.uvarint()
+	if p.err || length > uint64(len(p.b)) {
+		p.err = true
+		return nil
+	}
+	out := p.b[:length]
+	p.b = p.b[length:]
+	return out
+}
+
 func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
-	p := parser{b: src}
+	p := epaxosRecordParser{parser: parser{b: src}}
 	version := p.byte()
+	p.canonical = version >= 8
 	if version < 1 || version > epaxosRecordCodec {
 		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos record version")
 	}
@@ -256,7 +478,11 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 	if version >= 5 {
 		rec.RecordBallot = epaxos.Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: epaxos.ReplicaID(p.uvarint())}
 	}
-	rec.Status = epaxos.Status(p.uvarint())
+	statusValue := p.uvarint()
+	if version >= 8 && statusValue > uint64(epaxos.StatusExecuted) {
+		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos record status")
+	}
+	rec.Status = epaxos.Status(statusValue)
 	if version < 5 && rec.Status != epaxos.StatusNone {
 		rec.RecordBallot = rec.Ballot
 	}
@@ -308,7 +534,13 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 			}
 		}
 	}
-	rec.Command = epaxos.Command{ID: epaxos.CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: epaxos.CommandKind(p.uvarint())}
+	commandClient := p.uvarint()
+	commandSequence := p.uvarint()
+	commandKind := p.uvarint()
+	if version >= 8 && commandKind > uint64(epaxos.CommandConfChange) {
+		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos command kind")
+	}
+	rec.Command = epaxos.Command{ID: epaxos.CommandID{Client: commandClient, Sequence: commandSequence}, Kind: epaxos.CommandKind(commandKind)}
 	rec.Command.Payload = append([]byte(nil), p.bytes()...)
 	keys := p.uvarint()
 	if keys > 128 {
@@ -320,10 +552,57 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 	}
 	if version >= 3 {
 		rec.ProcessAt = p.uvarint()
-		rec.TOQPending = p.byte() == 1
-		rec.FastPathEligible = p.byte() == 1
+		if version >= 8 {
+			rec.TimingDomain = epaxos.TimingDomain(p.byte())
+			if rec.TimingDomain > epaxos.TimingDomainTOQ {
+				return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos timing domain")
+			}
+		}
+		toqPending := p.byte()
+		fastPathEligible := p.byte()
+		if version >= 8 && (toqPending > 1 || fastPathEligible > 1) {
+			return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos record flags")
+		}
+		rec.TOQPending = toqPending == 1
+		rec.FastPathEligible = fastPathEligible == 1
+		if version >= 8 {
+			switch rec.TimingDomain {
+			case epaxos.TimingDomainUntimed:
+				if rec.ProcessAt != 0 || rec.TOQPending {
+					return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos timing metadata")
+				}
+			case epaxos.TimingDomainLogical:
+				if rec.ProcessAt == 0 || rec.TOQPending {
+					return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos timing metadata")
+				}
+			}
+		}
 	} else if version >= 2 {
 		rec.FastPathEligible = p.byte() == 1
+	}
+	if version >= 7 {
+		outcomeValue := p.uvarint()
+		if outcomeValue > uint64(epaxos.ConfChangeRejectedInvalid) {
+			return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos conf change outcome")
+		}
+		rec.ConfChangeResult.Outcome = epaxos.ConfChangeOutcome(outcomeValue)
+		rec.ConfChangeResult.Conf.ID = epaxos.ConfID(p.uvarint())
+		voters := p.uvarint()
+		if voters > 7 {
+			return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos conf change voter count")
+		}
+		if voters > 0 {
+			rec.ConfChangeResult.Conf.Voters = make([]epaxos.ReplicaID, int(voters))
+			var previous epaxos.ReplicaID
+			for i := range rec.ConfChangeResult.Conf.Voters {
+				voter := epaxos.ReplicaID(p.uvarint())
+				if voter == 0 || voter <= previous {
+					return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos conf change voter order")
+				}
+				rec.ConfChangeResult.Conf.Voters[i] = voter
+				previous = voter
+			}
+		}
 	}
 	if len(p.b) < len(rec.Checksum) {
 		p.err = true
@@ -334,48 +613,74 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 	if p.err || len(p.b) != 0 {
 		return epaxos.InstanceRecord{}, fmt.Errorf("kv: malformed epaxos record")
 	}
-	if epaxos.VerifyRecordChecksum(rec) {
+	if version == epaxosRecordCodec {
+		if epaxos.VerifyRecordChecksum(rec) {
+			return rec, nil
+		}
+		return epaxos.InstanceRecord{}, epaxos.ErrChecksumMismatch
+	}
+	if version == 7 {
+		if epaxos.VerifyRecordChecksumWithoutTimingDomain(rec) {
+			return rec, nil
+		}
+		return epaxos.InstanceRecord{}, epaxos.ErrChecksumMismatch
+	}
+	if version == 6 {
+		if epaxos.VerifyRecordChecksumWithoutConfChangeResult(rec) {
+			rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
+			return rec, nil
+		}
+		return epaxos.InstanceRecord{}, epaxos.ErrChecksumMismatch
+	}
+	if version < 6 && epaxos.VerifyRecordChecksumWithoutTimingDomain(rec) {
 		return rec, nil
 	}
 	if version < 6 {
 		if epaxos.VerifyRecordChecksumWithoutSenderAcceptEvidence(rec) {
-			rec.Checksum = epaxos.ChecksumRecord(rec)
+			rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 			return rec, nil
 		}
 	}
 	if version < 5 {
-		if epaxos.VerifyRecordChecksumWithoutRecordBallot(rec) {
-			rec.Checksum = epaxos.ChecksumRecord(rec)
+		legacy := rec
+		legacy.RecordBallot = epaxos.Ballot{}
+		if epaxos.VerifyRecordChecksumWithoutRecordBallot(legacy) {
+			rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 			return rec, nil
 		}
 	}
 	if version < 4 {
-		if epaxos.VerifyRecordChecksumWithoutAcceptEvidence(rec) {
-			rec.Checksum = epaxos.ChecksumRecord(rec)
+		legacy := rec
+		legacy.RecordBallot = epaxos.Ballot{}
+		if epaxos.VerifyRecordChecksumWithoutAcceptEvidence(legacy) {
+			rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 			return rec, nil
 		}
 	}
 	if version == 1 {
 		rec.FastPathEligible = true
-		if epaxos.VerifyRecordChecksum(rec) {
+		if epaxos.VerifyRecordChecksumWithoutTimingDomain(rec) {
 			return rec, nil
 		}
 		rec.FastPathEligible = false
 	}
 	if version < 3 {
-		if epaxos.VerifyRecordChecksumWithoutTOQ(rec) {
-			rec.Checksum = epaxos.ChecksumRecord(rec)
+		legacy := rec
+		legacy.RecordBallot = epaxos.Ballot{}
+		if epaxos.VerifyRecordChecksumWithoutTOQ(legacy) {
+			rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 			return rec, nil
 		}
 		if version == 1 {
-			rec.FastPathEligible = true
-			if epaxos.VerifyRecordChecksumWithoutTOQ(rec) {
-				rec.Checksum = epaxos.ChecksumRecord(rec)
+			legacy.FastPathEligible = true
+			if epaxos.VerifyRecordChecksumWithoutTOQ(legacy) {
+				rec.FastPathEligible = true
+				rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 				return rec, nil
 			}
-			rec.FastPathEligible = false
-			if epaxos.VerifyRecordChecksumWithoutFastPathOrTOQ(rec) {
-				rec.Checksum = epaxos.ChecksumRecord(rec)
+			legacy.FastPathEligible = false
+			if epaxos.VerifyRecordChecksumWithoutFastPathOrTOQ(legacy) {
+				rec.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(rec)
 				return rec, nil
 			}
 		}

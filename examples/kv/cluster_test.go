@@ -49,3 +49,28 @@ func TestOpenClusterRejectsInvalidSizes(t *testing.T) {
 		t.Fatal("expected large cluster rejection")
 	}
 }
+
+func TestClusterDrainQuiescesWithoutAdvancingLogicalTime(t *testing.T) {
+	paths := make([]string, 3)
+	for i := range paths {
+		paths[i] = t.TempDir()
+	}
+	cluster, err := OpenCluster(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cluster.Close() }()
+
+	before := make(map[epaxos.ReplicaID]uint64, len(cluster.Nodes))
+	for id, node := range cluster.Nodes {
+		before[id] = node.Status().Tick
+	}
+	if err := cluster.Drain(); err != nil {
+		t.Fatal(err)
+	}
+	for id, node := range cluster.Nodes {
+		if got := node.Status().Tick; got != before[id] {
+			t.Fatalf("Drain advanced replica %d logical tick from %d to %d", id, before[id], got)
+		}
+	}
+}

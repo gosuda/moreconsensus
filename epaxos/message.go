@@ -67,6 +67,10 @@ const (
 	RejectStaleBallot
 	RejectCommittedConflict
 	RejectUncommittedConflict
+	// RejectAcceptedTarget means TryPreAccept reached a replica that already
+	// durably accepted the target instance. The rejection carries that exact
+	// accepted tuple so the coordinator can abandon Try and restart Prepare.
+	RejectAcceptedTarget
 )
 
 // AcceptEvidence records recovery-only Accept-Deps evidence together with the
@@ -85,12 +89,39 @@ type TryPreAcceptIgnore struct {
 	Ref InstanceRef
 }
 
-func cloneAcceptEvidence(in []AcceptEvidence) []AcceptEvidence {
-	out := append([]AcceptEvidence(nil), in...)
-	for i := range out {
-		out[i].Deps = append([]InstanceNum(nil), out[i].Deps...)
+func cloneAcceptEvidenceInto(dst, src []AcceptEvidence) []AcceptEvidence {
+	source := src
+	if slicesPartiallyOverlap(dst, source) {
+		snapshot := make([]AcceptEvidence, len(source))
+		for i := range source {
+			snapshot[i] = AcceptEvidence{
+				Sender: source[i].Sender,
+				Seq:    source[i].Seq,
+				Deps:   append([]InstanceNum(nil), source[i].Deps...),
+			}
+		}
+		source = snapshot
 	}
-	return out
+	if cap(dst) < len(source) {
+		grown := make([]AcceptEvidence, len(source))
+		copy(grown, dst)
+		dst = grown
+	} else {
+		dst = dst[:len(source)]
+	}
+	for i := range source {
+		deps := cloneSliceInto(dst[i].Deps, source[i].Deps)
+		dst[i] = AcceptEvidence{Sender: source[i].Sender, Seq: source[i].Seq, Deps: deps}
+	}
+	full := dst[:cap(dst)]
+	for i := len(source); i < len(full); i++ {
+		full[i] = AcceptEvidence{}
+	}
+	return dst
+}
+
+func cloneAcceptEvidence(in []AcceptEvidence) []AcceptEvidence {
+	return cloneAcceptEvidenceInto(nil, in)
 }
 
 func mergeAcceptEvidenceEntries(dst, src []AcceptEvidence) []AcceptEvidence {
@@ -129,12 +160,12 @@ type Message struct {
 	From ReplicaID
 	To   ReplicaID
 	Ref  InstanceRef
-	// ProcessAt is the logical or TOQ timestamp at or after which a receiver
-	// should process MsgPreAccept. Zero means process immediately.
+	// ProcessAt is pinned by the instance owner. Its clock domain is encoded
+	// by ProcessAt together with TOQ and is authenticated by the checksum.
 	ProcessAt uint64
-	// TOQ marks an EPaxos Revisited Timestamp-Ordered Queueing PreAccept. TOQ
-	// PreAccepts intentionally carry Seq=0 and no deps; receivers compute attrs
-	// at ProcessAt instead of merging legacy proposer attrs.
+	// TOQ marks a nonzero ProcessAt as caller-sampled TOQ time. False marks
+	// nonzero ProcessAt as logical time. On an initial TOQ PreAccept, Seq and
+	// Deps remain empty until ProcessTOQ closes the timestamp bucket.
 	TOQ    bool
 	Ballot Ballot
 	// RecordBallot is the pre-promise durable ballot for MsgPrepareResp
@@ -167,13 +198,24 @@ func (m *Message) Reset() {
 	*m = Message{}
 }
 
+// CloneInto deep-copies m into dst while reusing destination capacity.
+func (m Message) CloneInto(dst *Message) {
+	deps := cloneSliceInto(dst.Deps, m.Deps)
+	acceptDeps := cloneSliceInto(dst.AcceptDeps, m.AcceptDeps)
+	acceptEvidence := cloneAcceptEvidenceInto(dst.AcceptEvidence, m.AcceptEvidence)
+	command := dst.Command
+	m.Command.CloneInto(&command)
+	*dst = m
+	dst.Deps = deps
+	dst.AcceptDeps = acceptDeps
+	dst.AcceptEvidence = acceptEvidence
+	dst.Command = command
+}
+
 // Clone returns a deep copy of the message.
 func (m Message) Clone() Message {
-	out := m
-	out.Deps = append([]InstanceNum(nil), m.Deps...)
-	out.AcceptDeps = append([]InstanceNum(nil), m.AcceptDeps...)
-	out.AcceptEvidence = cloneAcceptEvidence(m.AcceptEvidence)
-	out.Command = m.Command.Clone()
+	var out Message
+	m.CloneInto(&out)
 	return out
 }
 
@@ -197,25 +239,172 @@ func (m Message) Validate(conf ConfState) error {
 	if m.Type < MsgPreAccept || m.Type > MsgEvidenceResp {
 		return ErrInvalidMessage
 	}
-	if m.TOQ && m.Type != MsgPreAccept {
+	if len(conf.Voters) == 0 || len(conf.Voters) > 7 {
 		return ErrInvalidMessage
 	}
-	if m.From == 0 || m.To == 0 || m.Ref.IsZero() {
+	for i, voter := range conf.Voters {
+		if voter == 0 || (i > 0 && conf.Voters[i-1] >= voter) {
+			return ErrInvalidMessage
+		}
+	}
+	if conf.ID == 0 ||
+		m.Ref.Replica == 0 ||
+		m.Ref.Instance == 0 ||
+		m.Ref.Conf == 0 ||
+		m.Ref.Conf != conf.ID {
 		return ErrInvalidMessage
 	}
-	if !conf.Contains(m.From) || !conf.Contains(m.To) {
+	if m.From == 0 || m.To == 0 {
+		return ErrInvalidMessage
+	}
+	if !conf.Contains(m.From) || !conf.Contains(m.To) || !conf.Contains(m.Ref.Replica) {
 		return ErrMessageRejected
 	}
-	if (m.Type == MsgEvidence || m.Type == MsgEvidenceResp) && (m.ConflictRef.IsZero() || m.ConflictRef.Conf != m.Ref.Conf || !conf.Contains(m.ConflictRef.Replica)) {
+	if m.Command.Kind > CommandMembership ||
+		m.RecordStatus > StatusExecuted ||
+		m.ConflictStatus > StatusExecuted ||
+		m.RejectReason > RejectAcceptedTarget {
 		return ErrInvalidMessage
 	}
+	if m.Command.Kind == CommandNoop && (m.ProcessAt != 0 || m.TOQ) {
+		return ErrInvalidMessage
+	}
+	validBallot := func(ballot Ballot) bool {
+		return ballot == (Ballot{}) || (ballot.Replica != 0 && conf.Contains(ballot.Replica))
+	}
+	if !validBallot(m.Ballot) || !validBallot(m.RecordBallot) || !validBallot(m.RejectHint) {
+		return ErrInvalidMessage
+	}
+	if m.Type != MsgEvidenceResp && m.Ballot != (Ballot{}) && m.RecordBallot != (Ballot{}) && m.Ballot.Less(m.RecordBallot) {
+		return ErrInvalidMessage
+	}
+	if m.Ballot == (Ballot{}) {
+		return ErrInvalidMessage
+	}
+	switch m.Type {
+	case MsgPreAccept:
+		if m.Ballot.IsInitialFor(m.Ref.Replica) {
+			if m.From != m.Ref.Replica {
+				return ErrInvalidMessage
+			}
+		} else if !m.Ballot.IsRecovery() || m.From != m.Ballot.Replica {
+			return ErrInvalidMessage
+		}
+	case MsgAccept, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+		if m.From != m.Ballot.Replica {
+			return ErrInvalidMessage
+		}
+	}
+	validRef := func(ref InstanceRef) bool {
+		return ref.Replica != 0 && ref.Instance != 0 && ref.Conf == conf.ID && conf.Contains(ref.Replica)
+	}
+	conflictPresent := m.ConflictRef != (InstanceRef{})
+	if conflictPresent && !validRef(m.ConflictRef) {
+		return ErrInvalidMessage
+	}
+	if m.Type == MsgEvidence || m.Type == MsgEvidenceResp {
+		if !conflictPresent {
+			return ErrInvalidMessage
+		}
+	} else if conflictPresent && !(m.Type == MsgTryPreAcceptResp && m.Reject) {
+		return ErrInvalidMessage
+	}
+	if m.IgnoreDependency != (TryPreAcceptIgnore{}) {
+		if m.Type != MsgTryPreAccept || m.Reject || !validRef(m.IgnoreDependency.Ref) {
+			return ErrInvalidMessage
+		}
+	}
+	isResponse := m.Type == MsgPreAcceptResp ||
+		m.Type == MsgAcceptResp ||
+		m.Type == MsgPrepareResp ||
+		m.Type == MsgTryPreAcceptResp ||
+		m.Type == MsgEvidenceResp
+	if isResponse && !m.Reject && m.To != m.Ballot.Replica {
+		return ErrInvalidMessage
+	}
+	if m.Reject {
+		if !isResponse || m.Type == MsgEvidenceResp {
+			return ErrInvalidMessage
+		}
+		if m.Type != MsgTryPreAcceptResp {
+			if m.RejectReason != RejectNone || conflictPresent || m.ConflictStatus != StatusNone {
+				return ErrInvalidMessage
+			}
+		} else {
+			switch m.RejectReason {
+			case RejectNone, RejectStaleBallot:
+				if m.RejectHint == (Ballot{}) || conflictPresent || m.ConflictStatus != StatusNone {
+					return ErrInvalidMessage
+				}
+			case RejectCommittedConflict:
+				if !conflictPresent || m.ConflictStatus < StatusCommitted || m.RejectHint != (Ballot{}) {
+					return ErrInvalidMessage
+				}
+			case RejectUncommittedConflict:
+				if !conflictPresent || (m.ConflictStatus != StatusPreAccepted && m.ConflictStatus != StatusAccepted) || m.RejectHint != (Ballot{}) {
+					return ErrInvalidMessage
+				}
+			case RejectAcceptedTarget:
+				if conflictPresent || m.ConflictStatus != StatusNone || m.RejectHint != (Ballot{}) {
+					return ErrInvalidMessage
+				}
+			default:
+				return ErrInvalidMessage
+			}
+		}
+	} else if m.RejectReason != RejectNone || m.RejectHint != (Ballot{}) || (m.Type != MsgEvidence && m.Type != MsgEvidenceResp && m.ConflictStatus != StatusNone) {
+		return ErrInvalidMessage
+	}
+	if m.TOQ {
+		if m.Type == MsgPreAccept && m.Ballot.IsInitialFor(m.Ref.Replica) {
+			if m.From != m.Ref.Replica ||
+				m.RecordBallot != (Ballot{}) ||
+				m.RecordStatus != StatusNone {
+				return ErrInvalidMessage
+			}
+		} else {
+			switch m.Type {
+			case MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgEvidenceResp:
+			case MsgTryPreAcceptResp:
+				if !m.Reject || m.RejectReason != RejectAcceptedTarget {
+					return ErrInvalidMessage
+				}
+			default:
+				return ErrInvalidMessage
+			}
+		}
+	}
 	if !m.Reject && (m.Type == MsgPreAccept || m.Type == MsgPreAcceptResp || m.Type == MsgAccept || m.Type == MsgCommit || m.Type == MsgPrepareResp || m.Type == MsgTryPreAccept || m.Type == MsgTryPreAcceptResp || m.Type == MsgEvidenceResp) {
-		if m.Type == MsgPreAccept && m.TOQ {
+		if m.Type == MsgPreAccept && m.TOQ && m.Ballot.IsInitialFor(m.Ref.Replica) {
 			if m.Seq != 0 || len(m.Deps) != 0 {
 				return ErrInvalidMessage
 			}
 		} else if len(m.Deps) != len(conf.Voters) {
 			return ErrInvalidMessage
+		}
+	}
+	if !m.Reject {
+		switch m.Type {
+		case MsgPreAccept:
+			if !m.TOQ && m.Seq == 0 {
+				return ErrInvalidMessage
+			}
+		case MsgAccept, MsgCommit, MsgTryPreAccept:
+			if m.Seq == 0 {
+				return ErrInvalidMessage
+			}
+		case MsgPreAcceptResp:
+			if m.Seq == 0 {
+				return ErrInvalidMessage
+			}
+		case MsgTryPreAcceptResp:
+			if m.Seq == 0 || m.RecordStatus != StatusPreAccepted {
+				return ErrInvalidMessage
+			}
+		case MsgPrepareResp, MsgEvidenceResp:
+			if m.RecordStatus >= StatusPreAccepted && m.Seq == 0 {
+				return ErrInvalidMessage
+			}
 		}
 	}
 	if (m.AcceptSeq == 0) != (len(m.AcceptDeps) == 0) {
@@ -224,32 +413,245 @@ func (m Message) Validate(conf ConfState) error {
 	if len(m.AcceptDeps) > 0 && len(m.AcceptDeps) != len(conf.Voters) {
 		return ErrInvalidMessage
 	}
+	if len(m.AcceptEvidence) > len(conf.Voters) {
+		return ErrInvalidMessage
+	}
 	if len(m.AcceptEvidence) > 0 {
 		switch m.Type {
-		case MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp:
+		case MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgEvidenceResp:
+		case MsgTryPreAcceptResp:
+			if !m.Reject || m.RejectReason != RejectAcceptedTarget {
+				return ErrInvalidMessage
+			}
 		default:
 			return ErrInvalidMessage
 		}
-		seen := make(map[ReplicaID]AcceptEvidence, len(m.AcceptEvidence))
-		for _, ev := range m.AcceptEvidence {
-			if ev.Sender == 0 || !conf.Contains(ev.Sender) || ev.Seq == 0 || len(ev.Deps) != len(conf.Voters) {
+		var seen uint64
+		var evidenceSeq [7]uint64
+		var evidenceDeps [7][]InstanceNum
+		for _, evidence := range m.AcceptEvidence {
+			index, ok := conf.Index(evidence.Sender)
+			if !ok || evidence.Seq == 0 || len(evidence.Deps) != len(conf.Voters) {
 				return ErrInvalidMessage
 			}
-			if existing, ok := seen[ev.Sender]; ok {
-				if existing.Seq != ev.Seq || !instanceNumsEqual(existing.Deps, ev.Deps) {
+			bit := uint64(1) << uint(index)
+			if seen&bit != 0 {
+				if evidenceSeq[index] != evidence.Seq || !instanceNumsEqual(evidenceDeps[index], evidence.Deps) {
 					return ErrInvalidMessage
 				}
 				continue
 			}
-			seen[ev.Sender] = ev
+			evidenceSeq[index] = evidence.Seq
+			evidenceDeps[index] = evidence.Deps
+			seen |= bit
 		}
 	}
-	if m.IgnoreDependency != (TryPreAcceptIgnore{}) {
-		if m.Type != MsgTryPreAccept || m.IgnoreDependency.Ref.Conf != m.Ref.Conf || !conf.Contains(m.IgnoreDependency.Ref.Replica) {
+	hasAcceptMetadata := m.AcceptSeq != 0 || len(m.AcceptDeps) != 0 || len(m.AcceptEvidence) != 0
+	switch m.Type {
+	case MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgEvidenceResp:
+	case MsgTryPreAcceptResp:
+		if hasAcceptMetadata && (!m.Reject || m.RejectReason != RejectAcceptedTarget) {
+			return ErrInvalidMessage
+		}
+	default:
+		if hasAcceptMetadata {
 			return ErrInvalidMessage
 		}
 	}
-	if m.DepsCommitted>>uint(len(conf.Voters)) != 0 {
+	if (m.Type == MsgPrepareResp || m.Type == MsgEvidenceResp) &&
+		m.RecordStatus < StatusAccepted &&
+		hasAcceptMetadata {
+		return ErrInvalidMessage
+	}
+	if m.ProcessAt != 0 {
+		switch m.Type {
+		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidenceResp:
+		default:
+			return ErrInvalidMessage
+		}
+	}
+	if m.FastPathEligible {
+		switch m.Type {
+		case MsgPreAcceptResp:
+			if m.Reject || m.RecordStatus != StatusNone {
+				return ErrInvalidMessage
+			}
+		case MsgPrepareResp, MsgEvidenceResp:
+			if m.Reject ||
+				m.RecordStatus != StatusPreAccepted ||
+				m.RecordBallot != (Ballot{Replica: m.Ref.Replica}) {
+				return ErrInvalidMessage
+			}
+		default:
+			return ErrInvalidMessage
+		}
+	}
+	if m.DepsCommitted != 0 && (m.Type != MsgPreAcceptResp || m.Reject || m.RecordStatus != StatusNone) {
+		return ErrInvalidMessage
+	}
+	commandEmpty := m.Command.ID == (CommandID{}) &&
+		m.Command.Kind == CommandUser &&
+		len(m.Command.Payload) == 0 &&
+		len(m.Command.ConflictKeys) == 0
+	depsAllZero := func() bool {
+		for _, dep := range m.Deps {
+			if dep != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	if m.Reject {
+		timedAcceptedTarget := m.Type == MsgTryPreAcceptResp && m.RejectReason == RejectAcceptedTarget
+		if m.FastPathEligible ||
+			m.DepsCommitted != 0 ||
+			(!timedAcceptedTarget && (m.ProcessAt != 0 || m.TOQ)) ||
+			m.IgnoreDependency != (TryPreAcceptIgnore{}) {
+			return ErrInvalidMessage
+		}
+		if m.Type == MsgTryPreAcceptResp && m.RejectReason == RejectAcceptedTarget {
+			if !m.Ballot.IsRecovery() ||
+				m.To != m.Ballot.Replica ||
+				m.RejectHint != (Ballot{}) ||
+				conflictPresent ||
+				m.ConflictStatus != StatusNone ||
+				m.RecordBallot == (Ballot{}) ||
+				m.RecordStatus != StatusAccepted ||
+				m.Seq == 0 ||
+				len(m.Deps) != len(conf.Voters) {
+				return ErrInvalidMessage
+			}
+			return nil
+		}
+		if len(m.Deps) != len(conf.Voters) ||
+			!depsAllZero() ||
+			m.RecordBallot != (Ballot{}) ||
+			m.Seq != 0 ||
+			!commandEmpty ||
+			m.RecordStatus != StatusNone ||
+			hasAcceptMetadata {
+			return ErrInvalidMessage
+		}
+		switch m.Type {
+		case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp:
+			if m.RejectReason != RejectNone || m.RejectHint == (Ballot{}) || m.Ballot != m.RejectHint {
+				return ErrInvalidMessage
+			}
+		case MsgTryPreAcceptResp:
+			switch m.RejectReason {
+			case RejectStaleBallot:
+				if m.RejectHint == (Ballot{}) || m.Ballot != m.RejectHint {
+					return ErrInvalidMessage
+				}
+			case RejectCommittedConflict, RejectUncommittedConflict:
+				if m.RejectHint != (Ballot{}) {
+					return ErrInvalidMessage
+				}
+			default:
+				return ErrInvalidMessage
+			}
+		default:
+			return ErrInvalidMessage
+		}
+		return nil
+	}
+	switch m.Type {
+	case MsgPreAccept:
+		if m.RecordBallot != (Ballot{}) ||
+			m.RecordStatus != StatusNone ||
+			m.FastPathEligible ||
+			m.DepsCommitted != 0 {
+			return ErrInvalidMessage
+		}
+	case MsgPreAcceptResp:
+		if m.RecordBallot != (Ballot{}) ||
+			m.RecordStatus != StatusNone ||
+			!commandEmpty ||
+			hasAcceptMetadata {
+			return ErrInvalidMessage
+		}
+	case MsgAccept:
+		if m.RecordStatus != StatusNone || m.RecordBallot != (Ballot{}) {
+			return ErrInvalidMessage
+		}
+	case MsgAcceptResp:
+		if m.RecordStatus != StatusAccepted ||
+			m.RecordBallot == (Ballot{}) ||
+			m.RecordBallot != m.Ballot ||
+			m.Seq == 0 ||
+			len(m.Deps) != len(conf.Voters) ||
+			!commandEmpty {
+			return ErrInvalidMessage
+		}
+	case MsgCommit:
+		if m.RecordStatus != StatusNone || m.RecordBallot == (Ballot{}) {
+			return ErrInvalidMessage
+		}
+	case MsgPrepare:
+		if !m.Ballot.IsRecovery() ||
+			m.RecordBallot != (Ballot{}) ||
+			m.RecordStatus != StatusNone ||
+			m.Seq != 0 ||
+			len(m.Deps) != 0 ||
+			!commandEmpty ||
+			hasAcceptMetadata ||
+			m.FastPathEligible ||
+			m.DepsCommitted != 0 {
+			return ErrInvalidMessage
+		}
+	case MsgPrepareResp:
+		if !m.Ballot.IsRecovery() {
+			return ErrInvalidMessage
+		}
+		if m.RecordStatus == StatusNone {
+			if m.RecordBallot != (Ballot{}) ||
+				m.Seq != 0 ||
+				!depsAllZero() ||
+				!commandEmpty ||
+				hasAcceptMetadata ||
+				m.FastPathEligible {
+				return ErrInvalidMessage
+			}
+		} else if m.RecordBallot == (Ballot{}) || m.Seq == 0 {
+			return ErrInvalidMessage
+		}
+	case MsgTryPreAccept:
+		if !m.Ballot.IsRecovery() ||
+			m.RecordStatus != StatusNone ||
+			m.RecordBallot != (Ballot{}) {
+			return ErrInvalidMessage
+		}
+	case MsgTryPreAcceptResp:
+		if m.RecordStatus != StatusPreAccepted ||
+			m.RecordBallot != (Ballot{}) ||
+			!commandEmpty {
+			return ErrInvalidMessage
+		}
+	case MsgEvidence:
+		if m.RecordBallot != (Ballot{}) ||
+			m.Seq != 0 ||
+			len(m.Deps) != 0 ||
+			!commandEmpty ||
+			m.RecordStatus != StatusNone ||
+			hasAcceptMetadata ||
+			m.FastPathEligible {
+			return ErrInvalidMessage
+		}
+	case MsgEvidenceResp:
+		if m.RecordStatus == StatusNone {
+			if m.RecordBallot != (Ballot{}) ||
+				m.Seq != 0 ||
+				!depsAllZero() ||
+				!commandEmpty ||
+				hasAcceptMetadata ||
+				m.FastPathEligible {
+				return ErrInvalidMessage
+			}
+		} else if m.RecordBallot == (Ballot{}) || m.Seq == 0 {
+			return ErrInvalidMessage
+		}
+	}
+	if m.DepsCommitted>>uint(len(conf.Voters)) != 0 || (m.DepsCommitted != 0 && m.Type != MsgPreAcceptResp) {
 		return ErrInvalidMessage
 	}
 	return nil

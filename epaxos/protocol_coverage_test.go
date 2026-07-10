@@ -3,8 +3,27 @@ package epaxos
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"testing"
 )
+
+func protocolCoverageNewRawNode(t *testing.T, id ReplicaID, voters int) *RawNode {
+	t.Helper()
+	rn := optimizedNewRawNode(t, id, voters)
+	protocolCoverageAdvanceHardStateOnly(t, rn, 0)
+	return rn
+}
+
+func protocolCoverageAdvanceHardStateOnly(t *testing.T, rn *RawNode, wantTick uint64) {
+	t.Helper()
+	rd := rn.Ready()
+	want := HardState{Conf: rn.Status().Conf, Tick: wantTick}
+	if !rd.HardState.Equal(want) || !rd.MustSync ||
+		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+		t.Fatalf("hard-state-only Ready = %#v, want %#v without protocol payload", rd, want)
+	}
+	advanceOK(t, rn, rd)
+}
 
 func TestEncodeMessagePreservesFastPathEligibilityWireMarker(t *testing.T) {
 	for _, tt := range []struct {
@@ -16,19 +35,14 @@ func TestEncodeMessagePreservesFastPathEligibilityWireMarker(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-			msg := Message{
-				Type:             MsgTryPreAccept,
-				From:             1,
-				To:               2,
-				Ref:              ref,
-				Ballot:           Ballot{Number: 1, Replica: 1},
-				Seq:              3,
-				Deps:             []InstanceNum{0, 2, 0},
-				Command:          optimizedTestCommand("try-encode", "try-encode-key"),
-				RecordStatus:     StatusPreAccepted,
-				FastPathEligible: tt.fast,
-				DepsCommitted:    0b101,
-			}
+			msg := Message{Type: MsgTryPreAccept, From: 1,
+				To:      2,
+				Ref:     ref,
+				Ballot:  Ballot{Number: 1, Replica: 1},
+				Seq:     3,
+				Deps:    []InstanceNum{0, 2, 0},
+				Command: optimizedTestCommand("try-encode", "try-encode-key"), FastPathEligible: tt.fast,
+				DepsCommitted: 0b101}
 			encoded, err := EncodeMessage(nil, msg)
 			if err != nil {
 				t.Fatal(err)
@@ -40,7 +54,10 @@ func TestEncodeMessagePreservesFastPathEligibilityWireMarker(t *testing.T) {
 			if decoded.FastPathEligible != tt.fast {
 				t.Fatalf("decoded TryPreAccept FastPathEligible = %v, want %v from wire marker: %#v", decoded.FastPathEligible, tt.fast, decoded)
 			}
-			if decoded.Type != msg.Type || decoded.Ref != msg.Ref || decoded.Seq != msg.Seq || decoded.RecordStatus != msg.RecordStatus || decoded.DepsCommitted != msg.DepsCommitted {
+			if decoded.Type != msg.Type || decoded.Ref != msg.Ref || decoded.Ballot != msg.Ballot ||
+				decoded.RecordBallot != (Ballot{}) || decoded.RecordStatus != StatusNone ||
+				decoded.Seq != msg.Seq || !instanceNumsEqual(decoded.Deps, msg.Deps) ||
+				!commandEqual(decoded.Command, msg.Command) || decoded.DepsCommitted != msg.DepsCommitted {
 				t.Fatalf("decoded TryPreAccept = %#v, want protocol fields from %#v", decoded, msg)
 			}
 		})
@@ -48,7 +65,7 @@ func TestEncodeMessagePreservesFastPathEligibilityWireMarker(t *testing.T) {
 }
 
 func TestPrepareExpandsStoredDependencyVectorBeforeResponding(t *testing.T) {
-	rn := optimizedNewRawNode(t, 2, 3)
+	rn := protocolCoverageNewRawNode(t, 2, 3)
 	ref := InstanceRef{Replica: 1, Instance: 4, Conf: 1}
 	cmd := optimizedTestCommand("prepare-expand", "prepare-expand-key")
 	rec := checkedRecord(InstanceRecord{
@@ -76,7 +93,7 @@ func TestPrepareExpandsStoredDependencyVectorBeforeResponding(t *testing.T) {
 }
 
 func TestStartTryPreAcceptDoesNotReopenCommittedInstance(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	ref := InstanceRef{Replica: 1, Instance: 5, Conf: 1}
 	committed := checkedRecord(InstanceRecord{
 		Ref:     ref,
@@ -89,7 +106,7 @@ func TestStartTryPreAcceptDoesNotReopenCommittedInstance(t *testing.T) {
 	inst := &instance{rec: committed, phase: phaseCommitted, generation: 11}
 	rn.instances[ref] = inst
 
-	rn.startTryPreAccept(inst, Attributes{Seq: 9, Deps: []InstanceNum{3, 3, 3}}, map[ReplicaID]struct{}{2: {}})
+	rn.startTryPreAccept(inst, Attributes{Seq: 9, Deps: []InstanceNum{3, 3, 3}}, map[ReplicaID]struct{}{2: {}}, true)
 	if inst.phase != phaseCommitted || inst.rec.Status != StatusCommitted || inst.rec.Seq != committed.Seq || inst.generation != 11 {
 		t.Fatalf("TryPreAccept reopened committed instance: phase=%d record=%#v generation=%d", inst.phase, inst.rec, inst.generation)
 	}
@@ -100,7 +117,7 @@ func TestStartTryPreAcceptDoesNotReopenCommittedInstance(t *testing.T) {
 
 func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 	t.Run("committed instance replies with commit only", func(t *testing.T) {
-		rn := optimizedNewRawNode(t, 2, 3)
+		rn := protocolCoverageNewRawNode(t, 2, 3)
 		ref := InstanceRef{Replica: 1, Instance: 6, Conf: 1}
 		cmd := optimizedTestCommand("already-committed", "already-committed-key")
 		optimizedSeedRecord(t, rn, InstanceRecord{Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusCommitted, Seq: 2, Deps: rn.q.deps(), Command: cmd})
@@ -110,8 +127,12 @@ func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 		}
 		rd := rn.Ready()
 		commit := optimizedRequireMessage(t, rd.Messages, MsgCommit, 1)
-		if commit.Ref != ref || commit.RecordStatus != StatusCommitted || commit.Seq != 2 {
-			t.Fatalf("committed TryPreAccept reply = %#v, want committed record", commit)
+		want := rn.instances[ref].rec
+		if commit.From != 2 || commit.Ref != ref || commit.Ballot != want.Ballot ||
+			commit.RecordBallot == (Ballot{}) || commit.RecordBallot != want.RecordBallot ||
+			commit.RecordStatus != StatusNone || commit.Seq != want.Seq ||
+			!instanceNumsEqual(commit.Deps, want.Deps) || !commandEqual(commit.Command, want.Command) {
+			t.Fatalf("committed TryPreAccept reply = %#v, want canonical committed tuple %#v", commit, want)
 		}
 		optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAcceptResp)
 		if len(rd.Records) != 0 {
@@ -120,7 +141,7 @@ func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 	})
 
 	t.Run("duplicate matching preaccept only re-acks", func(t *testing.T) {
-		rn := optimizedNewRawNode(t, 2, 3)
+		rn := protocolCoverageNewRawNode(t, 2, 3)
 		ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 		cmd := optimizedTestCommand("idempotent", "idempotent-key")
 		attrs := Attributes{Seq: 3, Deps: []InstanceNum{0, 1, 0}}
@@ -131,8 +152,11 @@ func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 		}
 		rd := rn.Ready()
 		resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-		if resp.Reject || resp.RecordStatus != StatusPreAccepted || resp.Seq != attrs.Seq || len(resp.Deps) != len(attrs.Deps) {
-			t.Fatalf("idempotent TryPreAccept response = %#v, want matching preaccept ack", resp)
+		if resp.From != 2 || resp.Ref != ref || resp.Ballot != (Ballot{Number: 1, Replica: 1}) ||
+			resp.RecordBallot != (Ballot{}) || resp.Reject || resp.RecordStatus != StatusPreAccepted ||
+			resp.Seq != attrs.Seq || !instanceNumsEqual(resp.Deps, attrs.Deps) ||
+			!commandEqual(resp.Command, Command{}) {
+			t.Fatalf("idempotent TryPreAccept response = %#v, want canonical matching preaccept ack", resp)
 		}
 		if len(rd.Records) != 0 {
 			t.Fatalf("idempotent TryPreAccept duplicated durable record: %#v", rd.Records)
@@ -144,24 +168,51 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 	t.Run("stale rejection with higher hint restarts prepare", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
 		hint := Ballot{Number: 7, Replica: 2}
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Reject: true, RejectReason: RejectStaleBallot, RejectHint: hint, Deps: rn.q.deps()}); err != nil {
+		want, err := hint.Next(1)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if inst.phase != phasePrepare || inst.rec.Ballot != hint.Next(1) {
-			t.Fatalf("stale TryPreAccept rejection phase/ballot = %d/%#v, want prepare at %#v", inst.phase, inst.rec.Ballot, hint.Next(1))
+		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: hint, Reject: true, RejectReason: RejectStaleBallot, RejectHint: hint, Deps: rn.q.deps()}); err != nil {
+			t.Fatal(err)
 		}
-		optimizedRequireMessage(t, rn.Ready().Messages, MsgPrepare, 2)
+		if inst.phase != phasePrepare || inst.rec.Ballot != want {
+			t.Fatalf("stale TryPreAccept rejection phase/ballot = %d/%#v, want prepare at %#v", inst.phase, inst.rec.Ballot, want)
+		}
+		prepare := optimizedRequireMessage(t, rn.Ready().Messages, MsgPrepare, 2)
+		if prepare.From != 1 || prepare.Ref != ref || prepare.Ballot != inst.rec.Ballot ||
+			prepare.RecordBallot != (Ballot{}) || prepare.RecordStatus != StatusNone ||
+			prepare.Seq != 0 || len(prepare.Deps) != 0 || !commandEqual(prepare.Command, Command{}) {
+			t.Fatalf("stale TryPreAccept rejection Prepare = %#v, want minimal request at ballot %#v", prepare, inst.rec.Ballot)
+		}
 	})
 
 	t.Run("committed conflict falls back to slow accept", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Reject: true, RejectReason: RejectCommittedConflict, Deps: rn.q.deps()}); err != nil {
+		conflictRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+		if err := rn.Step(Message{
+			Type:           MsgTryPreAcceptResp,
+			From:           2,
+			To:             1,
+			Ref:            ref,
+			Ballot:         inst.rec.Ballot,
+			Deps:           rn.q.deps(),
+			Reject:         true,
+			RejectReason:   RejectCommittedConflict,
+			ConflictRef:    conflictRef,
+			ConflictStatus: StatusCommitted,
+		}); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted || inst.rec.FastPathEligible {
 			t.Fatalf("committed-conflict TryPreAccept rejection phase/record = %d/%#v, want non-fast accepted", inst.phase, inst.rec)
 		}
-		optimizedRequireMessage(t, rn.Ready().Messages, MsgAccept, 2)
+		accept := optimizedRequireMessage(t, rn.Ready().Messages, MsgAccept, 2)
+		if accept.From != 1 || accept.Ref != ref || accept.Ballot != inst.rec.Ballot ||
+			accept.RecordBallot != (Ballot{}) || accept.RecordStatus != StatusNone ||
+			accept.Seq != inst.rec.Seq || !instanceNumsEqual(accept.Deps, inst.rec.Deps) ||
+			!commandEqual(accept.Command, inst.rec.Command) {
+			t.Fatalf("committed-conflict slow Accept = %#v, want canonical tuple %#v", accept, inst.rec)
+		}
 	})
 
 	t.Run("older ballot response is ignored", func(t *testing.T) {
@@ -210,7 +261,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 }
 
 func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	ref := InstanceRef{Replica: 1, Instance: 31, Conf: 1}
 	rec := checkedRecord(InstanceRecord{
 		Ref:              ref,
@@ -227,18 +278,13 @@ func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
 
 	respDeps := []InstanceNum{0, 1, 0}
 	const depsCommitted uint64 = 0b101
-	if err := rn.Step(Message{
-		Type:             MsgPreAcceptResp,
-		From:             2,
-		To:               1,
-		Ref:              ref,
-		Ballot:           rec.Ballot,
-		Seq:              4,
-		Deps:             respDeps,
-		RecordStatus:     StatusPreAccepted,
-		FastPathEligible: true,
-		DepsCommitted:    depsCommitted,
-	}); err != nil {
+	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2,
+		To:     1,
+		Ref:    ref,
+		Ballot: rec.Ballot,
+		Seq:    4,
+		Deps:   respDeps, FastPathEligible: true,
+		DepsCommitted: depsCommitted}); err != nil {
 		t.Fatal(err)
 	}
 	if inst.preOK == nil {
@@ -286,6 +332,7 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 		RejectReason:   RejectCommittedConflict,
 		ConflictRef:    conflictRef,
 		ConflictStatus: StatusCommitted,
+		Deps:           rn.q.deps(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -300,8 +347,11 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 	}
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgAccept, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusAccepted || msg.Seq != wantSeq || !instanceNumsEqual(msg.Deps, wantDeps) {
-			t.Fatalf("committed-conflict slow accept message to %d = %#v, want accepted seq %d deps %v", to, msg, wantSeq, wantDeps)
+		if msg.From != 1 || msg.Ref != ref || msg.Ballot != inst.rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != wantSeq || !instanceNumsEqual(msg.Deps, wantDeps) ||
+			!commandEqual(msg.Command, inst.rec.Command) {
+			t.Fatalf("committed-conflict slow accept message to %d = %#v, want canonical seq %d deps %v", to, msg, wantSeq, wantDeps)
 		}
 	}
 	if len(rd.Committed) != 0 {
@@ -310,7 +360,7 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 }
 
 func TestPrepareResponsePreservesOriginalAcceptEvidenceSender(t *testing.T) {
-	rn := optimizedNewRawNode(t, 2, 3)
+	rn := protocolCoverageNewRawNode(t, 2, 3)
 	ref := InstanceRef{Replica: 1, Instance: 8, Conf: 1}
 	reporter := rn.id
 	originalSender := ReplicaID(3)
@@ -342,7 +392,7 @@ func TestPrepareResponsePreservesOriginalAcceptEvidenceSender(t *testing.T) {
 }
 
 func TestLegacyAggregateAcceptDepsCannotAuthorizeTryPreAcceptIgnoreMarker(t *testing.T) {
-	rn := optimizedNewRawNode(t, 2, 3)
+	rn := protocolCoverageNewRawNode(t, 2, 3)
 	key := "legacy-aggregate-accept-deps-ignore"
 	targetRef := InstanceRef{Replica: 1, Instance: 9, Conf: 1}
 	conflictRef := InstanceRef{Replica: 2, Instance: 2, Conf: 1}
@@ -382,7 +432,7 @@ func TestLegacyAggregateAcceptDepsCannotAuthorizeTryPreAcceptIgnoreMarker(t *tes
 }
 
 func TestDependencyPredicatesConservativelyRejectMissingConfigKnowledge(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	if rn.attrsDependsOn(Attributes{Seq: 1, Deps: []InstanceNum{0, 4, 0}}, InstanceRef{Replica: 2, Instance: 1, Conf: 2}, 1) {
 		t.Fatal("dependency from another configuration was treated as known in this config")
 	}
@@ -402,7 +452,7 @@ func TestDependencyPredicatesConservativelyRejectMissingConfigKnowledge(t *testi
 		t.Fatal("short timed fast-path attrs covered wider local deps")
 	}
 
-	single := optimizedNewRawNode(t, 1, 1)
+	single := protocolCoverageNewRawNode(t, 1, 1)
 	if got := single.recoveryCoordinator(InstanceRef{Replica: 1, Instance: 1, Conf: 1}); got != 1 {
 		t.Fatalf("single-voter recovery coordinator = %d, want self", got)
 	}
@@ -418,8 +468,11 @@ func TestTryPreAcceptTimerRebroadcastsOnlyWhileInTryPhase(t *testing.T) {
 	rd := rn.Ready()
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusPreAccepted || msg.FastPathEligible {
-			t.Fatalf("TryPreAccept timer message to %d = %#v, want non-fast preaccepted recovery record", to, msg)
+		if msg.From != 1 || msg.Ref != ref || msg.Ballot != inst.rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != inst.rec.Seq || !instanceNumsEqual(msg.Deps, inst.rec.Deps) ||
+			!commandEqual(msg.Command, inst.rec.Command) || msg.FastPathEligible {
+			t.Fatalf("TryPreAccept timer message to %d = %#v, want canonical non-fast recovery tuple %#v", to, msg, inst.rec)
 		}
 	}
 	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
@@ -457,8 +510,11 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 	rd := rn.Ready()
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusPreAccepted || msg.FastPathEligible {
-			t.Fatalf("TryPreAccept timer retry message to %d = %#v, want target preaccepted recovery record", to, msg)
+		if msg.From != 1 || msg.Ref != ref || msg.Ballot != inst.rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != inst.rec.Seq || !instanceNumsEqual(msg.Deps, inst.rec.Deps) ||
+			!commandEqual(msg.Command, inst.rec.Command) || msg.FastPathEligible {
+			t.Fatalf("TryPreAccept timer retry message to %d = %#v, want canonical recovery tuple %#v", to, msg, inst.rec)
 		}
 	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
@@ -471,57 +527,59 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 	}
 	for tick := uint64(1); tick < rn.retryTicks; tick++ {
 		rn.Tick()
-		if rn.HasReady() {
-			t.Fatalf("rescheduled TryPreAccept retry fired after %d ticks, before deadline: %#v", tick, rn.Ready())
-		}
+		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
 	}
 
 	rn.Tick()
 	retry := rn.Ready()
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, retry.Messages, MsgTryPreAccept, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusPreAccepted || msg.FastPathEligible {
-			t.Fatalf("rescheduled TryPreAccept retry message to %d = %#v, want target preaccepted recovery record", to, msg)
+		if msg.From != 1 || msg.Ref != ref || msg.Ballot != inst.rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != inst.rec.Seq || !instanceNumsEqual(msg.Deps, inst.rec.Deps) ||
+			!commandEqual(msg.Command, inst.rec.Command) || msg.FastPathEligible {
+			t.Fatalf("rescheduled TryPreAccept retry message to %d = %#v, want canonical recovery tuple %#v", to, msg, inst.rec)
 		}
 	}
 	optimizedRequireNoMessageType(t, retry.Messages, MsgAccept)
-	if len(retry.Records) != 0 || len(retry.Committed) != 0 || retry.MustSync {
-		t.Fatalf("rescheduled TryPreAccept retry emitted durable/application effects: %#v", retry)
+	if !retry.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: rn.tick}) ||
+		len(retry.Records) != 0 || len(retry.Committed) != 0 || !retry.MustSync {
+		t.Fatalf("rescheduled TryPreAccept retry did not carry only tick durability plus messages: %#v", retry)
 	}
 }
 
 func TestEnsureDependencyRecoveryNoopsForAlreadyResolvedOrInFlightWork(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
-	rn.ensureDependencyRecovery(InstanceRef{})
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	rn.ensureDependencyRecovery(InstanceRef{}, false)
 	if rn.HasReady() || len(rn.instances) != 0 {
 		t.Fatalf("zero dependency started recovery: ready=%v instances=%#v", rn.HasReady(), rn.instances)
 	}
 
 	executedRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-	rn.executed[executedRef] = struct{}{}
-	rn.ensureDependencyRecovery(executedRef)
+	rn.executed.add(executedRef)
+	rn.ensureDependencyRecovery(executedRef, false)
 	if _, ok := rn.instances[executedRef]; ok || rn.HasReady() {
 		t.Fatalf("executed dependency restarted recovery: ready=%v instance=%#v", rn.HasReady(), rn.instances[executedRef])
 	}
 
 	committedRef := InstanceRef{Replica: 2, Instance: 2, Conf: 1}
 	optimizedSeedRecord(t, rn, InstanceRecord{Ref: committedRef, Ballot: Ballot{Number: 1, Replica: 2}, Status: StatusCommitted, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("committed-dep", "committed-dep-key")})
-	rn.ensureDependencyRecovery(committedRef)
+	rn.ensureDependencyRecovery(committedRef, false)
 	if rn.HasReady() {
 		t.Fatalf("committed dependency restarted recovery: %#v", rn.Ready())
 	}
 
 	preparingRef := InstanceRef{Replica: 2, Instance: 3, Conf: 1}
 	preparing := &instance{rec: checkedRecord(InstanceRecord{Ref: preparingRef, Ballot: Ballot{Number: 2, Replica: 1}, Status: StatusNone, Deps: rn.q.deps()}), phase: phasePrepare, generation: 5}
-	rn.instances[preparingRef] = preparing
-	rn.ensureDependencyRecovery(preparingRef)
+	rn.installInstance(preparing)
+	rn.ensureDependencyRecovery(preparingRef, false)
 	if preparing.phase != phasePrepare || preparing.generation != 5 || rn.HasReady() {
 		t.Fatalf("in-flight local prepare was restarted: phase=%d generation=%d ready=%v", preparing.phase, preparing.generation, rn.HasReady())
 	}
 }
 
 func TestDependencyKnownAfterRequiresBothRecordsAndMinimumStatus(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	base := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	other := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
 	if rn.dependencyKnownAfter(base, other, StatusCommitted) {
@@ -688,6 +746,148 @@ func TestSenderPreservingEvidenceValidationAndMergeContracts(t *testing.T) {
 	}
 }
 
+func TestMessageValidateRejectsSemanticMalleability(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	deps := []InstanceNum{0, 0, 0}
+	command := optimizedTestCommand("semantic-message", "semantic-message-key")
+	valid := map[MessageType]Message{
+		MsgPreAccept:        {Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgPreAcceptResp:    {Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps},
+		MsgAccept:           {Type: MsgAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgAcceptResp:       {Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: deps, RecordStatus: StatusAccepted},
+		MsgCommit:           {Type: MsgCommit, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgPrepare:          {Type: MsgPrepare, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}},
+		MsgPrepareResp:      {Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Deps: deps, RecordStatus: StatusNone},
+		MsgTryPreAccept:     {Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgTryPreAcceptResp: {Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: deps, RecordStatus: StatusPreAccepted},
+		MsgEvidence:         {Type: MsgEvidence, From: 1, To: 2, Ref: ref, ConflictRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Number: 1, Replica: 1}},
+		MsgEvidenceResp:     {Type: MsgEvidenceResp, From: 2, To: 1, Ref: ref, ConflictRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Number: 1, Replica: 1}, RecordBallot: Ballot{Number: 2, Replica: 2}, Seq: 1, Deps: deps, Command: command, RecordStatus: StatusCommitted},
+	}
+	for typ := MsgPreAccept; typ <= MsgEvidenceResp; typ++ {
+		msg, ok := valid[typ]
+		if !ok {
+			t.Fatalf("missing valid fixture for %s", typ)
+		}
+		if err := msg.Validate(conf); err != nil {
+			t.Fatalf("valid %s rejected: %v; message=%#v", typ, err, msg)
+		}
+	}
+	for _, malformedConf := range []ConfState{
+		{ID: 1, Voters: []ReplicaID{1, 2, 3, 4, 5, 6, 7, 8}},
+		{ID: 1, Voters: []ReplicaID{1, 2, 2}},
+		{ID: 1, Voters: []ReplicaID{0, 1, 2}},
+	} {
+		if err := valid[MsgCommit].Validate(malformedConf); !errors.Is(err, ErrInvalidMessage) {
+			t.Fatalf("Validate malformed configuration %#v err=%v, want ErrInvalidMessage", malformedConf, err)
+		}
+	}
+
+	base := valid[MsgCommit]
+	tests := []struct {
+		name string
+		msg  Message
+		want error
+	}{
+		{name: "zero owner", msg: func() Message { msg := base; msg.Ref.Replica = 0; return msg }(), want: ErrInvalidMessage},
+		{name: "zero instance", msg: func() Message { msg := base; msg.Ref.Instance = 0; return msg }(), want: ErrInvalidMessage},
+		{name: "zero configuration", msg: func() Message { msg := base; msg.Ref.Conf = 0; return msg }(), want: ErrInvalidMessage},
+		{name: "wrong configuration", msg: func() Message { msg := base; msg.Ref.Conf = 2; return msg }(), want: ErrInvalidMessage},
+		{name: "non-voter owner", msg: func() Message { msg := base; msg.Ref.Replica = 9; return msg }(), want: ErrMessageRejected},
+		{name: "non-voter ballot", msg: func() Message { msg := base; msg.Ballot.Replica = 9; return msg }(), want: ErrInvalidMessage},
+		{name: "record ballot above promise", msg: func() Message {
+			msg := base
+			msg.RecordBallot = Ballot{Number: 2, Replica: 1}
+			return msg
+		}(), want: ErrInvalidMessage},
+		{name: "invalid record status", msg: func() Message { msg := base; msg.RecordStatus = Status(255); return msg }(), want: ErrInvalidMessage},
+		{name: "invalid conflict status", msg: func() Message { msg := base; msg.ConflictStatus = Status(255); return msg }(), want: ErrInvalidMessage},
+		{name: "invalid command kind", msg: func() Message { msg := base; msg.Command.Kind = CommandKind(255); return msg }(), want: ErrInvalidMessage},
+		{name: "zero commit sequence", msg: func() Message { msg := base; msg.Seq = 0; return msg }(), want: ErrInvalidMessage},
+		{name: "partial conflict reference", msg: func() Message {
+			msg := valid[MsgEvidence]
+			msg.ConflictRef.Instance = 0
+			return msg
+		}(), want: ErrInvalidMessage},
+		{name: "partial ignore reference", msg: func() Message {
+			msg := valid[MsgTryPreAccept]
+			msg.IgnoreDependency.Ref = InstanceRef{Replica: 2, Conf: 1}
+			return msg
+		}(), want: ErrInvalidMessage},
+		{name: "conflict reject without conflict", msg: Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Deps: deps, Reject: true, RejectReason: RejectCommittedConflict}, want: ErrInvalidMessage},
+		{name: "stale reject without hint", msg: Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Deps: deps, Reject: true, RejectReason: RejectStaleBallot}, want: ErrInvalidMessage},
+		{name: "dependency evidence on commit", msg: func() Message { msg := base; msg.DepsCommitted = 1; return msg }(), want: ErrInvalidMessage},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.msg.Validate(conf); !errors.Is(err, tc.want) {
+				t.Fatalf("Validate err=%v, want %v; message=%#v", err, tc.want, tc.msg)
+			}
+		})
+	}
+}
+
+func TestMessageValidateHotPathAllocatesZero(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	msg := Message{
+		Type:         MsgEvidenceResp,
+		From:         2,
+		To:           1,
+		Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		ConflictRef:  InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:       Ballot{Number: 1, Replica: 1},
+		RecordBallot: Ballot{Number: 2, Replica: 2},
+		RecordStatus: StatusCommitted,
+		Seq:          2,
+		Deps:         []InstanceNum{0, 1, 0},
+		Command:      optimizedTestCommand("validation-allocation", "validation-allocation-key"),
+		AcceptEvidence: []AcceptEvidence{{
+			Sender: 2,
+			Seq:    2,
+			Deps:   []InstanceNum{0, 1, 0},
+		}},
+	}
+	var validationErr error
+	allocs := testing.AllocsPerRun(1000, func() {
+		validationErr = msg.Validate(conf)
+	})
+	if validationErr != nil {
+		t.Fatalf("Validate returned %v", validationErr)
+	}
+	if allocs != 0 {
+		t.Fatalf("Validate allocations = %v, want 0", allocs)
+	}
+}
+
+func TestMessageValidateRejectsCommittedFastPathRecoveryEvidence(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: makeIDs(3)}
+	target := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	conflict := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	base := Message{
+		From:             2,
+		To:               1,
+		Ref:              target,
+		Ballot:           Ballot{Number: 1, Replica: 1},
+		RecordBallot:     Ballot{Replica: 2},
+		RecordStatus:     StatusCommitted,
+		Seq:              2,
+		Deps:             []InstanceNum{0, 1, 0},
+		Command:          optimizedTestCommand("committed-fast-evidence", "committed-fast-evidence-key"),
+		FastPathEligible: true,
+	}
+	for _, typ := range []MessageType{MsgPrepareResp, MsgEvidenceResp} {
+		msg := base.Clone()
+		msg.Type = typ
+		if typ == MsgEvidenceResp {
+			msg.Ref = conflict
+			msg.ConflictRef = target
+		}
+		if err := msg.Validate(conf); !errors.Is(err, ErrInvalidMessage) {
+			t.Fatalf("%s committed fast-path evidence err=%v, want ErrInvalidMessage", typ, err)
+		}
+	}
+}
+
 func TestCodecRejectsMalformedSenderEvidenceWireFrames(t *testing.T) {
 	base := Message{
 		Type:           MsgEvidenceResp,
@@ -742,7 +942,9 @@ func TestLegacyRecordBallotChecksumVerifierAcceptsOnlyLegacyLayout(t *testing.T)
 		Command:        optimizedTestCommand("legacy-record-ballot", "legacy-record-ballot-key"),
 	}
 	legacy := rec.Clone()
-	legacy.Checksum = checksumRecord(legacy, true, true, true, false, false)
+	legacy.RecordBallot = Ballot{}
+	legacy.AcceptEvidence = nil
+	legacy.Checksum = checksumRecord(legacy, true, true, true, false, false, false)
 	if VerifyRecordChecksum(legacy) {
 		t.Fatalf("legacy checksum without durable record ballot was accepted as canonical: %#v", legacy)
 	}
@@ -757,7 +959,7 @@ func TestLegacyRecordBallotChecksumVerifierAcceptsOnlyLegacyLayout(t *testing.T)
 }
 
 func TestEvidenceRequestIsReadOnlyAndPreservesSenderEvidence(t *testing.T) {
-	rn := optimizedNewRawNode(t, 2, 3)
+	rn := protocolCoverageNewRawNode(t, 2, 3)
 	ref := InstanceRef{Replica: 1, Instance: 10, Conf: 1}
 	target := InstanceRef{Replica: 3, Instance: 4, Conf: 1}
 	acceptDeps := []InstanceNum{0, 0, target.Instance}
@@ -818,7 +1020,7 @@ func TestEvidenceRequestIsReadOnlyAndPreservesSenderEvidence(t *testing.T) {
 }
 
 func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 5)
+	rn := protocolCoverageNewRawNode(t, 1, 5)
 	target := InstanceRef{Replica: 1, Instance: 30, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 7, Conf: 1}
 	deps := rn.q.deps()
@@ -864,7 +1066,7 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 }
 
 func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 31, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 8, Conf: 1}
 	deps := rn.q.deps()
@@ -967,8 +1169,15 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 	if rec.Status != StatusAccepted || rec.Deps[1] != conflict.Instance {
 		t.Fatalf("stale duplicate evidence accepted record = %#v, want accepted record retaining conflict %s", rec, conflict)
 	}
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
+	for _, to := range []ReplicaID{2, 3} {
+		msg := optimizedRequireMessage(t, rd.Messages, MsgAccept, to)
+		if msg.From != 1 || msg.Ref != target || msg.Ballot != rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != rec.Seq || !instanceNumsEqual(msg.Deps, rec.Deps) ||
+			!commandEqual(msg.Command, rec.Command) {
+			t.Fatalf("stale duplicate evidence Accept to %d = %#v, want canonical tuple %#v", to, msg, rec)
+		}
+	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
 	if rn.tryEvidenceChecks != nil {
 		t.Fatalf("stale duplicate evidence left stale checks: %#v", rn.tryEvidenceChecks)
@@ -976,7 +1185,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 }
 
 func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 40, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 6, Conf: 1}
 	deps := rn.q.deps()
@@ -1005,7 +1214,13 @@ func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
 	if rec.Status != StatusAccepted || rec.FastPathEligible || rec.Deps[1] != conflict.Instance {
 		t.Fatalf("timeout fallback record = %#v, want non-fast accept retaining conflict dependency %s", rec, conflict)
 	}
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	msg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	if msg.From != 1 || msg.Ref != target || msg.Ballot != rec.Ballot ||
+		msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+		msg.Seq != rec.Seq || !instanceNumsEqual(msg.Deps, rec.Deps) ||
+		!commandEqual(msg.Command, rec.Command) {
+		t.Fatalf("timeout fallback Accept = %#v, want canonical tuple %#v", msg, rec)
+	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
 	if rn.tryEvidenceChecks != nil {
 		t.Fatalf("timeout fallback left stale evidence checks: %#v", rn.tryEvidenceChecks)
@@ -1013,7 +1228,7 @@ func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
 }
 
 func TestTryEvidenceHelperBranchesFailClosedConservatively(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 50, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 8, Conf: 1}
 	deps := rn.q.deps()
@@ -1041,7 +1256,7 @@ func TestTryEvidenceHelperBranchesFailClosedConservatively(t *testing.T) {
 	}
 	inst.tryIgnored = nil
 
-	single := optimizedNewRawNode(t, 1, 1)
+	single := protocolCoverageNewRawNode(t, 1, 1)
 	singleRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	singleInst := &instance{rec: checkedRecord(InstanceRecord{Ref: singleRef, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusPreAccepted, Seq: 1, Deps: []InstanceNum{1}, Command: optimizedTestCommand("single", "helper-key")}), phase: phaseTryPreAccept}
 	if single.maybeStartTryEvidenceCheck(singleInst, singleRef) {
@@ -1077,7 +1292,7 @@ func TestTryEvidenceHelperBranchesFailClosedConservatively(t *testing.T) {
 }
 
 func TestTryEvidenceDecisionAndRecordValidationBranches(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 5)
+	rn := protocolCoverageNewRawNode(t, 1, 5)
 	target := InstanceRef{Replica: 1, Instance: 60, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 10, Conf: 1}
 	targetDeps := rn.q.deps()
@@ -1112,7 +1327,7 @@ func TestTryEvidenceDecisionAndRecordValidationBranches(t *testing.T) {
 		t.Fatalf("decision with self response plus f usable records = authorized %v failClosed %v, want authorized", authorized, failClosed)
 	}
 
-	rnFive := optimizedNewRawNode(t, 1, 5)
+	rnFive := protocolCoverageNewRawNode(t, 1, 5)
 	instFive := &instance{rec: inst.rec, phase: phaseTryPreAccept}
 	rnFive.instances[conflict] = &instance{rec: tuple, phase: phaseCommitted}
 	oneUsable := tuple.Clone()
@@ -1169,7 +1384,7 @@ func TestTryEvidenceDecisionAndRecordValidationBranches(t *testing.T) {
 }
 
 func TestAttrsWithConflictDependencySeqFloorsWrappedMaxConflictSeq(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	conflict := InstanceRef{Replica: 2, Instance: 11, Conf: 1}
 	attrs := Attributes{Seq: 0, Deps: rn.q.deps()}
 
@@ -1192,7 +1407,7 @@ func TestAttrsWithConflictDependencySeqFloorsWrappedMaxConflictSeq(t *testing.T)
 }
 
 func TestEvidenceDependencyAndBroadcastHelperBranches(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 70, Conf: 1}
 	conflict := InstanceRef{Replica: 2, Instance: 11, Conf: 1}
 	attrs := Attributes{Seq: 0, Deps: []InstanceNum{0}}
@@ -1227,9 +1442,6 @@ func TestEvidenceDependencyAndBroadcastHelperBranches(t *testing.T) {
 		t.Fatal("empty deps merged own AcceptEvidence")
 	}
 
-	if rn.canCountInitialLeaderForTry(nil) {
-		t.Fatal("nil TryPreAccept instance counted initial leader")
-	}
 	if rn.tryConflictForcesSlowAccept(nil, conflict) {
 		t.Fatal("nil TryPreAccept instance forced slow accept")
 	}
@@ -1259,12 +1471,22 @@ func TestEvidenceDependencyAndBroadcastHelperBranches(t *testing.T) {
 	rn.broadcastTryPreAccept(inst)
 	rd := rn.Ready()
 	first := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, 2)
-	if first.IgnoreDependency.Ref != (InstanceRef{Replica: 2, Instance: 9, Conf: 1}) {
-		t.Fatalf("first ignored dependency broadcast = %#v, want refs sorted by replica", first.IgnoreDependency.Ref)
+	if first.From != 1 || first.Ref != target || first.Ballot != inst.rec.Ballot ||
+		first.RecordBallot != (Ballot{}) || first.RecordStatus != StatusNone ||
+		first.Seq != inst.rec.Seq || !instanceNumsEqual(first.Deps, inst.rec.Deps) ||
+		!commandEqual(first.Command, inst.rec.Command) || first.FastPathEligible ||
+		first.IgnoreDependency.Ref != (InstanceRef{Replica: 2, Instance: 9, Conf: 1}) {
+		t.Fatalf("first ignored dependency broadcast = %#v, want canonical tuple with refs sorted by replica", first)
 	}
 	secondSeen := false
 	for _, msg := range rd.Messages {
 		if msg.Type == MsgTryPreAccept && msg.IgnoreDependency.Ref == (InstanceRef{Replica: 3, Instance: 1, Conf: 1}) {
+			if msg.From != 1 || msg.Ref != target || msg.Ballot != inst.rec.Ballot ||
+				msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+				msg.Seq != inst.rec.Seq || !instanceNumsEqual(msg.Deps, inst.rec.Deps) ||
+				!commandEqual(msg.Command, inst.rec.Command) || msg.FastPathEligible {
+				t.Fatalf("second ignored dependency broadcast = %#v, want canonical tuple %#v", msg, inst.rec)
+			}
 			secondSeen = true
 		}
 	}
@@ -1276,7 +1498,7 @@ func TestEvidenceDependencyAndBroadcastHelperBranches(t *testing.T) {
 func TestFailPendingEvidenceCheckSortsAndDropsByTarget(t *testing.T) {
 	run := func(t *testing.T, conflicts []InstanceRef, want InstanceRef) {
 		t.Helper()
-		rn := optimizedNewRawNode(t, 1, 3)
+		rn := protocolCoverageNewRawNode(t, 1, 3)
 		target := InstanceRef{Replica: 1, Instance: 80, Conf: 1}
 		inst := &instance{rec: checkedRecord(InstanceRecord{Ref: target, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusPreAccepted, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("fail-pending", "fail-pending-key")}), phase: phaseTryPreAccept}
 		rn.instances[target] = inst
@@ -1311,7 +1533,7 @@ func TestFailPendingEvidenceCheckSortsAndDropsByTarget(t *testing.T) {
 	run(t, []InstanceRef{{Replica: 3, Instance: 1, Conf: 1}, {Replica: 2, Instance: 5, Conf: 1}, {Replica: 2, Instance: 4, Conf: 1}}, InstanceRef{Replica: 2, Instance: 4, Conf: 1})
 	run(t, []InstanceRef{{Replica: 2, Instance: 4, Conf: 2}, {Replica: 2, Instance: 4, Conf: 1}}, InstanceRef{Replica: 2, Instance: 4, Conf: 1})
 
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	target := InstanceRef{Replica: 1, Instance: 82, Conf: 1}
 	keep := tryEvidenceKey{target: InstanceRef{Replica: 1, Instance: 83, Conf: 1}, conflict: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, ballot: Ballot{Number: 1, Replica: 1}}
 	drop := tryEvidenceKey{target: target, conflict: InstanceRef{Replica: 2, Instance: 2, Conf: 1}, ballot: Ballot{Number: 1, Replica: 1}}
@@ -1326,11 +1548,11 @@ func TestFailPendingEvidenceCheckSortsAndDropsByTarget(t *testing.T) {
 }
 
 func TestCommitAndPrepareResponsesWithoutRecordBallotFailClosed(t *testing.T) {
-	rn := optimizedNewRawNode(t, 1, 3)
+	rn := protocolCoverageNewRawNode(t, 1, 3)
 	ref := InstanceRef{Replica: 2, Instance: 90, Conf: 1}
 	msg := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("zero-record-ballot", "zero-record-ballot-key")}
-	if err := rn.Step(msg); err != nil {
-		t.Fatal(err)
+	if err := rn.Step(msg); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("commit without RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
 	if rn.HasReady() || rn.instances[ref] != nil {
 		t.Fatalf("commit without RecordBallot changed state: ready=%v instance=%#v", rn.HasReady(), rn.instances[ref])
@@ -1339,12 +1561,14 @@ func TestCommitAndPrepareResponsesWithoutRecordBallotFailClosed(t *testing.T) {
 	recoveryRef := InstanceRef{Replica: 1, Instance: 91, Conf: 1}
 	recovery := &instance{rec: checkedRecord(InstanceRecord{Ref: recoveryRef, Ballot: Ballot{Number: 2, Replica: 1}, Status: StatusNone, Deps: rn.q.deps()}), phase: phasePrepare, prepareOK: map[ReplicaID]InstanceRecord{}}
 	rn.instances[recoveryRef] = recovery
+	before := recovery.rec.Clone()
 	resp := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: recoveryRef, Ballot: recovery.rec.Ballot, RecordStatus: StatusCommitted, Seq: 2, Deps: rn.q.deps(), Command: optimizedTestCommand("prepare-zero-record-ballot", "zero-record-ballot-key")}
-	if err := rn.Step(resp); err != nil {
-		t.Fatal(err)
+	if err := rn.Step(resp); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("prepare response without RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
-	if len(recovery.prepareOK) != 0 || rn.HasReady() {
-		t.Fatalf("prepare response without RecordBallot was accepted: prepareOK=%#v ready=%v", recovery.prepareOK, rn.HasReady())
+	if len(recovery.prepareOK) != 0 || recovery.phase != phasePrepare ||
+		!instanceRecordEqual(recovery.rec, before) || rn.HasReady() {
+		t.Fatalf("prepare response without RecordBallot changed state: phase=%d record=%#v prepareOK=%#v ready=%v", recovery.phase, recovery.rec, recovery.prepareOK, rn.HasReady())
 	}
 }
 
@@ -1430,7 +1654,7 @@ func protocolMalformedEvidenceFrame(evidence, evidenceDeps, conflictKeys uint64)
 
 func protocolTryInstance(t *testing.T, voters int, ballotNumber uint64) (*RawNode, *instance, InstanceRef) {
 	t.Helper()
-	rn := optimizedNewRawNode(t, 1, voters)
+	rn := protocolCoverageNewRawNode(t, 1, voters)
 	ref := InstanceRef{Replica: 1, Instance: InstanceNum(20 + ballotNumber), Conf: 1}
 	rec := checkedRecord(InstanceRecord{
 		Ref:     ref,
@@ -1443,4 +1667,1298 @@ func protocolTryInstance(t *testing.T, voters int, ballotNumber uint64) (*RawNod
 	inst := &instance{rec: rec, phase: phaseTryPreAccept, tryOK: map[ReplicaID]struct{}{}}
 	rn.instances[ref] = inst
 	return rn, inst, ref
+}
+
+func TestPrepareRecoveryPreservesExecutedChosenTuple(t *testing.T) {
+	ref := InstanceRef{Replica: 2, Instance: 91, Conf: 1}
+	rn, inst, ballot := optimizedStartRecovery(t, 3, ref)
+	cmd := optimizedTestCommand("executed-prepare-value", "executed-prepare-key")
+	valueBallot := Ballot{Replica: ref.Replica}
+	if err := rn.Step(Message{
+		Type:         MsgPrepareResp,
+		From:         2,
+		To:           1,
+		Ref:          ref,
+		Ballot:       ballot,
+		RecordBallot: valueBallot,
+		RecordStatus: StatusExecuted,
+		Seq:          1,
+		Deps:         rn.q.deps(),
+		Command:      cmd,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if inst.phase != phaseCommitted || !commandEqual(inst.rec.Command, cmd) {
+		t.Fatalf("executed prepare evidence recovered phase/record = %d/%#v, want committed original value", inst.phase, inst.rec)
+	}
+	rd := rn.Ready()
+	rec := optimizedRequireRecord(t, rd, ref)
+	if rec.Status != StatusCommitted || !commandEqual(rec.Command, cmd) {
+		t.Fatalf("executed prepare evidence durable record = %#v, want committed original value", rec)
+	}
+	optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
+	for _, to := range []ReplicaID{2, 3} {
+		msg := optimizedRequireMessage(t, rd.Messages, MsgCommit, to)
+		if msg.From != 1 || msg.Ref != ref || msg.Ballot != rec.Ballot ||
+			msg.RecordBallot == (Ballot{}) || msg.RecordBallot != rec.RecordBallot ||
+			msg.RecordStatus != StatusNone || msg.Seq != rec.Seq ||
+			!instanceNumsEqual(msg.Deps, rec.Deps) || !commandEqual(msg.Command, rec.Command) {
+			t.Fatalf("executed prepare evidence Commit to %d = %#v, want canonical tuple %#v", to, msg, rec)
+		}
+	}
+}
+
+func TestReorderedPreAcceptDoesNotDowngradeAcceptedRecord(t *testing.T) {
+	for _, typ := range []MessageType{MsgPreAccept, MsgTryPreAccept} {
+		t.Run(typ.String(), func(t *testing.T) {
+			rn := protocolCoverageNewRawNode(t, 2, 3)
+			ref := InstanceRef{Replica: 1, Instance: 92, Conf: 1}
+			cmd := optimizedTestCommand("accepted-before-preaccept", "accepted-before-preaccept-key")
+			ballot := Ballot{Replica: ref.Replica}
+			if typ == MsgTryPreAccept {
+				ballot.Number = 1
+			}
+			optimizedSeedRecord(t, rn, InstanceRecord{
+				Ref:          ref,
+				Ballot:       ballot,
+				RecordBallot: ballot,
+				Status:       StatusAccepted,
+				Seq:          1,
+				Deps:         rn.q.deps(),
+				Command:      cmd,
+			})
+			if err := rn.Step(Message{
+				Type:    typ,
+				From:    1,
+				To:      2,
+				Ref:     ref,
+				Ballot:  ballot,
+				Seq:     1,
+				Deps:    rn.q.deps(),
+				Command: cmd,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got := rn.instances[ref]
+			if got == nil || got.rec.Status != StatusAccepted || got.rec.RecordBallot != ballot || !commandEqual(got.rec.Command, cmd) {
+				t.Fatalf("reordered %s downgraded accepted record: %#v", typ, got)
+			}
+			for _, rec := range rn.Ready().Records {
+				if rec.Ref == ref && rec.Status < StatusAccepted {
+					t.Fatalf("reordered %s emitted downgraded durable record %#v", typ, rec)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalFastPathAdoptsCoveringRemoteTupleAtPaperQuorum(t *testing.T) {
+	for _, voters := range []int{3, 5, 7} {
+		t.Run(string(rune('0'+voters))+"-voters", func(t *testing.T) {
+			rn := protocolCoverageNewRawNode(t, 1, voters)
+			cmd := optimizedTestCommand("covering-normal-fast", "covering-normal-fast-key")
+			ref, err := rn.Propose(cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, rn.Ready())
+			inst := rn.instances[ref]
+			if inst == nil {
+				t.Fatalf("missing proposed instance %s", ref)
+			}
+			dependency := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+			optimizedSeedRecord(t, rn, InstanceRecord{
+				Ref:          dependency,
+				Ballot:       Ballot{Replica: dependency.Replica},
+				RecordBallot: Ballot{Replica: dependency.Replica},
+				Status:       StatusExecuted,
+				Seq:          1,
+				Deps:         rn.q.deps(),
+				Command:      optimizedTestCommand("covering-normal-dependency", "covering-normal-fast-key"),
+			})
+			rn.executed.add(dependency)
+			covering := inst.rec.Attributes()
+			covering.Seq++
+			covering.Deps[1] = dependency.Instance
+			neededRemote := rn.fastQuorumForConf(ref.Conf) - 1
+			for id := ReplicaID(2); id < ReplicaID(2+neededRemote); id++ {
+				if err := rn.Step(Message{Type: MsgPreAcceptResp, From: id,
+					To:     1,
+					Ref:    ref,
+					Ballot: inst.rec.Ballot,
+					Seq:    covering.Seq,
+					Deps:   append([]InstanceNum(nil), covering.Deps...), FastPathEligible: true,
+					DepsCommitted: dependencyMask(covering.Deps)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if inst.phase != phaseCommitted || inst.rec.Status < StatusCommitted || !inst.rec.Attributes().Equal(covering) {
+				t.Fatalf("%d-voter covering fast path phase/record = %d/%#v, want committed attrs %#v", voters, inst.phase, inst.rec, covering)
+			}
+			rd := rn.Ready()
+			optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
+			if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusCommitted || !rec.Attributes().Equal(covering) {
+				t.Fatalf("%d-voter covering fast-path record = %#v, want committed %#v", voters, rec, covering)
+			}
+		})
+	}
+}
+
+func TestRecoveryRecomputesAttrsForUnsafePreAcceptedCandidate(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	target := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	conflict := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
+	key := "recovery-recompute-key"
+	targetCommand := optimizedTestCommand("recovery-recompute-target", key)
+	optimizedSeedRecord(t, rn, InstanceRecord{
+		Ref:          conflict,
+		Ballot:       Ballot{Replica: conflict.Replica},
+		RecordBallot: Ballot{Replica: conflict.Replica},
+		Status:       StatusCommitted,
+		Seq:          2,
+		Deps:         rn.q.deps(),
+		Command:      optimizedTestCommand("recovery-recompute-conflict", key),
+	})
+
+	rec := InstanceRecord{Ref: target, Status: StatusNone, Deps: rn.q.deps()}
+	rec.Checksum = ChecksumRecord(rec)
+	inst := &instance{rec: rec, phase: phaseIdle}
+	rn.instances[target] = inst
+	rn.startPrepare(inst)
+	if err := rn.Step(Message{
+		Type:             MsgPrepareResp,
+		From:             2,
+		To:               1,
+		Ref:              target,
+		Ballot:           inst.rec.Ballot,
+		RecordBallot:     Ballot{Replica: target.Replica},
+		Seq:              1,
+		Deps:             rn.q.deps(),
+		Command:          targetCommand,
+		RecordStatus:     StatusPreAccepted,
+		FastPathEligible: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
+		t.Fatalf("recovery phase/record = %d/%#v, want direct slow Accept after recomputing unsafe PreAccepted attrs", inst.phase, inst.rec)
+	}
+	if !commandEqual(inst.rec.Command, targetCommand) {
+		t.Fatalf("recovered command = %#v, want %#v", inst.rec.Command, targetCommand)
+	}
+	if got := inst.rec.Deps[2]; got != conflict.Instance {
+		t.Fatalf("recovered deps = %v, want dependency on %s", inst.rec.Deps, conflict)
+	}
+	if inst.rec.Seq <= 2 {
+		t.Fatalf("recovered seq = %d, want greater than conflicting seq 2", inst.rec.Seq)
+	}
+}
+
+func TestPromisedFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 3, 3)
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	if err := rn.Step(Message{
+		Type:   MsgPrepare,
+		From:   2,
+		To:     3,
+		Ref:    ref,
+		Ballot: Ballot{Number: 1, Replica: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, rn.Ready())
+
+	deadline := rn.recoveryTicks * 2
+	for tick := uint64(1); tick < deadline; tick++ {
+		rn.Tick()
+		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
+	}
+	rn.Tick()
+	rd := rn.Ready()
+	if !rd.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: deadline}) || !rd.MustSync {
+		t.Fatalf("takeover Ready hard state = %#v, want tick %d", rd.HardState, deadline)
+	}
+	prepare := optimizedRequireMessage(t, rd.Messages, MsgPrepare, 1)
+	if prepare.From != 3 || prepare.Ref != ref || prepare.Ballot.Number <= 1 || prepare.Ballot.Replica != 3 ||
+		prepare.RecordBallot != (Ballot{}) || prepare.RecordStatus != StatusNone ||
+		prepare.Seq != 0 || len(prepare.Deps) != 0 || !commandEqual(prepare.Command, Command{}) {
+		t.Fatalf("takeover Prepare = %#v, want minimal higher-ballot request from replica 3", prepare)
+	}
+}
+
+func TestTryPreAcceptFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 3, 3)
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	if err := rn.Step(Message{Type: MsgTryPreAccept, From: 2,
+		To:      3,
+		Ref:     ref,
+		Ballot:  Ballot{Number: 1, Replica: 2},
+		Seq:     1,
+		Deps:    rn.q.deps(),
+		Command: optimizedTestCommand("orphaned-try", "orphaned-try-key")}); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, rn.Ready())
+
+	deadline := rn.recoveryTicks * 2
+	for tick := uint64(1); tick < deadline; tick++ {
+		rn.Tick()
+		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
+	}
+	rn.Tick()
+	rd := rn.Ready()
+	if !rd.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: deadline}) || !rd.MustSync {
+		t.Fatalf("TryPreAccept takeover Ready hard state = %#v, want tick %d", rd.HardState, deadline)
+	}
+	prepare := optimizedRequireMessage(t, rd.Messages, MsgPrepare, 1)
+	if prepare.From != 3 || prepare.Ref != ref || prepare.Ballot.Number <= 1 || prepare.Ballot.Replica != 3 ||
+		prepare.RecordBallot != (Ballot{}) || prepare.RecordStatus != StatusNone ||
+		prepare.Seq != 0 || len(prepare.Deps) != 0 || !commandEqual(prepare.Command, Command{}) {
+		t.Fatalf("TryPreAccept takeover = %#v, want minimal higher-ballot request from replica 3", prepare)
+	}
+}
+
+func TestLateTimedPreAcceptFallsBackToConservativeConflictOrdering(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 2, Voters: makeIDs(3), TimeOptimization: true, TimeOptimizationTicks: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocolCoverageAdvanceHardStateOnly(t, rn, 0)
+	rn.Tick()
+	protocolCoverageAdvanceHardStateOnly(t, rn, 1)
+	rn.Tick()
+	protocolCoverageAdvanceHardStateOnly(t, rn, 2)
+
+	key := "late-timed-conflict"
+	laterRef := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
+	earlierRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	step := func(ref InstanceRef, from ReplicaID, payload string) {
+		t.Helper()
+		if err := rn.Step(Message{
+			Type:      MsgPreAccept,
+			From:      from,
+			To:        2,
+			Ref:       ref,
+			ProcessAt: 1,
+			Ballot:    Ballot{Replica: from},
+			Seq:       1,
+			Deps:      rn.q.deps(),
+			Command:   optimizedTestCommand(payload, key),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		advanceOK(t, rn, rn.Ready())
+	}
+	step(laterRef, 3, "late-higher-ref")
+	step(earlierRef, 1, "late-lower-ref")
+
+	earlier := rn.instances[earlierRef]
+	if earlier == nil || earlier.rec.Deps[2] < laterRef.Instance || earlier.rec.Seq <= rn.instances[laterRef].rec.Seq {
+		t.Fatalf("late earlier-order tuple = %#v, want conservative dependency on already processed %s", earlier, laterRef)
+	}
+}
+
+func TestTimerSchedulingNearCounterLimitDoesNotWrapOrRefire(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	rec := InstanceRecord{
+		Ref:              ref,
+		Ballot:           Ballot{Replica: 1},
+		RecordBallot:     Ballot{Replica: 1},
+		Status:           StatusPreAccepted,
+		Seq:              1,
+		Deps:             rn.q.deps(),
+		Command:          optimizedTestCommand("counter-limit", "counter-limit-key"),
+		FastPathEligible: true,
+	}
+	rec.Checksum = ChecksumRecord(rec)
+	inst := &instance{rec: rec, phase: phasePreAccept}
+	rn.instances[ref] = inst
+	rn.tick = ^uint64(0) - 1
+
+	if err := rn.schedule(inst, timerPreAccept, 2); !errors.Is(err, ErrLogicalTimeExhausted) {
+		t.Fatalf("overflowing near-limit schedule err=%v, want %v", err, ErrLogicalTimeExhausted)
+	}
+	if len(rn.timers) != 0 {
+		t.Fatalf("overflowing near-limit schedule inserted timers: %#v", rn.timers)
+	}
+	if err := rn.schedule(inst, timerPreAccept, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(rn.timers) != 1 || rn.timers[0].deadline != ^uint64(0) {
+		t.Fatalf("exact near-limit timer = %#v, want one timer at MaxUint64", rn.timers)
+	}
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	rd := rn.Ready()
+	if !rd.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: ^uint64(0)}) || !rd.MustSync {
+		t.Fatalf("counter-limit Ready hard state = %#v, want exact durable tick", rd.HardState)
+	}
+	if rn.tick != ^uint64(0) || len(rn.timers) != 0 {
+		t.Fatalf("counter-limit tick/timers = %d/%#v, want saturated tick and no unrepresentable retry", rn.tick, rn.timers)
+	}
+}
+
+func TestComputeAttrsUsesMaximumSequenceAcrossCompressedPrefix(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	highSeq := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	laterLowSeq := InstanceRef{Replica: 2, Instance: 2, Conf: 1}
+	optimizedSeedRecord(t, rn, InstanceRecord{
+		Ref:          highSeq,
+		Ballot:       Ballot{Replica: 2},
+		RecordBallot: Ballot{Replica: 2},
+		Status:       StatusCommitted,
+		Seq:          10,
+		Deps:         rn.q.deps(),
+		Command:      Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}},
+	})
+	optimizedSeedRecord(t, rn, InstanceRecord{
+		Ref:          laterLowSeq,
+		Ballot:       Ballot{Replica: 2},
+		RecordBallot: Ballot{Replica: 2},
+		Status:       StatusCommitted,
+		Seq:          1,
+		Deps:         rn.q.deps(),
+		Command:      Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}},
+	})
+	cmd := Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}}
+	attrs := rn.computeAttrs(cmd, InstanceRef{Replica: 1, Instance: 1, Conf: 1})
+	if attrs.Deps[1] != laterLowSeq.Instance || attrs.Seq != 11 {
+		t.Fatalf("compressed-prefix attrs = %#v, want replica-2 prefix %d and seq 11", attrs, laterLowSeq.Instance)
+	}
+	for i := range 32 {
+		timed := rn.computeAttrsAt(cmd, InstanceRef{Replica: 1, Instance: InstanceNum(i + 2), Conf: 1}, 10, true)
+		if timed.Deps[1] != laterLowSeq.Instance || timed.Seq != 11 {
+			t.Fatalf("timed compressed-prefix attrs iteration %d = %#v, want replica-2 prefix %d and seq 11", i, timed, laterLowSeq.Instance)
+		}
+	}
+}
+
+func TestUnresolvedKnownConflictStartsRecoveryOnAnyHealthyReplica(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 3, 5)
+	base := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
+	blocker := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	key := "unresolved-known-conflict-recovery"
+	optimizedSeedRecord(t, rn, InstanceRecord{
+		Ref:          base,
+		Ballot:       Ballot{Replica: base.Replica},
+		RecordBallot: Ballot{Replica: base.Replica},
+		Status:       StatusCommitted,
+		Seq:          1,
+		Deps:         rn.q.deps(),
+		Command:      optimizedTestCommand("base", key),
+	})
+	optimizedSeedRecord(t, rn, InstanceRecord{
+		Ref:              blocker,
+		Ballot:           Ballot{Replica: blocker.Replica},
+		RecordBallot:     Ballot{Replica: blocker.Replica},
+		Status:           StatusPreAccepted,
+		Seq:              1,
+		Deps:             rn.q.deps(),
+		Command:          optimizedTestCommand("blocker", key),
+		FastPathEligible: true,
+	})
+	if rn.shouldCoordinateRecovery(blocker) {
+		t.Fatalf("test replica unexpectedly selected as first recovery coordinator for %s", blocker)
+	}
+	rn.tryExecute()
+	deadline := rn.recoveryTicks * 2
+	var rd Ready
+	for tick := uint64(1); tick <= deadline; tick++ {
+		rn.Tick()
+		inst := rn.instances[blocker]
+		if inst != nil && inst.phase == phasePrepare {
+			rd = rn.Ready()
+			wantHard := HardState{Conf: rn.Status().Conf, Tick: tick}
+			if !rd.HardState.Equal(wantHard) || !rd.MustSync || len(rd.Committed) != 0 {
+				t.Fatalf("fallback recovery Ready at tick %d = %#v", tick, rd)
+			}
+			break
+		}
+		if tick == rn.recoveryTicks {
+			tickReady := rn.Ready()
+			wantHard := HardState{Conf: rn.Status().Conf, Tick: tick}
+			if !tickReady.HardState.Equal(wantHard) || !tickReady.MustSync ||
+				len(tickReady.Records) != 0 || len(tickReady.Committed) != 0 ||
+				len(tickReady.Messages) != len(rn.Status().Conf.Voters)-1 {
+				t.Fatalf("committed-base retry Ready at tick %d = %#v", tick, tickReady)
+			}
+			for _, msg := range tickReady.Messages {
+				if msg.Type != MsgCommit || msg.Ref != base {
+					t.Fatalf("tick %d emitted non-base retry message: %#v", tick, msg)
+				}
+			}
+			advanceOK(t, rn, tickReady)
+			continue
+		}
+		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
+	}
+	inst := rn.instances[blocker]
+	if inst == nil || inst.phase != phasePrepare || inst.rec.Ballot.Replica != rn.id {
+		t.Fatalf("healthy fallback replica did not start blocker recovery after coordinator rotation: %#v", inst)
+	}
+	for _, to := range []ReplicaID{1, 2, 4, 5} {
+		msg := optimizedRequireMessage(t, rd.Messages, MsgPrepare, to)
+		if msg.From != 3 || msg.Ref != blocker || msg.Ballot != inst.rec.Ballot ||
+			msg.RecordBallot != (Ballot{}) || msg.RecordStatus != StatusNone ||
+			msg.Seq != 0 || len(msg.Deps) != 0 || !commandEqual(msg.Command, Command{}) {
+			t.Fatalf("Prepare to %d = %#v, want minimal recovery request for %s at %#v", to, msg, blocker, inst.rec.Ballot)
+		}
+	}
+}
+
+func TestTryPreAcceptResponseRequiresCurrentBallotAndExactTuple(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*Message)
+		wantErr error
+	}{
+		{
+			name: "future ballot",
+			mutate: func(m *Message) {
+				m.Ballot.Number++
+			},
+		},
+		{
+			name: "different sequence",
+			mutate: func(m *Message) {
+				m.Seq++
+			},
+		},
+		{
+			name: "different dependencies",
+			mutate: func(m *Message) {
+				m.Deps[1] = 1
+			},
+		},
+		{
+			name: "wrong status",
+			mutate: func(m *Message) {
+				m.RecordStatus = StatusAccepted
+			},
+			wantErr: ErrInvalidMessage,
+		},
+		{
+			name: "unexpected record ballot",
+			mutate: func(m *Message) {
+				m.RecordBallot = m.Ballot
+			},
+			wantErr: ErrInvalidMessage,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rn, inst, ref := protocolTryInstance(t, 3, 1)
+			msg := Message{
+				Type:         MsgTryPreAcceptResp,
+				From:         2,
+				To:           1,
+				Ref:          ref,
+				Ballot:       inst.rec.Ballot,
+				RecordStatus: StatusPreAccepted,
+				Seq:          inst.rec.Seq,
+				Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
+			}
+			tc.mutate(&msg)
+			if err := rn.Step(msg); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Step error = %v, want %v for message %#v", err, tc.wantErr, msg)
+			}
+			if len(inst.tryOK) != 0 || inst.phase != phaseTryPreAccept || rn.HasReady() {
+				t.Fatalf("invalid TryPreAccept response changed state: phase=%d tryOK=%#v ready=%#v", inst.phase, inst.tryOK, rn.Ready())
+			}
+		})
+	}
+}
+
+func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	ref := InstanceRef{Replica: 1, Instance: 93, Conf: 1}
+	ballot := Ballot{Number: 1, Replica: 1}
+	rec := checkedRecord(InstanceRecord{
+		Ref:          ref,
+		Ballot:       ballot,
+		RecordBallot: ballot,
+		Status:       StatusAccepted,
+		Seq:          3,
+		Deps:         []InstanceNum{0, 2, 0},
+		Command:      optimizedTestCommand("accept-response-exact", "accept-response-key"),
+	})
+	inst := &instance{
+		rec:   rec,
+		phase: phaseAccept,
+		accOK: map[ReplicaID]struct{}{1: {}},
+	}
+	rn.instances[ref] = inst
+
+	exact := Message{
+		Type:         MsgAcceptResp,
+		From:         2,
+		To:           1,
+		Ref:          ref,
+		Ballot:       ballot,
+		RecordBallot: ballot,
+		RecordStatus: StatusAccepted,
+		Seq:          rec.Seq,
+		Deps:         append([]InstanceNum(nil), rec.Deps...),
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Message)
+	}{
+		{
+			name: "different current ballot",
+			mutate: func(m *Message) {
+				m.Ballot.Number++
+				m.RecordBallot = m.Ballot
+			},
+		},
+		{
+			name: "different sequence",
+			mutate: func(m *Message) {
+				m.Seq++
+			},
+		},
+		{
+			name: "different dependencies",
+			mutate: func(m *Message) {
+				m.Deps[0] = 1
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := exact.Clone()
+			tc.mutate(&msg)
+			if err := rn.Step(msg); err != nil {
+				t.Fatalf("well-formed mismatched AcceptResp rejected before handler: %v", err)
+			}
+			if inst.phase != phaseAccept || len(inst.accOK) != 1 || rn.HasReady() {
+				t.Fatalf("mismatched AcceptResp changed state: phase=%d accOK=%#v ready=%v", inst.phase, inst.accOK, rn.HasReady())
+			}
+		})
+	}
+
+	malformed := exact.Clone()
+	malformed.RecordBallot.Number++
+	if err := rn.Step(malformed); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("AcceptResp with non-echoed RecordBallot error = %v, want ErrInvalidMessage", err)
+	}
+	if inst.phase != phaseAccept || len(inst.accOK) != 1 || rn.HasReady() {
+		t.Fatalf("malformed AcceptResp changed state: phase=%d accOK=%#v ready=%v", inst.phase, inst.accOK, rn.HasReady())
+	}
+
+	if err := rn.Step(exact); err != nil {
+		t.Fatal(err)
+	}
+	if inst.phase != phaseCommitted || inst.accOK != nil {
+		t.Fatalf("exact AcceptResp phase/volatile votes = %d/%#v, want committed with votes released", inst.phase, inst.accOK)
+	}
+	rd := rn.Ready()
+	var committed InstanceRecord
+	for _, durable := range rd.Records {
+		if durable.Ref == ref && durable.Status == StatusCommitted {
+			committed = durable
+			break
+		}
+	}
+	if committed.Status != StatusCommitted || committed.Ballot != ballot ||
+		committed.RecordBallot != ballot || committed.Seq != rec.Seq ||
+		!instanceNumsEqual(committed.Deps, rec.Deps) || !commandEqual(committed.Command, rec.Command) {
+		t.Fatalf("exact AcceptResp committed record = %#v, want chosen tuple %#v", committed, rec)
+	}
+}
+
+func TestTimingDomainChecksumMutationIsDetected(t *testing.T) {
+	rec := checkedRecord(InstanceRecord{
+		Ref:          InstanceRef{Conf: 1, Replica: 1, Instance: 1},
+		Ballot:       Ballot{Replica: 1},
+		Status:       StatusCommitted,
+		Seq:          1,
+		Deps:         make([]InstanceNum, 3),
+		Command:      optimizedTestCommand("timing-checksum", "timing-checksum-key"),
+		ProcessAt:    0,
+		TimingDomain: TimingDomainTOQ,
+	})
+	rec.Checksum = ChecksumRecord(rec)
+	if !VerifyRecordChecksum(rec) {
+		t.Fatal("canonical TOQ@0 checksum did not verify")
+	}
+	rec.TimingDomain = TimingDomainUntimed
+	if VerifyRecordChecksum(rec) {
+		t.Fatal("TimingDomain mutation was not authenticated")
+	}
+}
+
+func TestTryEvidenceResolutionPreservesTupleBeforeOwnershipCleanup(t *testing.T) {
+	rn, inst, target := protocolTryInstance(t, 3, 1)
+	conflict := InstanceRef{Conf: 1, Replica: 2, Instance: 7}
+	key := tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}
+	payload := []byte("evidence-only-committed-tuple")
+	tuple := checkedRecord(InstanceRecord{
+		Ref:     conflict,
+		Ballot:  Ballot{Replica: conflict.Replica},
+		Status:  StatusCommitted,
+		Seq:     7,
+		Deps:    rn.q.deps(),
+		Command: Command{ID: CommandID{Client: 1400, Sequence: 1}, Payload: payload},
+	})
+	records := map[ReplicaID]InstanceRecord{2: tuple}
+	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: records}
+	rn.resolveTryEvidenceCheck(key)
+	if inst.phase != phaseAccept {
+		t.Fatalf("evidence-only committed tuple phase = %d, want Accept", inst.phase)
+	}
+	if inst.rec.Seq < tuple.Seq+1 {
+		t.Fatalf("captured conflict Seq was lost: accepted Seq=%d conflict Seq=%d", inst.rec.Seq, tuple.Seq)
+	}
+	if len(rn.tryEvidenceChecks) != 0 || len(records) != 0 {
+		t.Fatalf("resolved evidence retained maps: outer=%d nested=%d", len(rn.tryEvidenceChecks), len(records))
+	}
+}
+
+func TestTryEvidenceAdmissionIsBoundedPerTargetAndGlobally(t *testing.T) {
+	rn, inst, _ := protocolTryInstance(t, 3, 2)
+	rn.maxConcurrentRecoveries = 1
+	inst.rec.Deps = []InstanceNum{0, 20, 20}
+	inst.rec.Checksum = ChecksumRecord(inst.rec)
+	first := InstanceRef{Conf: 1, Replica: 2, Instance: 10}
+	second := InstanceRef{Conf: 1, Replica: 3, Instance: 11}
+	if !rn.maybeStartTryEvidenceCheck(inst, first) {
+		t.Fatal("first covered conflict did not start evidence check")
+	}
+	if len(rn.tryEvidenceChecks) != 1 {
+		t.Fatalf("first evidence check count = %d, want 1", len(rn.tryEvidenceChecks))
+	}
+	beforeMessages := len(rn.pendingReady.Messages)
+	if !rn.maybeStartTryEvidenceCheck(inst, second) {
+		t.Fatal("second covered conflict did not take deterministic fail-closed path")
+	}
+	if inst.phase != phaseAccept || len(rn.tryEvidenceChecks) != 0 {
+		t.Fatalf("second conflict phase/checks = %d/%d, want Accept/0", inst.phase, len(rn.tryEvidenceChecks))
+	}
+	if got := len(rn.pendingReady.Messages) - beforeMessages; got != len(rn.q.conf.Voters)-1 {
+		t.Fatalf("second conflict emitted %d new messages, want one bounded Accept broadcast of %d", got, len(rn.q.conf.Voters)-1)
+	}
+
+	other, otherInst, _ := protocolTryInstance(t, 3, 3)
+	other.maxConcurrentRecoveries = 1
+	otherInst.rec.Deps = []InstanceNum{0, 20, 20}
+	otherInst.rec.Checksum = ChecksumRecord(otherInst.rec)
+	other.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{
+		{target: InstanceRef{Conf: 1, Replica: 1, Instance: 999}, conflict: first, ballot: Ballot{Number: 1, Replica: 1}}: {},
+	}
+	if !other.maybeStartTryEvidenceCheck(otherInst, second) || otherInst.phase != phaseAccept {
+		t.Fatalf("global evidence cap did not fail closed: phase=%d checks=%d", otherInst.phase, len(other.tryEvidenceChecks))
+	}
+}
+
+func TestTerminalCommitReleasesInstanceVolatileOwnership(t *testing.T) {
+	rn := protocolCoverageNewRawNode(t, 1, 3)
+	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 40}
+	rec := checkedRecord(InstanceRecord{
+		Ref:     ref,
+		Ballot:  Ballot{Replica: 1},
+		Status:  StatusAccepted,
+		Seq:     1,
+		Deps:    rn.q.deps(),
+		Command: optimizedTestCommand("volatile-terminal", "volatile-terminal-key"),
+	})
+	inst := &instance{
+		rec:             rec,
+		phase:           phaseAccept,
+		preOK:           map[ReplicaID]attrVote{1: {seq: 1, deps: []InstanceNum{1, 2, 3}}},
+		accOK:           map[ReplicaID]struct{}{1: {}},
+		prepareOK:       map[ReplicaID]InstanceRecord{1: rec.Clone()},
+		prepareEvidence: map[ReplicaID]InstanceRecord{2: rec.Clone()},
+		tryOK:           map[ReplicaID]struct{}{1: {}},
+		tryDeferred:     map[InstanceRef]struct{}{{Conf: 1, Replica: 2, Instance: 1}: {}},
+		tryIgnored:      map[InstanceRef]struct{}{{Conf: 1, Replica: 3, Instance: 1}: {}},
+		waitDeadline:    99,
+	}
+	rn.installInstance(inst)
+	rn.commit(inst, rec.Attributes())
+	if inst.preOK != nil || inst.accOK != nil || inst.prepareOK != nil || inst.prepareEvidence != nil ||
+		inst.tryOK != nil || inst.tryDeferred != nil || inst.tryIgnored != nil || inst.waitDeadline != 0 {
+		t.Fatalf("terminal instance retained volatile ownership: %#v", inst)
+	}
+}
+
+func TestTryPreAcceptRetainsRequiredLocalPrepareWitness(t *testing.T) {
+	for _, voters := range []int{3, 5, 7} {
+		t.Run(fmt.Sprintf("n=%d", voters), func(t *testing.T) {
+			rn := protocolCoverageNewRawNode(t, 1, voters)
+			ref := InstanceRef{Conf: 1, Replica: 2, Instance: 50}
+			attrs := Attributes{Seq: 4, Deps: make([]InstanceNum, voters)}
+			command := optimizedTestCommand("local-prepare-witness", "local-prepare-witness-key")
+			rec := checkedRecord(InstanceRecord{
+				Ref:     ref,
+				Ballot:  Ballot{Number: 1, Replica: 1},
+				Status:  StatusPreAccepted,
+				Seq:     attrs.Seq,
+				Deps:    attrs.Deps,
+				Command: command,
+			})
+			local := rec.Clone()
+			local.FastPathEligible = true
+			inst := &instance{
+				rec:       rec,
+				phase:     phasePrepare,
+				prepareOK: map[ReplicaID]InstanceRecord{1: local},
+			}
+			rn.installInstance(inst)
+			witnesses := make(map[ReplicaID]struct{})
+			for id := ReplicaID(3); len(witnesses) < rn.slowQuorumForConf(1)-1; id++ {
+				witnesses[id] = struct{}{}
+			}
+			rn.startTryPreAccept(inst, attrs, witnesses, false)
+			if inst.phase != phaseAccept {
+				t.Fatalf("N=%d local Prepare witness lost: phase=%d tryOK=%v", voters, inst.phase, inst.tryOK)
+			}
+		})
+	}
+}
+
+func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
+	build := func(kind MessageType, toq bool) Message {
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(kind)}
+		command := optimizedTestCommand("wrong-domain", "wrong-domain-key")
+		requestBallot := Ballot{Number: 1, Replica: 2}
+		responseBallot := Ballot{Number: 1, Replica: 1}
+		message := Message{
+			Type:      kind,
+			From:      2,
+			To:        1,
+			Ref:       ref,
+			Ballot:    requestBallot,
+			Seq:       1,
+			Deps:      make([]InstanceNum, 3),
+			Command:   command,
+			ProcessAt: 9,
+			TOQ:       toq,
+		}
+		switch kind {
+		case MsgCommit:
+			message.RecordBallot = requestBallot
+		case MsgPrepareResp:
+			message.Ballot = responseBallot
+			message.RecordBallot = Ballot{Replica: ref.Replica}
+			message.RecordStatus = StatusAccepted
+		case MsgEvidenceResp:
+			message.Ballot = responseBallot
+			message.RecordBallot = Ballot{Replica: ref.Replica}
+			message.RecordStatus = StatusAccepted
+			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
+		}
+		return message
+	}
+	for _, tc := range []struct {
+		name   string
+		config Config
+		toq    bool
+	}{
+		{name: "toq-value-on-logical-node", config: Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true}, toq: true},
+		{name: "logical-value-on-toq-node-without-runtime", config: Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 0 }}, toq: false},
+	} {
+		for _, kind := range []MessageType{MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgEvidenceResp} {
+			t.Run(tc.name+"/"+kind.String(), func(t *testing.T) {
+				rn, err := NewRawNode(tc.config)
+				if err != nil {
+					t.Fatal(err)
+				}
+				message := build(kind, tc.toq)
+				if err := message.Validate(rn.q.conf); err != nil {
+					t.Fatalf("test message is malformed before domain gate: %v", err)
+				}
+				before := snapshotRemainingNodeProtocol(rn)
+				if err := rn.Step(message); !errors.Is(err, ErrMessageRejected) {
+					t.Fatalf("wrong-domain %s err=%v, want ErrMessageRejected", kind, err)
+				}
+				requireRemainingNodeProtocolUnchanged(t, rn, before)
+			})
+		}
+	}
+}
+
+func TestRestartRejectsIncompatibleNonNoopTimingDomain(t *testing.T) {
+	record := func(domain TimingDomain, kind CommandKind) InstanceRecord {
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
+		processAt := uint64(9)
+		if domain == TimingDomainUntimed {
+			processAt = 0
+		}
+		rec := checkedRecord(InstanceRecord{
+			Ref:          ref,
+			Ballot:       Ballot{Replica: 2},
+			Status:       StatusAccepted,
+			Seq:          1,
+			Deps:         make([]InstanceNum, 3),
+			Command:      Command{ID: CommandID{Client: 1500, Sequence: 1}, Kind: kind, Payload: []byte("restart-domain")},
+			ProcessAt:    processAt,
+			TimingDomain: domain,
+		})
+		if kind == CommandNoop {
+			rec.Command = Command{Kind: CommandNoop}
+		}
+		rec.Checksum = ChecksumRecord(rec)
+		return rec
+	}
+	makeStore := func(rec InstanceRecord) *MemoryStorage {
+		store := NewMemoryStorage()
+		store.Hard = HardState{Conf: ConfState{ID: 1, Voters: makeIDs(3)}}
+		store.Records[rec.Ref] = rec.Clone()
+		return store
+	}
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true, Storage: makeStore(record(TimingDomainTOQ, CommandUser))}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("logical reopen of TOQ value err=%v, want ErrInvalidConfig", err)
+	}
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 0 }, Storage: makeStore(record(TimingDomainLogical, CommandUser))}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("TOQ reopen of logical value err=%v, want ErrInvalidConfig", err)
+	}
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: makeStore(record(TimingDomainTOQ, CommandNoop))}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("timing-tagged no-op restart err=%v, want ErrInvalidConfig", err)
+	}
+}
+
+func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  func(*MemoryStorage, *int) Config
+	}{
+		{
+			name: "logical",
+			cfg: func(store *MemoryStorage, _ *int) Config {
+				return Config{ID: 1, Voters: makeIDs(3), Storage: store, TimeOptimization: true, TimeOptimizationTicks: 5}
+			},
+		},
+		{
+			name: "TOQ",
+			cfg: func(store *MemoryStorage, reads *int) Config {
+				conf := ConfState{ID: 1, Voters: makeIDs(3)}
+				return Config{
+					ID:         1,
+					Voters:     conf.Voters,
+					Storage:    store,
+					TOQ:        true,
+					TOQClock:   func() uint64 { (*reads)++; return 50 },
+					TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 1, 3: 1}},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			reads := 0
+			cfg := tc.cfg(store, &reads)
+			rn, err := NewRawNode(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial := rn.Ready()
+			if err := store.ApplyReady(initial); err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, initial)
+			ref, err := rn.Propose(Command{Kind: CommandNoop})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rd := rn.Ready()
+			if len(rd.Records) != 1 || rd.Records[0].Ref != ref {
+				t.Fatalf("no-op Ready records = %#v, want one record for %s", rd.Records, ref)
+			}
+			rec := rd.Records[0]
+			if rec.Command.Kind != CommandNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
+				t.Fatalf("timed-mode no-op record is not canonical untimed: %#v", rec)
+			}
+			var responses []Message
+			for _, message := range rd.Messages {
+				if message.Command.Kind != CommandNoop || message.ProcessAt != 0 || message.TOQ {
+					t.Fatalf("timed-mode no-op message is not canonical untimed: %#v", message)
+				}
+				if err := message.Validate(rn.q.conf); err != nil {
+					t.Fatalf("canonical no-op message failed validation: %v", err)
+				}
+				followerCfg := cfg
+				followerCfg.ID = message.To
+				followerCfg.Storage = NewMemoryStorage()
+				follower, err := NewRawNode(followerCfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, follower, follower.Ready())
+				if err := follower.Step(message); err != nil {
+					t.Fatalf("follower %d rejected canonical timed-mode no-op: %v", message.To, err)
+				}
+				followerReady := follower.Ready()
+				if len(followerReady.Records) != 1 || !VerifyRecordChecksum(followerReady.Records[0]) || followerReady.Records[0].TimingDomain != TimingDomainUntimed {
+					t.Fatalf("follower %d no-op Ready = %#v", message.To, followerReady)
+				}
+				responses = append(responses, followerReady.Messages...)
+			}
+			if len(rn.deferredIndex) != 0 {
+				t.Fatalf("canonical no-op entered timed deferred queue: %#v", rn.deferredIndex)
+			}
+			if tc.name == "TOQ" && reads != 0 {
+				t.Fatalf("TOQ no-op sampled caller clock %d times, want zero", reads)
+			}
+			if err := store.ApplyReady(rd); err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, rd)
+			for _, response := range responses {
+				if err := rn.Step(response); err != nil {
+					t.Fatalf("owner rejected no-op response: %v", err)
+				}
+			}
+			if rn.HasReady() {
+				committed := rn.Ready()
+				for _, record := range committed.Records {
+					if record.Command.Kind == CommandNoop && (record.ProcessAt != 0 || record.TimingDomain != TimingDomainUntimed || record.TOQPending || !VerifyRecordChecksum(record)) {
+						t.Fatalf("committed no-op record lost canonical timing: %#v", record)
+					}
+				}
+				if err := store.ApplyReady(committed); err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, rn, committed)
+			}
+			restarted, err := NewRawNode(tc.cfg(store, &reads))
+			if err != nil {
+				t.Fatalf("restart with canonical no-op: %v", err)
+			}
+			got := restarted.instances[ref]
+			if got == nil || got.rec.Command.Kind != CommandNoop || got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending {
+				t.Fatalf("restarted canonical no-op = %#v", got)
+			}
+		})
+	}
+}
+
+func TestTimedNoopMessagesRejectWithoutMutation(t *testing.T) {
+	build := func(kind MessageType, toq bool) Message {
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(kind)}
+		requestBallot := Ballot{Number: 1, Replica: 2}
+		responseBallot := Ballot{Number: 1, Replica: 1}
+		message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: requestBallot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}, ProcessAt: 9, TOQ: toq}
+		switch kind {
+		case MsgCommit:
+			message.RecordBallot = requestBallot
+		case MsgPrepareResp:
+			message.Ballot = responseBallot
+			message.RecordBallot = Ballot{Replica: ref.Replica}
+			message.RecordStatus = StatusAccepted
+		case MsgEvidenceResp:
+			message.Ballot = responseBallot
+			message.RecordBallot = Ballot{Replica: ref.Replica}
+			message.RecordStatus = StatusAccepted
+			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
+		}
+		return message
+	}
+	for _, toq := range []bool{false, true} {
+		for _, kind := range []MessageType{MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgEvidenceResp} {
+			t.Run(fmt.Sprintf("toq=%v/%s", toq, kind), func(t *testing.T) {
+				rn := protocolCoverageNewRawNode(t, 1, 3)
+				message := build(kind, toq)
+				before := snapshotRemainingNodeProtocol(rn)
+				if err := rn.Step(message); !errors.Is(err, ErrInvalidMessage) {
+					t.Fatalf("timed no-op %s error = %v, want ErrInvalidMessage", kind, err)
+				}
+				requireRemainingNodeProtocolUnchanged(t, rn, before)
+			})
+		}
+	}
+}
+
+func TestTimedModesRejectFreshUntimedValueAndPreserveLegacyContinuation(t *testing.T) {
+	for _, domain := range []TimingDomain{TimingDomainLogical, TimingDomainTOQ} {
+		for _, kind := range []MessageType{MsgAccept, MsgCommit} {
+			t.Run(fmt.Sprintf("%v/%s", domain, kind), func(t *testing.T) {
+				cfg := Config{ID: 1, Voters: makeIDs(3)}
+				if domain == TimingDomainLogical {
+					cfg.TimeOptimization = true
+				} else {
+					cfg.TOQ = true
+					cfg.TOQClock = func() uint64 { return 0 }
+				}
+				fresh, err := NewRawNode(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				protocolCoverageAdvanceHardStateOnly(t, fresh, 0)
+				ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(kind)}
+				ballot := Ballot{Number: 1, Replica: 2}
+				command := optimizedTestCommand("legacy-zero", "legacy-zero-key")
+				message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Command: command}
+				if kind == MsgCommit {
+					message.RecordBallot = ballot
+				}
+				before := snapshotRemainingNodeProtocol(fresh)
+				if err := fresh.Step(message); !errors.Is(err, ErrMessageRejected) {
+					t.Fatalf("fresh timed node accepted Untimed %s: %v", kind, err)
+				}
+				requireRemainingNodeProtocolUnchanged(t, fresh, before)
+
+				continued, err := NewRawNode(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				protocolCoverageAdvanceHardStateOnly(t, continued, 0)
+				oldStatus := StatusPreAccepted
+				if kind == MsgCommit {
+					oldStatus = StatusAccepted
+				}
+				old := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: oldStatus, Seq: 1, Deps: make([]InstanceNum, 3), Command: command, ProcessAt: 9, TimingDomain: domain})
+				continued.installInstance(&instance{rec: old, phase: phaseIdle})
+				if err := continued.Step(message); err != nil {
+					t.Fatalf("legacy zero-timing continuation failed: %v", err)
+				}
+				got := continued.instances[ref].rec
+				if got.ProcessAt != 9 || got.TimingDomain != domain {
+					t.Fatalf("legacy continuation lost pinned timing: %#v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestSameBallotTimedPhaseConflictsRejectWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   MessageType
+		status Status
+		phase  phase
+	}{
+		{name: "Accept duplicate", kind: MsgAccept, status: StatusAccepted, phase: phaseIdle},
+		{name: "Accept promotion", kind: MsgAccept, status: StatusPreAccepted, phase: phaseIdle},
+		{name: "Commit duplicate", kind: MsgCommit, status: StatusCommitted, phase: phaseCommitted},
+		{name: "Commit promotion", kind: MsgCommit, status: StatusPreAccepted, phase: phaseIdle},
+		{name: "TryPreAccept duplicate", kind: MsgTryPreAccept, status: StatusPreAccepted, phase: phaseIdle},
+	} {
+		for _, mutation := range []string{"ProcessAt", "domain"} {
+			t.Run(tc.name+"/"+mutation, func(t *testing.T) {
+				rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				protocolCoverageAdvanceHardStateOnly(t, rn, 0)
+				ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(tc.kind)}
+				ballot := Ballot{Number: 1, Replica: 2}
+				command := optimizedTestCommand("pinned-phase", "pinned-phase-key")
+				rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: tc.status, Seq: 1, Deps: make([]InstanceNum, 3), Command: command, ProcessAt: 100, TimingDomain: TimingDomainLogical})
+				inst := &instance{rec: rec, phase: tc.phase, generation: ^uint64(0)}
+				rn.installInstance(inst)
+				message := Message{Type: tc.kind, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: command.Clone(), ProcessAt: rec.ProcessAt}
+				if tc.kind == MsgCommit {
+					message.RecordBallot = ballot
+				}
+				wantErr := ErrInvalidMessage
+				if mutation == "ProcessAt" {
+					message.ProcessAt--
+				} else {
+					message.TOQ = true
+					wantErr = ErrMessageRejected
+				}
+				before := rec.Clone()
+				if err := rn.Step(message); !errors.Is(err, wantErr) {
+					t.Fatalf("%s conflict error = %v, want %v", mutation, err, wantErr)
+				}
+				if rn.instances[ref] != inst || inst.generation != ^uint64(0) || !instanceRecordEqual(inst.rec, before) || rn.HasReady() {
+					t.Fatalf("%s conflict mutated pinned phase: instance=%#v Ready=%#v", mutation, rn.instances[ref], rn.Ready())
+				}
+			})
+		}
+	}
+
+	t.Run("PreAccepted promotion may evolve attributes", func(t *testing.T) {
+		rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		protocolCoverageAdvanceHardStateOnly(t, rn, 0)
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: 99}
+		ballot := Ballot{Number: 1, Replica: 2}
+		command := optimizedTestCommand("promotion", "promotion-key")
+		rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: command, ProcessAt: 100, TimingDomain: TimingDomainLogical})
+		rn.installInstance(&instance{rec: rec, phase: phaseIdle})
+		deps := []InstanceNum{0, 0, 1}
+		message := Message{Type: MsgAccept, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 2, Deps: deps, Command: command, ProcessAt: 100}
+		if err := rn.Step(message); err != nil {
+			t.Fatalf("valid same-value promotion: %v", err)
+		}
+		got := rn.instances[ref].rec
+		if got.Status != StatusAccepted || got.Seq != 2 || !instanceNumsEqual(got.Deps, deps) || got.ProcessAt != 100 || got.TimingDomain != TimingDomainLogical {
+			t.Fatalf("same-value promotion = %#v", got)
+		}
+	})
+}
+
+func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
+	type setupFunc func(*testing.T) (*RawNode, *instance, Message)
+	cases := map[string]setupFunc{
+		"PreAcceptResp wrong ballot": func(t *testing.T) (*RawNode, *instance, Message) {
+			rn := protocolCoverageNewRawNode(t, 1, 3)
+			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+			ballot := Ballot{Number: 1, Replica: 1}
+			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
+			inst := &instance{rec: rec, phase: phasePreAccept, preOK: map[ReplicaID]attrVote{1: {seq: 1, deps: make([]InstanceNum, 3)}}}
+			rn.installInstance(inst)
+			return rn, inst, Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 3)}
+		},
+		"AcceptResp wrong tuple": func(t *testing.T) (*RawNode, *instance, Message) {
+			rn := protocolCoverageNewRawNode(t, 1, 3)
+			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 2}
+			ballot := Ballot{Number: 1, Replica: 1}
+			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
+			inst := &instance{rec: rec, phase: phaseAccept, accOK: map[ReplicaID]struct{}{1: {}}}
+			rn.installInstance(inst)
+			return rn, inst, Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, RecordStatus: StatusAccepted, Seq: 2, Deps: make([]InstanceNum, 3)}
+		},
+		"PrepareResp stale ballot": func(t *testing.T) (*RawNode, *instance, Message) {
+			rn := protocolCoverageNewRawNode(t, 1, 3)
+			ref := InstanceRef{Conf: 1, Replica: 2, Instance: 3}
+			ballot := Ballot{Number: 2, Replica: 1}
+			rec := InstanceRecord{Ref: ref, Ballot: ballot, Status: StatusNone, Deps: make([]InstanceNum, 3)}
+			rec.Checksum = ChecksumRecord(rec)
+			inst := &instance{rec: rec, phase: phasePrepare, prepareOK: map[ReplicaID]InstanceRecord{1: rec}}
+			rn.installInstance(inst)
+			return rn, inst, Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, RecordStatus: StatusNone, Deps: make([]InstanceNum, 3)}
+		},
+		"TryPreAcceptResp wrong tuple": func(t *testing.T) (*RawNode, *instance, Message) {
+			rn := protocolCoverageNewRawNode(t, 1, 3)
+			ref := InstanceRef{Conf: 1, Replica: 2, Instance: 4}
+			ballot := Ballot{Number: 1, Replica: 1}
+			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
+			inst := &instance{rec: rec, phase: phaseTryPreAccept, tryOK: map[ReplicaID]struct{}{1: {}}}
+			rn.installInstance(inst)
+			return rn, inst, Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordStatus: StatusPreAccepted, Seq: 2, Deps: make([]InstanceNum, 3)}
+		},
+		"EvidenceResp missing check": func(t *testing.T) (*RawNode, *instance, Message) {
+			rn := protocolCoverageNewRawNode(t, 1, 3)
+			target := InstanceRef{Conf: 1, Replica: 1, Instance: 5}
+			ballot := Ballot{Number: 1, Replica: 1}
+			rec := checkedRecord(InstanceRecord{Ref: target, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
+			inst := &instance{rec: rec, phase: phaseTryPreAccept}
+			rn.installInstance(inst)
+			conflict := InstanceRef{Conf: 1, Replica: 2, Instance: 6}
+			return rn, inst, Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Ballot: ballot, RecordStatus: StatusNone, Deps: make([]InstanceNum, 3)}
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			rn, inst, message := setup(t)
+			inst.generation = ^uint64(0)
+			rn.tick = ^uint64(0)
+			rn.currentHardState.Tick = rn.tick
+			rn.acknowledgedHardState = rn.currentHardState.Clone()
+			before := inst.rec.Clone()
+			if err := rn.Step(message); err != nil {
+				t.Fatalf("ignored response returned exhaustion/error: %v", err)
+			}
+			if inst.generation != ^uint64(0) || !instanceRecordEqual(inst.rec, before) || rn.HasReady() {
+				t.Fatalf("ignored response mutated state: instance=%#v Ready=%#v", inst, rn.Ready())
+			}
+		})
+	}
+}
+
+func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
+	for _, kind := range []MessageType{MsgAccept, MsgCommit} {
+		t.Run(kind.String(), func(t *testing.T) {
+			store := NewMemoryStorage()
+			conf := ConfState{ID: 1, Voters: makeIDs(3)}
+			cfg := Config{ID: 1, Voters: conf.Voters, Storage: store, TOQ: true, TOQClock: func() uint64 { return 50 }, TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 1, 3: 1}}}
+			rn, err := NewRawNode(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial := rn.Ready()
+			if err := store.ApplyReady(initial); err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, initial)
+			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+			pending := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("pending-user", "pending-user-key"), ProcessAt: 60, TimingDomain: TimingDomainTOQ, TOQPending: true}
+			pending.Checksum = ChecksumRecord(pending)
+			rn.installInstance(&instance{rec: pending, phase: phasePreAccept, processAt: pending.ProcessAt})
+			ballot := Ballot{Number: 1, Replica: 2}
+			message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}
+			if kind == MsgCommit {
+				message.RecordBallot = ballot
+			}
+			if err := rn.Step(message); err != nil {
+				t.Fatal(err)
+			}
+			got := rn.instances[ref].rec
+			if got.Command.Kind != CommandNoop || got.ProcessAt != 0 || got.TimingDomain != TimingDomainUntimed || got.TOQPending || !VerifyRecordChecksum(got) {
+				t.Fatalf("recovered no-op inherited pending user timing: %#v", got)
+			}
+			rd := rn.Ready()
+			if kind == MsgAccept {
+				if err := store.ApplyReady(rd); err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, rn, rd)
+				commit := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}
+				if err := rn.Step(commit); err != nil {
+					t.Fatal(err)
+				}
+				rd = rn.Ready()
+			}
+			for _, record := range rd.Records {
+				if record.Ref == ref && !VerifyRecordChecksum(record) {
+					t.Fatalf("recovered no-op emitted invalid Ready record: %#v", record)
+				}
+			}
+			if err := store.ApplyReady(rd); err != nil {
+				t.Fatal(err)
+			}
+			advanceOK(t, rn, rd)
+			if terminal := rn.instances[ref]; terminal == nil || terminal.rec.Status != StatusExecuted || terminal.rec.Command.Kind != CommandNoop {
+				t.Fatalf("recovered no-op did not reach terminal execution: %#v", terminal)
+			}
+			terminal := rn.instances[ref]
+			duplicate := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, ProcessAt: pending.ProcessAt, TOQ: true, Command: pending.Command}
+			if err := rn.Step(duplicate); err != nil {
+				t.Fatalf("late pending-value duplicate: %v", err)
+			}
+			if rn.instances[ref] != terminal || terminal.rec.Command.Kind != CommandNoop || terminal.rec.Status != StatusExecuted {
+				t.Fatalf("late pending-value duplicate resurrected original value: %#v", rn.instances[ref])
+			}
+			duplicateReady := rn.Ready()
+			if len(duplicateReady.Records) != 0 || len(duplicateReady.Messages) != 1 || duplicateReady.Messages[0].Type != MsgCommit || duplicateReady.Messages[0].Command.Kind != CommandNoop {
+				t.Fatalf("late pending-value duplicate response = %#v, want canonical no-op Commit only", duplicateReady)
+			}
+			restarted, err := NewRawNode(cfg)
+			if err != nil {
+				t.Fatalf("restart after pending-user/no-op recovery: %v", err)
+			}
+			restartedRecord := restarted.instances[ref]
+			if restartedRecord == nil || restartedRecord.rec.Command.Kind != CommandNoop || restartedRecord.rec.TimingDomain != TimingDomainUntimed || restartedRecord.rec.ProcessAt != 0 {
+				t.Fatalf("restarted recovered no-op = %#v", restartedRecord)
+			}
+		})
+	}
+}
+
+func TestTOQUnavailableRuntimeStillAllowsCanonicalNoop(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 99 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocolCoverageAdvanceHardStateOnly(t, rn, 0)
+	ref, err := rn.Propose(Command{Kind: CommandNoop})
+	if err != nil {
+		t.Fatalf("canonical no-op with unavailable TOQ runtime: %v", err)
+	}
+	rd := rn.Ready()
+	rec := optimizedRequireRecord(t, rd, ref)
+	if rec.Command.Kind != CommandNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
+		t.Fatalf("no-runtime TOQ no-op record = %#v", rec)
+	}
+	for _, message := range rd.Messages {
+		if message.ProcessAt != 0 || message.TOQ || message.Command.Kind != CommandNoop {
+			t.Fatalf("no-runtime TOQ no-op message = %#v", message)
+		}
+	}
 }

@@ -2,10 +2,87 @@ package epaxos
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
+	"unsafe"
 )
+
+func cloneSliceInto[T any](dst, src []T) []T {
+	source := src
+	sameStorage := slicesSameStorageAndShape(dst, source)
+	if len(source) == 0 {
+		if !sameStorage {
+			clear(dst[:cap(dst)])
+		}
+		return dst[:0]
+	}
+	if cap(dst) < len(source) {
+		dst = make([]T, len(source))
+	} else {
+		dst = dst[:len(source)]
+	}
+	copy(dst, source)
+	if !sameStorage {
+		clear(dst[len(source):cap(dst)])
+	}
+	return dst
+}
+
+func slicesSameStorageAndShape[T any](left, right []T) bool {
+	if len(left) != len(right) || cap(left) != cap(right) {
+		return false
+	}
+	if cap(left) == 0 {
+		return true
+	}
+	return unsafe.SliceData(left[:cap(left)]) == unsafe.SliceData(right[:cap(right)])
+}
+
+func slicesPartiallyOverlap[T any](dst, src []T) bool {
+	if len(src) == 0 || cap(dst) < len(src) {
+		return false
+	}
+	size := unsafe.Sizeof(*new(T))
+	if size == 0 {
+		return false
+	}
+	dstStart := uintptr(unsafe.Pointer(unsafe.SliceData(dst[:cap(dst)])))
+	srcStart := uintptr(unsafe.Pointer(unsafe.SliceData(src)))
+	if dstStart == srcStart {
+		return false
+	}
+	dstEnd := dstStart + uintptr(len(src))*size
+	srcEnd := srcStart + uintptr(len(src))*size
+	return dstStart < srcEnd && srcStart < dstEnd
+}
+
+func cloneByteSlicesInto(dst, src [][]byte) [][]byte {
+	source := src
+	if slicesPartiallyOverlap(dst, source) {
+		snapshot := make([][]byte, len(source))
+		for i := range source {
+			snapshot[i] = append([]byte(nil), source[i]...)
+		}
+		source = snapshot
+	}
+	if cap(dst) < len(source) {
+		grown := make([][]byte, len(source))
+		copy(grown, dst)
+		dst = grown
+	} else {
+		dst = dst[:len(source)]
+	}
+	for i := range source {
+		dst[i] = cloneSliceInto(dst[i], source[i])
+	}
+	full := dst[:cap(dst)]
+	for i := len(source); i < len(full); i++ {
+		full[i] = nil
+	}
+	return dst
+}
 
 // ReplicaID identifies a replica inside a configuration.
 type ReplicaID uint64
@@ -47,10 +124,43 @@ func (b Ballot) Less(other Ballot) bool {
 	return b.Replica < other.Replica
 }
 
-// Next returns a ballot owned by replica and greater than b.
-func (b Ballot) Next(replica ReplicaID) Ballot {
-	return Ballot{Epoch: b.Epoch, Number: b.Number + 1, Replica: replica}
+// IsInitialFor reports whether b is replica's exact configuration-epoch-zero
+// initial ballot. A nonzero Epoch is always a recovery ballot even when Number
+// is zero.
+func (b Ballot) IsInitialFor(replica ReplicaID) bool {
+	return replica != 0 && b.Epoch == 0 && b.Number == 0 && b.Replica == replica
 }
+
+// IsRecovery reports whether b is a non-initial, nonzero ballot.
+func (b Ballot) IsRecovery() bool {
+	return b != (Ballot{}) && (b.Epoch != 0 || b.Number != 0)
+}
+
+// Next returns a ballot owned by replica and strictly greater than b.
+// It carries a saturated Number into the next Epoch and fails when the
+// complete ballot counter space is exhausted.
+func (b Ballot) Next(replica ReplicaID) (Ballot, error) {
+	if b.Number != ^uint64(0) {
+		return Ballot{Epoch: b.Epoch, Number: b.Number + 1, Replica: replica}, nil
+	}
+	if b.Epoch == ^uint64(0) {
+		return Ballot{}, ErrBallotExhausted
+	}
+	return Ballot{Epoch: b.Epoch + 1, Replica: replica}, nil
+}
+
+// TimingDomain identifies the clock domain of an instance's ProcessAt value.
+// Numeric timestamps are comparable only within the same nonzero domain.
+type TimingDomain uint8
+
+const (
+	// TimingDomainUntimed means ProcessAt is zero and has no clock semantics.
+	TimingDomainUntimed TimingDomain = iota
+	// TimingDomainLogical means ProcessAt uses durable logical ticks.
+	TimingDomainLogical
+	// TimingDomainTOQ means ProcessAt uses the caller-sampled TOQ clock.
+	TimingDomainTOQ
+)
 
 // Status is the durable status of an EPaxos instance.
 type Status uint8
@@ -96,6 +206,8 @@ const (
 	CommandNoop
 	// CommandConfChange is a membership-change command.
 	CommandConfChange
+	// CommandMembership is a certified voter-bootstrap control command.
+	CommandMembership
 )
 
 // CommandID is an application-supplied id used for duplicate detection by clients.
@@ -126,18 +238,22 @@ func (c *Command) Reset() {
 	c.ConflictKeys = nil
 }
 
+// CloneInto deep-copies c into dst while reusing destination capacity.
+func (c Command) CloneInto(dst *Command) {
+	payload := cloneSliceInto(dst.Payload, c.Payload)
+	conflictKeys := cloneByteSlicesInto(dst.ConflictKeys, c.ConflictKeys)
+	*dst = Command{
+		ID:           c.ID,
+		Kind:         c.Kind,
+		Payload:      payload,
+		ConflictKeys: conflictKeys,
+	}
+}
+
 // Clone returns a deep copy of the command.
 func (c Command) Clone() Command {
-	out := Command{ID: c.ID, Kind: c.Kind}
-	if len(c.Payload) > 0 {
-		out.Payload = append([]byte(nil), c.Payload...)
-	}
-	if len(c.ConflictKeys) > 0 {
-		out.ConflictKeys = make([][]byte, len(c.ConflictKeys))
-		for i := range c.ConflictKeys {
-			out.ConflictKeys[i] = append([]byte(nil), c.ConflictKeys[i]...)
-		}
-	}
+	var out Command
+	c.CloneInto(&out)
 	return out
 }
 
@@ -150,7 +266,8 @@ func (c Command) ConflictsWith(other Command) bool {
 	if c.Kind == CommandNoop || other.Kind == CommandNoop {
 		return false
 	}
-	if c.Kind == CommandConfChange || other.Kind == CommandConfChange {
+	if c.Kind == CommandConfChange || other.Kind == CommandConfChange ||
+		c.Kind == CommandMembership || other.Kind == CommandMembership {
 		return true
 	}
 	for _, a := range c.ConflictKeys {
@@ -179,16 +296,47 @@ type ConfChange struct {
 	Replica ReplicaID
 }
 
+// ConfChangeOutcome is the terminal replicated result of an executed
+// configuration command.
+type ConfChangeOutcome uint8
+
+const (
+	// ConfChangeOutcomeUnspecified is valid only before a configuration command
+	// executes. Executed configuration records must carry a terminal outcome.
+	ConfChangeOutcomeUnspecified ConfChangeOutcome = iota
+	// ConfChangeApplied means the command installed ConfChangeResult.Conf.
+	ConfChangeApplied
+	// ConfChangeRejectedSuperseded means another command already applied the
+	// transition from this instance's pinned base configuration.
+	ConfChangeRejectedSuperseded
+	// ConfChangeRejectedInvalid means the durable command was invalid for its
+	// pinned base configuration.
+	ConfChangeRejectedInvalid
+)
+
+// ConfChangeResult is the checksummed terminal result of an executed
+// configuration command. Conf is populated only for ConfChangeApplied.
+type ConfChangeResult struct {
+	Outcome ConfChangeOutcome
+	Conf    ConfState
+}
+
 // ConfState is a deterministic snapshot of voters at a configuration id.
 type ConfState struct {
 	ID     ConfID
 	Voters []ReplicaID
 }
 
+// CloneInto deep-copies c into dst while reusing destination capacity.
+func (c ConfState) CloneInto(dst *ConfState) {
+	voters := cloneSliceInto(dst.Voters, c.Voters)
+	*dst = ConfState{ID: c.ID, Voters: voters}
+}
+
 // Clone returns a deep copy of the configuration state.
 func (c ConfState) Clone() ConfState {
-	out := ConfState{ID: c.ID}
-	out.Voters = append(out.Voters, c.Voters...)
+	var out ConfState
+	c.CloneInto(&out)
 	return out
 }
 
@@ -204,12 +352,56 @@ func (c ConfState) Index(id ReplicaID) (int, bool) {
 	return i, i < len(c.Voters) && c.Voters[i] == id
 }
 
+// TOQRuntimeConfig binds TOQ delay and synchronization-group inputs to one
+// exact configuration epoch. The node clones every supplied slice and map.
+type TOQRuntimeConfig struct {
+	Conf        ConfState
+	OneWayDelay map[ReplicaID]uint64
+	// SyncGroup is the group used when choosing the maximum delay. Empty means
+	// every voter in Conf.
+	SyncGroup []ReplicaID
+}
+
+// CloneInto deep-copies c into dst while reusing destination capacity.
+func (c TOQRuntimeConfig) CloneInto(dst *TOQRuntimeConfig) {
+	conf := dst.Conf
+	c.Conf.CloneInto(&conf)
+	delays := dst.OneWayDelay
+	if delays == nil {
+		delays = make(map[ReplicaID]uint64, len(c.OneWayDelay))
+	} else {
+		clear(delays)
+	}
+	for id, delay := range c.OneWayDelay {
+		delays[id] = delay
+	}
+	group := cloneSliceInto(dst.SyncGroup, c.SyncGroup)
+	*dst = TOQRuntimeConfig{Conf: conf, OneWayDelay: delays, SyncGroup: group}
+}
+
+// Clone returns a deep copy of the runtime configuration.
+func (c TOQRuntimeConfig) Clone() TOQRuntimeConfig {
+	var out TOQRuntimeConfig
+	c.CloneInto(&out)
+	return out
+}
+
 // Config configures a RawNode.
 type Config struct {
 	// ID is the local replica id and must be present in Voters.
 	ID ReplicaID
 	// Voters is the complete voting configuration for the initial cluster.
 	Voters []ReplicaID
+	// Cluster identifies the externally provisioned bootstrap trust domain. The
+	// zero value selects legacy genesis behavior and cannot prepare new voters.
+	Cluster ClusterID
+	// LocalIdentity is the exact locally fenced voter incarnation.
+	LocalIdentity VoterIdentity
+	// VoterIdentities supplies canonical verification identities for Voters.
+	VoterIdentities []VoterIdentity
+	// BootstrapPrivateKey signs bootstrap evidence for LocalIdentity. It is
+	// copied by NewRawNode and is never exposed through Ready or Status.
+	BootstrapPrivateKey ed25519.PrivateKey
 	// Storage persists hard state and instance records. A nil Storage selects
 	// an in-memory implementation.
 	Storage Storage
@@ -223,20 +415,24 @@ type Config struct {
 	// TimeOptimizationTicks is the logical ProcessAt offset and fast-wait duration.
 	TimeOptimizationTicks uint64
 	// TOQ enables EPaxos Revisited Timestamp-Ordered Queueing. It is a separate
-	// mode from TimeOptimization and requires explicit synchronized-clock and
+	// mode from TimeOptimization and requires an explicitly sampled clock plus
 	// conservative delay-bound inputs from the embedding application.
 	TOQ bool
-	// TOQClock returns the local synchronized clock value used for TOQ ProcessAt
-	// timestamps. Units must match TOQOneWayDelay.
+	// TOQClock returns the caller-managed TOQ clock. The core samples it only
+	// while proposing a TOQ instance or explicitly closing buckets through
+	// ProcessTOQ; NewRawNode, Tick, and Step never read it.
 	TOQClock func() uint64
-	// TOQOneWayDelay contains originator-to-replica conservative delivery bounds
-	// used to compute ProcessAt as TOQClock()+max(bound over the sync group).
-	// Each value must include one-way network delay plus the clock-skew/
-	// synchronization uncertainty margin for that receiver and sync group.
-	TOQOneWayDelay map[ReplicaID]uint64
-	// TOQSyncGroup is the optional group used when choosing the maximum TOQ delay.
-	// Empty means all current voters.
-	TOQSyncGroup []ReplicaID
+	// TOQRuntime binds operational timing inputs to an exact configuration.
+	// Nil is valid and leaves local TOQ proposal capability unavailable until
+	// RefreshTOQConfig installs a matching entry.
+	TOQRuntime *TOQRuntimeConfig
+	// LegacyProcessAtDomain explicitly assigns one domain while upgrading
+	// nonpending durable records written before TimingDomain was authenticated.
+	// Nil fails closed; a pointer may explicitly select Untimed, Logical, or TOQ.
+	LegacyProcessAtDomain *TimingDomain
+	// MaxDeferredPreAccepts bounds retained future timed PreAccept messages
+	// across the logical and TOQ domains. Zero selects a conservative default.
+	MaxDeferredPreAccepts int
 	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
 	// slices instead of cloning them. When true, the caller transfers ownership
 	// of those slices and must not mutate or reuse them while they remain
@@ -246,12 +442,52 @@ type Config struct {
 	// committed application commands. A value less than one leaves messages
 	// uncapped.
 	MaxReadyMessages int
+	// MaxDependencyRecoveriesPerDrive caps new exact dependency recoveries
+	// started across one outer Propose, Step, Tick, ProcessTOQ, or startup
+	// drive. Zero selects a conservative default.
+	MaxDependencyRecoveriesPerDrive int
+	// MaxConcurrentRecoveries caps unfinished ballot-based recoveries
+	// coordinated locally before dependency closure starts another. Zero
+	// selects a conservative default.
+	MaxConcurrentRecoveries int
 }
 
 // HardState is the durable node-level state loaded before instances.
 type HardState struct {
 	Conf ConfState
 	Tick uint64
+}
+
+// Empty reports whether h contains no durable update.
+func (h HardState) Empty() bool {
+	return h.Conf.ID == 0 && len(h.Conf.Voters) == 0 && h.Tick == 0
+}
+
+// Equal reports whether two hard states match exactly.
+func (h HardState) Equal(other HardState) bool {
+	if h.Tick != other.Tick || h.Conf.ID != other.Conf.ID || len(h.Conf.Voters) != len(other.Conf.Voters) {
+		return false
+	}
+	for i := range h.Conf.Voters {
+		if h.Conf.Voters[i] != other.Conf.Voters[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// CloneInto deep-copies h into dst while reusing destination capacity.
+func (h HardState) CloneInto(dst *HardState) {
+	conf := dst.Conf
+	h.Conf.CloneInto(&conf)
+	*dst = HardState{Conf: conf, Tick: h.Tick}
+}
+
+// Clone returns a deep copy of the hard state.
+func (h HardState) Clone() HardState {
+	var out HardState
+	h.CloneInto(&out)
+	return out
 }
 
 // InstanceRecord is the durable value for one EPaxos instance.
@@ -276,23 +512,50 @@ type InstanceRecord struct {
 	AcceptEvidence   []AcceptEvidence
 	Command          Command
 	FastPathEligible bool
-	// ProcessAt is persisted for TOQ-pending local proposals so a restart can
-	// finish delayed originator dependency assignment in the same timestamp order.
+	// ProcessAt is pinned when an instance is created or first received.
+	// TOQ mode interprets it only in the caller-sampled physical domain;
+	// TimeOptimization interprets it only in the durable logical-tick domain.
+	// Phase changes never recompute it or compare values across clock domains.
 	ProcessAt uint64
+	// TimingDomain authenticates the clock domain of ProcessAt. Untimed
+	// requires ProcessAt zero; Logical and TOQ require it nonzero.
+	TimingDomain TimingDomain
 	// TOQPending means the command has been durably accepted by the local API but
 	// has not yet assigned its originator dependencies at ProcessAt. It must not
 	// be indexed, recovered, or counted as an ordinary PreAccepted tuple.
 	TOQPending bool
-	Checksum   [32]byte
+	// ConfChangeResult is the terminal replicated outcome of a configuration
+	// command. It is zero before execution and for non-configuration commands.
+	ConfChangeResult ConfChangeResult
+	// MembershipResult is the terminal certified voter-control outcome. It is
+	// zero before execution and on non-membership records.
+	MembershipResult MembershipResult
+	Checksum         [32]byte
+}
+
+// CloneInto deep-copies r into dst while reusing destination capacity.
+func (r InstanceRecord) CloneInto(dst *InstanceRecord) {
+	deps := cloneSliceInto(dst.Deps, r.Deps)
+	acceptDeps := cloneSliceInto(dst.AcceptDeps, r.AcceptDeps)
+	acceptEvidence := cloneAcceptEvidenceInto(dst.AcceptEvidence, r.AcceptEvidence)
+	command := dst.Command
+	r.Command.CloneInto(&command)
+	conf := dst.ConfChangeResult.Conf
+	r.ConfChangeResult.Conf.CloneInto(&conf)
+	membership := r.MembershipResult.Clone()
+	*dst = r
+	dst.Deps = deps
+	dst.AcceptDeps = acceptDeps
+	dst.AcceptEvidence = acceptEvidence
+	dst.Command = command
+	dst.ConfChangeResult.Conf = conf
+	dst.MembershipResult = membership
 }
 
 // Clone returns a deep copy of the instance record.
 func (r InstanceRecord) Clone() InstanceRecord {
-	out := r
-	out.Deps = append([]InstanceNum(nil), r.Deps...)
-	out.AcceptDeps = append([]InstanceNum(nil), r.AcceptDeps...)
-	out.AcceptEvidence = cloneAcceptEvidence(r.AcceptEvidence)
-	out.Command = r.Command.Clone()
+	var out InstanceRecord
+	r.CloneInto(&out)
 	return out
 }
 
@@ -317,9 +580,17 @@ type Attributes struct {
 	Deps []InstanceNum
 }
 
+// CloneInto deep-copies a into dst while reusing destination capacity.
+func (a Attributes) CloneInto(dst *Attributes) {
+	deps := cloneSliceInto(dst.Deps, a.Deps)
+	*dst = Attributes{Seq: a.Seq, Deps: deps}
+}
+
 // Clone returns a deep copy of the attributes.
 func (a Attributes) Clone() Attributes {
-	return Attributes{Seq: a.Seq, Deps: append([]InstanceNum(nil), a.Deps...)}
+	var out Attributes
+	a.CloneInto(&out)
+	return out
 }
 
 // Equal reports whether two attribute sets match exactly.
@@ -343,25 +614,207 @@ type CommittedCommand struct {
 	Command Command
 }
 
+// CloneInto deep-copies c into dst while reusing destination capacity.
+func (c CommittedCommand) CloneInto(dst *CommittedCommand) {
+	deps := cloneSliceInto(dst.Deps, c.Deps)
+	command := dst.Command
+	c.Command.CloneInto(&command)
+	*dst = c
+	dst.Deps = deps
+	dst.Command = command
+}
+
 // Clone returns a deep copy of the committed command.
 func (c CommittedCommand) Clone() CommittedCommand {
-	out := c
-	out.Deps = append([]InstanceNum(nil), c.Deps...)
-	out.Command = c.Command.Clone()
+	var out CommittedCommand
+	c.CloneInto(&out)
 	return out
 }
 
 // Ready batches records to persist, messages to send, and commands to apply.
 type Ready struct {
-	Records   []InstanceRecord
-	Messages  []Message
-	Committed []CommittedCommand
-	MustSync  bool
+	HardState        HardState
+	ConfigHistory    []ConfigHistoryEntry
+	Records          []InstanceRecord
+	BootstrapRecords []BootstrapRecord
+	LocalVoterState  *LocalVoterState
+	FrontierUpdates  []FrontierUpdate
+	AllocatorFloor   InstanceNum
+	Messages          []Message
+	BootstrapMessages []BootstrapMessage
+	Committed         []CommittedCommand
+	MustSync          bool
 }
 
 // Empty reports whether the ready batch contains no work.
 func (r Ready) Empty() bool {
-	return len(r.Records) == 0 && len(r.Messages) == 0 && len(r.Committed) == 0 && !r.MustSync
+	return r.HardState.Empty() && len(r.ConfigHistory) == 0 && len(r.Records) == 0 &&
+		len(r.BootstrapRecords) == 0 && r.LocalVoterState == nil && len(r.FrontierUpdates) == 0 &&
+		r.AllocatorFloor == 0 && len(r.Messages) == 0 && len(r.BootstrapMessages) == 0 &&
+		len(r.Committed) == 0 && !r.MustSync
+}
+
+// CloneInto deep-copies r into dst while reusing destination capacity.
+func (r Ready) CloneInto(dst *Ready) {
+	hardState := dst.HardState
+	r.HardState.CloneInto(&hardState)
+	sourceHistory := r.ConfigHistory
+	if slicesPartiallyOverlap(dst.ConfigHistory, sourceHistory) {
+		sourceHistory = cloneConfigHistory(sourceHistory)
+	}
+	history := dst.ConfigHistory
+	if cap(history) < len(sourceHistory) {
+		history = make([]ConfigHistoryEntry, len(sourceHistory))
+	} else {
+		history = history[:len(sourceHistory)]
+	}
+	for i := range sourceHistory {
+		history[i] = sourceHistory[i].Clone()
+	}
+	clear(history[len(history):cap(history)])
+
+
+	sourceRecords := r.Records
+	if slicesPartiallyOverlap(dst.Records, sourceRecords) {
+		snapshot := make([]InstanceRecord, len(sourceRecords))
+		for i := range sourceRecords {
+			sourceRecords[i].CloneInto(&snapshot[i])
+		}
+		sourceRecords = snapshot
+	}
+	records := dst.Records
+	if cap(records) < len(sourceRecords) {
+		records = make([]InstanceRecord, len(sourceRecords))
+	} else {
+		records = records[:len(sourceRecords)]
+	}
+	for i := range sourceRecords {
+		sourceRecords[i].CloneInto(&records[i])
+	}
+	fullRecords := records[:cap(records)]
+	for i := len(records); i < len(fullRecords); i++ {
+		fullRecords[i] = InstanceRecord{}
+	}
+	sourceBootstrapRecords := r.BootstrapRecords
+	if slicesPartiallyOverlap(dst.BootstrapRecords, sourceBootstrapRecords) {
+		sourceBootstrapRecords = cloneBootstrapRecords(sourceBootstrapRecords)
+	}
+	bootstrapRecords := dst.BootstrapRecords
+	if cap(bootstrapRecords) < len(sourceBootstrapRecords) {
+		bootstrapRecords = make([]BootstrapRecord, len(sourceBootstrapRecords))
+	} else {
+		bootstrapRecords = bootstrapRecords[:len(sourceBootstrapRecords)]
+	}
+	for i := range sourceBootstrapRecords {
+		bootstrapRecords[i] = sourceBootstrapRecords[i].Clone()
+	}
+	clear(bootstrapRecords[len(bootstrapRecords):cap(bootstrapRecords)])
+
+	var localVoterState *LocalVoterState
+	if r.LocalVoterState != nil {
+		state := r.LocalVoterState.Clone()
+		localVoterState = &state
+	}
+
+	sourceFrontiers := r.FrontierUpdates
+	if slicesPartiallyOverlap(dst.FrontierUpdates, sourceFrontiers) {
+		sourceFrontiers = cloneFrontierUpdates(sourceFrontiers)
+	}
+	frontiers := dst.FrontierUpdates
+	if cap(frontiers) < len(sourceFrontiers) {
+		frontiers = make([]FrontierUpdate, len(sourceFrontiers))
+	} else {
+		frontiers = frontiers[:len(sourceFrontiers)]
+	}
+	for i := range sourceFrontiers {
+		frontiers[i] = sourceFrontiers[i].Clone()
+	}
+	clear(frontiers[len(frontiers):cap(frontiers)])
+
+
+	sourceMessages := r.Messages
+	if slicesPartiallyOverlap(dst.Messages, sourceMessages) {
+		snapshot := make([]Message, len(sourceMessages))
+		for i := range sourceMessages {
+			sourceMessages[i].CloneInto(&snapshot[i])
+		}
+		sourceMessages = snapshot
+	}
+	messages := dst.Messages
+	if cap(messages) < len(sourceMessages) {
+		messages = make([]Message, len(sourceMessages))
+	} else {
+		messages = messages[:len(sourceMessages)]
+	}
+	for i := range sourceMessages {
+		sourceMessages[i].CloneInto(&messages[i])
+	}
+	fullMessages := messages[:cap(messages)]
+	for i := len(messages); i < len(fullMessages); i++ {
+		fullMessages[i] = Message{}
+	}
+	sourceBootstrapMessages := r.BootstrapMessages
+	if slicesPartiallyOverlap(dst.BootstrapMessages, sourceBootstrapMessages) {
+		snapshot := make([]BootstrapMessage, len(sourceBootstrapMessages))
+		for i := range sourceBootstrapMessages {
+			snapshot[i] = sourceBootstrapMessages[i].Clone()
+		}
+		sourceBootstrapMessages = snapshot
+	}
+	bootstrapMessages := dst.BootstrapMessages
+	if cap(bootstrapMessages) < len(sourceBootstrapMessages) {
+		bootstrapMessages = make([]BootstrapMessage, len(sourceBootstrapMessages))
+	} else {
+		bootstrapMessages = bootstrapMessages[:len(sourceBootstrapMessages)]
+	}
+	for i := range sourceBootstrapMessages {
+		bootstrapMessages[i] = sourceBootstrapMessages[i].Clone()
+	}
+	clear(bootstrapMessages[len(bootstrapMessages):cap(bootstrapMessages)])
+
+
+	sourceCommitted := r.Committed
+	if slicesPartiallyOverlap(dst.Committed, sourceCommitted) {
+		snapshot := make([]CommittedCommand, len(sourceCommitted))
+		for i := range sourceCommitted {
+			sourceCommitted[i].CloneInto(&snapshot[i])
+		}
+		sourceCommitted = snapshot
+	}
+	committed := dst.Committed
+	if cap(committed) < len(sourceCommitted) {
+		committed = make([]CommittedCommand, len(sourceCommitted))
+	} else {
+		committed = committed[:len(sourceCommitted)]
+	}
+	for i := range sourceCommitted {
+		sourceCommitted[i].CloneInto(&committed[i])
+	}
+	fullCommitted := committed[:cap(committed)]
+	for i := len(committed); i < len(fullCommitted); i++ {
+		fullCommitted[i] = CommittedCommand{}
+	}
+
+	*dst = Ready{
+		HardState:         hardState,
+		ConfigHistory:     history,
+		Records:           records,
+		BootstrapRecords:  bootstrapRecords,
+		LocalVoterState:   localVoterState,
+		FrontierUpdates:   frontiers,
+		AllocatorFloor:    r.AllocatorFloor,
+		Messages:          messages,
+		BootstrapMessages: bootstrapMessages,
+		Committed:         committed,
+		MustSync:          r.MustSync,
+	}
+}
+
+// Clone returns a deep copy of the Ready batch.
+func (r Ready) Clone() Ready {
+	var out Ready
+	r.CloneInto(&out)
+	return out
 }
 
 // Release clears slice headers so a Ready value can be reused by the caller.
@@ -369,15 +822,37 @@ func (r *Ready) Release() {
 	for i := range r.Records {
 		r.Records[i] = InstanceRecord{}
 	}
+	for i := range r.ConfigHistory {
+		r.ConfigHistory[i] = ConfigHistoryEntry{}
+	}
 	for i := range r.Messages {
 		r.Messages[i].Reset()
+	}
+	for i := range r.BootstrapRecords {
+		r.BootstrapRecords[i] = BootstrapRecord{}
+	}
+	if r.LocalVoterState != nil {
+		*r.LocalVoterState = LocalVoterState{}
+	}
+	for i := range r.FrontierUpdates {
+		r.FrontierUpdates[i] = FrontierUpdate{}
+	}
+	for i := range r.BootstrapMessages {
+		r.BootstrapMessages[i] = BootstrapMessage{}
 	}
 	for i := range r.Committed {
 		r.Committed[i] = CommittedCommand{}
 	}
+	r.HardState = HardState{}
 	r.Records = nil
+	r.ConfigHistory = nil
 	r.Messages = nil
+	r.BootstrapRecords = nil
+	r.LocalVoterState = nil
+	r.FrontierUpdates = nil
+	r.AllocatorFloor = 0
 	r.Committed = nil
+	r.BootstrapMessages = nil
 	r.MustSync = false
 }
 
@@ -388,6 +863,9 @@ type StatusSnapshot struct {
 	Conf      ConfState
 	Instances []InstanceRecord
 	Executed  []InstanceRef
+	// TOQAvailable reports whether this TOQ-configured node can originate new
+	// local proposals with the current configuration.
+	TOQAvailable bool
 }
 
 var (
@@ -399,6 +877,22 @@ var (
 	ErrChecksumMismatch = errors.New("epaxos: checksum mismatch")
 	// ErrMessageRejected reports a stale, duplicate, or non-local message.
 	ErrMessageRejected = errors.New("epaxos: message rejected")
+	// ErrTOQConfigUnavailable reports that local TOQ runtime inputs do not cover
+	// the exact current configuration. It is retryable after RefreshTOQConfig.
+	ErrTOQConfigUnavailable = errors.New("epaxos: TOQ config unavailable")
+	// ErrTOQClockRollback reports a caller clock sample below the last accepted
+	// TOQ sample or reconstructed durable closed-bucket floor.
+	ErrTOQClockRollback = errors.New("epaxos: TOQ clock rollback")
+	// ErrTOQTimestampOverflow reports an unrepresentable TOQ timestamp bound.
+	ErrTOQTimestampOverflow = errors.New("epaxos: TOQ timestamp overflow")
+	// ErrLogicalTimeExhausted reports an unrepresentable logical tick or timer deadline.
+	ErrLogicalTimeExhausted = errors.New("epaxos: logical time exhausted")
+	// ErrDeferredQueueFull reports that the bounded timed PreAccept queue is full.
+	ErrDeferredQueueFull = errors.New("epaxos: deferred PreAccept queue full")
+	// ErrBallotExhausted reports that no strictly greater ballot is representable.
+	ErrBallotExhausted = errors.New("epaxos: ballot exhausted")
+	// ErrInstanceExhausted reports that no further local instance number is representable.
+	ErrInstanceExhausted = errors.New("epaxos: local instance number exhausted")
 	// ErrUnknownInstance reports a request for an instance not known locally.
 	ErrUnknownInstance = errors.New("epaxos: unknown instance")
 	// ErrInvalidReady reports an acknowledgement that does not match the outstanding Ready batch.

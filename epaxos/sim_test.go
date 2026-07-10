@@ -2,6 +2,7 @@ package epaxos
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
@@ -33,6 +34,75 @@ func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 		s.stores[id] = st
 	}
 	return s
+}
+
+func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, ClusterID, []VoterIdentity, []ed25519.PrivateKey) {
+	t.Helper()
+	ids := makeIDs(voters)
+	cluster := ClusterID{0x51, byte(voters)}
+	identities := make([]VoterIdentity, voters+1)
+	privateKeys := make([]ed25519.PrivateKey, voters+1)
+	for i := range identities {
+		seed := make([]byte, ed25519.SeedSize)
+		seed[0] = byte(i + 41)
+		privateKeys[i] = ed25519.NewKeyFromSeed(seed)
+		identities[i] = VoterIdentity{
+			Replica: ReplicaID(i + 1), Incarnation: 1,
+			VerifyKey: append([]byte(nil), privateKeys[i].Public().(ed25519.PublicKey)...),
+		}
+	}
+	s := &simCluster{
+		t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage),
+		apps: make(map[ReplicaID][]CommittedCommand), drop: make(map[[2]ReplicaID]bool),
+		paused: make(map[ReplicaID]bool),
+	}
+	base := ConfState{ID: 1, Voters: ids}
+	for _, id := range ids {
+		store := NewMemoryStorage()
+		store.Hard = HardState{Conf: base.Clone()}
+		store.ConfigHistory = []ConfigHistoryEntry{{Conf: base.Clone()}}
+		store.AllocatorFloor = 1
+		store.LocalVoterState = LocalVoterState{
+			Cluster: cluster, Identity: identities[id-1].Clone(), Conf: base.Clone(),
+			Status: LocalVoterStatusEligible, AllocatorFloor: 1,
+		}
+		node, err := NewRawNode(Config{
+			ID: id, Voters: ids, Cluster: cluster, LocalIdentity: identities[id-1],
+			VoterIdentities:     cloneVoterIdentities(identities[:voters]),
+			BootstrapPrivateKey: privateKeys[id-1], Storage: store,
+			RetryTicks: 2, RecoveryTicks: 5,
+		})
+		if err != nil {
+			t.Fatalf("new certified node %d: %v", id, err)
+		}
+		s.nodes[id] = node
+		s.stores[id] = store
+	}
+	return s, cluster, identities, privateKeys
+}
+
+func persistBootstrapSimNode(t *testing.T, s *simCluster, id ReplicaID) []BootstrapMessage {
+	t.Helper()
+	var messages []BootstrapMessage
+	for attempts := 0; attempts < 16 && s.nodes[id].HasReady(); attempts++ {
+		rd := s.nodes[id].Ready()
+		if len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+			t.Fatalf("bootstrap persistence for node %d unexpectedly contained EPaxos output: %#v", id, rd)
+		}
+		if err := s.stores[id].ApplyReady(rd); err != nil {
+			t.Fatalf("persist bootstrap node %d: %v", id, err)
+		}
+		for _, message := range rd.BootstrapMessages {
+			messages = append(messages, message.Clone())
+		}
+		if err := s.nodes[id].Advance(rd); err != nil {
+			t.Fatalf("advance bootstrap node %d: %v", id, err)
+		}
+	}
+	if s.nodes[id].HasReady() {
+		t.Fatalf("bootstrap persistence for node %d did not quiesce", id)
+	}
+	return messages
 }
 
 func (s *simCluster) ids() []ReplicaID {
@@ -345,18 +415,14 @@ func TestDuplicateInboundPreAcceptAndAcceptDoNotQueueDuplicateRecords(t *testing
 }
 
 func TestCodecChecksumZeroCopy(t *testing.T) {
-	m := Message{
-		Type:         MsgCommit,
-		From:         1,
+	m := Message{Type: MsgCommit, From: 1,
 		To:           2,
 		Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Ballot:       Ballot{Replica: 1},
 		RecordBallot: Ballot{Replica: 1},
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), ConflictKeys: [][]byte{[]byte("conflict-key-beta")}},
-		RecordStatus: StatusCommitted,
-	}
+		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), ConflictKeys: [][]byte{[]byte("conflict-key-beta")}}}
 	buf, err := EncodeMessage(make([]byte, 0, 128), m)
 	if err != nil {
 		t.Fatal(err)
@@ -495,14 +561,181 @@ func TestLogicalTicksRecoveryAndStorageFailure(t *testing.T) {
 }
 
 func TestConfChangeAndPools(t *testing.T) {
-	s := newSimCluster(t, 3, false)
-	if _, err := s.nodes[1].ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); err != nil {
+	s, cluster, identities, privateKeys := newCertifiedBootstrapSimCluster(t, 3)
+	target := identities[3].Clone()
+	request := PrepareVoterRequest{
+		Cluster: cluster, Plan: BootstrapID{0x73, 0x69, 0x6d}, Base: s.nodes[1].Status().Conf,
+		OldVoters: cloneVoterIdentities(identities[:3]), Target: target, Source: 1,
+		SourceDigest: StateDigest{1}, ReleaseDigest: StateDigest{2},
+		TargetAllocatorFloor: 1, TimingDigest: StateDigest{3},
+	}
+	plan, err := s.nodes[1].PrepareVoter(request)
+	if err != nil {
 		t.Fatal(err)
 	}
-	s.drain()
-	if !s.nodes[1].Status().Conf.Contains(4) {
-		t.Fatal("configuration was not applied")
+	if s.nodes[1].Status().Conf.Contains(target.Replica) {
+		t.Fatal("prepared target became a voter")
 	}
+	s.drain()
+
+	sealAcks := make([]BootstrapMessage, 0, 3)
+	for _, id := range []ReplicaID{1, 2, 3} {
+		if err := s.nodes[id].BeginVoterSeal(plan); err != nil {
+			t.Fatalf("BeginVoterSeal node %d: %v", id, err)
+		}
+		sealAcks = append(sealAcks, persistBootstrapSimNode(t, s, id)...)
+	}
+	for _, ack := range sealAcks[:slowQuorumSize(len(plan.Request.Base.Voters))] {
+		if err := s.nodes[1].StepBootstrap(ack); err != nil {
+			t.Fatalf("SealAck from %d: %v", ack.From, err)
+		}
+	}
+	seal := s.nodes[1].BootstrapStatus().Plans[0].SealCertificate
+	if VerifySealCertificate(plan, seal) != nil {
+		t.Fatal("owner did not form a valid seal certificate")
+	}
+	persistBootstrapSimNode(t, s, 1)
+	for _, id := range []ReplicaID{2, 3} {
+		if err := s.nodes[id].ApplySealCertificate(seal); err != nil {
+			t.Fatalf("ApplySealCertificate node %d: %v", id, err)
+		}
+		persistBootstrapSimNode(t, s, id)
+	}
+	for _, id := range []ReplicaID{1, 2, 3} {
+		if closure := s.nodes[id].BootstrapClosure(plan); !closure.Complete {
+			t.Fatalf("node %d closure=%#v", id, closure)
+		}
+	}
+
+	descriptor := standaloneSnapshotDescriptor(plan, seal)
+	descriptorDigest := DigestSnapshotDescriptor(descriptor)
+	attestations := make([]VoterAttestation, 2)
+	for i := range attestations {
+		attestations[i], err = SignVoterAttestation(descriptorDigest, identities[i], privateKeys[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, marshalErr := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Attestation: attestations[i]})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		message, signErr := SignBootstrapMessage(BootstrapMessage{
+			Type: BootstrapMsgSnapshotVote, Cluster: cluster, Plan: plan.Request.Plan,
+			From: identities[i].Replica, FromIncarnation: identities[i].Incarnation, To: 1,
+			BaseID: plan.Request.Base.ID, BaseDigest: plan.RequestDigest, Payload: payload,
+		}, identities[i], privateKeys[i])
+		if signErr != nil {
+			t.Fatal(signErr)
+		}
+		if err := s.nodes[1].StepBootstrap(message); err != nil {
+			t.Fatalf("SnapshotVote from %d: %v", message.From, err)
+		}
+	}
+	persistBootstrapSimNode(t, s, 1)
+	snapshot := s.nodes[1].BootstrapStatus().Plans[0].SnapshotCertificate
+	if VerifySnapshotCertificate(plan, snapshot) != nil {
+		t.Fatal("owner did not durably retain a valid snapshot certificate")
+	}
+
+	proof, err := SignVoterReadyProof(VoterReadyProof{
+		Cluster: cluster, Plan: plan.Request.Plan, Target: target,
+		SnapshotDigest: snapshot.Digest, InstalledStateDigest: descriptor.InstalledStateDigest,
+		AllocatorFloor: descriptor.TargetAllocatorFloor, TOQClosedThrough: descriptor.TOQClosedThrough,
+	}, privateKeys[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetStore := NewMemoryStorage()
+	targetStore.Hard = HardState{Conf: plan.Request.Base.Clone()}
+	targetStore.ConfigHistory = []ConfigHistoryEntry{{Conf: plan.Request.Base.Clone()}}
+	targetStore.AllocatorFloor = proof.AllocatorFloor
+	targetStore.LocalVoterState = LocalVoterState{
+		Cluster: cluster, Identity: target.Clone(), Conf: plan.Request.Base.Clone(),
+		Status: LocalVoterStatusStaged, Plan: plan.Request.Plan, AllocatorFloor: proof.AllocatorFloor,
+	}
+	if _, err := NewRawNode(Config{
+		ID: target.Replica, Voters: plan.Request.Base.Voters, Cluster: cluster,
+		LocalIdentity: target, VoterIdentities: cloneVoterIdentities(identities[:3]),
+		BootstrapPrivateKey: privateKeys[3], Storage: targetStore,
+	}); !errors.Is(err, ErrBootstrapEligibility) {
+		t.Fatalf("staged target startup err=%v, want ErrBootstrapEligibility", err)
+	}
+
+	readyAcks := make([]BootstrapMessage, 0, 2)
+	installPayload, err := marshalBootstrapCanonical(installProofPayload{Snapshot: snapshot, Proof: proof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []ReplicaID{1, 2} {
+		message, signErr := SignBootstrapMessage(BootstrapMessage{
+			Type: BootstrapMsgInstallProof, Cluster: cluster, Plan: plan.Request.Plan,
+			From: target.Replica, FromIncarnation: target.Incarnation, To: id,
+			BaseID: plan.Request.Base.ID, BaseDigest: plan.RequestDigest, Payload: installPayload,
+		}, target, privateKeys[3])
+		if signErr != nil {
+			t.Fatal(signErr)
+		}
+		if err := s.nodes[id].StepBootstrap(message); err != nil {
+			t.Fatalf("InstallProof node %d: %v", id, err)
+		}
+		readyAcks = append(readyAcks, persistBootstrapSimNode(t, s, id)...)
+	}
+	for _, ack := range readyAcks {
+		if err := s.nodes[1].StepBootstrap(ack); err != nil {
+			t.Fatalf("ReadyAck from %d: %v", ack.From, err)
+		}
+	}
+	persistBootstrapSimNode(t, s, 1)
+	readyCertificate := s.nodes[1].BootstrapStatus().Plans[0].ReadyCertificate
+	if VerifyReadyCertificate(plan, snapshot, readyCertificate) != nil {
+		t.Fatal("owner did not durably retain a valid ready certificate")
+	}
+
+	if _, err := s.nodes[1].ActivateVoter(plan, snapshot, readyCertificate); err != nil {
+		t.Fatal(err)
+	}
+	if targetStore.LocalVoterState.Status != LocalVoterStatusStaged {
+		t.Fatal("target became eligible before certified activation was durable")
+	}
+	s.drain()
+	for _, id := range []ReplicaID{1, 2, 3} {
+		if !confStateEqual(s.nodes[id].Status().Conf, plan.Successor) {
+			t.Fatalf("node %d config=%#v, want certified successor %#v", id, s.nodes[id].Status().Conf, plan.Successor)
+		}
+	}
+
+	activated := s.nodes[1].BootstrapStatus().Plans[0]
+	local := LocalVoterState{
+		Cluster: cluster, Identity: target.Clone(), Conf: plan.Successor.Clone(),
+		Status: LocalVoterStatusEligible, Plan: plan.Request.Plan,
+		InstalledDigest: descriptor.InstalledStateDigest, AllocatorFloor: proof.AllocatorFloor,
+		TOQClosedThrough: proof.TOQClosedThrough,
+	}
+	targetActivation := Ready{
+		HardState: HardState{Conf: plan.Successor.Clone()},
+		ConfigHistory: []ConfigHistoryEntry{{
+			Conf: plan.Successor.Clone(), AppliedRef: plan.Reservations.Activate,
+			IdentityDigest: bootstrapIdentityDigest(plan),
+		}},
+		BootstrapRecords: []BootstrapRecord{activated}, LocalVoterState: &local,
+		AllocatorFloor: proof.AllocatorFloor, MustSync: true,
+	}
+	if err := targetStore.ApplyReady(targetActivation); err != nil {
+		t.Fatalf("persist target activation: %v", err)
+	}
+	targetNode, err := NewRawNode(Config{
+		ID: target.Replica, Voters: plan.Request.Base.Voters, Cluster: cluster,
+		LocalIdentity: target, VoterIdentities: cloneVoterIdentities(identities),
+		BootstrapPrivateKey: privateKeys[3], Storage: targetStore,
+	})
+	if err != nil {
+		t.Fatalf("start durably activated target: %v", err)
+	}
+	targetRef, err := targetNode.Propose(Command{Payload: []byte("target-after-activation"), ConflictKeys: [][]byte{[]byte("target")}})
+	if err != nil || targetRef.Conf != plan.Successor.ID {
+		t.Fatalf("activated target proposal ref=%s err=%v", targetRef, err)
+	}
+
 	m := GetMessage()
 	m.Type = MsgCommit
 	PutMessage(m)
@@ -577,11 +810,12 @@ func TestExecutionEqualSeqTieBreaksByRef(t *testing.T) {
 	a := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
 	b := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	c := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-	rn.instances[a] = &instance{rec: InstanceRecord{Ref: a, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{1, 0, 0}, Command: Command{Payload: []byte("a")}}}
-	rn.instances[b] = &instance{rec: InstanceRecord{Ref: b, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("b")}}}
-	rn.instances[c] = &instance{rec: InstanceRecord{Ref: c, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 0, 1}, Command: Command{Payload: []byte("c")}}}
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: a, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{1, 0, 0}, Command: Command{Payload: []byte("a")}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: b, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("b")}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: c, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 0, 1}, Command: Command{Payload: []byte("c")}}})
 
-	comps := rn.executionComponents()
+	view := rn.newExecutionView()
+	comps := rn.executionComponents(&view)
 	if len(comps) != 1 || len(comps[0]) != 3 {
 		t.Fatalf("equal-seq cycle components = %#v", comps)
 	}
@@ -618,16 +852,18 @@ func TestExecutionComponentsWaitForInactiveDependencyRefs(t *testing.T) {
 			}
 			x := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 			y := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-			rn.instances[x] = &instance{rec: InstanceRecord{Ref: x, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("x")}}}
+			rn.installInstance(&instance{rec: InstanceRecord{Ref: x, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("x")}}})
 			if tt.dep != nil {
-				rn.instances[y] = tt.dep
+				rn.installInstance(tt.dep)
 			}
 
-			comps := rn.executionComponents()
+			view := rn.newExecutionView()
+			comps := rn.executionComponents(&view)
 			if len(comps) != 1 || len(comps[0]) != 1 || comps[0][0] != x {
 				t.Fatalf("component with inactive dependency = %#v, want unresolved %s component", comps, x)
 			}
-			if rn.componentReady(comps[0]) {
+			var candidates []recoveryCandidate
+			if rn.componentReady(&view, comps[0], &candidates) {
 				t.Fatalf("component with inactive dependency %s was ready: %#v", y, comps)
 			}
 		})
@@ -716,12 +952,23 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 		t.Fatalf("config change used config %d, want 1", confRef.Conf)
 	}
 	s.drain()
+	s.tickAll(2)
 	for _, id := range []ReplicaID{2, 3, 4} {
 		conf := s.nodes[id].Status().Conf
 		if conf.ID != 2 || conf.Contains(4) || !conf.Contains(1) || !conf.Contains(2) || !conf.Contains(3) {
 			t.Fatalf("node %d config after voter removal = %#v", id, conf)
 		}
 		requireCommittedPayloadCount(t, s.apps[id], id, oldRef, oldCmd.Payload, 0)
+	}
+
+	var delayedRemoval []Message
+	for _, message := range s.delayed {
+		if message.Ref == confRef {
+			delayedRemoval = append(delayedRemoval, message.Clone())
+		}
+	}
+	if len(delayedRemoval) == 0 {
+		t.Fatalf("paused node had no delayed removal traffic; delayed=%#v", s.delayed)
 	}
 
 	s.resume(1)
@@ -735,7 +982,7 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 	for _, id := range s.ids() {
 		conf := s.nodes[id].Status().Conf
 		if conf.ID != 2 || conf.Contains(4) || !conf.Contains(1) || !conf.Contains(2) || !conf.Contains(3) {
-			t.Fatalf("node %d config after replaying delayed removal = %#v", id, conf)
+			t.Fatalf("node %d config after replaying delayed removal = %#v; delayed removal=%#v stored removal=%#v stored old=%#v", id, conf, delayedRemoval, s.stores[id].Records[confRef], s.stores[id].Records[oldRef])
 		}
 		oldRec, ok := s.stores[id].Records[oldRef]
 		if !ok {
@@ -751,8 +998,8 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 	if _, err := s.nodes[4].Propose(removedCmd); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("removed voter Propose error = %v, want %v", err, ErrMessageRejected)
 	}
-	if _, err := s.nodes[4].ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); !errors.Is(err, ErrMessageRejected) {
-		t.Fatalf("removed voter ProposeConfChange error = %v, want %v", err, ErrMessageRejected)
+	if _, err := s.nodes[4].ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); !errors.Is(err, ErrVoterCertificateRequired) {
+		t.Fatalf("removed voter ProposeConfChange error = %v, want %v", err, ErrVoterCertificateRequired)
 	}
 	if s.nodes[4].HasReady() {
 		t.Fatal("removed voter proposal rejection created Ready work")
@@ -1252,4 +1499,91 @@ func refs(cmds []CommittedCommand) []InstanceRef {
 		out[i] = cmds[i].Ref
 	}
 	return out
+}
+
+func TestIterativeExecutionComponentsMatchExplicitPrefixOracle(t *testing.T) {
+	refs := []InstanceRef{
+		{Conf: 1, Replica: 1, Instance: 1},
+		{Conf: 1, Replica: 2, Instance: 1},
+		{Conf: 1, Replica: 3, Instance: 1},
+	}
+	for mask := range 1 << 9 {
+		rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for from, ref := range refs {
+			deps := make([]InstanceNum, 3)
+			for to := range refs {
+				if mask&(1<<(from*3+to)) != 0 {
+					deps[to] = 1
+				}
+			}
+			rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: deps, Command: Command{Kind: CommandNoop}}})
+		}
+		view := rn.newExecutionView()
+		components := rn.executionComponents(&view)
+		componentOf := make(map[InstanceRef]int, len(refs))
+		for componentIndex, component := range components {
+			for _, ref := range component {
+				componentOf[ref] = componentIndex
+			}
+		}
+		reachable := [3][3]bool{}
+		for from := range refs {
+			reachable[from][from] = true
+			for to := range refs {
+				if from != to && mask&(1<<(from*3+to)) != 0 {
+					reachable[from][to] = true
+				}
+			}
+		}
+		for via := range refs {
+			for from := range refs {
+				for to := range refs {
+					reachable[from][to] = reachable[from][to] || (reachable[from][via] && reachable[via][to])
+				}
+			}
+		}
+		for left := range refs {
+			for right := range refs {
+				wantSame := reachable[left][right] && reachable[right][left]
+				gotSame := componentOf[refs[left]] == componentOf[refs[right]]
+				if gotSame != wantSame {
+					t.Fatalf("mask=%09b pair=%s/%s same-component=%v want %v components=%v", mask, refs[left], refs[right], gotSame, wantSame, components)
+				}
+			}
+		}
+	}
+}
+
+func TestSparseMaxPrefixBuildsMaterializedSCCButBlocksOnFirstHole(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	max := ^InstanceNum(0)
+	left := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+	right := InstanceRef{Conf: 1, Replica: 2, Instance: max}
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: left, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, max, 0}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: right, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}}})
+	view := rn.newExecutionView()
+	components := rn.executionComponents(&view)
+	if len(components) != 1 || len(components[0]) != 2 {
+		t.Fatalf("sparse Max materialized SCC = %v, want one two-member component", components)
+	}
+	var candidates []recoveryCandidate
+	if rn.componentReady(&view, components[0], &candidates) {
+		t.Fatal("sparse Max SCC crossed unknown lower prefix hole")
+	}
+	want := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.ref == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sparse Max SCC candidates = %v, want first exact blocker %s", candidates, want)
+	}
 }

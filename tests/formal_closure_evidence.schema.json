@@ -1,0 +1,1510 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gosuda.org/moreconsensus/schemas/formal-closure-evidence-3.0.0.json",
+  "title": "Formal closure evidence",
+  "description": "Strict semantic-v3 evidence for the broader-formal release criterion; every target, provenance, execution, mutation, reviewed-input, chronology, trace, clock, and signature input is first-class and fail-closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_kind",
+    "record_mode",
+    "claim",
+    "release",
+    "target",
+    "generated_at",
+    "valid_until",
+    "toolchain",
+    "specification_manifest",
+    "properties",
+    "finite_model_checks",
+    "inductive_proofs",
+    "evidence_basis",
+    "mutation_evidence",
+    "trace_refinement",
+    "joint_consensus",
+    "toq_clock_discipline",
+    "native_execution",
+    "reviewed_input_set",
+    "production_attestation",
+    "sign_off",
+    "raw_artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "3.0.0"
+    },
+    "record_kind": {
+      "const": "formal-closure-evidence"
+    },
+    "record_mode": {
+      "enum": [
+        "target",
+        "synthetic-test"
+      ]
+    },
+    "claim": {
+      "enum": [
+        "formal-closure-criteria-met",
+        "none"
+      ]
+    },
+    "release": {
+      "$ref": "#/$defs/release"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "generated_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "valid_until": {
+      "$ref": "#/$defs/utc"
+    },
+    "toolchain": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/tool"
+      }
+    },
+    "specification_manifest": {
+      "$ref": "#/$defs/specificationManifest"
+    },
+    "properties": {
+      "$ref": "#/$defs/propertyManifest"
+    },
+    "finite_model_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/finiteCheck"
+      }
+    },
+    "inductive_proofs": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/inductiveProof"
+      }
+    },
+    "evidence_basis": {
+      "$ref": "#/$defs/evidenceBasis"
+    },
+    "mutation_evidence": {
+      "$ref": "#/$defs/mutationEvidence"
+    },
+    "trace_refinement": {
+      "$ref": "#/$defs/traceRefinement"
+    },
+    "joint_consensus": {
+      "$ref": "#/$defs/jointConsensus"
+    },
+    "toq_clock_discipline": {
+      "$ref": "#/$defs/toqClockDiscipline"
+    },
+    "native_execution": {
+      "$ref": "#/$defs/nativeExecution"
+    },
+    "reviewed_input_set": {
+      "$ref": "#/$defs/reviewedInputSet"
+    },
+    "production_attestation": {
+      "$ref": "#/$defs/productionAttestation"
+    },
+    "sign_off": {
+      "$ref": "#/$defs/signOff"
+    },
+    "raw_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/rawArtifact"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "record_mode": {
+            "const": "target"
+          }
+        },
+        "required": [
+          "record_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "claim": {
+            "const": "formal-closure-criteria-met"
+          },
+          "target": {
+            "properties": {
+              "environment": {
+                "const": "production"
+              },
+              "execution_mode": {
+                "const": "native-darwin"
+              }
+            }
+          },
+          "toq_clock_discipline": {
+            "properties": {
+              "target_environment": {
+                "const": "production"
+              }
+            }
+          },
+          "native_execution": {
+            "properties": {
+              "attested": {
+                "const": true
+              },
+              "execution_mode": {
+                "const": "native-darwin"
+              },
+              "result": {
+                "const": "pass"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "claim": {
+            "const": "none"
+          },
+          "target": {
+            "properties": {
+              "environment": {
+                "const": "synthetic-test"
+              },
+              "execution_mode": {
+                "const": "synthetic-test"
+              }
+            }
+          },
+          "toq_clock_discipline": {
+            "properties": {
+              "target_environment": {
+                "const": "synthetic-test"
+              }
+            }
+          },
+          "native_execution": {
+            "properties": {
+              "attested": {
+                "const": false
+              },
+              "execution_mode": {
+                "const": "synthetic-test"
+              },
+              "result": {
+                "const": "not-applicable"
+              },
+              "completed_at": {
+                "type": "null"
+              },
+              "record_artifact_id": {
+                "type": "null"
+              },
+              "record_sha256": {
+                "type": "null"
+              },
+              "signature_artifact_id": {
+                "type": "null"
+              },
+              "signature_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!\\s)(?!.*[\\r\\n]).*\\S$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "stringCommand": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/nonEmpty"
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_id",
+        "source_repository",
+        "source_revision",
+        "source_tree",
+        "formal_spec_sha256"
+      ],
+      "properties": {
+        "release_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_repository": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "source_tree": {
+          "const": "clean"
+        },
+        "formal_spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_id",
+        "version",
+        "repository_pin_path",
+        "repository_pin_sha256",
+        "binary_sha256",
+        "binary_artifact_id",
+        "source_revision"
+      ],
+      "properties": {
+        "tool_id": {
+          "enum": [
+            "go",
+            "java",
+            "tlc",
+            "tlaps",
+            "trace-replay"
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "repository_pin_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "repository_pin_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binary_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "path",
+        "sha256",
+        "role",
+        "source_revision"
+      ],
+      "properties": {
+        "model_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "role": {
+          "enum": [
+            "claim-root-shaped-spec",
+            "supporting"
+          ]
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_id",
+        "path",
+        "sha256",
+        "model_id",
+        "source_revision"
+      ],
+      "properties": {
+        "config_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "model_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      }
+    },
+    "specificationManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_sha256",
+        "models",
+        "configs"
+      ],
+      "properties": {
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "models": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/model"
+          }
+        },
+        "configs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/config"
+          }
+        }
+      }
+    },
+    "propertyEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "property_id",
+        "operator",
+        "module_id",
+        "required"
+      ],
+      "properties": {
+        "property_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "operator": {
+          "$ref": "#/$defs/identifier"
+        },
+        "module_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "required": {
+          "const": true
+        }
+      }
+    },
+    "propertyManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invariants",
+        "temporal_properties"
+      ],
+      "properties": {
+        "invariants": {
+          "type": "array",
+          "minItems": 33,
+          "maxItems": 33,
+          "items": {
+            "$ref": "#/$defs/propertyEntry"
+          }
+        },
+        "temporal_properties": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/propertyEntry"
+          }
+        }
+      }
+    },
+    "finiteCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_id",
+        "area_ids",
+        "checked_invariant_ids",
+        "checked_temporal_ids",
+        "command",
+        "tool_id",
+        "tool_version",
+        "tool_binary_sha256",
+        "generated_states",
+        "distinct_states",
+        "search_depth",
+        "queue_states",
+        "errors",
+        "deadlock_result",
+        "result",
+        "started_at",
+        "completed_at",
+        "tlc_log_artifact_id",
+        "command_sha256",
+        "java_binary_sha256",
+        "working_directory",
+        "environment_sha256",
+        "exit_code"
+      ],
+      "properties": {
+        "config_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "area_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "checked_invariant_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "checked_temporal_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "tool_id": {
+          "const": "tlc"
+        },
+        "tool_version": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tool_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "generated_states": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "distinct_states": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "search_depth": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "queue_states": {
+          "const": 0
+        },
+        "errors": {
+          "const": 0
+        },
+        "deadlock_result": {
+          "const": "pass"
+        },
+        "result": {
+          "const": "pass"
+        },
+        "started_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "completed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "tlc_log_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "java_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_directory": {
+          "const": "."
+        },
+        "environment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exit_code": {
+          "const": 0
+        }
+      }
+    },
+    "inductiveProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "theorem_id",
+        "theorem_class",
+        "module_id",
+        "status",
+        "result",
+        "inductive",
+        "history_scope",
+        "assumptions",
+        "obligations_total",
+        "obligations_proved",
+        "admitted_obligations",
+        "omitted_obligations",
+        "tool_id",
+        "tool_version",
+        "tool_binary_sha256",
+        "checked_at",
+        "tlaps_log_artifact_id",
+        "command",
+        "command_sha256",
+        "working_directory",
+        "environment_sha256",
+        "exit_code"
+      ],
+      "properties": {
+        "theorem_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "theorem_class": {
+          "enum": [
+            "arbitrary-history-safety",
+            "fair-loss-liveness",
+            "recovery-induction",
+            "configuration-induction",
+            "refinement"
+          ]
+        },
+        "module_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "status": {
+          "const": "checked"
+        },
+        "result": {
+          "const": "pass"
+        },
+        "inductive": {
+          "const": true
+        },
+        "history_scope": {
+          "const": "arbitrary-history"
+        },
+        "assumptions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "obligations_total": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "obligations_proved": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "admitted_obligations": {
+          "const": 0
+        },
+        "omitted_obligations": {
+          "const": 0
+        },
+        "tool_id": {
+          "const": "tlaps"
+        },
+        "tool_version": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "tool_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checked_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "tlaps_log_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_directory": {
+          "const": "."
+        },
+        "environment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exit_code": {
+          "const": 0
+        }
+      }
+    },
+    "evidenceBasis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finite_status",
+        "inductive_status",
+        "closure_basis",
+        "finite_only",
+        "unchecked_proof_count"
+      ],
+      "properties": {
+        "finite_status": {
+          "const": "passed-bounded-checks"
+        },
+        "inductive_status": {
+          "const": "checked-passed-unbounded"
+        },
+        "closure_basis": {
+          "const": "finite-plus-inductive"
+        },
+        "finite_only": {
+          "const": false
+        },
+        "unchecked_proof_count": {
+          "const": 0
+        }
+      }
+    },
+    "traceRefinement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "exporter",
+        "format",
+        "shaped_spec_model_id",
+        "deterministic",
+        "trace_count",
+        "export_command",
+        "export_command_sha256",
+        "replay_command",
+        "replay_command_sha256",
+        "java_binary_sha256",
+        "go_binary_sha256",
+        "replay_tool_binary_sha256",
+        "working_directory",
+        "environment_sha256",
+        "export_exit_code",
+        "replay_exit_code",
+        "export_result",
+        "replay_result",
+        "trace_artifact_id",
+        "trace_sha256",
+        "replay_artifact_id",
+        "replay_sha256",
+        "exported_at",
+        "replayed_at"
+      ],
+      "properties": {
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "exporter": {
+          "const": "go-to-shaped-spec-v1"
+        },
+        "format": {
+          "const": "moreconsensus-shaped-spec-trace-v1"
+        },
+        "shaped_spec_model_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "deterministic": {
+          "const": true
+        },
+        "trace_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "export_command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "export_command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "replay_command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "java_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "go_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_tool_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_directory": {
+          "const": "."
+        },
+        "environment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "export_exit_code": {
+          "const": 0
+        },
+        "replay_exit_code": {
+          "const": 0
+        },
+        "export_result": {
+          "const": "pass"
+        },
+        "replay_result": {
+          "const": "pass"
+        },
+        "trace_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "trace_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "replay_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exported_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "replayed_at": {
+          "$ref": "#/$defs/utc"
+        }
+      }
+    },
+    "jointConsensus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "declared_scope",
+        "release_scope_enforced",
+        "proof_theorem_id",
+        "scope_artifact_id",
+        "collected_at"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "implemented-and-proved",
+            "excluded-from-declared-scope"
+          ]
+        },
+        "declared_scope": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "release_scope_enforced": {
+          "const": true
+        },
+        "proof_theorem_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "collected_at": {
+          "$ref": "#/$defs/utc"
+        }
+      }
+    },
+    "toqClockDiscipline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "in_claim",
+        "target_environment",
+        "result",
+        "clock_source",
+        "maximum_clock_error_ms",
+        "collected_at",
+        "evidence_uri",
+        "remote_evidence_sha256",
+        "artifact_id",
+        "artifact_sha256",
+        "remote_artifact_id",
+        "remote_artifact_sha256",
+        "source_revision"
+      ],
+      "properties": {
+        "in_claim": {
+          "const": true
+        },
+        "target_environment": {
+          "enum": [
+            "production",
+            "synthetic-test"
+          ]
+        },
+        "result": {
+          "const": "pass"
+        },
+        "clock_source": {
+          "const": "authenticated monotonic source"
+        },
+        "maximum_clock_error_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "collected_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "evidence_uri": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "remote_evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "remote_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "remote_artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        }
+      }
+    },
+    "productionAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signer_identity",
+        "trust_root_path",
+        "trust_root_sha256",
+        "signature_algorithm",
+        "signed_payload_sha256",
+        "signature_artifact_id",
+        "signed_at",
+        "decision",
+        "decided_at"
+      ],
+      "properties": {
+        "signer_identity": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "trust_root_path": {
+          "const": "tests/formal_closure_producer_public.pem"
+        },
+        "trust_root_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature_algorithm": {
+          "const": "rsa-sha256"
+        },
+        "signed_payload_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "signed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "decision": {
+          "const": "approved"
+        },
+        "decided_at": {
+          "$ref": "#/$defs/utc"
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "organization",
+        "authenticated_identity"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "organization": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "authenticated_identity": {
+          "$ref": "#/$defs/nonEmpty"
+        }
+      }
+    },
+    "signOff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "submitted_by",
+        "reviewed_by",
+        "independent",
+        "decision",
+        "reviewed_at",
+        "artifact_id",
+        "artifact_sha256",
+        "reviewer_trust_root_path",
+        "reviewer_trust_root_sha256",
+        "signature_artifact_id",
+        "signature_algorithm",
+        "reviewed_input_bindings_sha256",
+        "mutation_evidence_sha256",
+        "signed_payload_sha256"
+      ],
+      "properties": {
+        "submitted_by": {
+          "$ref": "#/$defs/identity"
+        },
+        "reviewed_by": {
+          "$ref": "#/$defs/identity"
+        },
+        "independent": {
+          "const": true
+        },
+        "decision": {
+          "const": "approved"
+        },
+        "reviewed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reviewer_trust_root_path": {
+          "const": "tests/formal_closure_reviewer_public.pem"
+        },
+        "reviewer_trust_root_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "signature_algorithm": {
+          "const": "rsa-sha256"
+        },
+        "reviewed_input_bindings_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutation_evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signed_payload_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rawArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "kind",
+        "path",
+        "sha256",
+        "size_bytes",
+        "source_revision",
+        "created_at"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "enum": [
+            "collection-manifest",
+            "execution-result-manifest",
+            "independent-review",
+            "go-binary",
+            "java-binary",
+            "mutation-baseline",
+            "mutation-detector",
+            "mutation-manifest",
+            "mutation-mutant",
+            "native-execution-record",
+            "native-execution-signature",
+            "nonvacuity-witness",
+            "producer-signature",
+            "reviewer-signature",
+            "scope-enforcement",
+            "tlaps-binary",
+            "tlaps-raw-log",
+            "tlc-binary",
+            "tlc-raw-log",
+            "toq-clock-discipline",
+            "toq-clock-observation",
+            "trace-export",
+            "trace-replay-binary",
+            "trace-replay"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        "source_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "created_at": {
+          "$ref": "#/$defs/utc"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_id",
+        "operating_system",
+        "architecture",
+        "execution_mode",
+        "environment",
+        "source_tree_id"
+      ],
+      "properties": {
+        "target_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "operating_system": {
+          "const": "Darwin"
+        },
+        "architecture": {
+          "$ref": "#/$defs/identifier"
+        },
+        "execution_mode": {
+          "enum": [
+            "native-darwin",
+            "synthetic-test"
+          ]
+        },
+        "environment": {
+          "enum": [
+            "production",
+            "synthetic-test"
+          ]
+        },
+        "source_tree_id": {
+          "$ref": "#/$defs/revision"
+        }
+      }
+    },
+    "mutationSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject_id",
+        "subject_kind",
+        "authoritative_id",
+        "authoritative_path",
+        "authoritative_sha256",
+        "mutation_operator",
+        "baseline_artifact_id",
+        "baseline_sha256",
+        "mutant_artifact_id",
+        "mutant_sha256",
+        "detector_artifact_id",
+        "detector_sha256",
+        "detected_by",
+        "detector_tool_id",
+        "detector_tool_binary_sha256",
+        "java_binary_sha256",
+        "baseline_command",
+        "baseline_command_sha256",
+        "mutant_command",
+        "mutant_command_sha256",
+        "working_directory",
+        "environment_sha256",
+        "baseline_exit_code",
+        "mutant_exit_code",
+        "baseline_completed_at",
+        "baseline_result",
+        "detector_completed_at",
+        "mutation_result",
+        "witness_artifact_id",
+        "witness_sha256",
+        "witness_count",
+        "witness_observed_at",
+        "nonvacuity_result"
+      ],
+      "properties": {
+        "subject_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "subject_kind": {
+          "enum": [
+            "theorem",
+            "config",
+            "property"
+          ]
+        },
+        "authoritative_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "authoritative_path": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "authoritative_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutation_operator": {
+          "enum": [
+            "disable-deadlock-check",
+            "remove-property-directive",
+            "remove-theorem-declaration"
+          ]
+        },
+        "baseline_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "baseline_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutant_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mutant_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "detector_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "detector_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "detected_by": {
+          "$ref": "#/$defs/identifier"
+        },
+        "detector_tool_id": {
+          "enum": ["tlaps", "tlc"]
+        },
+        "detector_tool_binary_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "java_binary_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "baseline_command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "baseline_command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "mutant_command": {
+          "$ref": "#/$defs/stringCommand"
+        },
+        "mutant_command_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_directory": {
+          "const": "."
+        },
+        "environment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "baseline_exit_code": {
+          "const": 0
+        },
+        "mutant_exit_code": {
+          "const": 1
+        },
+        "baseline_completed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "baseline_result": {
+          "const": "accepted"
+        },
+        "detector_completed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "mutation_result": {
+          "const": "rejected"
+        },
+        "witness_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "witness_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "witness_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "witness_observed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "nonvacuity_result": {
+          "const": "pass"
+        }
+      }
+    },
+    "mutationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_artifact_id",
+        "record_sha256",
+        "executed_at",
+        "result",
+        "subjects"
+      ],
+      "properties": {
+        "record_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "record_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "executed_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "result": {
+          "const": "pass"
+        },
+        "subjects": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/mutationSubject"
+          }
+        }
+      }
+    },
+    "nativeExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attested",
+        "execution_mode",
+        "input_manifest_sha256",
+        "command_manifest_sha256",
+        "toolchain_manifest_sha256",
+        "result_manifest_artifact_id",
+        "result_manifest_sha256",
+        "completed_at",
+        "result",
+        "record_artifact_id",
+        "record_sha256",
+        "signature_artifact_id",
+        "signature_sha256"
+      ],
+      "properties": {
+        "attested": {
+          "type": "boolean"
+        },
+        "execution_mode": {
+          "enum": [
+            "native-darwin",
+            "synthetic-test"
+          ]
+        },
+        "input_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "command_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "toolchain_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_manifest_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "result_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "completed_at": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/utc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "enum": [
+            "pass",
+            "not-applicable"
+          ]
+        },
+        "record_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "record_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signature_artifact_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signature_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "reviewedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/identifier"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        }
+      }
+    },
+    "reviewedInputSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest_algorithm",
+        "manifest_artifact_id",
+        "manifest_sha256",
+        "reviewed_input_bindings_sha256",
+        "inputs"
+      ],
+      "properties": {
+        "digest_algorithm": {
+          "const": "sha256-canonical-json-v1"
+        },
+        "manifest_artifact_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reviewed_input_bindings_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/reviewedInput"
+          }
+        }
+      }
+    }
+  }
+}

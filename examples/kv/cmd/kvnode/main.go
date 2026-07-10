@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,13 +16,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -32,25 +37,308 @@ import (
 type readyApplier interface {
 	ApplyReady(epaxos.Ready) error
 }
+type outboundFrame struct {
+	to       epaxos.ReplicaID
+	endpoint string
+	body     []byte
+	retryAttempt uint32
+	retryAt      uint64
+	retryOrder   uint64
+	admitted     bool
+}
+
+type pooledTransportBuffer struct {
+	bytes []byte
+}
+type outboundRetryHeap []*outboundFrame
+
+func (h outboundRetryHeap) Len() int {
+	return len(h)
+}
+
+func (h outboundRetryHeap) Less(i, j int) bool {
+	if h[i].retryAt != h[j].retryAt {
+		return h[i].retryAt < h[j].retryAt
+	}
+	return h[i].retryOrder < h[j].retryOrder
+}
+
+func (h outboundRetryHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *outboundRetryHeap) Push(value any) {
+	*h = append(*h, value.(*outboundFrame))
+}
+
+func (h *outboundRetryHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	frame := old[last]
+	old[last] = nil
+	*h = old[:last]
+	return frame
+}
+
+
+type transportAdmissionError struct {
+	Cause     error
+	Attempted int
+	Available int
+}
+
+func (e *transportAdmissionError) Error() string {
+	if errors.Is(e.Cause, errSendQueueBackpressure) {
+		return fmt.Sprintf("outbound transport backpressure: admit %d frames with %d queue slots available: %v", e.Attempted, e.Available, e.Cause)
+	}
+	return fmt.Sprintf("outbound transport backpressure: prepare %d frames: %v", e.Attempted, e.Cause)
+}
+
+func (e *transportAdmissionError) Unwrap() error {
+	return e.Cause
+}
+
+type outboundFrameMetrics struct {
+	attempted     atomic.Uint64
+	admitted      atomic.Uint64
+	retried       atomic.Uint64
+	backpressured atomic.Uint64
+	terminalFailed atomic.Uint64
+	retryOverflow  atomic.Uint64
+}
+
+type postOutcome uint8
+
+const (
+	postSucceeded postOutcome = iota
+	postRetry
+	postTerminalFailure
+)
+
+const maxRetainedTransportBufferCapacity = 64 << 10
+
+const maxWireMessageCollectionEntries = 128
+
+const transportReadChunkSize = 4 << 10
+const initialRetryDelayTicks = uint64(1)
+
+const maxRetryDelayTicks = uint64(64)
+
+
+var (
+	errSendQueueBackpressure = errors.New("outbound send queue capacity exhausted")
+	errTransportClosed       = errors.New("outbound transport closed")
+	errOutboundFrameTooLarge = errors.New("outbound frame too large")
+	errTransportTickOverflow  = errors.New("outbound transport logical tick overflow")
+)
+
+func uvarintSize(value uint64) int64 {
+	size := int64(1)
+	for value >= 0x80 {
+		value >>= 7
+		size++
+	}
+	return size
+}
+
+func encodedMessageSizeWithin(message epaxos.Message, limit int64) (int, error) {
+	if len(message.Deps) > maxWireMessageCollectionEntries ||
+		len(message.AcceptDeps) > maxWireMessageCollectionEntries ||
+		len(message.AcceptEvidence) > maxWireMessageCollectionEntries ||
+		len(message.Command.ConflictKeys) > maxWireMessageCollectionEntries {
+		return 0, epaxos.ErrInvalidMessage
+	}
+	for _, evidence := range message.AcceptEvidence {
+		if len(evidence.Deps) > maxWireMessageCollectionEntries {
+			return 0, epaxos.ErrInvalidMessage
+		}
+	}
+
+	size := int64(4 + 1 + 1 + 1 + 32) // Magic, three boolean flags, and checksum.
+	add := func(n int64) bool {
+		if n < 0 || size > limit || n > limit-size {
+			return false
+		}
+		size += n
+		return true
+	}
+	addUvarints := func(values ...uint64) bool {
+		for _, value := range values {
+			if !add(uvarintSize(value)) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if !addUvarints(
+		uint64(message.Type), uint64(message.From), uint64(message.To),
+		uint64(message.Ref.Replica), uint64(message.Ref.Instance), uint64(message.Ref.Conf),
+		message.ProcessAt,
+		message.Ballot.Epoch, message.Ballot.Number, uint64(message.Ballot.Replica),
+		message.RecordBallot.Epoch, message.RecordBallot.Number, uint64(message.RecordBallot.Replica),
+		message.Seq, uint64(len(message.Deps)),
+	) {
+		return 0, errOutboundFrameTooLarge
+	}
+	for _, dependency := range message.Deps {
+		if !add(uvarintSize(uint64(dependency))) {
+			return 0, errOutboundFrameTooLarge
+		}
+	}
+	if !addUvarints(message.AcceptSeq, uint64(len(message.AcceptDeps))) {
+		return 0, errOutboundFrameTooLarge
+	}
+	for _, dependency := range message.AcceptDeps {
+		if !add(uvarintSize(uint64(dependency))) {
+			return 0, errOutboundFrameTooLarge
+		}
+	}
+	if !add(uvarintSize(uint64(len(message.AcceptEvidence)))) {
+		return 0, errOutboundFrameTooLarge
+	}
+	for _, evidence := range message.AcceptEvidence {
+		if !addUvarints(uint64(evidence.Sender), evidence.Seq, uint64(len(evidence.Deps))) {
+			return 0, errOutboundFrameTooLarge
+		}
+		for _, dependency := range evidence.Deps {
+			if !add(uvarintSize(uint64(dependency))) {
+				return 0, errOutboundFrameTooLarge
+			}
+		}
+	}
+	if !addUvarints(
+		uint64(message.IgnoreDependency.Ref.Replica),
+		uint64(message.IgnoreDependency.Ref.Instance),
+		uint64(message.IgnoreDependency.Ref.Conf),
+		message.Command.ID.Client,
+		message.Command.ID.Sequence,
+		uint64(message.Command.Kind),
+		uint64(len(message.Command.Payload)),
+	) || !add(int64(len(message.Command.Payload))) ||
+		!add(uvarintSize(uint64(len(message.Command.ConflictKeys)))) {
+		return 0, errOutboundFrameTooLarge
+	}
+	for _, key := range message.Command.ConflictKeys {
+		if !add(uvarintSize(uint64(len(key)))) || !add(int64(len(key))) {
+			return 0, errOutboundFrameTooLarge
+		}
+	}
+	if !addUvarints(
+		message.RejectHint.Epoch,
+		message.RejectHint.Number,
+		uint64(message.RejectHint.Replica),
+		uint64(message.RejectReason),
+		uint64(message.ConflictRef.Replica),
+		uint64(message.ConflictRef.Instance),
+		uint64(message.ConflictRef.Conf),
+		uint64(message.ConflictStatus),
+		message.DepsCommitted,
+		uint64(message.RecordStatus),
+	) {
+		return 0, errOutboundFrameTooLarge
+	}
+	if size > int64(^uint(0)>>1) {
+		return 0, errOutboundFrameTooLarge
+	}
+	return int(size), nil
+}
+
+func resetTransportBytes(payload []byte) []byte {
+	if cap(payload) > maxRetainedTransportBufferCapacity {
+		clear(payload[:cap(payload)])
+		return nil
+	}
+	clear(payload[:cap(payload)])
+	return payload[:0]
+}
+
+func readLimitedBodyInto(body io.Reader, limit int64, dst []byte) ([]byte, error) {
+	dst = dst[:0]
+	maximum := limit + 1
+	emptyReads := 0
+	for {
+		if int64(len(dst)) > limit {
+			return dst, errRequestBodyTooLarge
+		}
+		if int64(len(dst)) == maximum {
+			return dst, errRequestBodyTooLarge
+		}
+		if len(dst) == cap(dst) {
+			nextCapacity := int64(cap(dst) * 2)
+			if nextCapacity < transportReadChunkSize {
+				nextCapacity = transportReadChunkSize
+			}
+			if nextCapacity > maximum {
+				nextCapacity = maximum
+			}
+			grown := make([]byte, len(dst), int(nextCapacity))
+			copy(grown, dst)
+			dst = grown
+		}
+		available := cap(dst) - len(dst)
+		remaining := int(maximum - int64(len(dst)))
+		if available > remaining {
+			available = remaining
+		}
+		n, err := body.Read(dst[len(dst) : len(dst)+available])
+		dst = dst[:len(dst)+n]
+		if int64(len(dst)) > limit {
+			return dst, errRequestBodyTooLarge
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return dst, nil
+			}
+			return dst, err
+		}
+		if n == 0 {
+			emptyReads++
+			if emptyReads >= 100 {
+				return dst, io.ErrNoProgress
+			}
+			continue
+		}
+		emptyReads = 0
+	}
+}
+
 
 type service struct {
 	mu                 sync.Mutex
 	faultMu            sync.RWMutex
+	transportMu        sync.RWMutex
+	transportWG        sync.WaitGroup
+	transportCloseOnce sync.Once
+	transportSchedulerOnce sync.Once
 	id                 epaxos.ReplicaID
 	node               *epaxos.RawNode
 	ready              readyApplier
 	db                 *kv.DB
 	peers              map[epaxos.ReplicaID]string
 	client             *http.Client
-	sendq              chan epaxos.Message
+	sendq              chan *outboundFrame
+	transportCtx       context.Context
+	transportCancel    context.CancelFunc
+	framePool          sync.Pool
+	peerBodyPool       sync.Pool
+	outboundMetrics    outboundFrameMetrics
+	retryq             outboundRetryHeap
+	transportWake      chan struct{}
+	transportTick      uint64
+	retryOrder         uint64
+	outstandingFrames  int
+	schedulerTick      atomic.Uint64
 	nextSeq            uint64
 	transportDrops     map[transportLink]struct{}
 	storageFailed      bool
+	transportClosed    bool
 	requestDeadline    time.Duration
 	maxClientBodyBytes int64
 	maxPeerBodyBytes   int64
 	maxAdminBodyBytes  int64
 	maxScanLimit       int
+	legacyProcessAtDomain string
 }
 
 type transportLink struct {
@@ -68,6 +356,18 @@ type storageFaultRequest struct {
 	Fail bool `json:"fail"`
 }
 
+type listenerFactory func(network, address string) (net.Listener, error)
+
+type application struct {
+	service         *service
+	servers         []*http.Server
+	storage         io.Closer
+	listen          listenerFactory
+	shutdownTimeout time.Duration
+	closeOnce       sync.Once
+	closeErr        error
+}
+
 const (
 	maxDurationMillis        = int64(1<<63-1) / int64(time.Millisecond)
 	maxRequestBodySize       = int64(1<<63 - 2)
@@ -75,6 +375,8 @@ const (
 	defaultMaxPeerBodySize   = int64(1 << 20)
 	defaultMaxAdminBodySize  = int64(64 << 10)
 	defaultMaxScanLimit      = 1024
+	transportWorkerCount     = 8
+	gracefulShutdownTimeout  = 15 * time.Second
 )
 
 var (
@@ -83,80 +385,109 @@ var (
 )
 
 func main() {
-	idFlag := flag.Uint64("id", 1, "replica id")
-	listen := flag.String("listen", ":8080", "client HTTP listen address")
-	peerListen := flag.String("peer-listen", ":8081", "peer HTTP listen address")
-	adminListen := flag.String("admin-listen", ":8082", "admin HTTP listen address")
-	data := flag.String("data", "kvnode-data", "Pebble data directory")
-	peersFlag := flag.String("peers", "1=http://127.0.0.1:8081", "comma-separated id=peer-url entries")
-	requestDeadlineMS := flag.Int("request-deadline-ms", 5000, "client-facing HTTP deadline budget in milliseconds")
-	peerDeadlineMS := flag.Int("peer-deadline-ms", 2000, "peer HTTP deadline budget in milliseconds")
-	tlsCert := flag.String("tls-cert", "", "TLS certificate chain PEM for client, peer, and admin listeners")
-	tlsKey := flag.String("tls-key", "", "TLS private key PEM for client, peer, and admin listeners")
-	tlsCA := flag.String("tls-ca", "", "optional CA bundle PEM used by the peer HTTP client")
-	maxClientBodyBytes := flag.Int64("max-client-body-bytes", defaultMaxClientBodySize, "maximum bytes accepted for client write and transaction request bodies")
-	maxPeerBodyBytes := flag.Int64("max-peer-body-bytes", defaultMaxPeerBodySize, "maximum bytes accepted for peer replication message bodies")
-	maxAdminBodyBytes := flag.Int64("max-admin-body-bytes", defaultMaxAdminBodySize, "maximum bytes accepted for administrative request bodies")
-	maxScanLimitFlag := flag.Int("max-scan-limit", defaultMaxScanLimit, "maximum rows returned by one scan request")
-	flag.Parse()
+	if err := runWithSignals(os.Args[1:], net.Listen); err != nil {
+		log.Printf("kvnode: %v", err)
+		os.Exit(1)
+	}
+}
+
+func runWithSignals(args []string, listen listenerFactory) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runKVNode(ctx, args, listen)
+}
+
+func runKVNode(ctx context.Context, args []string, listen listenerFactory) error {
+	flags := flag.NewFlagSet("kvnode", flag.ContinueOnError)
+	idFlag := flags.Uint64("id", 1, "replica id")
+	clientListen := flags.String("listen", ":8080", "client HTTP listen address")
+	peerListen := flags.String("peer-listen", ":8081", "peer HTTP listen address")
+	adminListen := flags.String("admin-listen", ":8082", "admin HTTP listen address")
+	data := flags.String("data", "kvnode-data", "Pebble data directory")
+	peersFlag := flags.String("peers", "1=http://127.0.0.1:8081", "comma-separated id=peer-url entries")
+	requestDeadlineMS := flags.Int("request-deadline-ms", 5000, "client-facing HTTP deadline budget in milliseconds")
+	peerDeadlineMS := flags.Int("peer-deadline-ms", 2000, "peer HTTP deadline budget in milliseconds")
+	tlsCert := flags.String("tls-cert", "", "TLS certificate chain PEM for client, peer, and admin listeners")
+	tlsKey := flags.String("tls-key", "", "TLS private key PEM for client, peer, and admin listeners")
+	tlsCA := flags.String("tls-ca", "", "optional CA bundle PEM used by the peer HTTP client")
+	maxClientBodyBytes := flags.Int64("max-client-body-bytes", defaultMaxClientBodySize, "maximum bytes accepted for client write and transaction request bodies")
+	maxPeerBodyBytes := flags.Int64("max-peer-body-bytes", defaultMaxPeerBodySize, "maximum bytes accepted for peer replication message bodies")
+	maxAdminBodyBytes := flags.Int64("max-admin-body-bytes", defaultMaxAdminBodySize, "maximum bytes accepted for administrative request bodies")
+	maxScanLimitFlag := flags.Int("max-scan-limit", defaultMaxScanLimit, "maximum rows returned by one scan request")
+	legacyProcessAtDomainFlag := flags.String("legacy-process-at-domain", "", "trusted migration assertion for legacy ProcessAt records: untimed, logical, or toq")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if listen == nil {
+		return fmt.Errorf("listener factory is required")
+	}
 	requestDeadline, err := durationFromMillis("request deadline", *requestDeadlineMS)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	peerDeadline, err := durationFromMillis("peer deadline", *peerDeadlineMS)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	serverTLSConfig, clientTLSConfig, err := parseTLSConfig(*tlsCert, *tlsKey, *tlsCA)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	maxClientBody, err := positiveBytes("max client body bytes", *maxClientBodyBytes)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	maxPeerBody, err := positiveBytes("max peer body bytes", *maxPeerBodyBytes)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	maxAdminBody, err := positiveBytes("max admin body bytes", *maxAdminBodyBytes)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	maxScanLimit, err := positiveInt("max scan limit", *maxScanLimitFlag)
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	legacyProcessAtDomain, legacyProcessAtDomainMode, err := parseLegacyProcessAtDomain(*legacyProcessAtDomainFlag)
+	if err != nil {
+		return err
 	}
 	peers, voters, err := parsePeers(*peersFlag)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	db, err := kv.Open(*data)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer func() { _ = db.Close() }()
 	store := db.EPaxosStorage()
 	// kvnode has no synchronized logical tick driver across replicas; keep this
 	// request-driven service on classic EPaxos so time-optimized pre-accepts
 	// cannot wait on slower peer ticks.
-	node, err := epaxos.NewRawNode(epaxos.Config{ID: epaxos.ReplicaID(*idFlag), Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5})
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: epaxos.ReplicaID(*idFlag), Voters: voters, Storage: store, RetryTicks: 2, RecoveryTicks: 5, LegacyProcessAtDomain: legacyProcessAtDomain})
 	if err != nil {
-		log.Fatal(err)
+		return errorsJoin(err, db.Close())
 	}
-	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, ready: db, db: db, peers: peers, client: newPeerClient(peerDeadline, clientTLSConfig), sendq: make(chan epaxos.Message, 1024), nextSeq: 1, transportDrops: make(map[transportLink]struct{}), requestDeadline: requestDeadline, maxClientBodyBytes: maxClientBody, maxPeerBodyBytes: maxPeerBody, maxAdminBodyBytes: maxAdminBody, maxScanLimit: maxScanLimit}
-	for range 8 {
-		go s.transportWorker()
+	transportCtx, transportCancel := context.WithCancel(context.Background())
+	s := &service{id: epaxos.ReplicaID(*idFlag), node: node, ready: db, db: db, peers: peers, client: newPeerClient(peerDeadline, clientTLSConfig), sendq: make(chan *outboundFrame, 1024), transportCtx: transportCtx, transportCancel: transportCancel, retryq: make(outboundRetryHeap, 0, 1024), transportWake: make(chan struct{}, 1), nextSeq: 1, transportDrops: make(map[transportLink]struct{}), requestDeadline: requestDeadline, maxClientBodyBytes: maxClientBody, maxPeerBodyBytes: maxPeerBody, maxAdminBodyBytes: maxAdminBody, maxScanLimit: maxScanLimit, legacyProcessAtDomain: legacyProcessAtDomainMode}
+	s.startTransportWorkers(transportWorkerCount)
+	app := &application{
+		service: s,
+		servers: []*http.Server{
+			newHTTPServer(*clientListen, s.clientMux(), requestDeadline, serverTLSConfig),
+			newHTTPServer(*peerListen, s.peerMux(), peerDeadline, serverTLSConfig),
+			newHTTPServer(*adminListen, s.adminMux(), requestDeadline, serverTLSConfig),
+		},
+		storage:         db,
+		listen:          listen,
+		shutdownTimeout: gracefulShutdownTimeout,
 	}
-	clientMux := s.clientMux()
-	peerMux := s.peerMux()
-	adminMux := s.adminMux()
-	log.Printf("kvnode %d listening on client=%s peer=%s admin=%s", s.id, *listen, *peerListen, *adminListen)
-	log.Fatal(serveHTTPServers(
-		newHTTPServer(*listen, clientMux, requestDeadline, serverTLSConfig),
-		newHTTPServer(*peerListen, peerMux, peerDeadline, serverTLSConfig),
-		newHTTPServer(*adminListen, adminMux, requestDeadline, serverTLSConfig),
-	))
+	log.Printf("kvnode %d starting client=%s peer=%s admin=%s legacy-process-at-domain=%s (trusted operator migration assertion)", s.id, *clientListen, *peerListen, *adminListen, legacyProcessAtDomainMode)
+	return app.run(ctx)
 }
 
 func durationFromMillis(name string, ms int) (time.Duration, error) {
@@ -168,6 +499,23 @@ func durationFromMillis(name string, ms int) (time.Duration, error) {
 	}
 	return time.Duration(ms) * time.Millisecond, nil
 }
+func parseLegacyProcessAtDomain(raw string) (*epaxos.TimingDomain, string, error) {
+	var domain epaxos.TimingDomain
+	switch raw {
+	case "":
+		return nil, "unset", nil
+	case "untimed":
+		domain = epaxos.TimingDomainUntimed
+	case "logical":
+		domain = epaxos.TimingDomainLogical
+	case "toq":
+		domain = epaxos.TimingDomainTOQ
+	default:
+		return nil, "", fmt.Errorf("legacy process-at domain must be untimed, logical, or toq")
+	}
+	return &domain, raw, nil
+}
+
 
 func positiveBytes(name string, n int64) (int64, error) {
 	if n <= 0 {
@@ -187,13 +535,11 @@ func positiveInt(name string, n int) (int, error) {
 }
 
 func newPeerClient(deadline time.Duration, tlsConfig *tls.Config) *http.Client {
-	client := &http.Client{Timeout: deadline}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if tlsConfig != nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.TLSClientConfig = tlsConfig
-		client.Transport = transport
 	}
-	return client
+	return &http.Client{Timeout: deadline, Transport: transport}
 }
 
 func newHTTPServer(addr string, handler http.Handler, deadline time.Duration, tlsConfig *tls.Config) *http.Server {
@@ -279,23 +625,117 @@ func (s *service) adminMux() *http.ServeMux {
 	return mux
 }
 
-func serveHTTPServers(servers ...*http.Server) error {
-	errc := make(chan error, len(servers))
-	for _, srv := range servers {
-		srv := srv
-		go func() {
-			if srv.TLSConfig != nil {
-				errc <- srv.ListenAndServeTLS("", "")
-				return
+func serveHTTPServers(ctx context.Context, shutdownTimeout time.Duration, servers ...*http.Server) error {
+	return serveHTTPServersWithListener(ctx, shutdownTimeout, net.Listen, servers...)
+}
+
+func serveHTTPServersWithListener(ctx context.Context, shutdownTimeout time.Duration, listen listenerFactory, servers ...*http.Server) error {
+	if len(servers) == 0 {
+		return fmt.Errorf("at least one HTTP server is required")
+	}
+	if listen == nil {
+		return fmt.Errorf("listener factory is required")
+	}
+	listeners := make([]net.Listener, len(servers))
+	for i, srv := range servers {
+		ln, err := listen("tcp", srv.Addr)
+		if err != nil {
+			startErr := fmt.Errorf("listen %q: %w", srv.Addr, err)
+			for j := 0; j < i; j++ {
+				startErr = errorsJoin(startErr, listeners[j].Close())
 			}
-			errc <- srv.ListenAndServe()
-		}()
+			return startErr
+		}
+		listeners[i] = ln
 	}
-	err := <-errc
+	type serveResult struct {
+		index int
+		err   error
+	}
+	errc := make(chan serveResult, len(servers))
+	for i, srv := range servers {
+		go func(index int, srv *http.Server, ln net.Listener) {
+			var err error
+			if srv.TLSConfig != nil {
+				err = srv.ServeTLS(ln, "", "")
+			} else {
+				err = srv.Serve(ln)
+			}
+			errc <- serveResult{index: index, err: err}
+		}(i, srv, listeners[i])
+	}
+
+	remaining := len(servers)
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case result := <-errc:
+		remaining--
+		if result.err == nil {
+			serveErr = fmt.Errorf("HTTP server %q stopped unexpectedly", servers[result.index].Addr)
+		} else {
+			serveErr = fmt.Errorf("HTTP server %q stopped unexpectedly: %w", servers[result.index].Addr, result.err)
+		}
+	}
+	shutdownErr := shutdownHTTPServers(shutdownTimeout, servers)
+	for ; remaining > 0; remaining-- {
+		result := <-errc
+		if result.err != nil && !errors.Is(result.err, http.ErrServerClosed) {
+			serveErr = errorsJoin(serveErr, fmt.Errorf("serve HTTP server %q: %w", servers[result.index].Addr, result.err))
+		}
+	}
+	return errorsJoin(serveErr, shutdownErr)
+}
+
+func shutdownHTTPServers(timeout time.Duration, servers []*http.Server) error {
+	if timeout <= 0 {
+		var closeErr error
+		for _, srv := range servers {
+			closeErr = errorsJoin(closeErr, srv.Close())
+		}
+		return errorsJoin(fmt.Errorf("shutdown timeout must be positive"), closeErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	type shutdownResult struct {
+		addr string
+		err  error
+	}
+	errc := make(chan shutdownResult, len(servers))
 	for _, srv := range servers {
-		_ = srv.Close()
+		go func(srv *http.Server) {
+			errc <- shutdownResult{addr: srv.Addr, err: srv.Shutdown(ctx)}
+		}(srv)
 	}
-	return err
+	var shutdownErr error
+	for range servers {
+		result := <-errc
+		if result.err != nil {
+			shutdownErr = errorsJoin(shutdownErr, fmt.Errorf("shutdown HTTP server %q: %w", result.addr, result.err))
+		}
+	}
+	if shutdownErr == nil {
+		return nil
+	}
+	for _, srv := range servers {
+		if err := srv.Close(); err != nil {
+			shutdownErr = errorsJoin(shutdownErr, fmt.Errorf("close HTTP server %q: %w", srv.Addr, err))
+		}
+	}
+	return shutdownErr
+}
+
+func (a *application) run(ctx context.Context) error {
+	serveErr := serveHTTPServersWithListener(ctx, a.shutdownTimeout, a.listen, a.servers...)
+	return errorsJoin(serveErr, a.close())
+}
+
+func (a *application) close() error {
+	a.closeOnce.Do(func() {
+		a.service.closeTransport()
+		a.closeErr = a.storage.Close()
+	})
+	return a.closeErr
 }
 
 func readLimitedBody(body io.Reader, limit int64) ([]byte, error) {
@@ -331,6 +771,42 @@ func (s *service) clientBodyLimit() int64 {
 func (s *service) peerBodyLimit() int64 {
 	return configuredBodyLimit(s.maxPeerBodyBytes, defaultMaxPeerBodySize)
 }
+func (s *service) getOutboundFrame() *outboundFrame {
+	if pooled := s.framePool.Get(); pooled != nil {
+		return pooled.(*outboundFrame)
+	}
+	return new(outboundFrame)
+}
+
+func (s *service) releaseOutboundFrame(frame *outboundFrame) {
+	if frame == nil {
+		return
+	}
+	frame.body = resetTransportBytes(frame.body)
+	frame.to = 0
+	frame.endpoint = ""
+	frame.retryAttempt = 0
+	frame.retryAt = 0
+	frame.retryOrder = 0
+	frame.admitted = false
+	s.framePool.Put(frame)
+}
+
+func (s *service) getPeerBodyBuffer() *pooledTransportBuffer {
+	if pooled := s.peerBodyPool.Get(); pooled != nil {
+		return pooled.(*pooledTransportBuffer)
+	}
+	return new(pooledTransportBuffer)
+}
+
+func (s *service) releasePeerBodyBuffer(buffer *pooledTransportBuffer) {
+	if buffer == nil {
+		return
+	}
+	buffer.bytes = resetTransportBytes(buffer.bytes)
+	s.peerBodyPool.Put(buffer)
+}
+
 
 func (s *service) adminBodyLimit() int64 {
 	return configuredBodyLimit(s.maxAdminBodyBytes, defaultMaxAdminBodySize)
@@ -357,8 +833,12 @@ func (s *service) handleReady(w http.ResponseWriter, _ *http.Request) {
 func (s *service) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	status := s.node.Status()
-	queueDepth := len(s.sendq)
 	s.mu.Unlock()
+	s.transportMu.RLock()
+	queueDepth := len(s.sendq)
+	retryDepth := len(s.retryq)
+	outstanding := s.outstandingFrames
+	s.transportMu.RUnlock()
 
 	storageFaultActive := 0
 	if s.storageFaultActive() {
@@ -370,6 +850,25 @@ func (s *service) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, "# TYPE kvnode_epaxos_instances gauge\nkvnode_epaxos_instances %d\n", len(status.Instances))
 	_, _ = fmt.Fprintf(w, "# TYPE kvnode_epaxos_executed gauge\nkvnode_epaxos_executed %d\n", len(status.Executed))
 	_, _ = fmt.Fprintf(w, "# TYPE kvnode_send_queue_depth gauge\nkvnode_send_queue_depth %d\n", queueDepth)
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_retry_queue_depth gauge\nkvnode_outbound_retry_queue_depth %d\n", retryDepth)
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_outstanding gauge\nkvnode_outbound_frames_outstanding %d\n", outstanding)
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_attempted_total counter\nkvnode_outbound_frames_attempted_total %d\n", s.outboundMetrics.attempted.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_admitted_total counter\nkvnode_outbound_frames_admitted_total %d\n", s.outboundMetrics.admitted.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_retried_total counter\nkvnode_outbound_frames_retried_total %d\n", s.outboundMetrics.retried.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_backpressured_total counter\nkvnode_outbound_frames_backpressured_total %d\n", s.outboundMetrics.backpressured.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_frames_terminal_failed_total counter\nkvnode_outbound_frames_terminal_failed_total %d\n", s.outboundMetrics.terminalFailed.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE kvnode_outbound_retry_tick_overflow_total counter\nkvnode_outbound_retry_tick_overflow_total %d\n", s.outboundMetrics.retryOverflow.Load())
+	legacyMode := s.legacyProcessAtDomain
+	if legacyMode == "" {
+		legacyMode = "unset"
+	}
+	for _, mode := range []string{"unset", "untimed", "logical", "toq"} {
+		selected := 0
+		if legacyMode == mode {
+			selected = 1
+		}
+		_, _ = fmt.Fprintf(w, "# TYPE kvnode_legacy_process_at_domain_%s gauge\nkvnode_legacy_process_at_domain_%s %d\n", mode, mode, selected)
+	}
 }
 
 func parsePeers(raw string) (map[epaxos.ReplicaID]string, []epaxos.ReplicaID, error) {
@@ -872,13 +1371,20 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := readLimitedBody(r.Body, s.peerBodyLimit())
+	bodyBuffer := s.getPeerBodyBuffer()
+	body, err := readLimitedBodyInto(r.Body, s.peerBodyLimit(), bodyBuffer.bytes)
+	bodyBuffer.bytes = body
 	if err != nil {
+		s.releasePeerBodyBuffer(bodyBuffer)
 		writeBodyReadError(w, err)
 		return
 	}
+	defer s.releasePeerBodyBuffer(bodyBuffer)
+
+	scratch := epaxos.GetDecodeScratch()
+	defer epaxos.PutDecodeScratch(scratch)
 	var msg epaxos.Message
-	if err := epaxos.DecodeMessage(body, &msg); err != nil {
+	if err := epaxos.DecodeMessageWithScratch(body, &msg, scratch); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -892,7 +1398,7 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	err = s.node.Step(msg)
-	out, drainErr := s.drainLocked()
+	drainErr := s.drainLocked()
 	s.mu.Unlock()
 	if drainErr != nil {
 		http.Error(w, errorsJoin(err, drainErr).Error(), http.StatusServiceUnavailable)
@@ -902,7 +1408,6 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.send(out)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -956,13 +1461,12 @@ func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error 
 	}
 	s.mu.Lock()
 	ref, err := s.node.Propose(cmd)
-	out, drainErr := s.drainLocked()
+	drainErr := s.drainLocked()
 	done := err == nil && drainErr == nil && s.executedLocked(ref)
 	s.mu.Unlock()
 	if err != nil || drainErr != nil {
 		return errorsJoin(err, drainErr)
 	}
-	s.send(out)
 	if done {
 		return nil
 	}
@@ -973,14 +1477,16 @@ func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error 
 		default:
 		}
 		s.mu.Lock()
-		s.node.Tick()
-		out, drainErr := s.drainLocked()
+		if tickErr := s.tickLocked(); tickErr != nil {
+			s.mu.Unlock()
+			return tickErr
+		}
+		drainErr := s.drainLocked()
 		done := s.executedLocked(ref)
 		s.mu.Unlock()
 		if drainErr != nil {
 			return drainErr
 		}
-		s.send(out)
 		if done {
 			return nil
 		}
@@ -997,74 +1503,376 @@ func (s *service) executedLocked(ref epaxos.InstanceRef) bool {
 	return false
 }
 
-func (s *service) drainLocked() ([]epaxos.Message, error) {
-	var out []epaxos.Message
+func (s *service) prepareOutboundFrames(messages []epaxos.Message) ([]*outboundFrame, error) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	s.outboundMetrics.attempted.Add(uint64(len(messages)))
+	frames := make([]*outboundFrame, 0, len(messages))
+	releasePrepared := func() {
+		for _, frame := range frames {
+			s.releaseOutboundFrame(frame)
+		}
+	}
+	limit := s.peerBodyLimit()
+	for index, message := range messages {
+		size, err := encodedMessageSizeWithin(message, limit)
+		if err != nil {
+			releasePrepared()
+			s.outboundMetrics.backpressured.Add(uint64(len(messages)))
+			return nil, &transportAdmissionError{
+				Cause:     fmt.Errorf("encode outbound message %d: %w", index, err),
+				Attempted: len(messages),
+			}
+		}
+		frame := s.getOutboundFrame()
+		if int64(cap(frame.body)) > limit {
+			clear(frame.body[:cap(frame.body)])
+			frame.body = nil
+		}
+		if cap(frame.body) < size {
+			frame.body = make([]byte, 0, size)
+		} else {
+			frame.body = frame.body[:0]
+		}
+		frame.body, err = epaxos.EncodeMessage(frame.body, message)
+		actualSize := len(frame.body)
+		if err != nil || actualSize != size {
+			s.releaseOutboundFrame(frame)
+			releasePrepared()
+			s.outboundMetrics.backpressured.Add(uint64(len(messages)))
+			if err == nil {
+				err = fmt.Errorf("canonical size changed from %d to %d", size, actualSize)
+			}
+			return nil, &transportAdmissionError{
+				Cause:     fmt.Errorf("encode outbound message %d: %w", index, err),
+				Attempted: len(messages),
+			}
+		}
+		frame.to = message.To
+		frame.endpoint = s.peers[message.To]
+		frames = append(frames, frame)
+	}
+	return frames, nil
+}
+
+func (s *service) admitOutboundFrames(frames []*outboundFrame) error {
+	if len(frames) == 0 {
+		return nil
+	}
+	releasePrepared := func() {
+		for _, frame := range frames {
+			s.releaseOutboundFrame(frame)
+		}
+	}
+	s.transportMu.Lock()
+	if s.transportClosed {
+		s.transportMu.Unlock()
+		releasePrepared()
+		s.outboundMetrics.backpressured.Add(uint64(len(frames)))
+		return &transportAdmissionError{Cause: errTransportClosed, Attempted: len(frames)}
+	}
+	available := cap(s.sendq) - s.outstandingFrames
+	if len(frames) > available {
+		s.transportMu.Unlock()
+		releasePrepared()
+		s.outboundMetrics.backpressured.Add(uint64(len(frames)))
+		return &transportAdmissionError{
+			Cause:     errSendQueueBackpressure,
+			Attempted: len(frames),
+			Available: available,
+		}
+	}
+	// drainLocked serializes the only new-frame producer under service.mu.
+	// outstandingFrames counts queued, in-flight, and retry-heap owners, so this
+	// preflight reserves the entire batch before any frame becomes visible.
+	for _, frame := range frames {
+		frame.admitted = true
+		s.outstandingFrames++
+		s.sendq <- frame
+	}
+	s.transportMu.Unlock()
+	s.outboundMetrics.admitted.Add(uint64(len(frames)))
+	return nil
+}
+
+func (s *service) drainLocked() error {
 	for round := 0; round < 1000; round++ {
 		if !s.node.HasReady() {
-			return out, nil
+			return nil
 		}
-		rd := s.node.Ready()
-		if err := s.ready.ApplyReady(rd); err != nil {
-			return nil, err
+		ready := s.node.Ready()
+		if err := s.ready.ApplyReady(ready); err != nil {
+			return err
 		}
-		out = append(out, rd.Messages...)
-		if err := s.node.Advance(rd); err != nil {
-			return nil, err
+		frames, err := s.prepareOutboundFrames(ready.Messages)
+		if err != nil {
+			return err
+		}
+		if err := s.admitOutboundFrames(frames); err != nil {
+			return err
+		}
+		if err := s.node.Advance(ready); err != nil {
+			return err
 		}
 	}
-	return nil, fmt.Errorf("ready processing did not quiesce")
+	return fmt.Errorf("ready processing did not quiesce")
 }
 
-func (s *service) send(messages []epaxos.Message) {
-	for _, msg := range messages {
-		if msg.To == s.id || s.peers[msg.To] == "" {
-			continue
+func (s *service) postFrame(frame *outboundFrame) postOutcome {
+	if frame.to == s.id || frame.endpoint == "" || s.transportDropped(s.id, frame.to) || s.client == nil {
+		return postTerminalFailure
+	}
+	ctx := s.transportCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, frame.endpoint+"/epaxos/message", bytes.NewReader(frame.body))
+	if err != nil {
+		return postTerminalFailure
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return postRetry
+	}
+	if response.Body != nil {
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+	}
+	switch {
+	case response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices:
+		return postSucceeded
+	case response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError:
+		return postRetry
+	default:
+		return postTerminalFailure
+	}
+}
+
+func retryDelayTicks(attempt uint32) uint64 {
+	if attempt >= 6 {
+		return maxRetryDelayTicks
+	}
+	delay := initialRetryDelayTicks << attempt
+	if delay > maxRetryDelayTicks {
+		return maxRetryDelayTicks
+	}
+	return delay
+}
+
+func (s *service) signalTransportSchedulerLocked() {
+	if s.transportWake == nil {
+		return
+	}
+	select {
+	case s.transportWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *service) advanceTransportTick() error {
+	s.transportMu.Lock()
+	if s.transportTick == ^uint64(0) {
+		s.transportMu.Unlock()
+		s.outboundMetrics.retryOverflow.Add(1)
+		return errTransportTickOverflow
+	}
+	s.transportTick++
+	s.signalTransportSchedulerLocked()
+	s.transportMu.Unlock()
+	return nil
+}
+
+func (s *service) tickLocked() error {
+	if err := s.node.Tick(); err != nil {
+		return err
+	}
+	return s.advanceTransportTick()
+}
+
+func (s *service) finishOutboundFrame(frame *outboundFrame, terminal bool) {
+	s.transportMu.Lock()
+	admitted := frame.admitted
+	frame.admitted = false
+	s.transportMu.Unlock()
+	if terminal {
+		s.outboundMetrics.terminalFailed.Add(1)
+	}
+	s.releaseOutboundFrame(frame)
+	if admitted {
+		s.transportMu.Lock()
+		if s.outstandingFrames > 0 {
+			s.outstandingFrames--
 		}
-		if s.postMessage(msg) {
-			continue
+		s.transportMu.Unlock()
+	}
+}
+
+func (s *service) scheduleRetry(frame *outboundFrame) {
+	terminal := false
+	overflow := false
+	s.transportMu.Lock()
+	delay := retryDelayTicks(frame.retryAttempt)
+	if s.transportClosed || s.transportTick > ^uint64(0)-delay || len(s.retryq) >= cap(s.sendq) {
+		terminal = true
+		overflow = s.transportTick > ^uint64(0)-delay
+	} else {
+		frame.retryAt = s.transportTick + delay
+		frame.retryOrder = s.retryOrder
+		s.retryOrder++
+		if frame.retryAttempt < ^uint32(0) {
+			frame.retryAttempt++
 		}
+		heap.Push(&s.retryq, frame)
+	}
+	s.transportMu.Unlock()
+	if overflow {
+		s.outboundMetrics.retryOverflow.Add(1)
+	}
+	if terminal {
+		s.finishOutboundFrame(frame, true)
+		return
+	}
+	s.outboundMetrics.retried.Add(1)
+}
+
+func (s *service) releaseDueRetries() bool {
+	var terminal []*outboundFrame
+	s.transportMu.Lock()
+	if s.transportClosed {
+		s.transportMu.Unlock()
+		return false
+	}
+	now := s.transportTick
+	for len(s.retryq) != 0 && s.retryq[0].retryAt <= now {
+		frame := heap.Pop(&s.retryq).(*outboundFrame)
 		select {
-		case s.sendq <- msg:
+		case s.sendq <- frame:
 		default:
+			if frame.admitted {
+				if s.outstandingFrames > 0 {
+					s.outstandingFrames--
+				}
+				frame.admitted = false
+			}
+			terminal = append(terminal, frame)
+		}
+	}
+	s.schedulerTick.Store(now)
+	s.transportMu.Unlock()
+	for _, frame := range terminal {
+		s.outboundMetrics.backpressured.Add(1)
+		s.outboundMetrics.terminalFailed.Add(1)
+		s.releaseOutboundFrame(frame)
+	}
+	return true
+}
+
+func (s *service) transportRetryScheduler() {
+	for range s.transportWake {
+		if !s.releaseDueRetries() {
+			return
 		}
 	}
 }
 
-func (s *service) postMessage(msg epaxos.Message) bool {
-	base := s.peers[msg.To]
-	if base == "" {
-		return true
+func (s *service) startTransportWorkers(count int) {
+	s.transportMu.Lock()
+	if s.transportWake == nil {
+		s.transportWake = make(chan struct{}, 1)
 	}
-	if s.transportDropped(s.id, msg.To) {
-		return true
+	if s.retryq == nil {
+		s.retryq = make(outboundRetryHeap, 0, cap(s.sendq))
 	}
-	buf, err := epaxos.EncodeMessage(nil, msg)
-	if err != nil {
-		return false
+	s.transportMu.Unlock()
+	s.transportSchedulerOnce.Do(func() {
+		s.transportWG.Add(1)
+		go func() {
+			defer s.transportWG.Done()
+			s.transportRetryScheduler()
+		}()
+	})
+	s.transportWG.Add(count)
+	for range count {
+		go func() {
+			defer s.transportWG.Done()
+			s.transportWorker()
+		}()
 	}
-	resp, err := s.client.Post(base+"/epaxos/message", "application/octet-stream", bytes.NewReader(buf))
-	if err != nil {
-		return false
-	}
-	if resp.Body != nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}
-	return resp.StatusCode < http.StatusInternalServerError
+}
+
+func (s *service) closeTransport() {
+	s.transportCloseOnce.Do(func() {
+		s.transportMu.Lock()
+		s.transportClosed = true
+		retrying := s.retryq
+		s.retryq = nil
+		for _, frame := range retrying {
+			if frame.admitted {
+				if s.outstandingFrames > 0 {
+					s.outstandingFrames--
+				}
+				frame.admitted = false
+			}
+		}
+		if s.sendq != nil {
+			close(s.sendq)
+		}
+		s.signalTransportSchedulerLocked()
+		s.transportMu.Unlock()
+		for _, frame := range retrying {
+			s.outboundMetrics.terminalFailed.Add(1)
+			s.releaseOutboundFrame(frame)
+		}
+		if s.client != nil {
+			s.client.CloseIdleConnections()
+		}
+		if s.transportCancel != nil {
+			s.transportCancel()
+		}
+		s.transportWG.Wait()
+		if s.sendq != nil {
+			for frame := range s.sendq {
+				s.finishOutboundFrame(frame, true)
+			}
+		}
+	})
 }
 
 func (s *service) transportWorker() {
-	for msg := range s.sendq {
-		_ = s.postMessage(msg)
+	for frame := range s.sendq {
+		s.deliverFrame(frame)
+	}
+}
+
+func (s *service) deliverFrame(frame *outboundFrame) {
+	if s.transportCtx != nil {
+		select {
+		case <-s.transportCtx.Done():
+			s.finishOutboundFrame(frame, true)
+			return
+		default:
+		}
+	}
+	switch s.postFrame(frame) {
+	case postSucceeded:
+		s.finishOutboundFrame(frame, false)
+	case postTerminalFailure:
+		s.finishOutboundFrame(frame, true)
+	case postRetry:
+		if s.transportCtx != nil {
+			select {
+			case <-s.transportCtx.Done():
+				s.finishOutboundFrame(frame, true)
+				return
+			default:
+			}
+		}
+		s.scheduleRetry(frame)
 	}
 }
 
 func errorsJoin(a, b error) error {
-	if a != nil {
-		if b != nil {
-			return fmt.Errorf("%v; %w", a, b)
-		}
-		return a
-	}
-	return b
+	return errors.Join(a, b)
 }

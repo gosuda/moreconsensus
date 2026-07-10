@@ -708,7 +708,7 @@ func TestVerifyCheckpointRejectsSemanticDataCorruption(t *testing.T) {
 		writeAppliedCheckpointRecord(t, checkpoint, record)
 		deleteCheckpointAppliedMarker(t, checkpoint, ref)
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "data rows do not match applied epaxos commands") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "data rows do not match applied epaxos commands") {
 			t.Fatalf("VerifyCheckpoint deleted marker err=%v, want semantic data mismatch", err)
 		}
 	})
@@ -727,7 +727,7 @@ func TestVerifyCheckpointCrashWindowMarkerRules(t *testing.T) {
 		})
 		writeAppliedCheckpointRecord(t, checkpoint, record)
 
-		if err := VerifyCheckpoint(checkpoint); err != nil {
+		if err := VerifyLegacyCheckpoint(checkpoint); err != nil {
 			t.Fatalf("VerifyCheckpoint rejected committed applied user record: %v", err)
 		}
 	})
@@ -744,7 +744,7 @@ func TestVerifyCheckpointCrashWindowMarkerRules(t *testing.T) {
 		})
 		writeCheckpointRecordOnly(t, checkpoint, record)
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "missing applied marker") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "missing applied marker") {
 			t.Fatalf("VerifyCheckpoint executed user without marker err=%v, want missing applied marker", err)
 		}
 	})
@@ -761,7 +761,7 @@ func TestVerifyCheckpointCrashWindowMarkerRules(t *testing.T) {
 		})
 		writeCheckpointRecordOnly(t, checkpoint, record)
 
-		if err := VerifyCheckpoint(checkpoint); err != nil {
+		if err := VerifyLegacyCheckpoint(checkpoint); err != nil {
 			t.Fatalf("VerifyCheckpoint rejected executed noop without marker: %v", err)
 		}
 	})
@@ -772,7 +772,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		checkpoint := t.TempDir()
 		setRawPebbleKV(t, checkpoint, []byte{epaxosStorePrefix, epaxosRecordEntry, 0}, []byte{epaxosRecordCodec})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos record key") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos record key") {
 			t.Fatalf("VerifyCheckpoint err=%v, want malformed record key", err)
 		}
 	})
@@ -791,7 +791,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		})
 		setRawPebbleKV(t, checkpoint, epaxosRecordKey(keyRef), encodeEPaxosRecord(record))
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "key/value ref mismatch") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "key/value ref mismatch") {
 			t.Fatalf("VerifyCheckpoint err=%v, want record key/value mismatch", err)
 		}
 	})
@@ -800,7 +800,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		checkpoint := t.TempDir()
 		setRawPebbleKV(t, checkpoint, []byte{epaxosStorePrefix, epaxosAppliedEntry, 0}, []byte{1})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos applied marker key") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos applied marker key") {
 			t.Fatalf("VerifyCheckpoint err=%v, want malformed marker key", err)
 		}
 	})
@@ -812,7 +812,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		writeCheckpointRecordOnly(t, checkpoint, record)
 		setRawPebbleKV(t, checkpoint, epaxosAppliedKey(ref), []byte{2})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos applied marker") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "malformed epaxos applied marker") {
 			t.Fatalf("VerifyCheckpoint err=%v, want malformed marker value", err)
 		}
 	})
@@ -821,7 +821,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		checkpoint := t.TempDir()
 		setRawPebbleKV(t, checkpoint, epaxosAppliedKey(epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}), []byte{1})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "has no epaxos record") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "has no epaxos record") {
 			t.Fatalf("VerifyCheckpoint err=%v, want marker without record rejection", err)
 		}
 	})
@@ -840,7 +840,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		writeCheckpointRecordOnly(t, checkpoint, record)
 		setRawPebbleKV(t, checkpoint, epaxosAppliedKey(ref), []byte{1})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "references uncommitted epaxos record") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "references uncommitted epaxos record") {
 			t.Fatalf("VerifyCheckpoint err=%v, want uncommitted marker rejection", err)
 		}
 	})
@@ -859,7 +859,7 @@ func TestVerifyCheckpointRejectsMalformedConsensusAndMarkerState(t *testing.T) {
 		writeCheckpointRecordOnly(t, checkpoint, record)
 		setRawPebbleKV(t, checkpoint, epaxosAppliedKey(ref), []byte{1})
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "applied command") || !strings.Contains(err.Error(), "malformed command") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "applied command") || !strings.Contains(err.Error(), "malformed command") {
 			t.Fatalf("VerifyCheckpoint err=%v, want malformed applied command rejection", err)
 		}
 	})
@@ -919,7 +919,7 @@ func TestVerifyCheckpointRejectsMalformedDataRows(t *testing.T) {
 			checkpoint := t.TempDir()
 			tt.write(t, checkpoint)
 
-			if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("VerifyCheckpoint err=%v, want containing %q", err, tt.wantErr)
 			}
 		})
@@ -1059,6 +1059,40 @@ func TestCheckpointTimestampAssignmentHonorsDependenciesAndRefOrdering(t *testin
 	}
 }
 
+func TestCheckpointDependencyChecksDoNotExpandNumericPrefixes(t *testing.T) {
+	maxInstance := ^epaxos.InstanceNum(0)
+	dependency := epaxos.InstanceRef{Replica: 1, Instance: maxInstance, Conf: 1}
+	rec := epaxos.InstanceRecord{
+		Ref:  epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Deps: []epaxos.InstanceNum{maxInstance, 0},
+	}
+	writes := map[epaxos.InstanceRef]string{dependency: "group"}
+	state := checkpointState{
+		writeGroups: writes,
+		configHistory: map[epaxos.ConfID]epaxos.ConfState{
+			1: {ID: 1, Voters: []epaxos.ReplicaID{1, 2}},
+		},
+	}
+	if checkpointDependenciesAssignedForState(rec, nil, state) {
+		t.Fatal("state-aware dependency check accepted an unassigned maximum instance")
+	}
+	if checkpointDependenciesAssigned(rec, nil, writes) {
+		t.Fatal("legacy dependency check accepted an unassigned maximum instance")
+	}
+	assigned := map[epaxos.InstanceRef]uint64{dependency: 1}
+	if !checkpointDependenciesAssignedForState(rec, assigned, state) {
+		t.Fatal("state-aware dependency check rejected an assigned maximum instance")
+	}
+	if !checkpointDependenciesAssigned(rec, assigned, writes) {
+		t.Fatal("legacy dependency check rejected an assigned maximum instance")
+	}
+
+	rec.Deps = append(rec.Deps, 1)
+	if checkpointDependenciesAssignedForState(rec, assigned, state) {
+		t.Fatal("state-aware dependency check accepted a nonzero slot outside the configuration")
+	}
+}
+
 func TestClusterLiveCheckpointRecoveryRejectsInvalidOperatorsAndUnhealthySources(t *testing.T) {
 	paths := []string{t.TempDir(), t.TempDir(), t.TempDir()}
 	cluster, err := OpenCluster(paths)
@@ -1187,6 +1221,34 @@ func TestVerifyCheckpointTargetOwnerFloorRejectsMissingAndCommittedMismatch(t *t
 	}
 }
 
+func TestVerifyCheckpointTargetOwnerFloorDoesNotScanNumericGaps(t *testing.T) {
+	target := epaxos.ReplicaID(2)
+	maxInstance := ^epaxos.InstanceNum(0)
+	ref1 := epaxos.InstanceRef{Replica: target, Instance: 1, Conf: 1}
+	ref2 := epaxos.InstanceRef{Replica: target, Instance: 2, Conf: 1}
+	maxRef := epaxos.InstanceRef{Replica: target, Instance: maxInstance, Conf: 1}
+	rec1 := epaxos.InstanceRecord{Ref: ref1}
+	rec2 := epaxos.InstanceRecord{Ref: ref2}
+	maxRec := epaxos.InstanceRecord{Ref: maxRef}
+
+	err := verifyCheckpointTargetOwnerFloor(
+		map[epaxos.InstanceRef]epaxos.InstanceRecord{ref1: rec1, maxRef: maxRec},
+		map[epaxos.ReplicaID]map[epaxos.InstanceRef]epaxos.InstanceRecord{1: {maxRef: maxRec}},
+		target,
+	)
+	if err == nil || !strings.Contains(err.Error(), "missing target-owned prefix") {
+		t.Fatalf("maximum sparse floor err=%v, want bounded missing-prefix rejection", err)
+	}
+
+	if err := verifyCheckpointTargetOwnerFloor(
+		map[epaxos.InstanceRef]epaxos.InstanceRecord{ref1: rec1, ref2: rec2},
+		map[epaxos.ReplicaID]map[epaxos.InstanceRef]epaxos.InstanceRecord{1: {ref2: rec2}},
+		target,
+	); err != nil {
+		t.Fatalf("dense small floor rejected: %v", err)
+	}
+}
+
 func TestConsensusRecordEqualityHelpersRejectMismatches(t *testing.T) {
 	if acceptEvidenceEqualKV([]epaxos.AcceptEvidence{{Sender: 1}}, nil) {
 		t.Fatal("acceptEvidenceEqualKV accepted evidence length mismatch")
@@ -1275,7 +1337,7 @@ func TestVerifyCheckpointCoversOrderingAndIteratorErrorBranches(t *testing.T) {
 			t.Fatal(closeErr)
 		}
 
-		if err := VerifyCheckpoint(checkpoint); err != nil {
+		if err := VerifyLegacyCheckpoint(checkpoint); err != nil {
 			t.Fatalf("VerifyCheckpoint rejected sorted equivalent writes: %v", err)
 		}
 	})
@@ -1305,7 +1367,7 @@ func TestVerifyCheckpointCoversOrderingAndIteratorErrorBranches(t *testing.T) {
 			t.Fatal(closeErr)
 		}
 
-		if err := VerifyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "no dependency-satisfied") {
+		if err := VerifyLegacyCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "no dependency-satisfied") {
 			t.Fatalf("VerifyCheckpoint dependency-order err=%v, want dependency rejection", err)
 		}
 	})
@@ -1357,6 +1419,23 @@ func TestCheckpointDirectHelpersCoverDuplicateAndLegacyBranches(t *testing.T) {
 	}
 	if !checkpointDependenciesAssigned(epaxos.InstanceRecord{Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Deps: []epaxos.InstanceNum{1}}, nil, nil) {
 		t.Fatal("checkpointDependenciesAssigned should ignore non-writing dependencies")
+	}
+	zeroRef := epaxos.InstanceRef{Replica: 1, Instance: 0, Conf: 1}
+	zeroWrites := map[epaxos.InstanceRef]string{zeroRef: "malformed-zero"}
+	zeroDepRecord := epaxos.InstanceRecord{
+		Ref:  epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
+		Deps: []epaxos.InstanceNum{0},
+	}
+	if !checkpointDependenciesAssigned(zeroDepRecord, nil, zeroWrites) {
+		t.Fatal("checkpointDependenciesAssigned treated zero-instance state as a prefix dependency")
+	}
+	if !checkpointDependenciesAssignedForState(zeroDepRecord, nil, checkpointState{
+		writeGroups: zeroWrites,
+		configHistory: map[epaxos.ConfID]epaxos.ConfState{
+			1: {ID: 1, Voters: []epaxos.ReplicaID{1}},
+		},
+	}) {
+		t.Fatal("state-aware dependency check treated zero-instance state as a prefix dependency")
 	}
 }
 
@@ -1621,27 +1700,43 @@ func TestVerifyCheckpointAgainstLiveQuorumResidualBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("semantic checkpoint failure is returned before live scan", func(t *testing.T) {
+	t.Run("current checkpoint contract failure is returned before live scan", func(t *testing.T) {
 		checkpoint := t.TempDir()
 		setRawPebbleKV(t, checkpoint, EncodeDataKey(nil, 1, []byte("bad-checkpoint"), 2), []byte{valueRecord, 'x'})
 		cluster := &Cluster{ids: []epaxos.ReplicaID{1}, DBs: map[epaxos.ReplicaID]*DB{}}
-		if err := cluster.verifyCheckpointAgainstLiveQuorum(checkpoint, 1); err == nil || !strings.Contains(err.Error(), "not dense position") {
-			t.Fatalf("verifyCheckpointAgainstLiveQuorum err=%v, want checkpoint verification failure", err)
+		if err := cluster.verifyCheckpointAgainstLiveQuorum(checkpoint, 1); err == nil || !strings.Contains(err.Error(), "omitted epaxos hard state") {
+			t.Fatalf("verifyCheckpointAgainstLiveQuorum err=%v, want current checkpoint contract failure", err)
 		}
 	})
 
 	t.Run("nil live peer is skipped and uncommitted checkpoint records need no quorum", func(t *testing.T) {
-		checkpoint := t.TempDir()
+		sourceDir := t.TempDir()
+		checkpoint := filepath.Join(t.TempDir(), "checkpoint")
 		ref := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 		record := checkedKVRecord(epaxos.InstanceRecord{
 			Ref:     ref,
 			Ballot:  epaxos.Ballot{Replica: 1},
 			Status:  epaxos.StatusAccepted,
 			Seq:     1,
-			Deps:    []epaxos.InstanceNum{0},
+			Deps:    []epaxos.InstanceNum{0, 0, 0},
 			Command: CommandForPut(140, 1, []byte("uncommitted-quorum"), []byte("value")),
 		})
-		writeCheckpointRecordOnly(t, checkpoint, record)
+		source, err := Open(sourceDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hardState := epaxos.HardState{Conf: epaxos.ConfState{ID: 1, Voters: []epaxos.ReplicaID{1, 2, 3}}}
+		if err := source.EPaxosStorage().ApplyReady(epaxos.Ready{HardState: hardState, Records: []epaxos.InstanceRecord{record}, MustSync: true}); err != nil {
+			_ = source.Close()
+			t.Fatal(err)
+		}
+		if err := source.Checkpoint(checkpoint); err != nil {
+			_ = source.Close()
+			t.Fatal(err)
+		}
+		if err := source.Close(); err != nil {
+			t.Fatal(err)
+		}
 		db, err := Open(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -1685,14 +1780,253 @@ func TestDecodeEPaxosRecordRejectsZeroEvidenceSenderAndUpgradesLegacyChecksum(t 
 		Command:          CommandForPut(150, 2, []byte("legacy-sender"), []byte("value")),
 		FastPathEligible: true,
 	}
-	legacy.Checksum = checksumRecordWithoutSenderEvidenceKV(legacy)
+	legacy.Checksum = checksumLegacyRecordKV(legacy, false)
 	decoded, err := decodeEPaxosRecord(encodeEPaxosRecordV5KV(legacy))
 	if err != nil {
 		t.Fatalf("decodeEPaxosRecord legacy sender checksum err=%v", err)
 	}
-	if decoded.Ref != legacy.Ref || !epaxos.VerifyRecordChecksum(decoded) {
-		t.Fatalf("decoded legacy record=%#v, want canonical checksum for %s", decoded, legacy.Ref)
+	if decoded.Ref != legacy.Ref || !epaxos.VerifyRecordChecksumWithoutTimingDomain(decoded) {
+		t.Fatalf("decoded legacy record=%#v, want no-domain canonical checksum for %s", decoded, legacy.Ref)
 	}
+}
+
+func TestEPaxosRecordCodecV8RoundTripsConfChangeResults(t *testing.T) {
+	tests := []struct {
+		name   string
+		result epaxos.ConfChangeResult
+	}{
+		{
+			name: "applied exact successor",
+			result: epaxos.ConfChangeResult{
+				Outcome: epaxos.ConfChangeApplied,
+				Conf:    epaxos.ConfState{ID: 5, Voters: []epaxos.ReplicaID{1, 2, 3, 4}},
+			},
+		},
+		{
+			name:   "rejected superseded",
+			result: epaxos.ConfChangeResult{Outcome: epaxos.ConfChangeRejectedSuperseded},
+		},
+		{
+			name:   "rejected invalid",
+			result: epaxos.ConfChangeResult{Outcome: epaxos.ConfChangeRejectedInvalid},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := confChangeCodecRecordKV(tc.result)
+			encoded := encodeEPaxosRecord(rec)
+			if encoded[0] != 8 {
+				t.Fatalf("record codec version=%d, want 8", encoded[0])
+			}
+			decoded, err := decodeEPaxosRecord(encoded)
+			if err != nil {
+				t.Fatalf("decodeEPaxosRecord err=%v", err)
+			}
+			assertConfChangeResultKV(t, decoded.ConfChangeResult, tc.result)
+			if !epaxos.VerifyRecordChecksum(decoded) {
+				t.Fatalf("decoded record checksum does not authenticate result %#v", decoded.ConfChangeResult)
+			}
+		})
+	}
+}
+
+func TestEPaxosRecordCodecV8RejectsMalformedConfChangeResult(t *testing.T) {
+	rec := confChangeCodecRecordKV(epaxos.ConfChangeResult{
+		Outcome: epaxos.ConfChangeApplied,
+		Conf:    epaxos.ConfState{ID: 5, Voters: []epaxos.ReplicaID{1, 2, 3, 4}},
+	})
+	encoded := encodeEPaxosRecord(rec)
+	resultBytes := encodeConfChangeResultKV(rec.ConfChangeResult)
+	resultAt := len(encoded) - len(rec.Checksum) - len(resultBytes)
+	outcomeBytes := binary.AppendUvarint(nil, uint64(rec.ConfChangeResult.Outcome))
+	confIDBytes := binary.AppendUvarint(nil, uint64(rec.ConfChangeResult.Conf.ID))
+	countAt := resultAt + len(outcomeBytes) + len(confIDBytes)
+
+	for _, tc := range []struct {
+		name string
+		cut  int
+	}{
+		{name: "missing outcome", cut: resultAt},
+		{name: "missing conf id", cut: resultAt + len(outcomeBytes)},
+		{name: "missing voter count", cut: countAt},
+		{name: "truncated voters", cut: countAt + 1 + len(rec.ConfChangeResult.Conf.Voters) - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeEPaxosRecord(encoded[:tc.cut]); err == nil {
+				t.Fatal("decodeEPaxosRecord accepted truncated configuration result")
+			}
+		})
+	}
+
+	t.Run("impossible voter count", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded...)
+		corrupt[countAt] = 8
+		if _, err := decodeEPaxosRecord(corrupt); err == nil || !strings.Contains(err.Error(), "conf change voter count") {
+			t.Fatalf("decodeEPaxosRecord voter count err=%v", err)
+		}
+	})
+
+	t.Run("noncanonical voter order", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded...)
+		votersAt := countAt + 1
+		corrupt[votersAt+2] = corrupt[votersAt+1]
+		if _, err := decodeEPaxosRecord(corrupt); err == nil || !strings.Contains(err.Error(), "conf change voter order") {
+			t.Fatalf("decodeEPaxosRecord voter order err=%v", err)
+		}
+	})
+
+	t.Run("unknown outcome", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded...)
+		corrupt[resultAt] = byte(epaxos.ConfChangeRejectedInvalid) + 1
+		if _, err := decodeEPaxosRecord(corrupt); err == nil || !strings.Contains(err.Error(), "conf change outcome") {
+			t.Fatalf("decodeEPaxosRecord outcome err=%v", err)
+		}
+	})
+
+	t.Run("overflowing outcome", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded[:resultAt]...)
+		corrupt = binary.AppendUvarint(corrupt, 256)
+		corrupt = append(corrupt, encoded[resultAt+len(outcomeBytes):]...)
+		if _, err := decodeEPaxosRecord(corrupt); err == nil || !strings.Contains(err.Error(), "conf change outcome") {
+			t.Fatalf("decodeEPaxosRecord overflowing outcome err=%v", err)
+		}
+	})
+
+	t.Run("corrupt authenticated result", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded...)
+		corrupt[resultAt+len(outcomeBytes)] ^= 1
+		if _, err := decodeEPaxosRecord(corrupt); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+			t.Fatalf("decodeEPaxosRecord corrupt result err=%v, want %v", err, epaxos.ErrChecksumMismatch)
+		}
+	})
+
+	t.Run("corrupt checksum", func(t *testing.T) {
+		corrupt := append([]byte(nil), encoded...)
+		corrupt[len(corrupt)-1] ^= 1
+		if _, err := decodeEPaxosRecord(corrupt); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+			t.Fatalf("decodeEPaxosRecord corrupt checksum err=%v, want %v", err, epaxos.ErrChecksumMismatch)
+		}
+	})
+
+	t.Run("trailing content", func(t *testing.T) {
+		if _, err := decodeEPaxosRecord(append(append([]byte(nil), encoded...), 0)); err == nil || !strings.Contains(err.Error(), "malformed epaxos record") {
+			t.Fatalf("decodeEPaxosRecord trailing content err=%v", err)
+		}
+	})
+}
+
+func TestEPaxosRecordCodecV6MigratesConfChangeChecksum(t *testing.T) {
+	legacy := epaxos.InstanceRecord{
+		Ref:              epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 4},
+		Ballot:           epaxos.Ballot{Number: 1, Replica: 1},
+		RecordBallot:     epaxos.Ballot{Number: 1, Replica: 1},
+		Status:           epaxos.StatusAccepted,
+		Seq:              3,
+		Deps:             []epaxos.InstanceNum{0, 0, 0},
+		AcceptSeq:        4,
+		AcceptDeps:       []epaxos.InstanceNum{0, 0, 0},
+		AcceptEvidence:   []epaxos.AcceptEvidence{{Sender: 2, Seq: 4, Deps: []epaxos.InstanceNum{0, 0, 0}}},
+		Command:          CommandForPut(151, 1, []byte("legacy-v6"), []byte("value")),
+		FastPathEligible: true,
+	}
+	legacy.Checksum = checksumLegacyRecordKV(legacy, true)
+	encoded := encodeEPaxosRecordV6KV(legacy)
+	decoded, err := decodeEPaxosRecord(encoded)
+	if err != nil {
+		t.Fatalf("decodeEPaxosRecord v6 err=%v", err)
+	}
+	assertConfChangeResultKV(t, decoded.ConfChangeResult, epaxos.ConfChangeResult{})
+	if decoded.Checksum == legacy.Checksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(decoded) {
+		t.Fatalf("decoded v6 checksum=%x, want migrated no-domain checksum distinct from %x", decoded.Checksum, legacy.Checksum)
+	}
+
+	forgedCanonical := legacy
+	forgedCanonical.Checksum = epaxos.ChecksumRecord(forgedCanonical)
+	if _, err := decodeEPaxosRecord(encodeEPaxosRecordV6KV(forgedCanonical)); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+		t.Fatalf("decodeEPaxosRecord v6 with non-legacy checksum err=%v, want %v", err, epaxos.ErrChecksumMismatch)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		result epaxos.ConfChangeResult
+	}{
+		{name: "outcome", result: epaxos.ConfChangeResult{Outcome: epaxos.ConfChangeRejectedSuperseded}},
+		{name: "successor voters", result: epaxos.ConfChangeResult{Conf: epaxos.ConfState{ID: 5, Voters: []epaxos.ReplicaID{1, 2, 3}}}},
+	} {
+		t.Run("old checksum with injected "+tc.name, func(t *testing.T) {
+			injected := legacy
+			injected.ConfChangeResult = tc.result
+			injected.Checksum = legacy.Checksum
+			if epaxos.VerifyRecordChecksumWithoutConfChangeResult(injected) {
+				t.Fatalf("legacy verifier accepted injected result %#v", tc.result)
+			}
+			if _, err := decodeEPaxosRecord(encodeEPaxosRecord(injected)); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+				t.Fatalf("decodeEPaxosRecord old checksum with injected result err=%v, want %v", err, epaxos.ErrChecksumMismatch)
+			}
+		})
+	}
+
+	corrupt := append([]byte(nil), encoded...)
+	corrupt[len(corrupt)-1] ^= 1
+	if _, err := decodeEPaxosRecord(corrupt); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+		t.Fatalf("decodeEPaxosRecord corrupt v6 checksum err=%v, want %v", err, epaxos.ErrChecksumMismatch)
+	}
+}
+
+func confChangeCodecRecordKV(result epaxos.ConfChangeResult) epaxos.InstanceRecord {
+	payload := make([]byte, 9)
+	payload[0] = byte(epaxos.ConfChangeAddVoter)
+	binary.LittleEndian.PutUint64(payload[1:], 4)
+	rec := epaxos.InstanceRecord{
+		Ref:          epaxos.InstanceRef{Replica: 1, Instance: 9, Conf: 4},
+		Ballot:       epaxos.Ballot{Number: 1, Replica: 1},
+		RecordBallot: epaxos.Ballot{Number: 1, Replica: 1},
+		Status:       epaxos.StatusExecuted,
+		Seq:          9,
+		Deps:         []epaxos.InstanceNum{0, 0, 0},
+		Command: epaxos.Command{
+			Kind:         epaxos.CommandConfChange,
+			Payload:      payload,
+			ConflictKeys: [][]byte{[]byte("\xffconf")},
+		},
+		ConfChangeResult: result,
+	}
+	rec.Checksum = epaxos.ChecksumRecord(rec)
+	return rec
+}
+
+func assertConfChangeResultKV(t *testing.T, got, want epaxos.ConfChangeResult) {
+	t.Helper()
+	if got.Outcome != want.Outcome || got.Conf.ID != want.Conf.ID || len(got.Conf.Voters) != len(want.Conf.Voters) {
+		t.Fatalf("configuration result=%#v, want %#v", got, want)
+	}
+	for i := range want.Conf.Voters {
+		if got.Conf.Voters[i] != want.Conf.Voters[i] {
+			t.Fatalf("configuration result=%#v, want %#v", got, want)
+		}
+	}
+}
+
+func encodeConfChangeResultKV(result epaxos.ConfChangeResult) []byte {
+	out := binary.AppendUvarint(nil, uint64(result.Outcome))
+	out = binary.AppendUvarint(out, uint64(result.Conf.ID))
+	out = binary.AppendUvarint(out, uint64(len(result.Conf.Voters)))
+	for _, voter := range result.Conf.Voters {
+		out = binary.AppendUvarint(out, uint64(voter))
+	}
+	return out
+}
+
+func encodeEPaxosRecordV6KV(rec epaxos.InstanceRecord) []byte {
+	resultBytes := encodeConfChangeResultKV(rec.ConfChangeResult)
+	current := encodeEPaxosRecord(rec)
+	domainAt := len(current) - len(rec.Checksum) - len(resultBytes) - 3
+	withoutDomain := append([]byte(nil), current[:domainAt]...)
+	withoutDomain = append(withoutDomain, current[domainAt+1:]...)
+	legacyEnd := len(withoutDomain) - len(rec.Checksum) - len(resultBytes)
+	out := withoutDomain[:legacyEnd]
+	out[0] = 6
+	return append(out, rec.Checksum[:]...)
 }
 
 func encodeEPaxosRecordV5KV(rec epaxos.InstanceRecord) []byte {
@@ -1741,7 +2075,7 @@ func encodeEPaxosRecordV5KV(rec epaxos.InstanceRecord) []byte {
 	return append(out, rec.Checksum[:]...)
 }
 
-func checksumRecordWithoutSenderEvidenceKV(rec epaxos.InstanceRecord) [32]byte {
+func checksumLegacyRecordKV(rec epaxos.InstanceRecord, includeSenderEvidence bool) [32]byte {
 	h := blake3.New()
 	writeUint64KV := func(v uint64) {
 		var b [8]byte
@@ -1774,6 +2108,17 @@ func checksumRecordWithoutSenderEvidenceKV(rec epaxos.InstanceRecord) [32]byte {
 	writeUint64KV(uint64(len(rec.AcceptDeps)))
 	for _, dep := range rec.AcceptDeps {
 		writeUint64KV(uint64(dep))
+	}
+	if includeSenderEvidence {
+		writeUint64KV(uint64(len(rec.AcceptEvidence)))
+		for _, evidence := range rec.AcceptEvidence {
+			writeUint64KV(uint64(evidence.Sender))
+			writeUint64KV(evidence.Seq)
+			writeUint64KV(uint64(len(evidence.Deps)))
+			for _, dep := range evidence.Deps {
+				writeUint64KV(uint64(dep))
+			}
+		}
 	}
 	writeUint64KV(rec.Command.ID.Client)
 	writeUint64KV(rec.Command.ID.Sequence)
@@ -2641,14 +2986,15 @@ func TestPebbleStorageRoundTripsFastPathEligibleRecord(t *testing.T) {
 
 func TestEncodeEPaxosRecordPersistsTOQPendingMetadata(t *testing.T) {
 	record := checkedKVRecord(epaxos.InstanceRecord{
-		Ref:        epaxos.InstanceRef{Replica: 4, Instance: 21, Conf: 2},
-		Ballot:     epaxos.Ballot{Epoch: 2, Number: 3, Replica: 4},
-		Status:     epaxos.StatusCommitted,
-		Seq:        13,
-		Deps:       []epaxos.InstanceNum{2, 1, 0, 3},
-		Command:    CommandForPut(48, 1, []byte("toq-pending"), []byte("value")),
-		ProcessAt:  101,
-		TOQPending: true,
+		Ref:          epaxos.InstanceRef{Replica: 4, Instance: 21, Conf: 2},
+		Ballot:       epaxos.Ballot{Epoch: 2, Number: 3, Replica: 4},
+		Status:       epaxos.StatusCommitted,
+		Seq:          13,
+		Deps:         []epaxos.InstanceNum{2, 1, 0, 3},
+		Command:      CommandForPut(48, 1, []byte("toq-pending"), []byte("value")),
+		ProcessAt:    101,
+		TimingDomain: epaxos.TimingDomainTOQ,
+		TOQPending:   true,
 	})
 
 	got, err := decodeEPaxosRecord(encodeEPaxosRecord(record))
@@ -2677,6 +3023,7 @@ func TestEncodeDecodeEPaxosRecordPreservesAcceptDepsEvidence(t *testing.T) {
 		AcceptDeps:       []epaxos.InstanceNum{9, 10, 11},
 		Command:          CommandForPut(50, 1, []byte("accept-deps"), []byte("evidence")),
 		ProcessAt:        113,
+		TimingDomain:     epaxos.TimingDomainTOQ,
 		TOQPending:       true,
 		FastPathEligible: true,
 	})
@@ -2728,6 +3075,7 @@ func TestEncodeDecodeEPaxosRecordPreservesSenderAcceptEvidence(t *testing.T) {
 		},
 		Command:          CommandForPut(52, 1, []byte("sender-evidence"), []byte("value")),
 		ProcessAt:        377,
+		TimingDomain:     epaxos.TimingDomainTOQ,
 		TOQPending:       true,
 		FastPathEligible: true,
 	})
@@ -2774,6 +3122,7 @@ func TestEncodeDecodeEPaxosRecordPreservesRecordBallot(t *testing.T) {
 		AcceptDeps:       []epaxos.InstanceNum{18, 19, 20},
 		Command:          CommandForPut(51, 1, []byte("record-ballot"), []byte("value-ballot")),
 		ProcessAt:        233,
+		TimingDomain:     epaxos.TimingDomainTOQ,
 		TOQPending:       true,
 		FastPathEligible: true,
 	})
@@ -2854,9 +3203,9 @@ func TestDecodeEPaxosRecordV4BackfillsRecordBallot(t *testing.T) {
 			if got.Checksum == legacy.Checksum {
 				t.Fatalf("decoded checksum stayed on legacy v4 no-record-ballot value %x for %#v", got.Checksum, got)
 			}
-			wantChecksum := epaxos.ChecksumRecord(got)
-			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksum(got) {
-				t.Fatalf("decoded checksum = %x, want canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
+			wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(got)
+			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(got) {
+				t.Fatalf("decoded checksum = %x, want no-domain canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
 			}
 		})
 	}
@@ -2889,9 +3238,9 @@ func TestDecodeEPaxosRecordMigratesVersion3ChecksumWithoutAcceptEvidence(t *test
 	if got.Checksum == legacy.Checksum {
 		t.Fatalf("decoded checksum stayed on legacy no-Accept-evidence value %x for %#v", got.Checksum, got)
 	}
-	wantChecksum := epaxos.ChecksumRecord(got)
-	if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksum(got) {
-		t.Fatalf("decoded checksum = %x, want canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
+	wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(got)
+	if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(got) {
+		t.Fatalf("decoded checksum = %x, want no-domain canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
 	}
 	if got.AcceptSeq != 0 || len(got.AcceptDeps) != 0 {
 		t.Fatalf("decoded legacy v3 record invented Accept evidence AcceptSeq=%d AcceptDeps=%#v", got.AcceptSeq, got.AcceptDeps)
@@ -2981,9 +3330,9 @@ func TestDecodeEPaxosRecordMigratesPreTOQChecksums(t *testing.T) {
 			if got.Checksum == tt.record.Checksum {
 				t.Fatalf("decoded checksum stayed on pre-TOQ value %x for %#v", got.Checksum, got)
 			}
-			wantChecksum := epaxos.ChecksumRecord(got)
-			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksum(got) {
-				t.Fatalf("decoded checksum = %x, want canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
+			wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(got)
+			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(got) {
+				t.Fatalf("decoded checksum = %x, want no-domain canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
 			}
 			if got.ProcessAt != 0 || got.TOQPending {
 				t.Fatalf("decoded legacy record invented TOQ metadata ProcessAt=%d TOQPending=%v for %#v", got.ProcessAt, got.TOQPending, got)
@@ -3066,6 +3415,11 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 			wantMigrated: true,
 		},
 	}
+	for i := range tests {
+		if !tests[i].wantMigrated {
+			tests[i].record.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(tests[i].record)
+		}
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := decodeEPaxosRecord(legacyEPaxosRecordV1(tt.record))
@@ -3082,9 +3436,9 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 			} else if got.Checksum != tt.record.Checksum {
 				t.Fatalf("decoded checksum = %x, want original %x for %#v", got.Checksum, tt.record.Checksum, got)
 			}
-			wantChecksum := epaxos.ChecksumRecord(got)
-			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksum(got) {
-				t.Fatalf("decoded checksum = %x, want canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
+			wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(got)
+			if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(got) {
+				t.Fatalf("decoded checksum = %x, want no-domain canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
 			}
 			if got.Ref != tt.record.Ref || got.Ballot != tt.record.Ballot || got.Status != tt.record.Status || got.Seq != tt.record.Seq {
 				t.Fatalf("decoded metadata = %#v, want %#v", got, tt.record)
@@ -3138,9 +3492,9 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 		if got.Checksum == legacyNoFastPath.Checksum {
 			t.Fatalf("loaded checksum stayed on legacy pre-fast-path value %x for %#v", got.Checksum, got)
 		}
-		wantChecksum := epaxos.ChecksumRecord(got)
-		if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksum(got) {
-			t.Fatalf("loaded checksum = %x, want canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
+		wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(got)
+		if got.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(got) {
+			t.Fatalf("loaded checksum = %x, want no-domain canonical %x and valid for %#v", got.Checksum, wantChecksum, got)
 		}
 		if got.Ref != legacyNoFastPath.Ref || got.Ballot != legacyNoFastPath.Ballot || got.Status != legacyNoFastPath.Status || got.Seq != legacyNoFastPath.Seq {
 			t.Fatalf("loaded metadata = %#v, want %#v", got, legacyNoFastPath)

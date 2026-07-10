@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/cockroachdb/pebble"
 	"gosuda.org/moreconsensus/epaxos"
@@ -164,11 +165,28 @@ func (c *Cluster) proposeAndDrain(cmd epaxos.Command) error {
 	if proposer == nil {
 		return fmt.Errorf("kv: no live replica available for proposal")
 	}
-	_, err := proposer.Propose(cmd)
+	ref, err := proposer.Propose(cmd)
 	if err != nil {
 		return err
 	}
-	return c.Drain()
+	if err := c.Drain(); err != nil {
+		return err
+	}
+	if c.allLiveReplicasExecuted(ref) {
+		return nil
+	}
+	for range 1000 {
+		if err := c.TickAll(); err != nil {
+			return err
+		}
+		if err := c.Drain(); err != nil {
+			return err
+		}
+		if c.allLiveReplicasExecuted(ref) {
+			return nil
+		}
+	}
+	return fmt.Errorf("kv: proposal %s did not execute within deterministic tick limit", ref)
 }
 
 func (c *Cluster) firstLiveReplica() *epaxos.RawNode {
@@ -178,6 +196,28 @@ func (c *Cluster) firstLiveReplica() *epaxos.RawNode {
 		}
 	}
 	return nil
+}
+
+func (c *Cluster) allLiveReplicasExecuted(ref epaxos.InstanceRef) bool {
+	live := 0
+	for _, id := range c.ids {
+		node := c.Nodes[id]
+		if node == nil {
+			continue
+		}
+		live++
+		found := false
+		for _, executed := range node.Status().Executed {
+			if executed == ref {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return live > 0
 }
 
 // Get reads from one replica's local Pebble state.
@@ -277,12 +317,38 @@ func verifyCheckpointTargetOwnerFloor(checkpointRecords map[epaxos.InstanceRef]e
 			}
 		}
 	}
+	instancesByConf := make(map[epaxos.ConfID][]epaxos.InstanceNum, len(maxByConf))
+	for ref := range checkpointRecords {
+		if ref.Replica != target {
+			continue
+		}
+		maxInstance, needed := maxByConf[ref.Conf]
+		if !needed || ref.Instance == 0 || ref.Instance > maxInstance {
+			continue
+		}
+		instancesByConf[ref.Conf] = append(instancesByConf[ref.Conf], ref.Instance)
+	}
 	for conf, maxInstance := range maxByConf {
-		for instance := epaxos.InstanceNum(1); instance <= maxInstance; instance++ {
-			ref := epaxos.InstanceRef{Replica: target, Instance: instance, Conf: conf}
-			if _, ok := checkpointRecords[ref]; !ok {
-				return fmt.Errorf("kv: checkpoint missing target-owned prefix record %s", ref)
+		if maxInstance == 0 {
+			continue
+		}
+		instances := instancesByConf[conf]
+		sort.Slice(instances, func(i, j int) bool { return instances[i] < instances[j] })
+		expected := epaxos.InstanceNum(1)
+		complete := false
+		for _, instance := range instances {
+			if instance != expected {
+				break
 			}
+			if instance == maxInstance {
+				complete = true
+				break
+			}
+			expected++
+		}
+		if !complete {
+			ref := epaxos.InstanceRef{Replica: target, Instance: expected, Conf: conf}
+			return fmt.Errorf("kv: checkpoint missing target-owned prefix record %s", ref)
 		}
 	}
 	for liveID, records := range liveRecords {
@@ -365,6 +431,19 @@ func sameEPaxosCommand(left, right epaxos.Command) bool {
 	return true
 }
 
+// TickAll advances every live replica by one deterministic logical tick.
+// Tick driving is explicit so Drain can quiesce without manufacturing time.
+func (c *Cluster) TickAll() error {
+	for _, id := range c.ids {
+		if node := c.Nodes[id]; node != nil {
+			if err := node.Tick(); err != nil {
+				return fmt.Errorf("kv: tick replica %d: %w", id, err)
+			}
+		}
+	}
+	return nil
+}
+
 // Drain runs deterministic transport until no node has ready work.
 func (c *Cluster) Drain() error {
 	return c.drainWithLimit(1000)
@@ -393,19 +472,7 @@ func (c *Cluster) drainWithLimit(limit int) error {
 			}
 		}
 		if !progress {
-			for _, id := range c.ids {
-				rn := c.Nodes[id]
-				if rn == nil {
-					continue
-				}
-				rn.Tick()
-				if rn.HasReady() {
-					progress = true
-				}
-			}
-			if !progress {
-				return nil
-			}
+			return nil
 		}
 	}
 	return fmt.Errorf("kv: cluster did not quiesce")

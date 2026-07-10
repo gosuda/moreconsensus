@@ -79,7 +79,7 @@ func TestRestoreCheckpointCopiesAbsentAndPresentDataDirectories(t *testing.T) {
 	writeCheckpointFile(t, checkpointDir, "nested/value", "checkpoint-value")
 
 	absentData := filepath.Join(t.TempDir(), "absent", "node")
-	if err := RestoreCheckpoint(absentData, checkpointDir); err != nil {
+	if err := restoreCheckpointDirectory(absentData, checkpointDir, nil); err != nil {
 		t.Fatalf("RestoreCheckpoint absent data dir failed: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(absentData, "nested/value"))
@@ -94,7 +94,7 @@ func TestRestoreCheckpointCopiesAbsentAndPresentDataDirectories(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(presentData, "old"), []byte("old-data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := RestoreCheckpoint(presentData, checkpointDir); err != nil {
+	if err := restoreCheckpointDirectory(presentData, checkpointDir, nil); err != nil {
 		t.Fatalf("RestoreCheckpoint present data dir failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(presentData, "old")); !os.IsNotExist(err) {
@@ -277,7 +277,7 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 			}
 			sentinel := errors.New("sentinel")
 			tc.hook(t, dataDir, checkpointDir, sentinel)
-			err := RestoreCheckpoint(dataDir, checkpointDir)
+			err := restoreCheckpointDirectory(dataDir, checkpointDir, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("RestoreCheckpoint err=%v, want containing %q", err, tc.want)
 			}
@@ -297,7 +297,7 @@ func TestRestoreCheckpointFinalRenameFailureWithoutOldData(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
-	err := RestoreCheckpoint(dataDir, checkpointDir)
+	err := restoreCheckpointDirectory(dataDir, checkpointDir, nil)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("RestoreCheckpoint final rename err=%v, want %v", err, sentinel)
 	}

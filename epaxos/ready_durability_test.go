@@ -356,11 +356,11 @@ func TestAdvanceAcceptsRecordOnlyAcknowledgementWithoutExecution(t *testing.T) {
 	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
 		t.Fatalf("ready for %s = %#v", ref, rd)
 	}
-	if err := store.ApplyReady(Ready{Records: rd.Records, MustSync: rd.MustSync}); err != nil {
+	if err := store.ApplyReady(Ready{HardState: rd.HardState, Records: rd.Records, MustSync: rd.MustSync}); err != nil {
 		t.Fatal(err)
 	}
 
-	advanceOK(t, rn, Ready{Records: rd.Records, MustSync: rd.MustSync})
+	advanceOK(t, rn, Ready{HardState: rd.HardState, Records: rd.Records, MustSync: rd.MustSync})
 	if readyHasStatus(rn.pendingReady, ref, StatusExecuted) {
 		t.Fatalf("record-only acknowledgement enqueued executed record for %s: %#v", ref, rn.pendingReady.Records)
 	}
@@ -647,7 +647,7 @@ func TestAdvanceRejectsOverlongCommittedAcknowledgement(t *testing.T) {
 		Command:      Command{ID: CommandID{Client: 91, Sequence: 13}, Payload: []byte("unrelated-user"), ConflictKeys: [][]byte{[]byte("unrelated-key")}},
 	}
 	other.Checksum = ChecksumRecord(other)
-	rn.instances[otherRef] = &instance{rec: other, phase: phaseCommitted}
+	rn.installInstance(&instance{rec: other, phase: phaseCommitted})
 
 	ack := cloneReady(rd)
 	ack.Committed = append(ack.Committed, CommittedCommand{
@@ -714,40 +714,48 @@ func TestRestartWithOnlyCommittedRecordReemitsUserCommand(t *testing.T) {
 }
 
 func TestConfChangeExecutesWithoutApplicationCommit(t *testing.T) {
-	store := NewMemoryStorage()
-	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 2})
+	f := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, f)
+	seal := sealBootstrapPlan(t, f, plan)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	ready := readyBootstrapTarget(t, f, plan, snapshot)
+	ref, err := f.node.ActivateVoter(plan, snapshot, ready)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	rd := rn.Ready()
+	rd := f.node.Ready()
 	if len(rd.Committed) != 0 {
-		t.Fatalf("config change appeared as application command: %#v", rd.Committed)
+		t.Fatalf("certified membership control appeared as application command: %#v", rd.Committed)
 	}
 	if !readyHasStatus(rd, ref, StatusExecuted) {
-		t.Fatalf("config change ready for %s did not persist executed record: %#v", ref, rd.Records)
+		t.Fatalf("certified activation Ready for %s did not persist executed record: %#v", ref, rd.Records)
 	}
-	conf := rn.Status().Conf
-	if conf.ID != 2 || !conf.Contains(1) || !conf.Contains(2) {
-		t.Fatalf("config after executed change = %#v, want voters 1 and 2 at id 2", conf)
+	conf := f.node.Status().Conf
+	if !confStateEqual(conf, plan.Successor) {
+		t.Fatalf("config after certified activation = %#v, want %#v", conf, plan.Successor)
 	}
-	if err := store.ApplyReady(rd); err != nil {
+	if err := f.store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
-	advanceOK(t, rn, rd)
-	if rn.HasReady() {
-		t.Fatalf("config change left additional ready work: %#v", rn.Ready())
+	advanceOK(t, f.node, rd)
+	postDurable := f.node.Ready()
+	if postDurable.MustSync || len(postDurable.BootstrapMessages) != 1 ||
+		postDurable.BootstrapMessages[0].Type != BootstrapMsgActivationNotice {
+		t.Fatalf("post-durable activation notice Ready=%#v", postDurable)
 	}
-	stored, ok := store.Instance(ref)
+	advanceOK(t, f.node, postDurable)
+	if f.node.HasReady() {
+		t.Fatalf("certified activation left work after notice acknowledgement: %#v", f.node.Ready())
+	}
+	stored, ok := f.store.Instance(ref)
 	if !ok {
-		t.Fatalf("missing stored config change record %s", ref)
+		t.Fatalf("missing stored certified activation record %s", ref)
 	}
-	if stored.Status != StatusExecuted || stored.Command.Kind != CommandConfChange {
-		t.Fatalf("stored config change record = %#v, want executed config change", stored)
+	if stored.Status != StatusExecuted || stored.Command.Kind != CommandMembership ||
+		stored.MembershipResult.Outcome != BootstrapOutcomeActivated ||
+		stored.ConfChangeResult.Outcome != ConfChangeApplied {
+		t.Fatalf("stored certified activation record = %#v", stored)
 	}
 }
 
@@ -766,7 +774,7 @@ func advanceInvalid(t *testing.T, rn *RawNode, rd Ready) {
 }
 
 func cloneReady(rd Ready) Ready {
-	out := Ready{MustSync: rd.MustSync}
+	out := Ready{HardState: rd.HardState.Clone(), MustSync: rd.MustSync}
 	out.Records = make([]InstanceRecord, len(rd.Records))
 	for i := range rd.Records {
 		out.Records[i] = rd.Records[i].Clone()

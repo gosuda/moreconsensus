@@ -37,8 +37,15 @@ func optimizedSeedRecord(t *testing.T, rn *RawNode, rec InstanceRecord) {
 	if rec.Status >= StatusPreAccepted && rec.RecordBallot == (Ballot{}) {
 		rec.RecordBallot = rec.Ballot
 	}
+	if rec.TimingDomain == TimingDomainUntimed {
+		if rn.toqEnabled && rec.Status >= StatusPreAccepted {
+			rec.TimingDomain = TimingDomainTOQ
+		} else if rn.timeOptimization && rec.ProcessAt != 0 {
+			rec.TimingDomain = TimingDomainLogical
+		}
+	}
 	rec.Checksum = ChecksumRecord(rec)
-	rn.instances[rec.Ref] = &instance{rec: rec, phase: phaseFromStatus(rec.Status)}
+	rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status), processAt: rec.ProcessAt})
 	if rec.Status >= StatusPreAccepted {
 		rn.indexConflicts(rec)
 	}
@@ -64,6 +71,68 @@ func optimizedRequireMessage(t *testing.T, messages []Message, typ MessageType, 
 	}
 	t.Fatalf("messages do not include %s to %d: %#v", typ, to, messages)
 	return Message{}
+}
+
+func optimizedRequireCanonicalInstanceRequest(t *testing.T, msg Message, rec InstanceRecord) {
+	t.Helper()
+	if msg.Ref != rec.Ref ||
+		msg.Ballot != rec.Ballot ||
+		msg.RecordBallot != (Ballot{}) ||
+		msg.RecordStatus != StatusNone ||
+		msg.Seq != rec.Seq ||
+		!instanceNumsEqual(msg.Deps, rec.Deps) ||
+		!commandEqual(msg.Command, rec.Command) {
+		t.Fatalf("%s request = %#v, want ballot %#v, zero record metadata, seq %d deps %v command %#v", msg.Type, msg, rec.Ballot, rec.Seq, rec.Deps, rec.Command)
+	}
+}
+
+func optimizedRequireCanonicalCommitRequest(t *testing.T, msg Message, rec InstanceRecord) {
+	t.Helper()
+	if msg.Ref != rec.Ref ||
+		msg.Ballot != rec.Ballot ||
+		msg.RecordBallot != recordTupleBallot(rec) ||
+		msg.RecordBallot == (Ballot{}) ||
+		msg.RecordStatus != StatusNone ||
+		msg.Seq != rec.Seq ||
+		!instanceNumsEqual(msg.Deps, rec.Deps) ||
+		!commandEqual(msg.Command, rec.Command) {
+		t.Fatalf("commit request = %#v, want ballot %#v, record ballot %#v, zero record status, seq %d deps %v command %#v", msg, rec.Ballot, recordTupleBallot(rec), rec.Seq, rec.Deps, rec.Command)
+	}
+}
+
+func optimizedRequireCanonicalTryPreAcceptResp(t *testing.T, msg Message, ref InstanceRef, ballot Ballot, attrs Attributes) {
+	t.Helper()
+	if msg.Reject ||
+		msg.Ref != ref ||
+		msg.Ballot != ballot ||
+		msg.RecordBallot != (Ballot{}) ||
+		msg.RecordStatus != StatusPreAccepted ||
+		msg.Seq != attrs.Seq ||
+		!instanceNumsEqual(msg.Deps, attrs.Deps) ||
+		!commandEqual(msg.Command, Command{}) {
+		t.Fatalf("TryPreAccept response = %#v, want ballot %#v, preaccepted seq %d deps %v with zero record ballot and empty command", msg, ballot, attrs.Seq, attrs.Deps)
+	}
+}
+
+func optimizedRequireCanonicalTryReject(t *testing.T, msg Message, ref InstanceRef, ballot, hint Ballot, reason RejectReason, conflictRef InstanceRef, conflictStatus Status, zeroDeps []InstanceNum) {
+	t.Helper()
+	if !msg.Reject ||
+		msg.Ref != ref ||
+		msg.Ballot != ballot ||
+		msg.RejectHint != hint ||
+		msg.RejectReason != reason ||
+		msg.ConflictRef != conflictRef ||
+		msg.ConflictStatus != conflictStatus ||
+		msg.RecordBallot != (Ballot{}) ||
+		msg.RecordStatus != StatusNone ||
+		msg.Seq != 0 ||
+		!instanceNumsEqual(msg.Deps, zeroDeps) ||
+		!commandEqual(msg.Command, Command{}) ||
+		msg.AcceptSeq != 0 ||
+		len(msg.AcceptDeps) != 0 ||
+		len(msg.AcceptEvidence) != 0 {
+		t.Fatalf("TryPreAccept rejection = %#v, want ref %s ballot %#v hint %#v reason %v conflict %s/%s and zero tuple metadata", msg, ref, ballot, hint, reason, conflictRef, conflictStatus)
+	}
 }
 
 func optimizedRequireNoMessageType(t *testing.T, messages []Message, typ MessageType) {
@@ -131,14 +200,28 @@ func TestOptimizedMessageValidationAndStrings(t *testing.T) {
 		To:             1,
 		Ref:            ref,
 		Ballot:         ballot,
+		Deps:           []InstanceNum{0, 0, 0},
 		Reject:         true,
 		RejectReason:   RejectCommittedConflict,
-		RejectHint:     Ballot{Number: 2, Replica: 2},
 		ConflictRef:    InstanceRef{Replica: 2, Instance: 7, Conf: 1},
 		ConflictStatus: StatusCommitted,
 	}
 	if err := rejectResp.Validate(conf); err != nil {
 		t.Fatalf("reject TryPreAcceptResp with metadata rejected: %v", err)
+	}
+	staleResp := Message{
+		Type:         MsgTryPreAcceptResp,
+		From:         2,
+		To:           1,
+		Ref:          ref,
+		Ballot:       Ballot{Number: 2, Replica: 2},
+		Deps:         []InstanceNum{0, 0, 0},
+		Reject:       true,
+		RejectReason: RejectStaleBallot,
+		RejectHint:   Ballot{Number: 2, Replica: 2},
+	}
+	if err := staleResp.Validate(conf); err != nil {
+		t.Fatalf("canonical stale TryPreAcceptResp rejected: %v", err)
 	}
 	encoded, err := EncodeMessage(nil, rejectResp)
 	if err != nil {
@@ -153,7 +236,7 @@ func TestOptimizedMessageValidationAndStrings(t *testing.T) {
 	}
 }
 
-func TestFastPathEligibleMarksOnlyDefaultExactPreAccepts(t *testing.T) {
+func TestFastPathEligibleMarksDefaultPreAcceptWitnesses(t *testing.T) {
 	t.Run("local default proposal", func(t *testing.T) {
 		rn := optimizedNewRawNode(t, 1, 3)
 		ref, err := rn.Propose(optimizedTestCommand("local", "local-key"))
@@ -186,7 +269,7 @@ func TestFastPathEligibleMarksOnlyDefaultExactPreAccepts(t *testing.T) {
 		}
 	})
 
-	t.Run("divergent attrs", func(t *testing.T) {
+	t.Run("follower raises default-ballot attributes", func(t *testing.T) {
 		rn := optimizedNewRawNode(t, 2, 3)
 		conflict := InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 2}, Status: StatusPreAccepted, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("existing", "shared-key"), FastPathEligible: true}
 		optimizedSeedRecord(t, rn, conflict)
@@ -194,9 +277,14 @@ func TestFastPathEligibleMarksOnlyDefaultExactPreAccepts(t *testing.T) {
 		if err := rn.Step(Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("new", "shared-key")}); err != nil {
 			t.Fatal(err)
 		}
-		rec := optimizedRequireRecord(t, rn.Ready(), ref)
+		rd := rn.Ready()
+		rec := optimizedRequireRecord(t, rd, ref)
 		if rec.FastPathEligible || rec.Seq != 2 || rec.Deps[1] != 1 {
-			t.Fatalf("divergent follower preaccept record = %#v, want seq/dependency update and FastPathEligible=false", rec)
+			t.Fatalf("updated follower preaccept record = %#v, want raised attrs without durable recovery eligibility", rec)
+		}
+		resp := optimizedRequireMessage(t, rd.Messages, MsgPreAcceptResp, 1)
+		if !resp.FastPathEligible {
+			t.Fatalf("updated follower live PreAccept response lost covering fast-path eligibility: %#v", resp)
 		}
 	})
 
@@ -256,22 +344,21 @@ func TestOptimizedThreeNodeFastPathCommitsAfterOneRemoteMatch(t *testing.T) {
 	rd := rn.Ready()
 	optimizedApplyAndAdvance(t, store, rn, rd)
 	inst := rn.instances[ref]
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), RecordStatus: StatusPreAccepted, FastPathEligible: true}); err != nil {
+	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}); err != nil {
 		t.Fatal(err)
 	}
 	if inst.phase != phaseCommitted || inst.rec.Status != StatusExecuted {
 		t.Fatalf("one matching response phase/status = %d/%s, want committed/executed under optimized 3-node quorum", inst.phase, inst.rec.Status)
 	}
 	rd = rn.Ready()
-	if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusCommitted {
-		t.Fatalf("fast-path ready record = %#v, want committed", rec)
+	readyRecord := optimizedRequireRecord(t, rd, ref)
+	if readyRecord.Status != StatusCommitted {
+		t.Fatalf("fast-path ready record = %#v, want committed", readyRecord)
 	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgCommit, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusCommitted {
-			t.Fatalf("fast-path commit message to %d = %#v", to, msg)
-		}
+		optimizedRequireCanonicalCommitRequest(t, msg, readyRecord)
 	}
 	committed := requireCommittedForRef(t, rd, ref)
 	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
@@ -292,22 +379,21 @@ func TestOptimizedThreeNodeDivergentResponseFallsBackToAccept(t *testing.T) {
 	rd := rn.Ready()
 	optimizedApplyAndAdvance(t, store, rn, rd)
 	inst := rn.instances[ref]
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq + 1, Deps: append([]InstanceNum(nil), inst.rec.Deps...), RecordStatus: StatusPreAccepted}); err != nil {
+	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq + 1, Deps: append([]InstanceNum(nil), inst.rec.Deps...)}); err != nil {
 		t.Fatal(err)
 	}
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("divergent response phase/status = %d/%s, want accept/accepted", inst.phase, inst.rec.Status)
 	}
 	rd = rn.Ready()
-	if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusAccepted || rec.Seq != 2 {
-		t.Fatalf("divergent response ready record = %#v, want accepted with merged seq 2", rec)
+	accepted := optimizedRequireRecord(t, rd, ref)
+	if accepted.Status != StatusAccepted || accepted.Seq != 2 {
+		t.Fatalf("divergent response ready record = %#v, want accepted with merged seq 2", accepted)
 	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgCommit)
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgAccept, to)
-		if msg.Ref != ref || msg.Seq != 2 || msg.RecordStatus != StatusAccepted {
-			t.Fatalf("slow-path accept message to %d = %#v", to, msg)
-		}
+		optimizedRequireCanonicalInstanceRequest(t, msg, accepted)
 	}
 	if len(rd.Committed) != 0 {
 		t.Fatalf("divergent response committed application commands: %#v", rd.Committed)
@@ -359,8 +445,14 @@ func TestAcceptRecordsAndRepliesWithLocalConflictDeps(t *testing.T) {
 	}
 
 	resp := optimizedRequireMessage(t, rd.Messages, MsgAcceptResp, 1)
-	if resp.Reject || resp.RecordStatus != StatusAccepted || resp.Seq != 1 || !instanceNumsEqual(resp.Deps, chosenDeps) {
-		t.Fatalf("accept response chosen attrs = %#v, want accepted seq 1 deps %v", resp, chosenDeps)
+	if resp.Reject ||
+		resp.Ballot != rec.Ballot ||
+		resp.RecordBallot != rec.RecordBallot ||
+		resp.RecordStatus != StatusAccepted ||
+		resp.Seq != 1 ||
+		!instanceNumsEqual(resp.Deps, chosenDeps) ||
+		!commandEqual(resp.Command, Command{}) {
+		t.Fatalf("accept response chosen attrs = %#v, want ballot %#v, accepted seq 1 deps %v and empty command", resp, rec.Ballot, chosenDeps)
 	}
 	respEvidence, ok := resp.AcceptAttributes()
 	if !ok || respEvidence.Seq != wantEvidence.Seq || !instanceNumsEqual(respEvidence.Deps, wantEvidence.Deps) {
@@ -409,6 +501,7 @@ func TestAcceptRespQuorumCommitsChosenAttrsAndRecordsDepsEvidence(t *testing.T) 
 		To:           1,
 		Ref:          ref,
 		Ballot:       inst.rec.Ballot,
+		RecordBallot: inst.rec.RecordBallot,
 		Seq:          chosen.Seq,
 		Deps:         append([]InstanceNum(nil), chosen.Deps...),
 		AcceptSeq:    evidence.Seq,
@@ -441,8 +534,10 @@ func TestAcceptRespQuorumCommitsChosenAttrsAndRecordsDepsEvidence(t *testing.T) 
 	}
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgCommit, to)
-		if msg.Ref != ref || msg.RecordStatus != StatusCommitted || msg.Seq != chosen.Seq || !instanceNumsEqual(msg.Deps, chosen.Deps) {
-			t.Fatalf("commit message to %d chosen attrs = %#v, want committed seq %d deps %v", to, msg, chosen.Seq, chosen.Deps)
+		optimizedRequireCanonicalCommitRequest(t, msg, committed)
+		msgEvidence, ok := msg.AcceptAttributes()
+		if !ok || msgEvidence.Seq != evidence.Seq || !instanceNumsEqual(msgEvidence.Deps, evidence.Deps) {
+			t.Fatalf("commit message to %d evidence = seq %d deps %v ok=%v, want seq %d deps %v", to, msgEvidence.Seq, msgEvidence.Deps, ok, evidence.Seq, evidence.Deps)
 		}
 	}
 	optimizedApplyAndAdvance(t, store, rn, rd)
@@ -466,9 +561,7 @@ func TestTryPreAcceptRejectsStaleBallot(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := optimizedRequireMessage(t, rn.Ready().Messages, MsgTryPreAcceptResp, 1)
-	if !resp.Reject || resp.RejectReason != RejectStaleBallot || resp.RejectHint != higher {
-		t.Fatalf("stale TryPreAccept response = %#v, want stale rejection with hint %#v", resp, higher)
-	}
+	optimizedRequireCanonicalTryReject(t, resp, ref, higher, higher, RejectStaleBallot, InstanceRef{}, StatusNone, rn.q.deps())
 }
 
 func TestTryPreAcceptUsesAcceptDepsEvidenceToAvoidConflictRejection(t *testing.T) {
@@ -497,9 +590,7 @@ func TestTryPreAcceptUsesAcceptDepsEvidenceToAvoidConflictRejection(t *testing.T
 	}
 	rd := rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if resp.Reject || resp.RecordStatus != StatusPreAccepted || resp.Seq != 1 || !instanceNumsEqual(resp.Deps, targetDeps) {
-		t.Fatalf("TryPreAccept response = %#v, want non-reject preaccept ack with deps %v", resp, targetDeps)
-	}
+	optimizedRequireCanonicalTryPreAcceptResp(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Attributes{Seq: 1, Deps: targetDeps})
 	rec := optimizedRequireRecord(t, rd, targetRef)
 	if rec.Status != StatusPreAccepted || rec.Seq != 1 || !instanceNumsEqual(rec.Deps, targetDeps) {
 		t.Fatalf("TryPreAccept durable record = %#v, want target preaccepted with deps %v", rec, targetDeps)
@@ -535,9 +626,7 @@ func TestTryPreAcceptRejectsCommittedStaleDependencyWithoutAcceptDepsEvidence(t 
 	}
 	rd := rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if !resp.Reject || resp.RejectReason != RejectCommittedConflict || resp.ConflictRef != conflictRef || resp.ConflictStatus != StatusCommitted {
-		t.Fatalf("stale-dependency TryPreAccept response = %#v, want committed conflict %s without Accept-Deps waiver", resp, conflictRef)
-	}
+	optimizedRequireCanonicalTryReject(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Ballot{}, RejectCommittedConflict, conflictRef, StatusCommitted, rn.q.deps())
 	if inst := rn.instances[targetRef]; inst != nil && inst.rec.Status >= StatusPreAccepted {
 		t.Fatalf("stale-dependency conflict stored target without Accept-Deps evidence: %#v", inst.rec)
 	}
@@ -555,9 +644,7 @@ func TestTryPreAcceptRejectsCommittedConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := optimizedRequireMessage(t, rn.Ready().Messages, MsgTryPreAcceptResp, 1)
-	if !resp.Reject || resp.RejectReason != RejectCommittedConflict || resp.ConflictRef != conflictRef || resp.ConflictStatus != StatusCommitted {
-		t.Fatalf("committed conflict TryPreAccept response = %#v, want committed conflict %s", resp, conflictRef)
-	}
+	optimizedRequireCanonicalTryReject(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Ballot{}, RejectCommittedConflict, conflictRef, StatusCommitted, rn.q.deps())
 	if inst := rn.instances[targetRef]; inst != nil && inst.rec.Status >= StatusPreAccepted {
 		t.Fatalf("unsafe committed conflict stored target instance: %#v", inst.rec)
 	}
@@ -572,9 +659,7 @@ func TestTryPreAcceptDefersUncommittedConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := optimizedRequireMessage(t, rn.Ready().Messages, MsgTryPreAcceptResp, 1)
-	if !resp.Reject || resp.RejectReason != RejectUncommittedConflict || resp.ConflictRef != conflictRef || resp.ConflictStatus != StatusPreAccepted {
-		t.Fatalf("uncommitted conflict TryPreAccept response = %#v, want deferred conflict %s", resp, conflictRef)
-	}
+	optimizedRequireCanonicalTryReject(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Ballot{}, RejectUncommittedConflict, conflictRef, StatusPreAccepted, rn.q.deps())
 	if inst := rn.instances[targetRef]; inst != nil && inst.rec.Status >= StatusPreAccepted {
 		t.Fatalf("uncommitted conflict stored target instance instead of deferring: %#v", inst.rec)
 	}
@@ -591,11 +676,12 @@ func TestTryPreAcceptStatusNoneQuorumStillStartsNoopAccept(t *testing.T) {
 	}
 	rd := rn.Ready()
 	optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	optimizedRequireCanonicalInstanceRequest(t, accept, inst.rec)
 }
 
 func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
-	t.Run("below optimized witness quorum falls back to accept", func(t *testing.T) {
+	t.Run("below optimized witness quorum takes the slow accept path", func(t *testing.T) {
 		ref := InstanceRef{Replica: 2, Instance: 11, Conf: 1}
 		rn, inst, ballot := optimizedStartRecovery(t, 7, ref)
 		cmd := optimizedTestCommand("recover", "recover-key")
@@ -612,11 +698,12 @@ func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
 			}
 		}
 		if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
-			t.Fatalf("one conceptual witness phase/record = %d/%#v, want accept/accepted without try-preaccept", inst.phase, inst.rec)
+			t.Fatalf("below-witness recovery phase/record = %d/%#v, want direct slow accept", inst.phase, inst.rec)
 		}
 		rd := rn.Ready()
 		optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
-		optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+		accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+		optimizedRequireCanonicalInstanceRequest(t, accept, inst.rec)
 		if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusAccepted || rec.FastPathEligible {
 			t.Fatalf("below-witness recovery record = %#v, want non-fast-path accepted record", rec)
 		}
@@ -644,7 +731,8 @@ func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
 			t.Fatalf("prepare quorum phase = %d, want try-preaccept after one optimized five-node conceptual witness", inst.phase)
 		}
 		rd := rn.Ready()
-		optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, 4)
+		try := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, 4)
+		optimizedRequireCanonicalInstanceRequest(t, try, inst.rec)
 		for _, msg := range rd.Messages {
 			if msg.Type == MsgTryPreAccept && msg.FastPathEligible {
 				t.Fatalf("TryPreAccept message carried FastPathEligible marker: %#v", msg)
@@ -670,7 +758,8 @@ func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
 		}
 		rd = rn.Ready()
 		optimizedRequireNoMessageType(t, rd.Messages, MsgCommit)
-		optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+		accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+		optimizedRequireCanonicalInstanceRequest(t, accept, inst.rec)
 		if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusAccepted || rec.FastPathEligible {
 			t.Fatalf("five-node witness quorum recovery record = %#v, want non-fast-path accepted record", rec)
 		}
@@ -750,8 +839,8 @@ func TestPrepareRecoveryChoosesHighestPersistedRecordBallot(t *testing.T) {
 	highCmd := optimizedTestCommand("high-record-ballot", "record-ballot-filter-key")
 	lowDeps := []InstanceNum{0, 7, 0, 0, 0}
 	highDeps := []InstanceNum{0, 0, 3, 0, 0}
-	lowRecordBallot := Ballot{Number: 1, Replica: 2}
-	highRecordBallot := Ballot{Number: 4, Replica: 3}
+	lowRecordBallot := Ballot{Replica: ref.Replica}
+	highRecordBallot := ballot
 	low := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: lowRecordBallot, RecordStatus: StatusAccepted, Seq: 2, Deps: lowDeps, Command: lowCmd}
 	high := Message{Type: MsgPrepareResp, From: 3, To: 1, Ref: ref, Ballot: ballot, RecordBallot: highRecordBallot, RecordStatus: StatusAccepted, Seq: 5, Deps: highDeps, Command: highCmd}
 
@@ -775,10 +864,11 @@ func TestPrepareRecoveryChoosesHighestPersistedRecordBallot(t *testing.T) {
 	if rec.Status != StatusAccepted || rec.Seq != high.Seq || !instanceNumsEqual(rec.Deps, highDeps) {
 		t.Fatalf("durable recovered record = %#v, want accepted seq %d deps %v from highest persisted record ballot %v", rec, high.Seq, highDeps, highRecordBallot)
 	}
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	optimizedRequireCanonicalInstanceRequest(t, accept, rec)
 }
 
-func TestTryPreAcceptRecoveryCountsInitialLeaderImplicitWitness(t *testing.T) {
+func TestTryPreAcceptRecoveryCountsProvenInitialLeaderWhenOwnerIsStopped(t *testing.T) {
 	ref := InstanceRef{Replica: 2, Instance: 32, Conf: 1}
 	rn, inst, ballot := optimizedStartRecovery(t, 3, ref)
 	cmd := optimizedTestCommand("implicit-leader-witness", "implicit-leader-witness-key")
@@ -787,20 +877,13 @@ func TestTryPreAcceptRecoveryCountsInitialLeaderImplicitWitness(t *testing.T) {
 	if err := rn.Step(resp); err != nil {
 		t.Fatal(err)
 	}
-	if inst.phase == phaseTryPreAccept {
-		rd := rn.Ready()
-		optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, 3)
-		advanceOK(t, rn, rd)
-
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 3, To: 1, Ref: ref, Ballot: ballot, Seq: attrs.Seq, Deps: attrs.Deps, RecordStatus: StatusPreAccepted}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
-		t.Fatalf("implicit leader witness plus one remote TryPreAccept OK phase/status = %d/%s, want accept/%s; tryOK=%#v", inst.phase, inst.rec.Status, StatusAccepted, inst.tryOK)
+		t.Fatalf("stopped-owner recovery phase/status = %d/%s, want accept/%s from one proven witness plus implicit initial leader; tryOK=%#v", inst.phase, inst.rec.Status, StatusAccepted, inst.tryOK)
 	}
 	rd := rn.Ready()
-	optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
+	optimizedRequireNoMessageType(t, rd.Messages, MsgTryPreAccept)
+	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
+	optimizedRequireCanonicalInstanceRequest(t, accept, inst.rec)
 }
 
 func optimizedInstallTryRecoveryCandidate(t *testing.T, rn *RawNode, ref InstanceRef, cmd Command, attrs Attributes, impossibleFastQuorumMembers ...ReplicaID) *instance {
@@ -916,8 +999,9 @@ func TestTryPreAcceptCommittedStaleDependencyEvidenceResendsIgnoreMarker(t *test
 	if resend.Type != MsgTryPreAccept {
 		t.Fatalf("covered committed-conflict evidence messages = %#v, want resent TryPreAccept with IgnoreDependency.Ref %s", rd.Messages, deltaRef)
 	}
-	if resend.Ref != gammaRef || resend.Seq != gammaAttrs.Seq || !instanceNumsEqual(resend.Deps, gammaDeps) || resend.RecordStatus != StatusPreAccepted {
-		t.Fatalf("ignore-marker resend = %#v, want candidate %s preaccepted at seq %d deps %v", resend, gammaRef, gammaAttrs.Seq, gammaDeps)
+	optimizedRequireCanonicalInstanceRequest(t, resend, inst.rec)
+	if resend.IgnoreDependency.Ref != deltaRef {
+		t.Fatalf("ignore-marker resend = %#v, want ignored dependency %s", resend, deltaRef)
 	}
 }
 
@@ -953,9 +1037,7 @@ func TestTryPreAcceptIgnoreMarkerAllowsCommittedStaleDependency(t *testing.T) {
 	}
 	rd := rn.Ready()
 	reject := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if !reject.Reject || reject.RejectReason != RejectCommittedConflict || reject.ConflictRef != deltaRef || reject.ConflictStatus != StatusCommitted {
-		t.Fatalf("unmarked TryPreAccept response = %#v, want committed conflict %s", reject, deltaRef)
-	}
+	optimizedRequireCanonicalTryReject(t, reject, gammaRef, withoutMarker.Ballot, Ballot{}, RejectCommittedConflict, deltaRef, StatusCommitted, rn.q.deps())
 	if len(rd.Records) != 0 {
 		t.Fatalf("unmarked committed conflict persisted candidate records: %#v", rd.Records)
 	}
@@ -968,9 +1050,7 @@ func TestTryPreAcceptIgnoreMarkerAllowsCommittedStaleDependency(t *testing.T) {
 	}
 	rd = rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if resp.Reject || resp.RecordStatus != StatusPreAccepted || resp.Seq != withMarker.Seq || !instanceNumsEqual(resp.Deps, gammaDeps) {
-		t.Fatalf("ignore-marker TryPreAccept response = %#v, want preaccept OK for %s at seq %d deps %v", resp, gammaRef, withMarker.Seq, gammaDeps)
-	}
+	optimizedRequireCanonicalTryPreAcceptResp(t, resp, gammaRef, withMarker.Ballot, Attributes{Seq: withMarker.Seq, Deps: gammaDeps})
 	rec := optimizedRequireRecord(t, rd, gammaRef)
 	if rec.Status != StatusPreAccepted || rec.Seq != withMarker.Seq || !instanceNumsEqual(rec.Deps, gammaDeps) {
 		t.Fatalf("ignore-marker durable record = %#v, want candidate %s preaccepted at seq %d deps %v", rec, gammaRef, withMarker.Seq, gammaDeps)
@@ -1071,9 +1151,7 @@ func TestTryPreAcceptCommittedStaleDependencyEvidenceOmittingCandidateFallsBackT
 		t.Fatalf("fail-closed accepted record = %#v, want non-fast slow accept with deps %v", accepted, gammaDeps)
 	}
 	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 2)
-	if accept.Ref != gammaRef || accept.RecordStatus != StatusAccepted || !instanceNumsEqual(accept.Deps, gammaDeps) {
-		t.Fatalf("fail-closed accept message = %#v, want candidate slow accept with deps %v", accept, gammaDeps)
-	}
+	optimizedRequireCanonicalInstanceRequest(t, accept, accepted)
 	for _, msg := range rd.Messages {
 		if msg.Type == MsgTryPreAccept && msg.IgnoreDependency.Ref == deltaRef {
 			t.Fatalf("disqualifying evidence emitted unsafe ignore-marker TryPreAccept: %#v in %#v", msg, rd.Messages)
@@ -1100,9 +1178,7 @@ func TestTryPreAcceptUncommittedConflictLeaderInFastQuorumStartsAccept(t *testin
 		t.Fatalf("leader-in-fast-quorum accepted record = %#v, want non-fast accepted attrs %v", rec, attrs)
 	}
 	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
-	if accept.Ref != currentRef || accept.RecordStatus != StatusAccepted || !instanceNumsEqual(accept.Deps, attrs.Deps) {
-		t.Fatalf("leader-in-fast-quorum accept to conflict leader = %#v, want current candidate accepted attrs %v", accept, attrs)
-	}
+	optimizedRequireCanonicalInstanceRequest(t, accept, rec)
 	optimizedRequireNoMessageType(t, rd.Messages, MsgPrepare)
 	if _, ok := rn.instances[conflictRef]; ok {
 		t.Fatalf("leader-in-fast-quorum rejection started dependency recovery for %s instead of accepting current candidate", conflictRef)
@@ -1218,9 +1294,7 @@ func TestTryPreAcceptDeferredCycleLeaderInFastQuorumStartsAccept(t *testing.T) {
 		t.Fatalf("deferred-cycle accepted record = %#v, want current candidate accepted with deps %v", rec, currentDeps)
 	}
 	accept := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
-	if accept.Ref != currentRef || accept.RecordStatus != StatusAccepted || !instanceNumsEqual(accept.Deps, currentDeps) {
-		t.Fatalf("deferred-cycle accept to deferred command leader = %#v, want current candidate accepted deps %v", accept, currentDeps)
-	}
+	optimizedRequireCanonicalInstanceRequest(t, accept, rec)
 	optimizedRequireNoMessageType(t, rd.Messages, MsgPrepare)
 }
 
@@ -1264,9 +1338,7 @@ func TestCommitPreservesAcceptDepsEvidenceForLaterTryPreAccept(t *testing.T) {
 	}
 	rd := rn.Ready()
 	tryResp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if tryResp.Reject {
-		t.Fatalf("TryPreAccept rejected despite preserved Accept-Deps evidence depending on candidate: %#v", tryResp)
-	}
+	optimizedRequireCanonicalTryPreAcceptResp(t, tryResp, targetRef, Ballot{Number: 1, Replica: 1}, Attributes{Seq: 1, Deps: targetDeps})
 	if rec := optimizedRequireRecord(t, rd, targetRef); rec.Status != StatusPreAccepted {
 		t.Fatalf("TryPreAccept record after covered committed conflict = %#v, want preaccepted target", rec)
 	}
@@ -1313,9 +1385,7 @@ func TestCommitMessageAcceptDepsEvidenceAllowsLaterTryPreAccept(t *testing.T) {
 	}
 	rd := rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if resp.Reject {
-		t.Fatalf("TryPreAccept rejected despite committed conflict's message-carried Accept-Deps evidence depending on candidate: %#v", resp)
-	}
+	optimizedRequireCanonicalTryPreAcceptResp(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Attributes{Seq: 1, Deps: targetDeps})
 	rec := optimizedRequireRecord(t, rd, targetRef)
 	if rec.Status != StatusPreAccepted || rec.Seq != 1 || !instanceNumsEqual(rec.Deps, targetDeps) {
 		t.Fatalf("TryPreAccept record after message-evidence committed conflict = %#v, want preaccepted seq 1 deps %v", rec, targetDeps)
@@ -1348,10 +1418,9 @@ func TestTryPreAcceptAllowsConflictWhoseChosenAttrsDependOnCandidate(t *testing.
 	}
 	rd := rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if resp.Reject {
-		t.Fatalf("TryPreAccept rejected conflict whose chosen attrs already depend on candidate: %#v", resp)
-	}
-	if rec := optimizedRequireRecord(t, rd, targetRef); rec.Status != StatusPreAccepted {
+	rec := optimizedRequireRecord(t, rd, targetRef)
+	optimizedRequireCanonicalTryPreAcceptResp(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, rec.Attributes())
+	if rec.Status != StatusPreAccepted {
 		t.Fatalf("TryPreAccept record after chosen-covered conflict = %#v, want preaccepted target", rec)
 	}
 }
@@ -1378,10 +1447,8 @@ func TestTryPreAcceptAllowsSameLeaderDependentPreacceptedConflict(t *testing.T) 
 	}
 	rd := rn.Ready()
 	resp := optimizedRequireMessage(t, rd.Messages, MsgTryPreAcceptResp, 1)
-	if resp.Reject {
-		t.Fatalf("TryPreAccept rejected same-leader preaccepted dependency with equal seq: %#v", resp)
-	}
 	rec := optimizedRequireRecord(t, rd, targetRef)
+	optimizedRequireCanonicalTryPreAcceptResp(t, resp, targetRef, Ballot{Number: 1, Replica: 1}, Attributes{Seq: 1, Deps: targetDeps})
 	if rec.Status != StatusPreAccepted || rec.Seq != 1 || !instanceNumsEqual(rec.Deps, targetDeps) {
 		t.Fatalf("same-leader dependent TryPreAccept record = %#v, want preaccepted seq 1 deps %v", rec, targetDeps)
 	}

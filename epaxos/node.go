@@ -3,6 +3,7 @@ package epaxos
 import (
 	"bytes"
 	"container/heap"
+	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -38,18 +39,19 @@ type tryEvidenceKey struct {
 }
 
 type instance struct {
-	rec          InstanceRecord
-	phase        phase
-	preOK        map[ReplicaID]attrVote
-	accOK        map[ReplicaID]struct{}
-	prepareOK    map[ReplicaID]InstanceRecord
-	tryOK        map[ReplicaID]struct{}
-	tryDeferred  map[InstanceRef]struct{}
-	tryIgnored   map[InstanceRef]struct{}
-	createdTick  uint64
-	waitDeadline uint64
-	processAt    uint64
-	generation   uint64
+	rec             InstanceRecord
+	phase           phase
+	preOK           map[ReplicaID]attrVote
+	accOK           map[ReplicaID]struct{}
+	prepareOK       map[ReplicaID]InstanceRecord
+	tryOK           map[ReplicaID]struct{}
+	tryDeferred     map[InstanceRef]struct{}
+	prepareEvidence map[ReplicaID]InstanceRecord
+	tryIgnored      map[InstanceRef]struct{}
+	createdTick     uint64
+	waitDeadline    uint64
+	processAt       uint64
+	generation      uint64
 }
 
 type timerKind uint8
@@ -70,6 +72,71 @@ type timer struct {
 	index    int
 }
 
+type preAcceptDomain uint8
+
+const (
+	preAcceptLogical preAcceptDomain = iota + 1
+	preAcceptTOQ
+)
+
+type deferredPreAcceptKey struct {
+	domain preAcceptDomain
+	ref    InstanceRef
+	ballot Ballot
+	from   ReplicaID
+}
+
+type deferredPreAccept struct {
+	key     deferredPreAcceptKey
+	message Message
+	index   int
+}
+
+type deferredPreAcceptHeap []*deferredPreAccept
+
+func (h deferredPreAcceptHeap) Len() int { return len(h) }
+func (h deferredPreAcceptHeap) Less(i, j int) bool {
+	a, b := h[i].message, h[j].message
+	if preAcceptMessageLess(a, b) {
+		return true
+	}
+	if preAcceptMessageLess(b, a) {
+		return false
+	}
+	if a.Ballot.Epoch != b.Ballot.Epoch {
+		return a.Ballot.Epoch < b.Ballot.Epoch
+	}
+	if a.Ballot.Number != b.Ballot.Number {
+		return a.Ballot.Number < b.Ballot.Number
+	}
+	return a.Ballot.Replica < b.Ballot.Replica
+}
+func (h deferredPreAcceptHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *deferredPreAcceptHeap) Push(x any) {
+	entry := x.(*deferredPreAccept)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+func (h *deferredPreAcceptHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	entry := old[last]
+	old[last] = nil
+	entry.index = -1
+	*h = old[:last]
+	return entry
+}
+
+type toqRuntime struct {
+	conf   ConfState
+	delays map[ReplicaID]uint64
+	group  []ReplicaID
+}
+
 type timerHeap []timer
 
 func (h timerHeap) Len() int { return len(h) }
@@ -77,25 +144,54 @@ func (h timerHeap) Less(i, j int) bool {
 	if h[i].deadline != h[j].deadline {
 		return h[i].deadline < h[j].deadline
 	}
+	if h[i].ref.Conf != h[j].ref.Conf {
+		return h[i].ref.Conf < h[j].ref.Conf
+	}
 	if h[i].ref.Replica != h[j].ref.Replica {
 		return h[i].ref.Replica < h[j].ref.Replica
 	}
 	if h[i].ref.Instance != h[j].ref.Instance {
 		return h[i].ref.Instance < h[j].ref.Instance
 	}
-	return h[i].kind < h[j].kind
+	if h[i].kind != h[j].kind {
+		return h[i].kind < h[j].kind
+	}
+	return h[i].gen < h[j].gen
 }
 func (h timerHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *timerHeap) Push(x any)   { *h = append(*h, x.(timer)) }
-func (h *timerHeap) Pop() any     { old := *h; n := len(old); x := old[n-1]; *h = old[:n-1]; return x }
+func (h *timerHeap) Push(x any) {
+	entry := x.(timer)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+func (h *timerHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	entry := old[last]
+	old[last] = timer{}
+	entry.index = -1
+	*h = old[:last]
+	return entry
+}
 
 // RawNode is a deterministic raft-like EPaxos state machine.
 type RawNode struct {
-	id          ReplicaID
-	q           quorum
-	confHistory map[ConfID]ConfState
-	storage     Storage
-	zeroCopy    bool
+	id                  ReplicaID
+	q                   quorum
+	confHistory         map[ConfID]ConfState
+	storage             Storage
+	zeroCopy            bool
+	cluster             ClusterID
+	localIdentity       VoterIdentity
+	voterIdentities     map[ReplicaID]VoterIdentity
+	bootstrapPrivateKey []byte
+	localVoter          LocalVoterState
+	durableLocalVoter   LocalVoterState
+	bootstrapPlans      map[BootstrapID]*bootstrapState
+	bootstrapByBase     map[ConfID]BootstrapID
+	closedConfigs       map[ConfID]ClosedConfig
+	allocatorFloor      InstanceNum
+	bootstrapDurability []bootstrapDurabilityAction
 
 	retryTicks            uint64
 	recoveryTicks         uint64
@@ -103,77 +199,256 @@ type RawNode struct {
 	timeOptimizationTicks uint64
 	toqEnabled            bool
 	toqClock              func() uint64
-	toqOneWayDelay        map[ReplicaID]uint64
-	toqSyncGroup          []ReplicaID
+	toqRuntimes           map[ConfID]toqRuntime
+	toqActive             *toqRuntime
+	toqSeen               bool
+	toqLastNow            uint64
+	toqClosed             bool
+	toqClosedThrough      uint64
+	maxDeferredPreAccepts int
 	maxReadyMessages      int
 
-	tick              uint64
-	nextInstance      InstanceNum
-	instances         map[InstanceRef]*instance
-	conflicts         map[string]map[ReplicaID]InstanceRef
-	executed          map[InstanceRef]struct{}
-	pendingConf       bool
-	timers            timerHeap
-	pendingReady      Ready
-	awaitAdvance      bool
-	delayedPreAccepts []Message
-	tryEvidenceChecks map[tryEvidenceKey]map[ReplicaID]InstanceRecord
+	tick                            uint64
+	currentHardState                HardState
+	acknowledgedHardState           HardState
+	nextInstance                    InstanceNum
+	instances                       map[InstanceRef]*instance
+	conflicts                       map[string]map[ReplicaID]InstanceRef
+	executed                        executedTracker
+	pendingConf                     bool
+	appliedConfByBase               map[ConfID]InstanceRef
+	timers                          timerHeap
+	pendingReady                    Ready
+	nextReady                       Ready
+	frozenReady                     Ready
+	awaitAdvance                    bool
+	logicalPreAccepts               deferredPreAcceptHeap
+	toqPreAccepts                   deferredPreAcceptHeap
+	deferredIndex                   map[deferredPreAcceptKey]*deferredPreAccept
+	tryEvidenceChecks               map[tryEvidenceKey]map[ReplicaID]InstanceRecord
+	committedThrough                map[instanceLane]InstanceNum
+	maxDependencyRecoveriesPerDrive int
+	maxConcurrentRecoveries         int
+	dependencyRecoveryStartsLeft    int
+	driveDepth                      int
+	lastRecoverySource              recoverySource
+	hasRecoverySource               bool
+	executionWorkspace              executionWorkspace
 }
 
-func configureTOQ(cfg Config, q quorum) (func() uint64, map[ReplicaID]uint64, []ReplicaID, error) {
+func timingDomainFromMessage(message Message) TimingDomain {
+	if message.TOQ {
+		return TimingDomainTOQ
+	}
+	if message.ProcessAt != 0 {
+		return TimingDomainLogical
+	}
+	return TimingDomainUntimed
+}
+
+func recordUsesTOQ(record InstanceRecord) bool {
+	return record.TimingDomain == TimingDomainTOQ
+}
+
+func (n *RawNode) timingDomainEnabled(domain TimingDomain) bool {
+	switch domain {
+	case TimingDomainUntimed:
+		return !n.timeOptimization && !n.toqEnabled
+	case TimingDomainLogical:
+		return n.timeOptimization
+	case TimingDomainTOQ:
+		return n.toqEnabled
+	default:
+		return false
+	}
+}
+
+func messageCarriesValue(message Message) bool {
+	switch message.Type {
+	case MsgPreAccept, MsgAccept, MsgCommit, MsgTryPreAccept:
+		return true
+	case MsgPrepareResp, MsgEvidenceResp:
+		return message.RecordStatus >= StatusPreAccepted
+	case MsgTryPreAcceptResp:
+		return (!message.Reject && message.RecordStatus >= StatusPreAccepted) ||
+			(message.Reject && message.RejectReason == RejectAcceptedTarget)
+	default:
+		return false
+	}
+}
+
+func (n *RawNode) messageTimingDomainEnabled(message Message) bool {
+	domain := timingDomainFromMessage(message)
+	if n.timingDomainEnabled(domain) || message.Command.Kind == CommandNoop || message.Command.Kind == CommandMembership {
+		return true
+	}
+	if domain != TimingDomainUntimed {
+		return false
+	}
+	switch message.Type {
+	case MsgAccept, MsgCommit:
+	default:
+		return false
+	}
+	current := n.instances[message.Ref]
+	return current != nil &&
+		current.rec.TimingDomain != TimingDomainUntimed &&
+		commandEqual(current.rec.Command, message.Command)
+}
+
+func configureTOQ(cfg Config) (func() uint64, error) {
 	if !cfg.TOQ {
-		return nil, nil, nil, nil
+		if cfg.TOQClock != nil || cfg.TOQRuntime != nil {
+			return nil, fmt.Errorf("%w: TOQ inputs require TOQ mode", ErrInvalidConfig)
+		}
+		return nil, nil
 	}
 	if cfg.TimeOptimization {
-		return nil, nil, nil, fmt.Errorf("%w: TOQ and TimeOptimization are separate modes", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: TOQ and TimeOptimization are separate modes", ErrInvalidConfig)
 	}
 	if cfg.TOQClock == nil {
-		return nil, nil, nil, fmt.Errorf("%w: TOQ requires a synchronized clock", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: TOQ requires a caller-managed clock", ErrInvalidConfig)
 	}
-	group := append([]ReplicaID(nil), cfg.TOQSyncGroup...)
+	return cfg.TOQClock, nil
+}
+
+func normalizeTOQRuntime(runtime TOQRuntimeConfig, local ReplicaID) (toqRuntime, error) {
+	if runtime.Conf.ID == 0 {
+		return toqRuntime{}, fmt.Errorf("%w: TOQ runtime configuration id is zero", ErrInvalidConfig)
+	}
+	q, err := newQuorum(runtime.Conf.Voters)
+	if err != nil {
+		return toqRuntime{}, err
+	}
+	q.conf.ID = runtime.Conf.ID
+	group := append([]ReplicaID(nil), runtime.SyncGroup...)
 	if len(group) == 0 {
 		group = append(group, q.conf.Voters...)
 	}
-	delays := make(map[ReplicaID]uint64, len(group))
-	seen := make(map[ReplicaID]struct{}, len(group))
-	for _, id := range group {
+	delays := make(map[ReplicaID]uint64, len(runtime.OneWayDelay)+1)
+	for id, delay := range runtime.OneWayDelay {
 		if !q.contains(id) {
-			return nil, nil, nil, fmt.Errorf("%w: TOQ sync group contains non-voter", ErrInvalidConfig)
-		}
-		if _, ok := seen[id]; ok {
-			return nil, nil, nil, fmt.Errorf("%w: TOQ sync group duplicate voter", ErrInvalidConfig)
-		}
-		seen[id] = struct{}{}
-		delay, ok := cfg.TOQOneWayDelay[id]
-		if !ok && id != cfg.ID {
-			return nil, nil, nil, fmt.Errorf("%w: TOQ missing one-way delay", ErrInvalidConfig)
+			return toqRuntime{}, fmt.Errorf("%w: TOQ delay contains non-voter %d", ErrInvalidConfig, id)
 		}
 		delays[id] = delay
 	}
-	return cfg.TOQClock, delays, group, nil
-}
-func (n *RawNode) preAcceptOrderingEnabled() bool { return n.timeOptimization || n.toqEnabled }
-
-func (n *RawNode) preAcceptNow() uint64 {
-	if n.toqEnabled {
-		return n.toqClock()
-	}
-	return n.tick
-}
-
-func (n *RawNode) nextTOQProcessAt() uint64 {
-	now := n.toqClock()
-	processAt := now
-	for _, id := range n.toqSyncGroup {
-		candidate := now + n.toqOneWayDelay[id]
-		if candidate > processAt {
-			processAt = candidate
+	seen := make(map[ReplicaID]struct{}, len(group))
+	for _, id := range group {
+		if !q.contains(id) {
+			return toqRuntime{}, fmt.Errorf("%w: TOQ sync group contains non-voter %d", ErrInvalidConfig, id)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return toqRuntime{}, fmt.Errorf("%w: TOQ sync group duplicates voter %d", ErrInvalidConfig, id)
+		}
+		seen[id] = struct{}{}
+		if _, ok := delays[id]; !ok {
+			if id != local {
+				return toqRuntime{}, fmt.Errorf("%w: TOQ sync group is missing delay for voter %d", ErrInvalidConfig, id)
+			}
+			delays[id] = 0
 		}
 	}
-	return processAt
+	return toqRuntime{conf: q.conf.Clone(), delays: delays, group: group}, nil
 }
+
+func (n *RawNode) activateTOQRuntime(conf ConfState) {
+	if !n.toqEnabled {
+		return
+	}
+	runtime, ok := n.toqRuntimes[conf.ID]
+	if !ok || !sameReplicaIDs(runtime.conf.Voters, conf.Voters) {
+		n.toqActive = nil
+		return
+	}
+	active := runtime
+	n.toqActive = &active
+}
+
+// RefreshTOQConfig validates, clones, and stages exact timing inputs for one
+// configuration. Refreshing operational data does not mutate consensus state.
+func (n *RawNode) RefreshTOQConfig(runtime TOQRuntimeConfig) error {
+	if !n.toqEnabled {
+		return fmt.Errorf("%w: node is not in TOQ mode", ErrInvalidConfig)
+	}
+	normalized, err := normalizeTOQRuntime(runtime, n.id)
+	if err != nil {
+		return err
+	}
+	if known, ok := n.confHistory[normalized.conf.ID]; ok {
+		if !sameReplicaIDs(known.Voters, normalized.conf.Voters) {
+			return fmt.Errorf("%w: %w: voters do not match known configuration %d", ErrMessageRejected, ErrTOQConfigUnavailable, normalized.conf.ID)
+		}
+	} else if normalized.conf.ID <= n.q.conf.ID {
+		return fmt.Errorf("%w: %w: unknown non-future configuration %d", ErrMessageRejected, ErrTOQConfigUnavailable, normalized.conf.ID)
+	}
+	n.toqRuntimes[normalized.conf.ID] = normalized
+	if normalized.conf.ID == n.q.conf.ID {
+		n.activateTOQRuntime(n.q.conf)
+	}
+	return nil
+}
+
+func checkedLogicalAdd(now, after uint64) (uint64, error) {
+	if ^uint64(0)-now < after {
+		return 0, ErrLogicalTimeExhausted
+	}
+	return now + after, nil
+}
+
+func checkedTOQAdd(now, delay uint64) (uint64, error) {
+	if ^uint64(0)-now < delay {
+		return 0, ErrTOQTimestampOverflow
+	}
+	return now + delay, nil
+}
+
+func checkedLogicalDeadline(now, after uint64) (uint64, error) {
+	if after == 0 {
+		after = 1
+	}
+	return checkedLogicalAdd(now, after)
+}
+
+func (n *RawNode) sampleTOQClock() (uint64, error) {
+	now := n.toqClock()
+	if n.toqSeen && now < n.toqLastNow {
+		return 0, ErrTOQClockRollback
+	}
+	return now, nil
+}
+
+func (n *RawNode) nextTOQProcessAt(now uint64) (uint64, error) {
+	if n.toqActive == nil {
+		return 0, fmt.Errorf("%w: %w", ErrMessageRejected, ErrTOQConfigUnavailable)
+	}
+	maxDelay := uint64(0)
+	for _, id := range n.toqActive.group {
+		if delay := n.toqActive.delays[id]; delay > maxDelay {
+			maxDelay = delay
+		}
+	}
+	processAt, err := checkedTOQAdd(now, maxDelay)
+	if err != nil {
+		return 0, err
+	}
+	if n.toqClosed && processAt <= n.toqClosedThrough {
+		processAt, err = checkedTOQAdd(n.toqClosedThrough, 1)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return processAt, nil
+}
+
 func (n *RawNode) localTOQPreAcceptMessage(inst *instance) Message {
 	return Message{Type: MsgPreAccept, From: n.id, To: n.id, Ref: inst.rec.Ref, ProcessAt: inst.rec.ProcessAt, TOQ: true, Ballot: inst.rec.Ballot, Command: inst.rec.Command.Borrow(), RecordStatus: inst.rec.Status}
+}
+
+func saturatingSeqIncrement(value uint64) uint64 {
+	if value == ^uint64(0) {
+		return value
+	}
+	return value + 1
 }
 
 func recordHasValue(status Status) bool {
@@ -184,50 +459,259 @@ func recordTupleBallot(rec InstanceRecord) Ballot {
 	return rec.RecordBallot
 }
 
+func commandValidForConfiguration(command Command, ref InstanceRef, conf ConfState) bool {
+	switch command.Kind {
+	case CommandUser:
+		return true
+	case CommandNoop:
+		return command.ID == (CommandID{}) && len(command.Payload) == 0 && len(command.ConflictKeys) == 0
+	case CommandConfChange:
+		if ref.Conf == ^ConfID(0) || len(command.Payload) != 9 {
+			return false
+		}
+		change := ConfChange{
+			Type:    ConfChangeType(command.Payload[0]),
+			Replica: ReplicaID(binary.LittleEndian.Uint64(command.Payload[1:])),
+		}
+		_, err := confChangeQuorumFrom(conf, change)
+		return err == nil
+	case CommandMembership:
+		return membershipCommandValidForRef(command, ref, conf)
+	default:
+		return false
+	}
+}
+
+func confStateIsZero(conf ConfState) bool {
+	return conf.ID == 0 && len(conf.Voters) == 0
+}
+
+func validateConfChangeResult(rec InstanceRecord) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("%w: durable record %s %s", ErrInvalidConfig, rec.Ref, reason)
+	}
+	result := rec.ConfChangeResult
+	if (rec.Command.Kind != CommandConfChange && rec.Command.Kind != CommandMembership) || rec.Status != StatusExecuted {
+		if result.Outcome != ConfChangeOutcomeUnspecified || !confStateIsZero(result.Conf) {
+			return invalid("has a configuration result outside an executed configuration command")
+		}
+		return nil
+	}
+	if rec.Command.Kind == CommandMembership {
+		if err := validateMembershipResult(rec); err != nil {
+			return err
+		}
+		if rec.MembershipResult.Outcome == BootstrapOutcomeUnspecified {
+			if result.Outcome != ConfChangeOutcomeUnspecified || !confStateIsZero(result.Conf) {
+				return invalid("nonterminal membership command has a configuration result")
+			}
+			return nil
+		}
+		if rec.MembershipResult.Outcome == BootstrapOutcomeAborted {
+			if result.Outcome != ConfChangeOutcomeUnspecified || !confStateIsZero(result.Conf) {
+				return invalid("aborted membership command changed configuration")
+			}
+			return nil
+		}
+	}
+	switch result.Outcome {
+	case ConfChangeApplied:
+		if rec.Ref.Conf == ^ConfID(0) || result.Conf.ID != rec.Ref.Conf+1 {
+			return invalid("has an invalid applied successor id")
+		}
+		q, err := newQuorum(result.Conf.Voters)
+		if err != nil || !sameReplicaIDs(q.conf.Voters, result.Conf.Voters) {
+			return invalid("has non-canonical applied successor voters")
+		}
+	case ConfChangeRejectedSuperseded, ConfChangeRejectedInvalid:
+		if !confStateIsZero(result.Conf) {
+			return invalid("has configuration voters on a rejected result")
+		}
+	default:
+		return invalid("has no terminal configuration result")
+	}
+	return nil
+}
+
+func validateStoredInstanceRecord(rec InstanceRecord, conf ConfState) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("%w: durable record %s %s", ErrInvalidConfig, rec.Ref, reason)
+	}
+	if rec.Ref.Replica == 0 || rec.Ref.Instance == 0 || rec.Ref.Conf == 0 {
+		return invalid("has an incomplete reference")
+	}
+	if conf.ID != rec.Ref.Conf || !conf.Contains(rec.Ref.Replica) {
+		return invalid("is outside its pinned configuration")
+	}
+	if rec.Status > StatusExecuted {
+		return invalid("has an unknown status")
+	}
+	if err := validateMembershipResult(rec); err != nil {
+		return err
+	}
+	if !recordTimingInvariant(rec) {
+		return invalid("has invalid timing metadata")
+	}
+	commandValid := commandValidForConfiguration(rec.Command, rec.Ref, conf)
+	if !commandValid && !(rec.Command.Kind == CommandConfChange &&
+		rec.Status == StatusExecuted &&
+		rec.ConfChangeResult.Outcome == ConfChangeRejectedInvalid) {
+		return invalid("has an invalid command")
+	}
+	if err := validateConfChangeResult(rec); err != nil {
+		return err
+	}
+	if len(rec.Deps) != len(conf.Voters) {
+		return invalid("has the wrong dependency width")
+	}
+	validBallot := func(ballot Ballot, allowZero bool) bool {
+		if ballot == (Ballot{}) {
+			return allowZero
+		}
+		return ballot.Replica != 0 && conf.Contains(ballot.Replica)
+	}
+	if !validBallot(rec.Ballot, rec.Status == StatusNone && !rec.TOQPending) {
+		return invalid("has an invalid promise ballot")
+	}
+	if rec.Status >= StatusPreAccepted {
+		if rec.Seq == 0 || !validBallot(rec.RecordBallot, false) || rec.Ballot.Less(rec.RecordBallot) {
+			return invalid("has an invalid chosen tuple")
+		}
+	} else if rec.RecordBallot != (Ballot{}) || rec.Seq != 0 {
+		return invalid("has value metadata without a value")
+	}
+	hasAcceptAttrs := rec.AcceptSeq != 0 || len(rec.AcceptDeps) != 0
+	if (rec.AcceptSeq == 0) != (len(rec.AcceptDeps) == 0) || (len(rec.AcceptDeps) != 0 && len(rec.AcceptDeps) != len(conf.Voters)) {
+		return invalid("has malformed accept attributes")
+	}
+	if rec.Status < StatusAccepted && (hasAcceptAttrs || len(rec.AcceptEvidence) != 0) {
+		return invalid("has accept evidence before Accepted")
+	}
+	if len(rec.AcceptEvidence) > len(conf.Voters) {
+		return invalid("has too many sender accept evidence entries")
+	}
+	seenEvidence := make(map[ReplicaID]struct{}, len(rec.AcceptEvidence))
+	for _, evidence := range rec.AcceptEvidence {
+		if evidence.Sender == 0 || !conf.Contains(evidence.Sender) || evidence.Seq == 0 || len(evidence.Deps) != len(conf.Voters) {
+			return invalid("has malformed sender accept evidence")
+		}
+		if _, duplicate := seenEvidence[evidence.Sender]; duplicate {
+			return invalid("has duplicate sender accept evidence")
+		}
+		seenEvidence[evidence.Sender] = struct{}{}
+	}
+	if rec.FastPathEligible && (rec.Status != StatusPreAccepted || !rec.RecordBallot.IsInitialFor(rec.Ref.Replica)) {
+		return invalid("has impossible fast-path eligibility")
+	}
+	if rec.TOQPending {
+		if rec.Status != StatusNone || !rec.Ballot.IsInitialFor(rec.Ref.Replica) || rec.FastPathEligible || hasAcceptAttrs || len(rec.AcceptEvidence) != 0 || rec.Command.Kind == CommandNoop {
+			return invalid("has malformed TOQ-pending state")
+		}
+	} else if rec.Status == StatusNone {
+		if rec.ProcessAt != 0 || rec.FastPathEligible || rec.Command.ID != (CommandID{}) || rec.Command.Kind != CommandUser || len(rec.Command.Payload) != 0 || len(rec.Command.ConflictKeys) != 0 {
+			return invalid("has a value without durable status")
+		}
+	}
+	return nil
+}
+
 // NewRawNode constructs a deterministic EPaxos node from config and storage.
 func NewRawNode(cfg Config) (*RawNode, error) {
 	q, err := newQuorum(cfg.Voters)
 	if err != nil {
 		return nil, err
 	}
-	if !q.contains(cfg.ID) {
+	if !q.contains(cfg.ID) && cfg.Cluster == (ClusterID{}) {
 		return nil, fmt.Errorf("%w: local id is not a voter", ErrInvalidConfig)
 	}
 	if cfg.RetryTicks == 0 {
 		cfg.RetryTicks = 3
 	}
 	if cfg.RecoveryTicks == 0 {
-		cfg.RecoveryTicks = cfg.RetryTicks * 3
+		var err error
+		cfg.RecoveryTicks, err = checkedLogicalAdd(cfg.RetryTicks, cfg.RetryTicks)
+		if err == nil {
+			cfg.RecoveryTicks, err = checkedLogicalAdd(cfg.RecoveryTicks, cfg.RetryTicks)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: default RecoveryTicks overflows", ErrInvalidConfig)
+		}
 	}
 	if cfg.TimeOptimizationTicks == 0 {
 		cfg.TimeOptimizationTicks = 1
+	}
+	if cfg.MaxDeferredPreAccepts < 0 {
+		return nil, fmt.Errorf("%w: negative deferred PreAccept limit", ErrInvalidConfig)
+	}
+	if cfg.MaxDeferredPreAccepts == 0 {
+		cfg.MaxDeferredPreAccepts = 4096
+	}
+	if cfg.LegacyProcessAtDomain != nil && *cfg.LegacyProcessAtDomain > TimingDomainTOQ {
+		return nil, fmt.Errorf("%w: unknown legacy ProcessAt timing domain", ErrInvalidConfig)
+	}
+	if cfg.MaxDependencyRecoveriesPerDrive < 0 {
+		return nil, fmt.Errorf("%w: negative dependency recovery drive limit", ErrInvalidConfig)
+	}
+	if cfg.MaxDependencyRecoveriesPerDrive == 0 {
+		cfg.MaxDependencyRecoveriesPerDrive = defaultMaxDependencyRecoveriesPerDrive
+	}
+	if cfg.MaxConcurrentRecoveries < 0 {
+		return nil, fmt.Errorf("%w: negative concurrent recovery limit", ErrInvalidConfig)
+	}
+	if cfg.MaxConcurrentRecoveries == 0 {
+		cfg.MaxConcurrentRecoveries = defaultMaxConcurrentRecoveries
+	}
+	toqClock, err := configureTOQ(cfg)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Storage == nil {
 		cfg.Storage = NewMemoryStorage()
 	}
 	n := &RawNode{
-		id:                    cfg.ID,
-		q:                     q,
-		storage:               cfg.Storage,
-		zeroCopy:              cfg.ZeroCopyProposals,
-		retryTicks:            cfg.RetryTicks,
-		recoveryTicks:         cfg.RecoveryTicks,
-		timeOptimization:      cfg.TimeOptimization,
-		timeOptimizationTicks: cfg.TimeOptimizationTicks,
-		maxReadyMessages:      cfg.MaxReadyMessages,
-		nextInstance:          1,
-		instances:             make(map[InstanceRef]*instance),
-		conflicts:             make(map[string]map[ReplicaID]InstanceRef),
-		executed:              make(map[InstanceRef]struct{}),
-		confHistory:           make(map[ConfID]ConfState),
+		id:                              cfg.ID,
+		q:                               q,
+		storage:                         cfg.Storage,
+		zeroCopy:                        cfg.ZeroCopyProposals,
+		cluster:                         cfg.Cluster,
+		localIdentity:                   cfg.LocalIdentity.Clone(),
+		voterIdentities:                 make(map[ReplicaID]VoterIdentity),
+		bootstrapPrivateKey:             append([]byte(nil), cfg.BootstrapPrivateKey...),
+		retryTicks:                      cfg.RetryTicks,
+		recoveryTicks:                   cfg.RecoveryTicks,
+		timeOptimization:                cfg.TimeOptimization,
+		timeOptimizationTicks:           cfg.TimeOptimizationTicks,
+		toqEnabled:                      cfg.TOQ,
+		toqClock:                        toqClock,
+		toqRuntimes:                     make(map[ConfID]toqRuntime),
+		maxDeferredPreAccepts:           cfg.MaxDeferredPreAccepts,
+		maxReadyMessages:                cfg.MaxReadyMessages,
+		maxDependencyRecoveriesPerDrive: cfg.MaxDependencyRecoveriesPerDrive,
+		maxConcurrentRecoveries:         cfg.MaxConcurrentRecoveries,
+		nextInstance:                    1,
+		instances:                       make(map[InstanceRef]*instance),
+		conflicts:                       make(map[string]map[ReplicaID]InstanceRef),
+		executed:                        newExecutedTracker(),
+		committedThrough:                make(map[instanceLane]InstanceNum),
+		appliedConfByBase:               make(map[ConfID]InstanceRef),
+		confHistory:                     make(map[ConfID]ConfState),
+		deferredIndex:                   make(map[deferredPreAcceptKey]*deferredPreAccept),
+		bootstrapPlans:                  make(map[BootstrapID]*bootstrapState),
+		bootstrapByBase:                 make(map[ConfID]BootstrapID),
+		closedConfigs:                   make(map[ConfID]ClosedConfig),
 	}
 	q.conf.ID = normalizeConfID(q.conf.ID)
 	n.confHistory[q.conf.ID] = q.conf.Clone()
-	hs, configs, err := cfg.Storage.InitialState()
+	state, err := cfg.Storage.InitialState()
 	if err != nil {
 		return nil, err
 	}
-	if hs.Conf.ID != 0 && len(hs.Conf.Voters) > 0 {
+	hs := state.HardState.Clone()
+	legacyHardState := hs.Empty()
+	if !hs.Empty() {
+		if hs.Conf.ID == 0 || len(hs.Conf.Voters) == 0 {
+			return nil, fmt.Errorf("%w: durable hard state has incomplete configuration", ErrInvalidConfig)
+		}
 		loaded, err := newQuorum(hs.Conf.Voters)
 		if err != nil {
 			return nil, err
@@ -237,8 +721,10 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 			return nil, err
 		}
 		n.q = loaded
+		hs.Conf = loaded.conf.Clone()
 	}
-	for i, stored := range configs {
+	for _, entry := range state.ConfigHistory {
+		stored := entry.Conf
 		loaded, err := newQuorum(stored.Voters)
 		if err != nil {
 			return nil, err
@@ -247,85 +733,255 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		if err := n.rememberConf(loaded.conf); err != nil {
 			return nil, err
 		}
-		if i == len(configs)-1 {
+		if !entry.AppliedRef.IsZero() {
+			if existing := n.appliedConfByBase[entry.AppliedRef.Conf]; !existing.IsZero() && existing != entry.AppliedRef {
+				return nil, fmt.Errorf("%w: conflicting configuration winner for base %d", ErrInvalidConfig, entry.AppliedRef.Conf)
+			}
+			n.appliedConfByBase[entry.AppliedRef.Conf] = entry.AppliedRef
+		}
+		if loaded.conf.ID > n.q.conf.ID {
 			n.q = loaded
 		}
 	}
 	n.q.conf.ID = normalizeConfID(n.q.conf.ID)
-	n.toqEnabled = cfg.TOQ
 	n.tick = hs.Tick
+	n.allocatorFloor = state.AllocatorFloor
+	if n.allocatorFloor != 0 && n.allocatorFloor > n.nextInstance {
+		n.nextInstance = n.allocatorFloor
+	}
+	n.toqClosedThrough = state.TOQClosedThrough
+	n.toqClosed = state.TOQClosedThrough != 0
+	loadedRefs := make(map[InstanceRef]struct{})
+	loadedRecords := make([]InstanceRecord, 0)
+	if cfg.Cluster != (ClusterID{}) {
+		if !cfg.LocalIdentity.valid() || cfg.LocalIdentity.Replica != cfg.ID ||
+			len(cfg.VoterIdentities) != len(n.q.conf.Voters) ||
+			!publicKeyMatches(cfg.LocalIdentity, ed25519.PrivateKey(cfg.BootstrapPrivateKey)) {
+			return nil, fmt.Errorf("%w: complete current voter identities and matching bootstrap key required", ErrInvalidConfig)
+		}
+		for i, voter := range n.q.conf.Voters {
+			identity := cfg.VoterIdentities[i]
+			if identity.Replica != voter || !identity.valid() || (i > 0 && cfg.VoterIdentities[i-1].Replica >= identity.Replica) {
+				return nil, fmt.Errorf("%w: noncanonical voter identities", ErrInvalidConfig)
+			}
+			n.voterIdentities[voter] = identity.Clone()
+		}
+		n.localVoter = state.LocalVoterState.Clone()
+		if !n.localVoter.IsEligible(cfg.ID, n.q.conf) || n.localVoter.Cluster != cfg.Cluster ||
+			!voterIdentityEqual(n.localVoter.Identity, cfg.LocalIdentity) {
+			return nil, fmt.Errorf("%w: current membership lacks durable local eligibility", ErrBootstrapEligibility)
+		}
+	} else {
+		n.localIdentity = VoterIdentity{Replica: cfg.ID, Incarnation: 1}
+		n.localVoter = LocalVoterState{
+			Identity:       n.localIdentity.Clone(),
+			Conf:           n.q.conf.Clone(),
+			Status:         LocalVoterStatusEligible,
+			AllocatorFloor: n.nextInstance,
+		}
+	}
+	n.durableLocalVoter = n.localVoter.Clone()
+	if state.LocalVoterState.AllocatorFloor > n.nextInstance {
+		n.nextInstance = state.LocalVoterState.AllocatorFloor
+	}
+	for _, record := range state.BootstrapRecords {
+		if err := n.restoreBootstrapRecord(record); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := cfg.Storage.LoadInstances(func(rec InstanceRecord) error {
-		if !VerifyRecordChecksum(rec) {
-			return ErrChecksumMismatch
+		if rec.TimingDomain > TimingDomainTOQ {
+			return fmt.Errorf("%w: durable record %s has unknown timing domain", ErrInvalidConfig, rec.Ref)
 		}
-		phase := phaseFromStatus(rec.Status)
-		if rec.TOQPending {
-			if !n.toqEnabled {
-				return fmt.Errorf("%w: TOQ-pending record requires TOQ", ErrInvalidConfig)
+		if verifyCanonicalRecordChecksumBytes(rec) {
+			if !recordTimingInvariant(rec) {
+				return fmt.Errorf("%w: durable record %s has invalid timing metadata", ErrInvalidConfig, rec.Ref)
 			}
-			phase = phaseIdle
-			if rec.Ref.Replica == n.id {
-				phase = phasePreAccept
+		} else {
+			if !VerifyRecordChecksumWithoutMembershipResult(rec) &&
+				!VerifyRecordChecksumWithoutTimingDomain(rec) && !VerifyRecordChecksumWithoutConfChangeResult(rec) {
+				return ErrChecksumMismatch
 			}
-		} else if rec.Status < StatusCommitted && rec.Ballot.Number > 0 && rec.Ballot.Replica == n.id {
-			phase = phasePrepare
+			if rec.Command.Kind == CommandNoop {
+				if cfg.LegacyProcessAtDomain == nil {
+					return fmt.Errorf("%w: durable no-op record %s has ambiguous legacy timing domain", ErrInvalidConfig, rec.Ref)
+				}
+				legacyDomain := *cfg.LegacyProcessAtDomain
+				legacyPending := rec.TOQPending
+				if (legacyPending && legacyDomain != TimingDomainTOQ) ||
+					(!legacyPending && rec.ProcessAt != 0 && legacyDomain == TimingDomainUntimed) {
+					return fmt.Errorf("%w: durable no-op record %s conflicts with legacy timing policy", ErrInvalidConfig, rec.Ref)
+				}
+				if legacyPending {
+					if rec.Status != StatusNone || !rec.Ballot.IsInitialFor(rec.Ref.Replica) || rec.RecordBallot != (Ballot{}) || rec.Seq != 0 {
+						return fmt.Errorf("%w: durable no-op record %s has malformed legacy pending state", ErrInvalidConfig, rec.Ref)
+					}
+					rec.Status = StatusPreAccepted
+					rec.RecordBallot = rec.Ballot
+					rec.Seq = 1
+					for i := range rec.Deps {
+						rec.Deps[i] = 0
+					}
+					rec.FastPathEligible = true
+				}
+				rec.ProcessAt = 0
+				rec.TimingDomain = TimingDomainUntimed
+				rec.TOQPending = false
+			} else if rec.TOQPending {
+				rec.TimingDomain = TimingDomainTOQ
+			} else {
+				if cfg.LegacyProcessAtDomain == nil {
+					return fmt.Errorf("%w: durable record %s has ambiguous legacy timing domain", ErrInvalidConfig, rec.Ref)
+				}
+				rec.TimingDomain = *cfg.LegacyProcessAtDomain
+			}
+			if !recordTimingInvariant(rec) {
+				return fmt.Errorf("%w: durable record %s has invalid migrated timing metadata", ErrInvalidConfig, rec.Ref)
+			}
+			rec.Checksum = ChecksumRecord(rec)
+			n.enqueueRecord(rec)
 		}
-		inst := &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
-		n.seedLocalRestartVote(inst)
-		n.instances[rec.Ref] = inst
-		n.observeInstanceRef(rec.Ref)
-		if rec.Status >= StatusPreAccepted && !rec.TOQPending {
-			n.indexConflicts(rec)
+		if _, duplicate := loadedRefs[rec.Ref]; duplicate {
+			return fmt.Errorf("%w: duplicate durable record %s", ErrInvalidConfig, rec.Ref)
 		}
-		if rec.Status == StatusExecuted {
-			n.executed[rec.Ref] = struct{}{}
-		}
-		n.markPendingConf(rec)
+		loadedRefs[rec.Ref] = struct{}{}
+		loadedRecords = append(loadedRecords, rec.Clone())
 		return nil
 	}); err != nil {
 		return nil, err
 	}
+	if legacyHardState {
+		for _, rec := range loadedRecords {
+			if rec.TimingDomain == TimingDomainLogical && rec.ProcessAt > n.tick {
+				n.tick = rec.ProcessAt
+			}
+		}
+	}
+	if err := n.replayExecutedConfigRecords(loadedRecords); err != nil {
+		return nil, err
+	}
+	if n.cluster == (ClusterID{}) {
+		n.localVoter.Conf = n.q.conf.Clone()
+		n.localVoter.Status = LocalVoterStatusEligible
+	}
+	sort.Slice(loadedRecords, func(i, j int) bool {
+		return lessRef(loadedRecords[i].Ref, loadedRecords[j].Ref)
+	})
+	if cfg.TOQRuntime != nil {
+		if err := n.RefreshTOQConfig(*cfg.TOQRuntime); err != nil {
+			return nil, err
+		}
+	} else {
+		n.activateTOQRuntime(n.q.conf)
+	}
+	for _, rec := range loadedRecords {
+		conf, ok := n.confHistory[rec.Ref.Conf]
+		if !ok {
+			return nil, fmt.Errorf("%w: durable record %s references unknown configuration", ErrInvalidConfig, rec.Ref)
+		}
+		if err := validateStoredInstanceRecord(rec, conf); err != nil {
+			return nil, err
+		}
+		if rec.Command.Kind != CommandNoop && rec.Command.Kind != CommandMembership && rec.Status >= StatusPreAccepted && !n.timingDomainEnabled(rec.TimingDomain) {
+			return nil, fmt.Errorf("%w: durable record %s uses an incompatible timing domain", ErrInvalidConfig, rec.Ref)
+		}
+		if rec.TOQPending {
+			if !n.toqEnabled {
+				return nil, fmt.Errorf("%w: TOQ-pending record requires TOQ", ErrInvalidConfig)
+			}
+			if rec.Ref.Replica != n.id {
+				return nil, fmt.Errorf("%w: foreign TOQ-pending record %s", ErrInvalidConfig, rec.Ref)
+			}
+		}
+		phase := phaseFromStatus(rec.Status)
+		if rec.TOQPending {
+			phase = phasePreAccept
+		} else if rec.Status < StatusCommitted && rec.Ballot.IsRecovery() && rec.Ballot.Replica == n.id {
+			phase = phasePrepare
+		}
+		inst := &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
+		n.seedLocalRestartVote(inst)
+		n.installInstance(inst)
+		n.observeInstanceRef(rec.Ref)
+		if rec.Ref.Replica == n.id && rec.Ref.Instance >= n.nextInstance {
+			n.observeInstanceRef(rec.Ref)
+		}
+		if rec.Status >= StatusPreAccepted && !rec.TOQPending {
+			n.indexConflicts(rec)
+			if rec.TimingDomain == TimingDomainTOQ && n.toqEnabled && (!n.toqClosed || rec.ProcessAt > n.toqClosedThrough) {
+				n.toqClosed = true
+				n.toqClosedThrough = rec.ProcessAt
+				n.toqSeen = true
+				n.toqLastNow = rec.ProcessAt
+			}
+		}
+		n.markPendingConf(rec)
+	}
 	heap.Init(&n.timers)
-	if err := n.replayExecutedConfig(); err != nil {
-		return nil, err
+	heap.Init(&n.logicalPreAccepts)
+	heap.Init(&n.toqPreAccepts)
+	restartTimerError := func(err error) error {
+		if err == ErrLogicalTimeExhausted && n.tick == ^uint64(0) {
+			return nil
+		}
+		return err
 	}
-	toqClock, toqOneWayDelay, toqSyncGroup, err := configureTOQ(cfg, n.q)
-	if err != nil {
-		return nil, err
-	}
-	n.toqClock = toqClock
-	n.toqOneWayDelay = toqOneWayDelay
-	n.toqSyncGroup = toqSyncGroup
-	for _, inst := range n.instances {
-		if inst.rec.Status >= StatusCommitted {
+	for _, rec := range loadedRecords {
+		inst := n.instances[rec.Ref]
+		if inst == nil || inst.rec.Status >= StatusCommitted {
 			continue
 		}
 		if inst.rec.TOQPending {
 			if inst.rec.Ref.Replica == n.id {
-				n.delayedPreAccepts = append(n.delayedPreAccepts, n.localTOQPreAcceptMessage(inst))
-				n.schedule(inst, timerPreAccept, n.retryTicks)
+				if _, err := n.admitDeferredPreAccept(preAcceptTOQ, n.localTOQPreAcceptMessage(inst)); err != nil {
+					return nil, err
+				}
+				if err := restartTimerError(n.schedule(inst, timerPreAccept, n.retryTicks)); err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}
 		switch inst.phase {
+		case phaseIdle:
+			if inst.rec.Status == StatusNone && inst.rec.Ref.Replica == n.id {
+				if err := restartTimerError(n.startPrepare(inst)); err != nil {
+					return nil, err
+				}
+			} else if err := restartTimerError(n.scheduleRecovery(inst)); err != nil {
+				return nil, err
+			}
 		case phasePreAccept:
-			if inst.rec.Ref.Replica == n.id && inst.rec.Ballot.Number == 0 && inst.rec.Ballot.Replica == n.id {
-				n.schedule(inst, timerPreAccept, n.retryTicks)
-			} else if n.shouldCoordinateRecovery(inst.rec.Ref) {
-				n.schedule(inst, timerPrepare, n.recoveryTicks)
+			if inst.rec.Ref.Replica == n.id && inst.rec.Ballot.IsInitialFor(n.id) {
+				if err := restartTimerError(n.schedule(inst, timerPreAccept, n.retryTicks)); err != nil {
+					return nil, err
+				}
+			} else if err := restartTimerError(n.scheduleRecovery(inst)); err != nil {
+				return nil, err
 			}
 		case phaseAccept:
 			if inst.rec.Ref.Replica == n.id && inst.rec.Ballot.Replica == n.id {
-				n.schedule(inst, timerAccept, n.retryTicks)
-			} else if n.shouldCoordinateRecovery(inst.rec.Ref) {
-				n.schedule(inst, timerPrepare, n.recoveryTicks)
+				if err := restartTimerError(n.schedule(inst, timerAccept, n.retryTicks)); err != nil {
+					return nil, err
+				}
+			} else if err := restartTimerError(n.scheduleRecovery(inst)); err != nil {
+				return nil, err
 			}
 		case phasePrepare:
-			n.schedule(inst, timerPrepare, n.recoveryTicks)
+			if err := restartTimerError(n.schedule(inst, timerPrepare, n.recoveryTicks)); err != nil {
+				return nil, err
+			}
 		}
 	}
-	n.processDuePreAccepts()
+	n.beginDrive()
 	n.tryExecute()
+	n.endDrive()
+	n.currentHardState = HardState{Conf: n.q.conf.Clone(), Tick: n.tick}
+	n.acknowledgedHardState = hs.Clone()
+	if n.allocatorFloor == 0 || n.nextInstance > n.allocatorFloor {
+		n.allocatorFloor = n.nextInstance
+	}
 	return n, nil
 }
 
@@ -374,16 +1030,25 @@ func phaseFromStatus(s Status) phase {
 }
 
 func (n *RawNode) observeInstanceRef(ref InstanceRef) {
-	if ref.Replica == n.id && ref.Instance >= n.nextInstance {
-		n.nextInstance = ref.Instance + 1
+	if ref.Replica != n.id || n.nextInstance == 0 || ref.Instance < n.nextInstance {
+		return
 	}
+	next, ok := instanceSuccessor(ref.Instance)
+	if !ok {
+		n.nextInstance = 0
+		return
+	}
+	n.nextInstance = next
 }
 
 func (n *RawNode) confFor(id ConfID) ConfState {
-	if conf, ok := n.confHistory[id]; ok {
-		return conf
-	}
-	return n.q.conf
+	conf, _ := n.lookupConf(id)
+	return conf
+}
+
+func (n *RawNode) lookupConf(id ConfID) (ConfState, bool) {
+	conf, ok := n.confHistory[id]
+	return conf, ok
 }
 
 func (n *RawNode) depsForConf(id ConfID) []InstanceNum {
@@ -391,12 +1056,15 @@ func (n *RawNode) depsForConf(id ConfID) []InstanceNum {
 }
 
 func (n *RawNode) seedLocalRestartVote(inst *instance) {
-	if inst == nil || inst.rec.Ref.Replica != n.id || !n.confFor(inst.rec.Ref.Conf).Contains(n.id) {
+	if inst == nil || !n.confFor(inst.rec.Ref.Conf).Contains(n.id) {
 		return
 	}
 	switch inst.phase {
 	case phasePreAccept:
-		if inst.rec.Status != StatusPreAccepted || inst.rec.TOQPending || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != n.id {
+		if inst.rec.Ref.Replica != n.id ||
+			inst.rec.Status != StatusPreAccepted ||
+			inst.rec.TOQPending ||
+			!inst.rec.Ballot.IsInitialFor(n.id) {
 			return
 		}
 		if inst.preOK == nil {
@@ -404,16 +1072,24 @@ func (n *RawNode) seedLocalRestartVote(inst *instance) {
 		}
 		attrs := inst.rec.Attributes()
 		// Restart cannot reconstruct volatile fast-quorum dependency coverage; count the durable owner vote only for the slow path.
-		inst.rec.FastPathEligible = false
 		inst.preOK[n.id] = attrVote{seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), depsCommitted: 0, fastPathEligible: false}
 	case phaseAccept:
-		if inst.rec.Status != StatusAccepted || inst.rec.Ballot.Replica != n.id {
+		if inst.rec.Ref.Replica != n.id ||
+			inst.rec.Status != StatusAccepted ||
+			inst.rec.Ballot.Replica != n.id {
 			return
 		}
 		if inst.accOK == nil {
 			inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
 		}
 		inst.accOK[n.id] = struct{}{}
+	case phasePrepare:
+		if inst.rec.Status >= StatusCommitted ||
+			!inst.rec.Ballot.IsRecovery() ||
+			inst.rec.Ballot.Replica != n.id {
+			return
+		}
+		inst.prepareOK = map[ReplicaID]InstanceRecord{n.id: inst.rec.Clone()}
 	}
 }
 
@@ -444,41 +1120,238 @@ func (n *RawNode) ensureRecordDeps(rec *InstanceRecord) bool {
 	return true
 }
 
-func (n *RawNode) replayExecutedConfig() error {
-	refs := make([]InstanceRef, 0, len(n.instances))
-	for ref, inst := range n.instances {
-		if inst.rec.Status == StatusExecuted && inst.rec.Command.Kind == CommandConfChange {
-			refs = append(refs, ref)
-		}
+func confChangeSuccessor(rec InstanceRecord, base ConfState) (ConfState, bool) {
+	if !commandValidForConfiguration(rec.Command, rec.Ref, base) {
+		return ConfState{}, false
 	}
-	sortRefs(refs)
-	for _, ref := range refs {
-		if err := n.replayConfChange(ref, n.instances[ref].rec.Command); err != nil {
-			return err
-		}
+	cc := ConfChange{
+		Type:    ConfChangeType(rec.Command.Payload[0]),
+		Replica: ReplicaID(binary.LittleEndian.Uint64(rec.Command.Payload[1:])),
 	}
+	q, err := confChangeQuorumFrom(base, cc)
+	if err != nil {
+		return ConfState{}, false
+	}
+	q.conf.ID = rec.Ref.Conf + 1
+	return q.conf, true
+}
+
+func (n *RawNode) rememberAppliedConf(ref InstanceRef, successor ConfState) error {
+	if existing, duplicate := n.appliedConfByBase[ref.Conf]; duplicate {
+		if existing == ref {
+			return n.rememberConf(successor)
+		}
+		return fmt.Errorf("%w: multiple applied configuration commands for base %d", ErrInvalidConfig, ref.Conf)
+	}
+	if err := n.rememberConf(successor); err != nil {
+		return err
+	}
+	n.appliedConfByBase[ref.Conf] = ref
 	return nil
 }
 
-func (n *RawNode) replayConfChange(ref InstanceRef, cmd Command) error {
-	if len(cmd.Payload) != 9 {
-		return nil
+func legacyConfigExecutionOrder(records []InstanceRecord, indices []int, base ConfState) []int {
+	ordered := append([]int(nil), indices...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return lessRef(records[ordered[i]].Ref, records[ordered[j]].Ref)
+	})
+	byRef := make(map[InstanceRef]int, len(ordered))
+	for _, recordIndex := range ordered {
+		byRef[records[recordIndex].Ref] = recordIndex
 	}
-	cc := ConfChange{Type: ConfChangeType(cmd.Payload[0]), Replica: ReplicaID(binary.LittleEndian.Uint64(cmd.Payload[1:]))}
-	base := n.confFor(ref.Conf)
-	q, err := confChangeQuorumFrom(base, cc)
-	if err != nil {
-		return nil
-	}
-	q.conf.ID = ref.Conf + 1
-	if existing, exists := n.confHistory[q.conf.ID]; exists {
-		if !sameReplicaIDs(existing.Voters, q.conf.Voters) {
-			return fmt.Errorf("%w: replayed config %d conflicts with stored voters", ErrInvalidConfig, q.conf.ID)
+	dependsOn := func(from, to InstanceRecord) bool {
+		if from.Ref == to.Ref {
+			return false
 		}
-		return nil
+		slot, ok := base.Index(to.Ref.Replica)
+		return ok && slot < len(from.Deps) && from.Deps[slot] >= to.Ref.Instance
 	}
-	n.confHistory[q.conf.ID] = q.conf.Clone()
-	if ref.Conf == n.q.conf.ID {
+	dependencyKnownAfter := func(from, dependency InstanceRecord) bool {
+		return dependency.Seq > from.Seq && dependsOn(dependency, from)
+	}
+
+	index := make(map[int]int, len(ordered))
+	low := make(map[int]int, len(ordered))
+	onStack := make(map[int]bool, len(ordered))
+	stack := make([]int, 0, len(ordered))
+	components := make([][]int, 0, len(ordered))
+	next := 0
+	var visit func(int)
+	visit = func(recordIndex int) {
+		index[recordIndex] = next
+		low[recordIndex] = next
+		next++
+		stack = append(stack, recordIndex)
+		onStack[recordIndex] = true
+		from := records[recordIndex]
+		for _, dependencyIndex := range ordered {
+			dependency := records[dependencyIndex]
+			if _, candidate := byRef[dependency.Ref]; !candidate ||
+				!dependsOn(from, dependency) ||
+				dependencyKnownAfter(from, dependency) {
+				continue
+			}
+			if _, seen := index[dependencyIndex]; !seen {
+				visit(dependencyIndex)
+				if low[dependencyIndex] < low[recordIndex] {
+					low[recordIndex] = low[dependencyIndex]
+				}
+			} else if onStack[dependencyIndex] && index[dependencyIndex] < low[recordIndex] {
+				low[recordIndex] = index[dependencyIndex]
+			}
+		}
+		if low[recordIndex] != index[recordIndex] {
+			return
+		}
+		component := make([]int, 0, 1)
+		for {
+			member := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			onStack[member] = false
+			component = append(component, member)
+			if member == recordIndex {
+				break
+			}
+		}
+		sort.Slice(component, func(i, j int) bool {
+			left, right := records[component[i]], records[component[j]]
+			if left.Seq != right.Seq {
+				return left.Seq < right.Seq
+			}
+			return lessRef(left.Ref, right.Ref)
+		})
+		components = append(components, component)
+	}
+	for _, recordIndex := range ordered {
+		if _, seen := index[recordIndex]; !seen {
+			visit(recordIndex)
+		}
+	}
+	result := make([]int, 0, len(ordered))
+	for _, component := range components {
+		result = append(result, component...)
+	}
+	return result
+}
+
+func (n *RawNode) replayExecutedConfigRecords(records []InstanceRecord) error {
+	byBase := make(map[ConfID][]int)
+	bases := make([]ConfID, 0)
+	for i := range records {
+		rec := records[i]
+		if rec.Status != StatusExecuted || rec.Command.Kind != CommandConfChange {
+			continue
+		}
+		if _, exists := byBase[rec.Ref.Conf]; !exists {
+			bases = append(bases, rec.Ref.Conf)
+		}
+		byBase[rec.Ref.Conf] = append(byBase[rec.Ref.Conf], i)
+	}
+	sort.Slice(bases, func(i, j int) bool { return bases[i] < bases[j] })
+
+	for _, baseID := range bases {
+		base, known := n.confHistory[baseID]
+		if !known {
+			return fmt.Errorf("%w: executed configuration command references unknown base %d", ErrInvalidConfig, baseID)
+		}
+		indices := byBase[baseID]
+		sort.Slice(indices, func(i, j int) bool {
+			return lessRef(records[indices[i]].Ref, records[indices[j]].Ref)
+		})
+		appliedIndex := -1
+		legacyIndices := make([]int, 0)
+		for _, index := range indices {
+			rec := records[index]
+			switch rec.ConfChangeResult.Outcome {
+			case ConfChangeApplied:
+				if appliedIndex >= 0 {
+					return fmt.Errorf("%w: multiple applied configuration commands for base %d", ErrInvalidConfig, baseID)
+				}
+				appliedIndex = index
+			case ConfChangeRejectedSuperseded, ConfChangeRejectedInvalid:
+				if err := validateConfChangeResult(rec); err != nil {
+					return err
+				}
+			case ConfChangeOutcomeUnspecified:
+				if !confStateIsZero(rec.ConfChangeResult.Conf) {
+					return fmt.Errorf("%w: legacy configuration outcome for %s carries a successor", ErrInvalidConfig, rec.Ref)
+				}
+				legacyIndices = append(legacyIndices, index)
+			default:
+				return fmt.Errorf("%w: unknown configuration outcome for %s", ErrInvalidConfig, rec.Ref)
+			}
+		}
+
+		if appliedIndex >= 0 {
+			rec := records[appliedIndex]
+			if err := validateConfChangeResult(rec); err != nil {
+				return err
+			}
+			successor, valid := confChangeSuccessor(rec, base)
+			if !valid || successor.ID != rec.ConfChangeResult.Conf.ID ||
+				!sameReplicaIDs(successor.Voters, rec.ConfChangeResult.Conf.Voters) {
+				return fmt.Errorf("%w: applied configuration result for %s does not match its command", ErrInvalidConfig, rec.Ref)
+			}
+			if err := n.rememberAppliedConf(rec.Ref, successor); err != nil {
+				return err
+			}
+		}
+
+		for _, legacyIndex := range legacyConfigExecutionOrder(records, legacyIndices, base) {
+			rec := &records[legacyIndex]
+			successor, valid := confChangeSuccessor(*rec, base)
+			switch {
+			case !valid:
+				rec.ConfChangeResult = ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
+			case n.appliedConfByBase[baseID] != (InstanceRef{}):
+				rec.ConfChangeResult = ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}
+			default:
+				if existing, exists := n.confHistory[successor.ID]; exists &&
+					!sameReplicaIDs(existing.Voters, successor.Voters) {
+					return fmt.Errorf("%w: legacy configuration command for %s conflicts with stored successor", ErrInvalidConfig, rec.Ref)
+				}
+				rec.ConfChangeResult = ConfChangeResult{Outcome: ConfChangeApplied, Conf: successor.Clone()}
+				if err := n.rememberAppliedConf(rec.Ref, successor); err != nil {
+					return err
+				}
+			}
+			rec.Checksum = ChecksumRecord(*rec)
+			n.enqueueRecord(*rec)
+		}
+
+		for _, index := range indices {
+			rec := records[index]
+			successor, valid := confChangeSuccessor(rec, base)
+			switch rec.ConfChangeResult.Outcome {
+			case ConfChangeRejectedInvalid:
+				if valid {
+					return fmt.Errorf("%w: rejected-invalid configuration command %s is valid", ErrInvalidConfig, rec.Ref)
+				}
+			case ConfChangeRejectedSuperseded:
+				if !valid {
+					return fmt.Errorf("%w: superseded configuration command %s is invalid", ErrInvalidConfig, rec.Ref)
+				}
+				_, applied := n.appliedConfByBase[baseID]
+				_, checkpoint := n.confHistory[successor.ID]
+				if !applied && !checkpoint {
+					return fmt.Errorf("%w: superseded configuration command %s has no applied successor", ErrInvalidConfig, rec.Ref)
+				}
+			}
+		}
+	}
+
+	var highest ConfState
+	for _, conf := range n.confHistory {
+		if conf.ID > highest.ID {
+			highest = conf
+		}
+	}
+	if highest.ID != 0 {
+		q, err := newQuorum(highest.Voters)
+		if err != nil {
+			return err
+		}
+		q.conf.ID = highest.ID
 		n.q = q
 	}
 	return nil
@@ -493,7 +1366,7 @@ func (n *RawNode) markPendingConf(rec InstanceRecord) {
 func (n *RawNode) refreshPendingConf() {
 	n.pendingConf = false
 	for ref, inst := range n.instances {
-		if _, executed := n.executed[ref]; executed {
+		if n.executed.contains(ref) {
 			continue
 		}
 		n.markPendingConf(inst.rec)
@@ -504,35 +1377,120 @@ func (n *RawNode) refreshPendingConf() {
 }
 
 // Tick advances deterministic logical time by one tick and processes due timers.
-func (n *RawNode) Tick() {
-	n.tick++
+// If a due recovery would exhaust the ballot space, Tick stutters without
+// changing logical time, timers, instances, or Ready work.
+func (n *RawNode) Tick() error {
+	next, err := checkedLogicalAdd(n.tick, 1)
+	if err != nil {
+		return err
+	}
+	if n.recoveryWouldExhaustAt(next) {
+		return ErrBallotExhausted
+	}
+	if err := n.preflightDueTimers(next); err != nil {
+		return err
+	}
+	if err := n.preflightDeferredPreAccepts(preAcceptLogical, next, next); err != nil {
+		return err
+	}
+	n.beginDrive()
+	defer n.endDrive()
+	n.tick = next
+	n.currentHardState.Tick = next
 	if n.recoveryTicks > 0 && n.tick%n.recoveryTicks == 0 {
 		n.rebroadcastCommits()
 	}
-	n.processDuePreAccepts()
+	firstErr := n.processDeferredPreAccepts(preAcceptLogical, n.tick)
 	for n.timers.Len() > 0 {
 		t := n.timers[0]
 		if t.deadline > n.tick {
-			return
+			break
 		}
 		heap.Pop(&n.timers)
 		inst := n.instances[t.ref]
 		if inst == nil || inst.generation != t.gen || inst.phase == phaseCommitted {
 			continue
 		}
-		n.onTimer(inst, t.kind)
+		if err := n.onTimer(inst, t.kind); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	n.tryExecute()
+	return firstErr
+}
+
+func (n *RawNode) deferPreAccept(m Message) (bool, error) {
+	if !m.Ballot.IsInitialFor(m.Ref.Replica) {
+		return false, nil
+	}
+	if current := n.instances[m.Ref]; current != nil && !n.wouldReplaceInstance(m, current, true) {
+		return false, nil
+	}
+	switch {
+	case m.TOQ:
+		if n.toqClosed && m.ProcessAt <= n.toqClosedThrough {
+			return false, nil
+		}
+		return n.admitDeferredPreAccept(preAcceptTOQ, m)
+	case n.timeOptimization && m.ProcessAt > n.tick:
+		return n.admitDeferredPreAccept(preAcceptLogical, m)
+	default:
+		return false, nil
 	}
 }
 
-func (n *RawNode) deferPreAccept(m Message) bool {
-	if !n.preAcceptOrderingEnabled() || m.ProcessAt == 0 || m.ProcessAt <= n.preAcceptNow() {
+func (n *RawNode) preAcceptWouldDefer(m Message) bool {
+	if m.Type != MsgPreAccept || !m.Ballot.IsInitialFor(m.Ref.Replica) {
 		return false
 	}
-	if m.Ballot.Number != 0 || m.Ballot.Replica != m.Ref.Replica {
-		return false
+	if m.TOQ {
+		return !n.toqClosed || m.ProcessAt > n.toqClosedThrough
 	}
-	n.delayedPreAccepts = append(n.delayedPreAccepts, m.Clone())
-	return true
+	return n.timeOptimization && m.ProcessAt > n.tick
+}
+
+func deferredMessageEqual(a, b Message) bool {
+	a.Checksum = [32]byte{}
+	b.Checksum = [32]byte{}
+	return messageEqual(a, b)
+}
+
+func (n *RawNode) admitDeferredPreAccept(domain preAcceptDomain, m Message) (bool, error) {
+	key := deferredPreAcceptKey{domain: domain, ref: m.Ref, ballot: m.Ballot, from: m.From}
+	if existing := n.deferredIndex[key]; existing != nil {
+		if deferredMessageEqual(existing.message, m) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: conflicting deferred PreAccept for %s", ErrInvalidMessage, m.Ref)
+	}
+	if len(n.deferredIndex) >= n.maxDeferredPreAccepts {
+		return false, fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredQueueFull)
+	}
+	entry := &deferredPreAccept{key: key, message: m.Clone(), index: -1}
+	n.deferredIndex[key] = entry
+	if domain == preAcceptTOQ {
+		heap.Push(&n.toqPreAccepts, entry)
+	} else {
+		heap.Push(&n.logicalPreAccepts, entry)
+	}
+	return true, nil
+}
+
+func (n *RawNode) removeDeferredPreAccepts(ref InstanceRef) {
+	for key, entry := range n.deferredIndex {
+		if key.ref != ref {
+			continue
+		}
+		queue := &n.logicalPreAccepts
+		if key.domain == preAcceptTOQ {
+			queue = &n.toqPreAccepts
+		}
+		if entry.index >= 0 {
+			heap.Remove(queue, entry.index)
+		}
+		delete(n.deferredIndex, key)
+		entry.message.Reset()
+	}
 }
 func preAcceptOrderBefore(aProcessAt uint64, aRef InstanceRef, bProcessAt uint64, bRef InstanceRef) bool {
 	if aProcessAt != bProcessAt {
@@ -557,32 +1515,179 @@ func preAcceptMessageLess(a, b Message) bool {
 	return a.From < b.From
 }
 
-func (n *RawNode) processDuePreAccepts() {
-	if len(n.delayedPreAccepts) == 0 {
-		return
+func (n *RawNode) preAcceptVotesWouldAdvance(inst *instance) (bool, bool) {
+	if inst == nil || inst.rec.TOQPending {
+		return false, false
 	}
-	sort.Slice(n.delayedPreAccepts, func(i, j int) bool {
-		return preAcceptMessageLess(n.delayedPreAccepts[i], n.delayedPreAccepts[j])
-	})
-	now := n.preAcceptNow()
-	due := 0
-	for due < len(n.delayedPreAccepts) && n.delayedPreAccepts[due].ProcessAt <= now {
-		due++
+	if _, ok := n.fastCommitAttrsPreAccept(inst); ok {
+		return true, false
 	}
-	for i := 0; i < due; i++ {
-		m := n.delayedPreAccepts[i]
-		if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
-			n.handleLocalTOQPreAccept(m)
+	if len(inst.preOK) < n.slowQuorumForConf(inst.rec.Ref.Conf) {
+		return false, false
+	}
+	if len(inst.preOK) >= n.fastQuorumForConf(inst.rec.Ref.Conf) || !n.canStillFastCommitPreAccept(inst) {
+		return true, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
+	}
+	return false, false
+}
+
+func (n *RawNode) localTOQPreAcceptWouldAdvance(m Message, inst *instance) (bool, bool) {
+	if inst == nil || inst.phase != phasePreAccept || !inst.rec.TOQPending {
+		return false, false
+	}
+	temp := *inst
+	temp.rec = inst.rec.Clone()
+	attrs := n.computeAttrsAt(temp.rec.Command, temp.rec.Ref, m.ProcessAt, true)
+	temp.rec.Status = StatusPreAccepted
+	temp.rec.Seq = attrs.Seq
+	temp.rec.Deps = attrs.Deps
+	temp.rec.FastPathEligible = true
+	temp.rec.ProcessAt = m.ProcessAt
+	temp.rec.TimingDomain = TimingDomainTOQ
+	temp.rec.TOQPending = false
+	temp.rec.RecordBallot = temp.rec.Ballot
+	temp.preOK = make(map[ReplicaID]attrVote, len(inst.preOK)+1)
+	for id, vote := range inst.preOK {
+		temp.preOK[id] = vote
+	}
+	temp.preOK[n.id] = attrVote{seq: temp.rec.Seq, deps: temp.rec.Deps, depsCommitted: n.committedDepsMask(temp.rec.Attributes(), temp.rec.Ref.Conf), fastPathEligible: true}
+	if n.slowQuorumForConf(temp.rec.Ref.Conf) == 1 {
+		return true, false
+	}
+	return n.preAcceptVotesWouldAdvance(&temp)
+}
+
+func (n *RawNode) preflightDeferredPreAccepts(domain preAcceptDomain, now, logicalNow uint64) error {
+	queue := &n.logicalPreAccepts
+	if domain == preAcceptTOQ {
+		queue = &n.toqPreAccepts
+	}
+	for _, entry := range *queue {
+		m := entry.message
+		if m.ProcessAt > now {
 			continue
 		}
-		n.handlePreAccept(m)
+		inst := n.instances[m.Ref]
+		if n.deferredPreAcceptStateError(m) != nil {
+			continue
+		}
+		if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
+			advance, retryTimer := n.localTOQPreAcceptWouldAdvance(m, inst)
+			if !advance {
+				continue
+			}
+			if retryTimer {
+				if _, err := checkedLogicalDeadline(logicalNow, n.retryTicks); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if !n.wouldReplaceInstance(m, inst, true) {
+			continue
+		}
+		if _, err := checkedLogicalDeadline(logicalNow, n.recoveryTicks); err != nil {
+			return err
+		}
 	}
-	copy(n.delayedPreAccepts, n.delayedPreAccepts[due:])
-	tail := n.delayedPreAccepts[len(n.delayedPreAccepts)-due:]
-	for i := range tail {
-		tail[i].Reset()
+	return nil
+}
+
+func (n *RawNode) removeDeferredPreAcceptEntry(entry *deferredPreAccept) {
+	if entry == nil || n.deferredIndex[entry.key] != entry {
+		return
 	}
-	n.delayedPreAccepts = n.delayedPreAccepts[:len(n.delayedPreAccepts)-due]
+	queue := &n.logicalPreAccepts
+	if entry.key.domain == preAcceptTOQ {
+		queue = &n.toqPreAccepts
+	}
+	if entry.index >= 0 {
+		heap.Remove(queue, entry.index)
+	}
+	delete(n.deferredIndex, entry.key)
+	entry.message.Reset()
+}
+
+func (n *RawNode) deferredPreAcceptStateError(m Message) error {
+	inst := n.instances[m.Ref]
+	if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
+		advance, _ := n.localTOQPreAcceptWouldAdvance(m, inst)
+		if advance && inst != nil && inst.generation == ^uint64(0) {
+			return ErrLogicalTimeExhausted
+		}
+		return nil
+	}
+	if inst == nil {
+		return nil
+	}
+	if inst.rec.Status >= StatusCommitted {
+		if recordTupleBallot(inst.rec) == m.Ballot &&
+			(!commandEqual(inst.rec.Command, m.Command) || inst.rec.ProcessAt != m.ProcessAt || inst.rec.TimingDomain != timingDomainFromMessage(m)) {
+			return fmt.Errorf("%w: conflicting committed PreAccept retry for %s", ErrInvalidMessage, m.Ref)
+		}
+		return nil
+	}
+	if m.Ballot == inst.rec.Ballot &&
+		(!commandEqual(inst.rec.Command, m.Command) || inst.rec.ProcessAt != m.ProcessAt || inst.rec.TimingDomain != timingDomainFromMessage(m)) {
+		return fmt.Errorf("%w: conflicting same-ballot PreAccept for %s", ErrInvalidMessage, m.Ref)
+	}
+	if n.wouldReplaceInstance(m, inst, true) && inst.generation == ^uint64(0) {
+		return ErrLogicalTimeExhausted
+	}
+	return nil
+}
+
+func (n *RawNode) processDeferredPreAccepts(domain preAcceptDomain, now uint64) error {
+	queue := &n.logicalPreAccepts
+	if domain == preAcceptTOQ {
+		queue = &n.toqPreAccepts
+	}
+	var firstErr error
+	for queue.Len() > 0 && (*queue)[0].message.ProcessAt <= now {
+		entry := (*queue)[0]
+		m := entry.message.Clone()
+		err := n.deferredPreAcceptStateError(m)
+		if err == nil {
+			if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
+				n.handleLocalTOQPreAccept(m)
+			} else {
+				err = n.handlePreAccept(m, true)
+			}
+		}
+		m.Reset()
+		n.removeDeferredPreAcceptEntry(entry)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ProcessTOQ samples the caller clock once, processes every queued TOQ
+// PreAccept at or below that sample in total order, and closes those buckets.
+// Tick and Step never call this method implicitly.
+func (n *RawNode) ProcessTOQ() error {
+	if !n.toqEnabled {
+		return fmt.Errorf("%w: node is not in TOQ mode", ErrInvalidConfig)
+	}
+	now := n.toqClock()
+	if n.toqSeen && now < n.toqLastNow {
+		return ErrTOQClockRollback
+	}
+	if err := n.preflightDeferredPreAccepts(preAcceptTOQ, now, n.tick); err != nil {
+		return err
+	}
+	n.beginDrive()
+	defer n.endDrive()
+	n.toqSeen = true
+	n.toqLastNow = now
+	firstErr := n.processDeferredPreAccepts(preAcceptTOQ, now)
+	if !n.toqClosed || now > n.toqClosedThrough {
+		n.toqClosed = true
+		n.toqClosedThrough = now
+	}
+	n.tryExecute()
+	return firstErr
 }
 
 func (n *RawNode) handleLocalTOQPreAccept(m Message) {
@@ -614,10 +1719,36 @@ func (n *RawNode) handleLocalTOQPreAccept(m Message) {
 }
 
 func (n *RawNode) requireLocalVoter() error {
-	if n.q.contains(n.id) {
+	eligibility := n.durableLocalVoter
+	if n.cluster == (ClusterID{}) {
+		eligibility = n.localVoter
+	}
+	if n.q.contains(n.id) && eligibility.IsEligible(n.id, n.q.conf) {
 		return nil
 	}
-	return fmt.Errorf("%w: local replica %d is not a voter in config %d", ErrMessageRejected, n.id, n.q.conf.ID)
+	return fmt.Errorf("%w: %w: local replica %d is not durably eligible in config %d", ErrMessageRejected, ErrBootstrapEligibility, n.id, n.q.conf.ID)
+}
+
+func (n *RawNode) requireLocalVoterForConf(conf ConfState) error {
+	eligibility := n.durableLocalVoter
+	if n.cluster == (ClusterID{}) {
+		eligibility = n.localVoter
+	}
+	identityMatches := eligibility.Identity.Replica == n.id
+	if n.cluster != (ClusterID{}) {
+		identityMatches = identityMatches &&
+			eligibility.Cluster == n.cluster &&
+			voterIdentityEqual(eligibility.Identity, n.localIdentity)
+	}
+	eligible := conf.Contains(n.id) && identityMatches &&
+		(eligibility.IsEligible(n.id, conf) ||
+			(conf.ID < eligibility.Conf.ID &&
+				(eligibility.Status == LocalVoterStatusEligible ||
+					eligibility.Status == LocalVoterStatusIneligible)))
+	if eligible {
+		return nil
+	}
+	return fmt.Errorf("%w: %w: local replica %d is not durably eligible in config %d", ErrMessageRejected, ErrBootstrapEligibility, n.id, conf.ID)
 }
 
 // Propose creates a new local EPaxos instance for an application command.
@@ -625,28 +1756,46 @@ func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 	if cmd.Kind == CommandConfChange {
 		return InstanceRef{}, fmt.Errorf("%w: use ProposeConfChange", ErrInvalidConfig)
 	}
+	if cmd.Kind == CommandMembership {
+		return InstanceRef{}, fmt.Errorf("%w: use voter bootstrap API", ErrInvalidConfig)
+	}
 	if err := n.requireLocalVoter(); err != nil {
 		return InstanceRef{}, err
 	}
 	if n.pendingConf && cmd.Kind != CommandNoop {
 		return InstanceRef{}, fmt.Errorf("%w: configuration change pending", ErrMessageRejected)
 	}
+	if n.toqEnabled && n.toqActive == nil && cmd.Kind != CommandNoop {
+		return InstanceRef{}, fmt.Errorf("%w: %w", ErrMessageRejected, ErrTOQConfigUnavailable)
+	}
+	ref := InstanceRef{Conf: n.q.conf.ID}
+	if !commandValidForConfiguration(cmd, ref, n.q.conf) {
+		return InstanceRef{}, fmt.Errorf("%w: invalid command kind or no-op payload", ErrInvalidConfig)
+	}
 	if !n.zeroCopy {
 		cmd = cmd.Clone()
 	}
-	if cmd.Kind != CommandNoop {
-		cmd.Kind = CommandUser
-	}
-	return n.propose(cmd), nil
+	n.beginDrive()
+	defer n.endDrive()
+	return n.propose(cmd)
 }
 
 // ProposeConfChange proposes a validated membership change encoded as a consensus command.
 func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
+	if cc.Type == ConfChangeAddVoter {
+		return InstanceRef{}, ErrVoterCertificateRequired
+	}
 	if err := n.requireLocalVoter(); err != nil {
 		return InstanceRef{}, err
 	}
 	if n.pendingConf {
 		return InstanceRef{}, fmt.Errorf("%w: configuration change already pending", ErrMessageRejected)
+	}
+	if n.toqEnabled && n.toqActive == nil {
+		return InstanceRef{}, fmt.Errorf("%w: %w", ErrMessageRejected, ErrTOQConfigUnavailable)
+	}
+	if n.q.conf.ID == ^ConfID(0) {
+		return InstanceRef{}, fmt.Errorf("%w: configuration id exhausted", ErrInvalidConfig)
 	}
 	if _, err := n.confChangeQuorum(cc); err != nil {
 		return InstanceRef{}, err
@@ -655,8 +1804,14 @@ func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
 	payload[0] = byte(cc.Type)
 	binary.LittleEndian.PutUint64(payload[1:], uint64(cc.Replica))
 	cmd := Command{Kind: CommandConfChange, Payload: append([]byte(nil), payload[:]...), ConflictKeys: [][]byte{[]byte("\xffconf")}}
+	n.beginDrive()
+	defer n.endDrive()
 	n.pendingConf = true
-	ref := n.propose(cmd)
+	ref, err := n.propose(cmd)
+	if err != nil {
+		n.pendingConf = false
+		return InstanceRef{}, err
+	}
 	return ref, nil
 }
 
@@ -696,47 +1851,96 @@ func confChangeQuorumFrom(conf ConfState, cc ConfChange) (quorum, error) {
 	return q, nil
 }
 
-func (n *RawNode) propose(cmd Command) InstanceRef {
-	for {
-		ref := InstanceRef{Replica: n.id, Instance: n.nextInstance, Conf: n.q.conf.ID}
-		if _, exists := n.instances[ref]; !exists {
-			break
-		}
-		n.nextInstance++
+func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
+	ref, nextInstance, err := n.nextLocalRef()
+	if err != nil {
+		return InstanceRef{}, err
 	}
-	ref := InstanceRef{Replica: n.id, Instance: n.nextInstance, Conf: n.q.conf.ID}
-	n.nextInstance++
+	if _, err := checkedLogicalDeadline(n.tick, n.retryTicks); err != nil {
+		return InstanceRef{}, err
+	}
 	processAt := uint64(0)
-	if n.toqEnabled {
-		processAt = n.nextTOQProcessAt()
-		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, Status: StatusNone, Seq: 0, Deps: n.depsForConf(ref.Conf), Command: cmd, ProcessAt: processAt, TOQPending: true}
+	toqNow := uint64(0)
+	if n.toqEnabled && cmd.Kind != CommandNoop {
+		if len(n.deferredIndex) >= n.maxDeferredPreAccepts {
+			return InstanceRef{}, fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredQueueFull)
+		}
+		toqNow, err = n.sampleTOQClock()
+		if err != nil {
+			return InstanceRef{}, err
+		}
+		processAt, err = n.nextTOQProcessAt(toqNow)
+		if err != nil {
+			return InstanceRef{}, err
+		}
+	} else if n.timeOptimization && cmd.Kind != CommandNoop {
+		processAt, err = checkedLogicalAdd(n.tick, n.timeOptimizationTicks)
+		if err != nil {
+			return InstanceRef{}, err
+		}
+	}
+
+	if n.toqEnabled && cmd.Kind != CommandNoop {
+		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, Status: StatusNone, Seq: 0, Deps: n.depsForConf(ref.Conf), Command: cmd, ProcessAt: processAt, TimingDomain: TimingDomainTOQ, TOQPending: true}
 		rec.Checksum = ChecksumRecord(rec)
 		inst := &instance{rec: rec, phase: phasePreAccept, preOK: make(map[ReplicaID]attrVote, n.fastQuorumForConf(ref.Conf)), createdTick: n.tick, processAt: processAt}
-		n.instances[ref] = inst
+		if _, err := n.admitDeferredPreAccept(preAcceptTOQ, n.localTOQPreAcceptMessage(inst)); err != nil {
+			return InstanceRef{}, err
+		}
+		n.toqSeen = true
+		n.toqLastNow = toqNow
+		n.nextInstance = nextInstance
+		n.installInstance(inst)
 		n.enqueueRecord(rec)
-		n.delayedPreAccepts = append(n.delayedPreAccepts, n.localTOQPreAcceptMessage(inst))
 		n.broadcastPreAccept(inst)
-		n.schedule(inst, timerPreAccept, n.retryTicks)
-		n.processDuePreAccepts()
-		return ref
+		if err := n.schedule(inst, timerPreAccept, n.retryTicks); err != nil {
+			return InstanceRef{}, err
+		}
+		return ref, nil
 	}
-	if n.timeOptimization {
-		processAt = n.tick + n.timeOptimizationTicks
-	}
+
+	n.nextInstance = nextInstance
+
 	attrs := n.computeAttrsAt(cmd, ref, processAt, n.timeOptimization && processAt > 0)
-	rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, RecordBallot: Ballot{Replica: n.id}, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd, FastPathEligible: true, ProcessAt: processAt}
+	timingDomain := TimingDomainUntimed
+	if processAt != 0 {
+		timingDomain = TimingDomainLogical
+	}
+	rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, RecordBallot: Ballot{Replica: n.id}, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd, FastPathEligible: true, ProcessAt: processAt, TimingDomain: timingDomain}
 	rec.Checksum = ChecksumRecord(rec)
 	inst := &instance{rec: rec, phase: phasePreAccept, preOK: map[ReplicaID]attrVote{n.id: {seq: rec.Seq, deps: append([]InstanceNum(nil), rec.Deps...), depsCommitted: n.committedDepsMask(rec.Attributes(), ref.Conf), fastPathEligible: rec.FastPathEligible}}, createdTick: n.tick, processAt: processAt}
-	n.instances[ref] = inst
+	n.installInstance(inst)
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	if n.slowQuorumForConf(ref.Conf) == 1 {
 		n.commit(inst, rec.Attributes())
-		return ref
+		return ref, nil
 	}
 	n.broadcastPreAccept(inst)
-	n.schedule(inst, timerPreAccept, n.retryTicks)
-	return ref
+	if err := n.schedule(inst, timerPreAccept, n.retryTicks); err != nil {
+		return InstanceRef{}, err
+	}
+	return ref, nil
+}
+
+func (n *RawNode) nextLocalRef() (InstanceRef, InstanceNum, error) {
+	candidate := n.nextInstance
+	if candidate == 0 {
+		return InstanceRef{}, 0, ErrInstanceExhausted
+	}
+	for {
+		ref := InstanceRef{Replica: n.id, Instance: candidate, Conf: n.q.conf.ID}
+		if _, exists := n.instances[ref]; !exists {
+			if candidate == ^InstanceNum(0) {
+				return ref, 0, nil
+			}
+			return ref, candidate + 1, nil
+		}
+		if candidate == ^InstanceNum(0) {
+			return InstanceRef{}, 0, ErrInstanceExhausted
+		}
+		candidate++
+	}
 }
 
 // Step applies one validated transport message to the local node. It copies
@@ -746,41 +1950,83 @@ func (n *RawNode) Step(m Message) error {
 	if m.To != n.id {
 		return ErrMessageRejected
 	}
-	if err := m.Validate(n.confFor(m.Ref.Conf)); err != nil {
+	conf, ok := n.confHistory[m.Ref.Conf]
+	if !ok {
+		return ErrMessageRejected
+	}
+	if err := m.Validate(conf); err != nil {
 		return err
+	}
+	if !commandValidForConfiguration(m.Command, m.Ref, conf) {
+		if _, _, control := n.findBootstrapControl(m.Ref); control {
+			if _, sealed := n.closedConfigs[m.Ref.Conf]; sealed {
+				return ErrBootstrapControl
+			}
+		}
+		return ErrInvalidMessage
 	}
 	if m.Checksum != ([32]byte{}) && !VerifyMessageChecksum(m) {
 		return ErrChecksumMismatch
 	}
-	if m.TOQ && !n.toqEnabled {
+	if err := n.requireLocalVoterForConf(conf); err != nil {
+		return err
+	}
+	if err := n.admitWhileSealed(m); err != nil {
+		return err
+	}
+	if messageCarriesValue(m) && !n.messageTimingDomainEnabled(m) {
 		return ErrMessageRejected
 	}
-	if n.toqEnabled && m.Type == MsgPreAccept && m.ProcessAt > 0 && !m.TOQ {
-		return ErrMessageRejected
+	if m.Type == MsgPreAccept && m.Command.Kind != CommandNoop && m.Command.Kind != CommandMembership && m.Ballot.IsInitialFor(m.Ref.Replica) {
+		switch timingDomainFromMessage(m) {
+		case TimingDomainTOQ:
+			if !n.toqEnabled {
+				return ErrMessageRejected
+			}
+		case TimingDomainLogical:
+			if !n.timeOptimization {
+				return ErrMessageRejected
+			}
+		case TimingDomainUntimed:
+			if n.toqEnabled {
+				return ErrMessageRejected
+			}
+		}
 	}
-	n.processDuePreAccepts()
+	if err := n.preflightTimingStep(m); err != nil {
+		return err
+	}
+	if err := n.preflightRecoveryStep(m); err != nil {
+		return err
+	}
+	n.beginDrive()
+	defer n.endDrive()
 	switch m.Type {
 	case MsgPreAccept:
-		if n.deferPreAccept(m) {
+		deferred, err := n.deferPreAccept(m)
+		if err != nil {
+			return err
+		}
+		if deferred {
 			return nil
 		}
-		n.handlePreAccept(m)
+		return n.handlePreAccept(m, false)
 	case MsgPreAcceptResp:
-		n.handlePreAcceptResp(m)
+		return n.handlePreAcceptResp(m)
 	case MsgAccept:
-		n.handleAccept(m)
+		return n.handleAccept(m)
 	case MsgAcceptResp:
-		n.handleAcceptResp(m)
+		return n.handleAcceptResp(m)
 	case MsgCommit:
-		n.handleCommit(m)
+		return n.handleCommit(m)
 	case MsgPrepare:
-		n.handlePrepare(m)
+		return n.handlePrepare(m)
 	case MsgPrepareResp:
-		n.handlePrepareResp(m)
+		return n.handlePrepareResp(m)
 	case MsgTryPreAccept:
-		n.handleTryPreAccept(m)
+		return n.handleTryPreAccept(m)
 	case MsgTryPreAcceptResp:
-		n.handleTryPreAcceptResp(m)
+		return n.handleTryPreAcceptResp(m)
 	case MsgEvidence:
 		n.handleEvidence(m)
 	case MsgEvidenceResp:
@@ -789,37 +2035,54 @@ func (n *RawNode) Step(m Message) error {
 	return nil
 }
 
-func (n *RawNode) HasReady() bool { return !n.pendingReady.Empty() }
-
-// Ready returns the next batch of persistent records, messages, and commands.
-// Until Advance acknowledges a prefix, repeated Ready calls return the same
-// outstanding batch so callers can retry failed durable or application work.
-func (n *RawNode) Ready() Ready {
-	if n.pendingReady.Empty() {
-		return Ready{}
-	}
-	rd := Ready{MustSync: n.pendingReady.MustSync}
-	rd.Records = make([]InstanceRecord, len(n.pendingReady.Records))
-	for i := range n.pendingReady.Records {
-		rd.Records[i] = n.readyRecord(n.pendingReady.Records[i])
-	}
-	messageCount := len(n.pendingReady.Messages)
-	if n.maxReadyMessages > 0 && messageCount > n.maxReadyMessages {
-		messageCount = n.maxReadyMessages
-	}
-	rd.Messages = make([]Message, messageCount)
-	for i := range rd.Messages {
-		rd.Messages[i] = n.pendingReady.Messages[i].Clone()
-	}
-	rd.Committed = make([]CommittedCommand, len(n.pendingReady.Committed))
-	for i := range n.pendingReady.Committed {
-		rd.Committed[i] = n.pendingReady.Committed[i].Clone()
-	}
-	n.awaitAdvance = true
-	return rd
+func (n *RawNode) HasReady() bool {
+	return n.awaitAdvance || !n.pendingReady.Empty() || !n.currentHardState.Equal(n.acknowledgedHardState)
 }
 
-// Advance acknowledges a prefix of the outstanding Ready batch or returns ErrInvalidReady without mutating node state.
+// Ready returns the next batch of hard state, persistent records, messages, and commands.
+// Until the entire frozen view is acknowledged, repeated Ready calls return
+// only the unacknowledged part of that view. Later work remains isolated.
+func (n *RawNode) Ready() Ready {
+	if n.awaitAdvance {
+		return n.frozenReady.Clone()
+	}
+	if n.pendingReady.Empty() && n.currentHardState.Equal(n.acknowledgedHardState) {
+		return Ready{}
+	}
+	rd := n.pendingReady.Clone()
+	if !n.currentHardState.Equal(n.acknowledgedHardState) {
+		rd.HardState = n.currentHardState.Clone()
+	}
+	if n.maxReadyMessages > 0 && len(rd.Messages) > n.maxReadyMessages {
+		clear(rd.Messages[n.maxReadyMessages:])
+		rd.Messages = rd.Messages[:n.maxReadyMessages]
+	}
+	rd.MustSync = readyHasDurableUpdate(rd)
+	n.frozenReady = rd
+	n.awaitAdvance = true
+	return n.frozenReady.Clone()
+}
+
+func consumeReadyPrefix[T any](items []T, count int) []T {
+	if count <= 0 {
+		return items
+	}
+	if count >= len(items) {
+		clear(items)
+		return items[:0]
+	}
+	remaining := copy(items, items[count:])
+	clear(items[remaining:])
+	return items[:remaining]
+}
+
+func readyHasDurableUpdate(rd Ready) bool {
+	return !rd.HardState.Empty() || len(rd.ConfigHistory) > 0 || len(rd.Records) > 0 ||
+		len(rd.BootstrapRecords) > 0 || rd.LocalVoterState != nil || len(rd.FrontierUpdates) > 0 ||
+		rd.AllocatorFloor != 0
+}
+
+// Advance acknowledges a prefix of the frozen Ready batch or returns ErrInvalidReady without mutating node state.
 func (n *RawNode) Advance(rd Ready) error {
 	if !n.awaitAdvance {
 		if rd.Empty() {
@@ -831,59 +2094,142 @@ func (n *RawNode) Advance(rd Ready) error {
 		return err
 	}
 	ackedCommitted := len(rd.Committed)
-	if len(rd.Records) >= len(n.pendingReady.Records) {
-		n.pendingReady.Records = nil
-	} else {
-		n.pendingReady.Records = n.pendingReady.Records[len(rd.Records):]
+	if !rd.HardState.Empty() {
+		n.acknowledgedHardState = rd.HardState.Clone()
+		n.frozenReady.HardState = HardState{}
 	}
-	if len(rd.Messages) >= len(n.pendingReady.Messages) {
-		n.pendingReady.Messages = nil
-	} else {
-		n.pendingReady.Messages = n.pendingReady.Messages[len(rd.Messages):]
+	n.frozenReady.ConfigHistory = consumeReadyPrefix(n.frozenReady.ConfigHistory, len(rd.ConfigHistory))
+	n.frozenReady.Records = consumeReadyPrefix(n.frozenReady.Records, len(rd.Records))
+	n.frozenReady.BootstrapRecords = consumeReadyPrefix(n.frozenReady.BootstrapRecords, len(rd.BootstrapRecords))
+	if rd.LocalVoterState != nil {
+		n.durableLocalVoter = rd.LocalVoterState.Clone()
+		n.frozenReady.LocalVoterState = nil
 	}
-	if len(rd.Committed) >= len(n.pendingReady.Committed) {
-		n.pendingReady.Committed = nil
-	} else {
-		n.pendingReady.Committed = n.pendingReady.Committed[len(rd.Committed):]
+	n.frozenReady.FrontierUpdates = consumeReadyPrefix(n.frozenReady.FrontierUpdates, len(rd.FrontierUpdates))
+	if rd.AllocatorFloor != 0 {
+		n.frozenReady.AllocatorFloor = 0
 	}
-	n.pendingReady.MustSync = len(n.pendingReady.Records) > 0
+	n.frozenReady.Messages = consumeReadyPrefix(n.frozenReady.Messages, len(rd.Messages))
+	n.frozenReady.BootstrapMessages = consumeReadyPrefix(n.frozenReady.BootstrapMessages, len(rd.BootstrapMessages))
+	n.frozenReady.Committed = consumeReadyPrefix(n.frozenReady.Committed, len(rd.Committed))
+	n.frozenReady.MustSync = readyHasDurableUpdate(n.frozenReady)
+
+	n.pendingReady.ConfigHistory = consumeReadyPrefix(n.pendingReady.ConfigHistory, len(rd.ConfigHistory))
+	n.pendingReady.Records = consumeReadyPrefix(n.pendingReady.Records, len(rd.Records))
+	n.pendingReady.BootstrapRecords = consumeReadyPrefix(n.pendingReady.BootstrapRecords, len(rd.BootstrapRecords))
+	if rd.LocalVoterState != nil {
+		n.pendingReady.LocalVoterState = nil
+	}
+	n.pendingReady.FrontierUpdates = consumeReadyPrefix(n.pendingReady.FrontierUpdates, len(rd.FrontierUpdates))
+	if rd.AllocatorFloor != 0 {
+		n.pendingReady.AllocatorFloor = 0
+	}
+	n.pendingReady.Messages = consumeReadyPrefix(n.pendingReady.Messages, len(rd.Messages))
+	n.pendingReady.BootstrapMessages = consumeReadyPrefix(n.pendingReady.BootstrapMessages, len(rd.BootstrapMessages))
+	n.pendingReady.Committed = consumeReadyPrefix(n.pendingReady.Committed, len(rd.Committed))
+	n.pendingReady.MustSync = readyHasDurableUpdate(n.pendingReady)
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
-	n.awaitAdvance = false
+	n.applyBootstrapDurability(rd.BootstrapRecords)
+
+	if n.frozenReady.Empty() {
+		n.awaitAdvance = false
+		n.mergeNextReady()
+	}
 	return nil
 }
 
 func (n *RawNode) validateReadyAck(rd Ready) error {
-	if len(rd.Records) == 0 && len(rd.Messages) == 0 && len(rd.Committed) == 0 {
+	if rd.Empty() || rd.MustSync != readyHasDurableUpdate(rd) {
 		return ErrInvalidReady
 	}
-	if rd.MustSync != n.pendingReady.MustSync {
+	hasPayload := len(rd.ConfigHistory) > 0 || len(rd.Records) > 0 || len(rd.BootstrapRecords) > 0 ||
+		rd.LocalVoterState != nil || len(rd.FrontierUpdates) > 0 || rd.AllocatorFloor != 0 ||
+		len(rd.Messages) > 0 || len(rd.BootstrapMessages) > 0 || len(rd.Committed) > 0
+	if !rd.HardState.Empty() {
+		if n.frozenReady.HardState.Empty() || !rd.HardState.Equal(n.frozenReady.HardState) {
+			return ErrInvalidReady
+		}
+	} else if !n.frozenReady.HardState.Empty() && hasPayload {
 		return ErrInvalidReady
 	}
-	if len(rd.Records) > len(n.pendingReady.Records) || len(rd.Committed) > len(n.pendingReady.Committed) {
+	if len(rd.ConfigHistory) > len(n.frozenReady.ConfigHistory) ||
+		len(rd.Records) > len(n.frozenReady.Records) ||
+		len(rd.BootstrapRecords) > len(n.frozenReady.BootstrapRecords) ||
+		len(rd.FrontierUpdates) > len(n.frozenReady.FrontierUpdates) ||
+		len(rd.Messages) > len(n.frozenReady.Messages) ||
+		len(rd.BootstrapMessages) > len(n.frozenReady.BootstrapMessages) ||
+		len(rd.Committed) > len(n.frozenReady.Committed) ||
+		(rd.LocalVoterState != nil && n.frozenReady.LocalVoterState == nil) ||
+		(rd.AllocatorFloor != 0 && rd.AllocatorFloor != n.frozenReady.AllocatorFloor) {
 		return ErrInvalidReady
 	}
-	visibleMessages := len(n.pendingReady.Messages)
-	if n.maxReadyMessages > 0 && visibleMessages > n.maxReadyMessages {
-		visibleMessages = n.maxReadyMessages
+	if !rd.HardState.Empty() && rd.HardState.Conf.ID > n.acknowledgedHardState.Conf.ID {
+		requiredRecords := 0
+		membershipSuccessor := false
+		for i, rec := range n.frozenReady.Records {
+			if rec.Status != StatusExecuted || rec.ConfChangeResult.Outcome != ConfChangeApplied {
+				continue
+			}
+			successorID := rec.ConfChangeResult.Conf.ID
+			if successorID > n.acknowledgedHardState.Conf.ID && successorID <= rd.HardState.Conf.ID {
+				requiredRecords = i + 1
+				membershipSuccessor = membershipSuccessor || rec.Command.Kind == CommandMembership
+			}
+		}
+		if len(rd.Records) < requiredRecords {
+			return ErrInvalidReady
+		}
+		if membershipSuccessor && (len(rd.ConfigHistory) != len(n.frozenReady.ConfigHistory) ||
+			len(rd.BootstrapRecords) != len(n.frozenReady.BootstrapRecords) ||
+			rd.LocalVoterState == nil) {
+			return ErrInvalidReady
+		}
 	}
-	if len(rd.Messages) > visibleMessages {
-		return ErrInvalidReady
+	if len(rd.Messages) > 0 || len(rd.BootstrapMessages) > 0 || len(rd.Committed) > 0 {
+		if len(rd.ConfigHistory) != len(n.frozenReady.ConfigHistory) ||
+			len(rd.Records) != len(n.frozenReady.Records) ||
+			len(rd.BootstrapRecords) != len(n.frozenReady.BootstrapRecords) ||
+			len(rd.FrontierUpdates) != len(n.frozenReady.FrontierUpdates) ||
+			(n.frozenReady.LocalVoterState != nil && rd.LocalVoterState == nil) ||
+			(n.frozenReady.AllocatorFloor != 0 && rd.AllocatorFloor == 0) {
+			return ErrInvalidReady
+		}
 	}
-	if (len(rd.Messages) > 0 || len(rd.Committed) > 0) && len(rd.Records) != len(n.pendingReady.Records) {
-		return ErrInvalidReady
+	for i := range rd.ConfigHistory {
+		if !configHistoryEntryEqual(rd.ConfigHistory[i], n.frozenReady.ConfigHistory[i]) {
+			return ErrInvalidReady
+		}
 	}
 	for i := range rd.Records {
-		if !instanceRecordEqual(rd.Records[i], n.readyRecord(n.pendingReady.Records[i])) {
+		if !instanceRecordEqual(rd.Records[i], n.frozenReady.Records[i]) {
+			return ErrInvalidReady
+		}
+	}
+	for i := range rd.BootstrapRecords {
+		if !bootstrapRecordEqual(rd.BootstrapRecords[i], n.frozenReady.BootstrapRecords[i]) {
+			return ErrInvalidReady
+		}
+	}
+	if rd.LocalVoterState != nil && !localVoterStateEqual(*rd.LocalVoterState, *n.frozenReady.LocalVoterState) {
+		return ErrInvalidReady
+	}
+	for i := range rd.FrontierUpdates {
+		if !frontierUpdateEqual(rd.FrontierUpdates[i], n.frozenReady.FrontierUpdates[i]) {
 			return ErrInvalidReady
 		}
 	}
 	for i := range rd.Messages {
-		if !messageEqual(rd.Messages[i], n.pendingReady.Messages[i].Clone()) {
+		if !messageEqual(rd.Messages[i], n.frozenReady.Messages[i]) {
+			return ErrInvalidReady
+		}
+	}
+	for i := range rd.BootstrapMessages {
+		if !bootstrapMessageEqual(rd.BootstrapMessages[i], n.frozenReady.BootstrapMessages[i]) {
 			return ErrInvalidReady
 		}
 	}
 	for i := range rd.Committed {
-		if !committedCommandEqual(rd.Committed[i], n.pendingReady.Committed[i].Clone()) {
+		if !committedCommandEqual(rd.Committed[i], n.frozenReady.Committed[i]) {
 			return ErrInvalidReady
 		}
 	}
@@ -911,7 +2257,12 @@ func instanceRecordEqual(a, b InstanceRecord) bool {
 		a.AcceptSeq == b.AcceptSeq &&
 		a.FastPathEligible == b.FastPathEligible &&
 		a.ProcessAt == b.ProcessAt &&
+		a.TimingDomain == b.TimingDomain &&
 		a.TOQPending == b.TOQPending &&
+		a.ConfChangeResult.Outcome == b.ConfChangeResult.Outcome &&
+		membershipResultEqual(a.MembershipResult, b.MembershipResult) &&
+		a.ConfChangeResult.Conf.ID == b.ConfChangeResult.Conf.ID &&
+		sameReplicaIDs(a.ConfChangeResult.Conf.Voters, b.ConfChangeResult.Conf.Voters) &&
 		a.Checksum == b.Checksum &&
 		instanceNumsEqual(a.Deps, b.Deps) &&
 		instanceNumsEqual(a.AcceptDeps, b.AcceptDeps) &&
@@ -990,6 +2341,7 @@ func (n *RawNode) enqueueExecutedRecords(committed []CommittedCommand) {
 // Status returns a copy-only diagnostic snapshot of node state.
 func (n *RawNode) Status() StatusSnapshot {
 	s := StatusSnapshot{ID: n.id, Tick: n.tick, Conf: n.q.conf.Clone()}
+	s.TOQAvailable = n.toqEnabled && n.toqActive != nil
 	refs := make([]InstanceRef, 0, len(n.instances))
 	for ref := range n.instances {
 		refs = append(refs, ref)
@@ -997,77 +2349,120 @@ func (n *RawNode) Status() StatusSnapshot {
 	sortRefs(refs)
 	for _, ref := range refs {
 		s.Instances = append(s.Instances, n.instances[ref].rec.Clone())
-		if _, ok := n.executed[ref]; ok {
+		if n.executed.contains(ref) {
 			s.Executed = append(s.Executed, ref)
 		}
 	}
 	return s
 }
 
-func (n *RawNode) handlePreAccept(m Message) {
-	attrs := n.computeAttrsAt(m.Command, m.Ref, m.ProcessAt, m.TOQ || (n.timeOptimization && m.ProcessAt > 0))
+func (n *RawNode) preAcceptRecord(m Message, ordered bool) (InstanceRecord, bool) {
+	attrs := n.computeAttrsAt(m.Command, m.Ref, m.ProcessAt, ordered && (m.TOQ || (n.timeOptimization && m.ProcessAt > 0)))
 	if !m.TOQ {
 		attrs = mergeAttrs(attrs, m.Attributes())
 	}
-	defaultBallot := m.Ballot.Number == 0 && m.Ballot.Replica == m.Ref.Replica
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: inboundCommand(m.Command), FastPathEligible: defaultBallot && (m.TOQ || attrs.Equal(m.Attributes())), ProcessAt: m.ProcessAt}
+	defaultBallot := m.Ballot.IsInitialFor(m.Ref.Replica)
+	timedPreAccept := m.TOQ || (n.timeOptimization && m.ProcessAt > 0)
+	liveFastPathEligible := defaultBallot && (!timedPreAccept || ordered)
+	rec := InstanceRecord{
+		Ref:              m.Ref,
+		Ballot:           m.Ballot,
+		RecordBallot:     m.Ballot,
+		Status:           StatusPreAccepted,
+		Seq:              attrs.Seq,
+		Deps:             attrs.Deps,
+		Command:          inboundCommand(m.Command),
+		FastPathEligible: liveFastPathEligible && (m.TOQ || m.Attributes().Equal(attrs)),
+		ProcessAt:        m.ProcessAt,
+		TimingDomain:     timingDomainFromMessage(m),
+	}
+	rec.Checksum = ChecksumRecord(rec)
+	return rec, liveFastPathEligible
+}
+
+func (n *RawNode) handlePreAccept(m Message, ordered bool) error {
+	rec, liveFastPathEligible := n.preAcceptRecord(m, ordered)
 	old := n.instances[m.Ref]
 	if old != nil {
 		if old.rec.Status >= StatusCommitted {
+			if recordTupleBallot(old.rec) == m.Ballot && (!commandEqual(old.rec.Command, m.Command) || old.rec.ProcessAt != m.ProcessAt || old.rec.TimingDomain != timingDomainFromMessage(m)) {
+				return fmt.Errorf("%w: conflicting committed PreAccept retry for %s", ErrInvalidMessage, m.Ref)
+			}
 			n.sendCommitTo(m.From, old.rec)
-			return
+			return nil
 		}
 		if m.Ballot.Less(old.rec.Ballot) {
 			n.sendReject(MsgPreAcceptResp, m.From, m.Ref, old.rec.Ballot)
-			return
+			return nil
+		}
+		if m.Ballot == old.rec.Ballot &&
+			(!commandEqual(old.rec.Command, m.Command) || old.rec.ProcessAt != m.ProcessAt || old.rec.TimingDomain != timingDomainFromMessage(m)) {
+			return fmt.Errorf("%w: conflicting same-ballot PreAccept for %s", ErrInvalidMessage, m.Ref)
+		}
+		if old.rec.Status == StatusAccepted {
+			if m.Ballot == old.rec.Ballot {
+				resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: old.rec.Ballot, Seq: old.rec.Seq, Deps: old.rec.Deps}
+				n.enqueueMessage(resp)
+			}
+			return nil
+		}
+		if old.rec.Status == StatusPreAccepted && m.Ballot == old.rec.Ballot && old.rec.TimingDomain == timingDomainFromMessage(m) {
+			resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: old.rec.Ballot, Seq: old.rec.Seq, Deps: old.rec.Deps, FastPathEligible: old.rec.FastPathEligible, DepsCommitted: n.committedDepsMask(old.rec.Attributes(), m.Ref.Conf)}
+			n.enqueueMessage(resp)
+			return nil
 		}
 	}
-	rec.Checksum = ChecksumRecord(rec)
+
 	if old != nil && old.rec.Status == StatusPreAccepted && instanceRecordEqual(old.rec, rec) {
-		resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status, FastPathEligible: old.rec.FastPathEligible, DepsCommitted: n.committedDepsMask(rec.Attributes(), m.Ref.Conf)}
+		resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, FastPathEligible: liveFastPathEligible, DepsCommitted: n.committedDepsMask(rec.Attributes(), m.Ref.Conf)}
 		n.enqueueMessage(resp)
-		return
+		return nil
 	}
+	generation := uint64(0)
+	if old != nil {
+		generation = old.generation + 1
+	}
+	n.removeDeferredPreAccepts(rec.Ref)
 	n.observeInstanceRef(rec.Ref)
-	inst := &instance{rec: rec, phase: phaseIdle, processAt: m.ProcessAt}
-	n.instances[m.Ref] = inst
+	inst := &instance{rec: rec, phase: phaseIdle, processAt: m.ProcessAt, generation: generation}
+	n.installInstance(inst)
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
-	if n.shouldCoordinateRecovery(rec.Ref) {
-		n.schedule(inst, timerPrepare, n.recoveryTicks)
+	if err := n.scheduleRecovery(inst); err != nil {
+		return err
 	}
-	resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status, FastPathEligible: rec.FastPathEligible, DepsCommitted: n.committedDepsMask(rec.Attributes(), m.Ref.Conf)}
+	resp := Message{Type: MsgPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, FastPathEligible: liveFastPathEligible, DepsCommitted: n.committedDepsMask(rec.Attributes(), m.Ref.Conf)}
 	n.enqueueMessage(resp)
+	return nil
 }
 
-func (n *RawNode) handlePreAcceptResp(m Message) {
+func (n *RawNode) handlePreAcceptResp(m Message) error {
 	inst := n.instances[m.Ref]
 	if inst == nil || inst.phase != phasePreAccept || m.Ref.Replica != n.id {
-		return
+		return nil
 	}
 	if inst.rec.Ballot.Replica != n.id {
-		return
+		return nil
 	}
 	if m.Reject {
 		if !inst.rec.Ballot.Less(m.RejectHint) {
-			return
+			return nil
 		}
-		inst.rec.Ballot = m.RejectHint.Next(n.id)
-		n.startPrepare(inst)
-		return
+		return n.startPrepareFrom(inst, m.RejectHint)
 	}
 	if m.Ballot != inst.rec.Ballot {
-		return
+		return nil
 	}
 	if inst.preOK == nil {
 		inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.preOK[m.From]; duplicate {
-		return
+		return nil
 	}
 	inst.preOK[m.From] = attrVote{seq: m.Seq, deps: append([]InstanceNum(nil), m.Deps...), depsCommitted: m.DepsCommitted, fastPathEligible: m.FastPathEligible}
 	n.maybeFinalizePreAccept(inst)
+	return nil
 }
 
 func (n *RawNode) maybeFinalizePreAccept(inst *instance) {
@@ -1079,30 +2474,102 @@ func (n *RawNode) maybeFinalizePreAccept(inst *instance) {
 		n.commit(inst, fastAttrs)
 		return
 	}
-	if len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
-		deadline := inst.createdTick + n.timeOptimizationTicks
-		if n.timeOptimization && n.tick < deadline && len(inst.preOK) < len(n.confFor(inst.rec.Ref.Conf).Voters) {
+	slowQuorum := n.slowQuorumForConf(inst.rec.Ref.Conf)
+	if len(inst.preOK) < slowQuorum {
+		return
+	}
+	if len(inst.preOK) >= n.fastQuorumForConf(inst.rec.Ref.Conf) {
+		n.startAccept(inst, attrs)
+		return
+	}
+	if !n.canStillFastCommitPreAccept(inst) {
+		n.startAccept(inst, attrs)
+		return
+	}
+	if n.timeOptimization {
+		deadline := inst.rec.ProcessAt
+		if n.tick < deadline && len(inst.preOK) < len(n.confFor(inst.rec.Ref.Conf).Voters) {
 			inst.waitDeadline = deadline
-			n.schedule(inst, timerFastWait, deadline-n.tick)
+			_ = n.schedule(inst, timerFastWait, deadline-n.tick)
 			return
 		}
-		n.startAccept(inst, attrs)
 	}
 }
 
-func (n *RawNode) handleAccept(m Message) {
-	old := n.instances[m.Ref]
-	if old != nil {
-		if old.rec.Status >= StatusCommitted {
-			n.sendCommitTo(m.From, old.rec)
-			return
+func (n *RawNode) canStillFastCommitPreAccept(inst *instance) bool {
+	if inst == nil ||
+		!inst.rec.FastPathEligible ||
+		!inst.rec.Ballot.IsInitialFor(inst.rec.Ref.Replica) {
+		return false
+	}
+	conf := n.confFor(inst.rec.Ref.Conf)
+	unanswered := len(conf.Voters) - len(inst.preOK)
+	if unanswered < 0 {
+		unanswered = 0
+	}
+	fastQuorum := n.fastQuorumForConf(inst.rec.Ref.Conf)
+	localAttrs := inst.rec.Attributes()
+	canReach := func(candidate Attributes) bool {
+		if !candidate.Equal(localAttrs) && !attrsCover(localAttrs, candidate) {
+			return false
 		}
-		if m.Ballot.Less(old.rec.Ballot) {
-			n.sendReject(MsgAcceptResp, m.From, m.Ref, old.rec.Ballot)
-			return
+		count := 1
+		for id, vote := range inst.preOK {
+			if id == n.id || !vote.fastPathEligible {
+				continue
+			}
+			if (Attributes{Seq: vote.seq, Deps: vote.deps}).Equal(candidate) {
+				count++
+			}
+		}
+		return count+unanswered >= fastQuorum
+	}
+	if canReach(localAttrs) {
+		return true
+	}
+	for id, vote := range inst.preOK {
+		if id == n.id || !vote.fastPathEligible {
+			continue
+		}
+		if canReach(Attributes{Seq: vote.seq, Deps: vote.deps}) {
+			return true
 		}
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command)}
+	return false
+}
+
+func phaseMessageTimingEqual(rec InstanceRecord, m Message) bool {
+	if rec.ProcessAt == m.ProcessAt && rec.TimingDomain == timingDomainFromMessage(m) {
+		return true
+	}
+	return (m.Type == MsgAccept || m.Type == MsgCommit) &&
+		m.ProcessAt == 0 &&
+		!m.TOQ &&
+		rec.ProcessAt != 0 &&
+		rec.TimingDomain != TimingDomainUntimed
+}
+
+func phaseMessageTupleEqual(rec InstanceRecord, m Message) bool {
+	return rec.Seq == m.Seq &&
+		instanceNumsEqual(rec.Deps, m.Deps) &&
+		commandEqual(rec.Command, m.Command) &&
+		phaseMessageTimingEqual(rec, m)
+}
+
+func phaseMessageValueEqual(rec InstanceRecord, m Message) bool {
+	return commandEqual(rec.Command, m.Command) && phaseMessageTimingEqual(rec, m)
+}
+
+func (n *RawNode) acceptRecord(m Message, old *instance) InstanceRecord {
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command), ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
+	if old != nil && commandEqual(old.rec.Command, rec.Command) {
+		if rec.ProcessAt == 0 && old.rec.ProcessAt != 0 {
+			rec.ProcessAt = old.rec.ProcessAt
+			rec.TimingDomain = old.rec.TimingDomain
+		} else if rec.ProcessAt == old.rec.ProcessAt && old.rec.TimingDomain != TimingDomainUntimed {
+			rec.TimingDomain = old.rec.TimingDomain
+		}
+	}
 	acceptAttrs := mergeAttrs(acceptEvidenceFromMessage(m), n.computeAttrs(m.Command, m.Ref))
 	if old != nil && old.rec.Status == StatusAccepted && old.rec.RecordBallot == rec.RecordBallot && old.rec.Seq == rec.Seq && instanceNumsEqual(old.rec.Deps, rec.Deps) && commandEqual(old.rec.Command, rec.Command) {
 		if oldAttrs, ok := old.rec.AcceptAttributes(); ok {
@@ -1114,45 +2581,78 @@ func (n *RawNode) handleAccept(m Message) {
 	mergeSenderAcceptEvidence(&rec, m.AcceptEvidence)
 	mergeOwnAcceptEvidence(&rec, n.id, acceptAttrs)
 	rec.Checksum = ChecksumRecord(rec)
-	if old != nil && old.rec.Status == StatusAccepted && instanceRecordEqual(old.rec, rec) {
-		resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, AcceptSeq: rec.AcceptSeq, AcceptDeps: rec.AcceptDeps, AcceptEvidence: rec.AcceptEvidence, RecordStatus: rec.Status}
-		n.enqueueMessage(resp)
-		return
+	return rec
+}
+
+func (n *RawNode) handleAccept(m Message) error {
+	old := n.instances[m.Ref]
+	if old != nil {
+		if old.rec.Status >= StatusCommitted {
+			if recordTupleBallot(old.rec) == m.Ballot && !phaseMessageTupleEqual(old.rec, m) {
+				return fmt.Errorf("%w: conflicting committed Accept retry for %s", ErrInvalidMessage, m.Ref)
+			}
+			n.sendCommitTo(m.From, old.rec)
+			return nil
+		}
+		if m.Ballot.Less(old.rec.Ballot) {
+			n.sendReject(MsgAcceptResp, m.From, m.Ref, old.rec.Ballot)
+			return nil
+		}
+		if old.rec.Status == StatusAccepted && m.Ballot == old.rec.Ballot && old.rec.RecordBallot == m.Ballot {
+			if !phaseMessageTupleEqual(old.rec, m) {
+				return fmt.Errorf("%w: conflicting same-ballot Accept for %s", ErrInvalidMessage, m.Ref)
+			}
+			resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: old.rec.Ballot, RecordBallot: old.rec.RecordBallot, Seq: old.rec.Seq, Deps: old.rec.Deps, AcceptSeq: old.rec.AcceptSeq, AcceptDeps: old.rec.AcceptDeps, AcceptEvidence: old.rec.AcceptEvidence, RecordStatus: old.rec.Status}
+			n.enqueueMessage(resp)
+			return nil
+		}
+	}
+	if old != nil && old.rec.Status == StatusPreAccepted && old.rec.RecordBallot == m.Ballot && !phaseMessageValueEqual(old.rec, m) {
+		return fmt.Errorf("%w: conflicting same-ballot Accept promotion for %s", ErrInvalidMessage, m.Ref)
+	}
+	n.removeDeferredPreAccepts(m.Ref)
+	rec := n.acceptRecord(m, old)
+	generation := uint64(0)
+	if old != nil {
+		generation = old.generation + 1
 	}
 	n.observeInstanceRef(rec.Ref)
-	inst := &instance{rec: rec, phase: phaseIdle}
-	n.instances[m.Ref] = inst
+	inst := &instance{rec: rec, phase: phaseIdle, processAt: rec.ProcessAt, generation: generation}
+	n.installInstance(inst)
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
-	if n.shouldCoordinateRecovery(rec.Ref) {
-		n.schedule(inst, timerPrepare, n.recoveryTicks)
+	if err := n.scheduleRecovery(inst); err != nil {
+		return err
 	}
 	resp := Message{Type: MsgAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, AcceptSeq: rec.AcceptSeq, AcceptDeps: rec.AcceptDeps, AcceptEvidence: rec.AcceptEvidence, RecordStatus: rec.Status}
 	n.enqueueMessage(resp)
+	return nil
 }
 
-func (n *RawNode) handleAcceptResp(m Message) {
+func (n *RawNode) handleAcceptResp(m Message) error {
 	inst := n.instances[m.Ref]
 	if inst == nil || inst.phase != phaseAccept || !n.coordinatesInstance(inst) {
-		return
+		return nil
 	}
 	if m.Reject {
 		if !inst.rec.Ballot.Less(m.RejectHint) {
-			return
+			return nil
 		}
-		inst.rec.Ballot = m.RejectHint.Next(n.id)
-		n.startPrepare(inst)
-		return
+		return n.startPrepareFrom(inst, m.RejectHint)
 	}
-	if m.Ballot != inst.rec.Ballot {
-		return
+	if m.Ballot != inst.rec.Ballot ||
+		m.RecordBallot != inst.rec.RecordBallot ||
+		m.RecordStatus != StatusAccepted ||
+		m.Seq != inst.rec.Seq ||
+		!instanceNumsEqual(m.Deps, inst.rec.Deps) {
+		return nil
 	}
 	if inst.accOK == nil {
 		inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.accOK[m.From]; duplicate {
-		return
+		return nil
 	}
 	inst.accOK[m.From] = struct{}{}
 	changed := mergeAcceptEvidence(&inst.rec, acceptEvidenceFromMessage(m))
@@ -1166,16 +2666,40 @@ func (n *RawNode) handleAcceptResp(m Message) {
 	if len(inst.accOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.commit(inst, inst.rec.Attributes())
 	}
+	return nil
 }
 
-func (n *RawNode) handleCommit(m Message) {
+func (n *RawNode) handleCommit(m Message) error {
 	old := n.instances[m.Ref]
 	if old != nil && old.rec.Status >= StatusCommitted {
-		return
+		if recordTupleBallot(old.rec) == m.RecordBallot && !phaseMessageTupleEqual(old.rec, m) {
+			return fmt.Errorf("%w: conflicting committed Commit retry for %s", ErrInvalidMessage, m.Ref)
+		}
+		return nil
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: StatusCommitted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: inboundCommand(m.Command)}
+	if old != nil && old.rec.RecordBallot == m.RecordBallot {
+		switch {
+		case old.rec.Status >= StatusAccepted && !phaseMessageTupleEqual(old.rec, m):
+			return fmt.Errorf("%w: conflicting same-ballot Commit for %s", ErrInvalidMessage, m.Ref)
+		case old.rec.Status == StatusPreAccepted && !phaseMessageValueEqual(old.rec, m):
+			return fmt.Errorf("%w: conflicting same-ballot Commit promotion for %s", ErrInvalidMessage, m.Ref)
+		}
+	}
+	n.removeDeferredPreAccepts(m.Ref)
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: StatusCommitted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: inboundCommand(m.Command), ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
+	if old != nil && rec.Ballot.Less(old.rec.Ballot) {
+		rec.Ballot = old.rec.Ballot
+	}
+	if old != nil && commandEqual(old.rec.Command, rec.Command) {
+		if rec.ProcessAt == 0 && old.rec.ProcessAt != 0 {
+			rec.ProcessAt = old.rec.ProcessAt
+			rec.TimingDomain = old.rec.TimingDomain
+		} else if rec.ProcessAt == old.rec.ProcessAt && old.rec.TimingDomain != TimingDomainUntimed {
+			rec.TimingDomain = old.rec.TimingDomain
+		}
+	}
 	if rec.RecordBallot == (Ballot{}) {
-		return
+		return nil
 	}
 	var acceptAttrs Attributes
 	hasAcceptAttrs := false
@@ -1201,35 +2725,46 @@ func (n *RawNode) handleCommit(m Message) {
 	}
 	rec.Checksum = ChecksumRecord(rec)
 	n.observeInstanceRef(rec.Ref)
-	n.instances[m.Ref] = &instance{rec: rec, phase: phaseCommitted}
+	n.installInstance(&instance{rec: rec, phase: phaseCommitted, processAt: rec.ProcessAt})
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
 	n.tryExecute()
+	return nil
 }
 
-func (n *RawNode) handlePrepare(m Message) {
+func (n *RawNode) handlePrepare(m Message) error {
 	resp := Message{Type: MsgPrepareResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: m.Ballot}
 	inst := n.instances[m.Ref]
 	if inst != nil && inst.rec.TOQPending {
-		n.processDuePreAccepts()
-		inst = n.instances[m.Ref]
-		if inst != nil && inst.rec.TOQPending {
-			return
-		}
+		return nil
 	}
 	if inst != nil && m.Ballot.Less(inst.rec.Ballot) {
 		n.sendReject(MsgPrepareResp, m.From, m.Ref, inst.rec.Ballot)
-		return
+		return nil
+	}
+	n.removeDeferredPreAccepts(m.Ref)
+	deadline := uint64(0)
+	needsWait := m.Ballot.IsRecovery() && m.Ballot.Replica != n.id &&
+		(inst == nil || inst.rec.Ballot.Less(m.Ballot))
+	if needsWait {
+		var err error
+		deadline, err = checkedLogicalDeadline(n.tick, n.recoveryTicks)
+		if err != nil {
+			return err
+		}
 	}
 	if inst == nil {
 		rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, Status: StatusNone, Deps: n.depsForConf(m.Ref.Conf)}
 		rec.Checksum = ChecksumRecord(rec)
 		inst = &instance{rec: rec, phase: phaseIdle}
-		n.instances[m.Ref] = inst
+		n.installInstance(inst)
 		n.observeInstanceRef(rec.Ref)
-		if m.Ballot.Number > 0 && m.Ballot.Replica != n.id {
-			inst.waitDeadline = n.tick + n.recoveryTicks
+		if needsWait {
+			inst.waitDeadline = deadline
+			if err := n.schedule(inst, timerPrepare, n.recoveryTicks); err != nil {
+				return err
+			}
 		}
 		n.enqueueRecord(rec)
 	} else {
@@ -1238,12 +2773,15 @@ func (n *RawNode) handlePrepare(m Message) {
 			inst.rec.Ballot = m.Ballot
 			changed = true
 			if m.Ballot.Replica != n.id {
+				n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
+				n.cancelTimersForRef(inst.rec.Ref)
+				releaseInstanceVolatile(inst)
 				inst.phase = phaseIdle
-				inst.preOK = nil
-				inst.accOK = nil
-				inst.prepareOK = nil
 				inst.generation++
-				inst.waitDeadline = n.tick + n.recoveryTicks
+				inst.waitDeadline = deadline
+				if err := n.schedule(inst, timerPrepare, n.recoveryTicks); err != nil {
+					return err
+				}
 			}
 		}
 		if n.ensureRecordDeps(&inst.rec) {
@@ -1264,16 +2802,15 @@ func (n *RawNode) handlePrepare(m Message) {
 	resp.AcceptSeq = inst.rec.AcceptSeq
 	resp.AcceptDeps = inst.rec.AcceptDeps
 	resp.AcceptEvidence = inst.rec.AcceptEvidence
+	resp.ProcessAt = inst.rec.ProcessAt
+	resp.TOQ = recordUsesTOQ(inst.rec)
 	n.enqueueMessage(resp)
+	return nil
 }
 
 func (n *RawNode) handleEvidence(m Message) {
 	resp := Message{Type: MsgEvidenceResp, From: n.id, To: m.From, Ref: m.Ref, ConflictRef: m.ConflictRef, Ballot: m.Ballot, Deps: n.depsForConf(m.Ref.Conf), RecordStatus: StatusNone}
 	inst := n.instances[m.Ref]
-	if inst != nil && inst.rec.TOQPending {
-		n.processDuePreAccepts()
-		inst = n.instances[m.Ref]
-	}
 	if inst != nil && !inst.rec.TOQPending {
 		deps := inst.rec.Deps
 		conf := n.confFor(m.Ref.Conf)
@@ -1291,6 +2828,8 @@ func (n *RawNode) handleEvidence(m Message) {
 		resp.AcceptSeq = inst.rec.AcceptSeq
 		resp.AcceptDeps = inst.rec.AcceptDeps
 		resp.AcceptEvidence = inst.rec.AcceptEvidence
+		resp.ProcessAt = inst.rec.ProcessAt
+		resp.TOQ = recordUsesTOQ(inst.rec)
 	}
 	n.enqueueMessage(resp)
 }
@@ -1309,64 +2848,72 @@ func (n *RawNode) handleEvidenceResp(m Message) {
 	if _, duplicate := records[m.From]; duplicate {
 		return
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 	records[m.From] = rec
 	n.resolveTryEvidenceCheck(key)
 }
 
-func (n *RawNode) handlePrepareResp(m Message) {
+func prepareResponseRecord(inst *instance, id ReplicaID) InstanceRecord {
+	if rec, ok := inst.prepareOK[id]; ok {
+		return rec
+	}
+	return inst.prepareEvidence[id]
+}
+
+func (n *RawNode) handlePrepareResp(m Message) error {
 	inst := n.instances[m.Ref]
-	if inst == nil || inst.phase != phasePrepare || inst.rec.Ballot.Number == 0 || inst.rec.Ballot.Replica != n.id {
-		return
+	if inst == nil || inst.phase != phasePrepare || !inst.rec.Ballot.IsRecovery() || inst.rec.Ballot.Replica != n.id {
+		return nil
 	}
 	if m.Reject {
 		if !inst.rec.Ballot.Less(m.RejectHint) {
-			return
+			return nil
 		}
-		inst.rec.Ballot = m.RejectHint
-		n.startPrepare(inst)
-		return
+		return n.startPrepareFrom(inst, m.RejectHint)
 	}
 	if m.Ballot.Less(inst.rec.Ballot) {
-		return
+		return nil
 	}
 	if inst.rec.Ballot.Less(m.Ballot) {
-		inst.rec.Ballot = m.Ballot
-		n.startPrepare(inst)
-		return
+		return n.startPrepareFrom(inst, m.Ballot)
 	}
 	if inst.prepareOK == nil {
 		inst.prepareOK = make(map[ReplicaID]InstanceRecord, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.prepareOK[m.From]; duplicate {
-		return
+		return nil
 	}
 	recordBallot := m.RecordBallot
 	if recordHasValue(m.RecordStatus) && recordBallot == (Ballot{}) {
-		return
+		return nil
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: recordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: recordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 	n.ensureRecordDeps(&rec)
 	rec.Checksum = ChecksumRecord(rec)
 	inst.prepareOK[m.From] = rec
 	if len(inst.prepareOK) < n.slowQuorumForConf(inst.rec.Ref.Conf) {
-		return
+		return nil
 	}
 
-	responders := make([]ReplicaID, 0, len(inst.prepareOK))
+	responders := make([]ReplicaID, 0, len(inst.prepareOK)+len(inst.prepareEvidence))
 	for id := range inst.prepareOK {
 		responders = append(responders, id)
+	}
+	for id := range inst.prepareEvidence {
+		if _, fresh := inst.prepareOK[id]; !fresh {
+			responders = append(responders, id)
+		}
 	}
 	sort.Slice(responders, func(i, j int) bool { return responders[i] < responders[j] })
 
 	for _, id := range responders {
-		rec := inst.prepareOK[id]
-		if rec.Status == StatusCommitted {
+		rec := prepareResponseRecord(inst, id)
+		if rec.Status >= StatusCommitted {
 			inst.rec = rec.Clone()
 			inst.rec.Status = StatusCommitted
 			inst.rec.Checksum = ChecksumRecord(inst.rec)
 			n.commit(inst, inst.rec.Attributes())
-			return
+			return nil
 		}
 	}
 	var chosen InstanceRecord
@@ -1374,7 +2921,7 @@ func (n *RawNode) handlePrepareResp(m Message) {
 	foundAccepted := false
 	var highestAccepted Ballot
 	for _, id := range responders {
-		rec := inst.prepareOK[id]
+		rec := prepareResponseRecord(inst, id)
 		if rec.Status != StatusAccepted {
 			continue
 		}
@@ -1391,15 +2938,18 @@ func (n *RawNode) handlePrepareResp(m Message) {
 	}
 	if foundAccepted {
 		inst.rec.Command = chosen.Command.Clone()
+		inst.rec.ProcessAt = chosen.ProcessAt
+		inst.rec.TimingDomain = chosen.TimingDomain
+		inst.processAt = chosen.ProcessAt
 		n.startAccept(inst, attrs)
-		return
+		return nil
 	}
 
 	attrs = Attributes{}
 	foundPreAccepted := false
 	var highestPreAccepted Ballot
 	for _, id := range responders {
-		rec := inst.prepareOK[id]
+		rec := prepareResponseRecord(inst, id)
 		if rec.Status != StatusPreAccepted {
 			continue
 		}
@@ -1412,7 +2962,7 @@ func (n *RawNode) handlePrepareResp(m Message) {
 	foundPreAccepted = false
 	var candidates []tryCandidate
 	for _, id := range responders {
-		rec := inst.prepareOK[id]
+		rec := prepareResponseRecord(inst, id)
 		if rec.Status != StatusPreAccepted || recordTupleBallot(rec) != highestPreAccepted {
 			continue
 		}
@@ -1428,18 +2978,38 @@ func (n *RawNode) handlePrepareResp(m Message) {
 	for _, candidate := range candidates {
 		if len(candidate.voters) >= n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
 			inst.rec.Command = candidate.rec.Command.Clone()
-			n.startTryPreAccept(inst, candidate.rec.Attributes(), candidate.voters)
-			return
+			inst.rec.ProcessAt = candidate.rec.ProcessAt
+			inst.rec.TimingDomain = candidate.rec.TimingDomain
+			inst.processAt = candidate.rec.ProcessAt
+			n.startTryPreAccept(inst, candidate.rec.Attributes(), candidate.voters, true)
+			return nil
 		}
 	}
 	if foundPreAccepted {
 		inst.rec.Command = chosen.Command.Clone()
+		inst.rec.ProcessAt = chosen.ProcessAt
+		inst.rec.TimingDomain = chosen.TimingDomain
+		inst.processAt = chosen.ProcessAt
+		attrs = mergeAttrs(attrs, n.computeAttrs(inst.rec.Command, inst.rec.Ref))
 		n.startAccept(inst, attrs)
-		return
+		return nil
 	}
 
-	inst.rec.Command = Command{Kind: CommandNoop}
+	if _, _, control := n.findBootstrapControl(inst.rec.Ref); control {
+		command, ok := n.membershipAllNoneCommand(inst.rec.Ref)
+		if !ok {
+			return ErrBootstrapControl
+		}
+		inst.rec.Command = command
+	} else {
+		inst.rec.Command = Command{Kind: CommandNoop}
+	}
+	inst.rec.ProcessAt = 0
+	inst.rec.TimingDomain = TimingDomainUntimed
+	inst.rec.TOQPending = false
+	inst.processAt = 0
 	n.startAccept(inst, Attributes{Seq: 1, Deps: n.depsForConf(m.Ref.Conf)})
+	return nil
 }
 
 func acceptEvidenceFromMessage(m Message) Attributes {
@@ -1489,10 +3059,48 @@ func clearRecordAcceptEvidence(rec *InstanceRecord) {
 	rec.AcceptEvidence = nil
 }
 
+func releaseInstanceVolatile(inst *instance) {
+	if inst == nil {
+		return
+	}
+	for id, vote := range inst.preOK {
+		clear(vote.deps)
+		vote.deps = nil
+		inst.preOK[id] = attrVote{}
+		delete(inst.preOK, id)
+	}
+	clear(inst.accOK)
+	for id := range inst.prepareOK {
+		inst.prepareOK[id] = InstanceRecord{}
+		delete(inst.prepareOK, id)
+	}
+	for id := range inst.prepareEvidence {
+		inst.prepareEvidence[id] = InstanceRecord{}
+		delete(inst.prepareEvidence, id)
+	}
+	clear(inst.tryOK)
+	clear(inst.tryDeferred)
+	clear(inst.tryIgnored)
+	inst.preOK = nil
+	inst.accOK = nil
+	inst.prepareOK = nil
+	inst.prepareEvidence = nil
+	inst.tryOK = nil
+	inst.tryDeferred = nil
+	inst.tryIgnored = nil
+	inst.createdTick = 0
+	inst.waitDeadline = 0
+	inst.processAt = inst.rec.ProcessAt
+}
+
 func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	if inst.phase == phaseCommitted {
 		return
 	}
+	n.cancelTimersForRef(inst.rec.Ref)
+	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
+	n.removeDeferredPreAccepts(inst.rec.Ref)
+	releaseInstanceVolatile(inst)
 	clearRecordAcceptEvidence(&inst.rec)
 	inst.phase = phaseAccept
 	inst.rec.Status = StatusAccepted
@@ -1517,10 +3125,17 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	n.schedule(inst, timerAccept, n.retryTicks)
 }
 
-func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses map[ReplicaID]struct{}) {
+func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses map[ReplicaID]struct{}, countInitialLeader bool) {
 	if inst.phase == phaseCommitted {
 		return
 	}
+	n.cancelTimersForRef(inst.rec.Ref)
+	localPrepareWitness := false
+	if rec, ok := inst.prepareOK[n.id]; ok {
+		localPrepareWitness = rec.FastPathEligible && commandEqual(rec.Command, inst.rec.Command) && rec.Attributes().Equal(attrs)
+	}
+	n.removeDeferredPreAccepts(inst.rec.Ref)
+	releaseInstanceVolatile(inst)
 	inst.phase = phaseTryPreAccept
 	inst.rec.Status = StatusPreAccepted
 	inst.rec.Seq = attrs.Seq
@@ -1537,10 +3152,10 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 	for id := range witnesses {
 		inst.tryOK[id] = struct{}{}
 	}
-	if n.canCountInitialLeaderForTry(inst) {
+	if countInitialLeader {
 		inst.tryOK[inst.rec.Ref.Replica] = struct{}{}
 	}
-	if rec, ok := inst.prepareOK[n.id]; ok && rec.FastPathEligible && commandEqual(rec.Command, inst.rec.Command) && rec.Attributes().Equal(inst.rec.Attributes()) {
+	if localPrepareWitness {
 		inst.tryOK[n.id] = struct{}{}
 	}
 	inst.generation++
@@ -1553,16 +3168,75 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 	n.schedule(inst, timerTryPreAccept, n.retryTicks)
 }
 
-func (n *RawNode) handleTryPreAccept(m Message) {
+func (n *RawNode) handleTryPreAccept(m Message) error {
 	old := n.instances[m.Ref]
 	if old != nil {
 		if old.rec.Status >= StatusCommitted {
+			if recordTupleBallot(old.rec) == m.Ballot && !phaseMessageTupleEqual(old.rec, m) {
+				return fmt.Errorf("%w: conflicting committed TryPreAccept retry for %s", ErrInvalidMessage, m.Ref)
+			}
 			n.sendCommitTo(m.From, old.rec)
-			return
+			return nil
 		}
 		if m.Ballot.Less(old.rec.Ballot) {
 			n.sendReject(MsgTryPreAcceptResp, m.From, m.Ref, old.rec.Ballot)
-			return
+			return nil
+		}
+		if old.rec.Status == StatusAccepted {
+			if m.Ballot == old.rec.Ballot && old.rec.RecordBallot == m.Ballot && !phaseMessageTupleEqual(old.rec, m) {
+				return fmt.Errorf("%w: conflicting same-ballot TryPreAccept for %s", ErrInvalidMessage, m.Ref)
+			}
+			n.removeDeferredPreAccepts(m.Ref)
+			if old.rec.Ballot.Less(m.Ballot) {
+				old.rec.Ballot = m.Ballot
+				old.rec.Checksum = ChecksumRecord(old.rec)
+				if m.Ballot.Replica != n.id {
+					n.cancelTimersForRef(old.rec.Ref)
+					old.phase = phaseIdle
+					old.preOK = nil
+					old.accOK = nil
+					old.prepareOK = nil
+					old.generation++
+					deadline, err := checkedLogicalDeadline(n.tick, n.recoveryTicks)
+					if err != nil {
+						return err
+					}
+					old.waitDeadline = deadline
+					if err := n.schedule(old, timerPrepare, n.recoveryTicks); err != nil {
+						return err
+					}
+				}
+				n.enqueueRecord(old.rec)
+			}
+			resp := Message{
+				Type:           MsgTryPreAcceptResp,
+				From:           n.id,
+				To:             m.From,
+				Ref:            m.Ref,
+				Ballot:         m.Ballot,
+				RecordBallot:   old.rec.RecordBallot,
+				Seq:            old.rec.Seq,
+				Deps:           old.rec.Deps,
+				AcceptSeq:      old.rec.AcceptSeq,
+				AcceptDeps:     old.rec.AcceptDeps,
+				AcceptEvidence: old.rec.AcceptEvidence,
+				Command:        old.rec.Command.Borrow(),
+				Reject:         true,
+				RejectReason:   RejectAcceptedTarget,
+				RecordStatus:   StatusAccepted,
+				ProcessAt:      old.rec.ProcessAt,
+				TOQ:            recordUsesTOQ(old.rec),
+			}
+			n.enqueueMessage(resp)
+			return nil
+		}
+		if old.rec.Status == StatusPreAccepted && m.Ballot == old.rec.Ballot && old.rec.RecordBallot == m.Ballot {
+			if !phaseMessageTupleEqual(old.rec, m) {
+				return fmt.Errorf("%w: conflicting same-ballot TryPreAccept for %s", ErrInvalidMessage, m.Ref)
+			}
+			resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: old.rec.Ballot, Seq: old.rec.Seq, Deps: old.rec.Deps, RecordStatus: old.rec.Status, ProcessAt: old.rec.ProcessAt, TOQ: recordUsesTOQ(old.rec)}
+			n.enqueueMessage(resp)
+			return nil
 		}
 	}
 	if conflictRef, conflictStatus, ok := n.tryPreAcceptConflict(m); ok {
@@ -1572,39 +3246,74 @@ func (n *RawNode) handleTryPreAccept(m Message) {
 		}
 		resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: m.Ballot, Reject: true, RejectReason: reason, ConflictRef: conflictRef, ConflictStatus: conflictStatus, Deps: n.depsForConf(m.Ref.Conf)}
 		n.enqueueMessage(resp)
-		return
+		return nil
 	}
-	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusPreAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command)}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusPreAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command), ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 	rec.Checksum = ChecksumRecord(rec)
 	if old != nil && old.rec.Status == StatusPreAccepted && instanceRecordEqual(old.rec, rec) {
-		resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
+		resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status, ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
 		n.enqueueMessage(resp)
-		return
+		return nil
 	}
+	n.removeDeferredPreAccepts(rec.Ref)
 	n.observeInstanceRef(rec.Ref)
-	inst := &instance{rec: rec, phase: phaseIdle}
-	n.instances[m.Ref] = inst
+	generation := uint64(0)
+	if old != nil {
+		generation = old.generation + 1
+	}
+	inst := &instance{rec: rec, phase: phaseIdle, generation: generation}
+	n.installInstance(inst)
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
-	resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status}
+	n.markPendingConf(rec)
+	if err := n.scheduleRecovery(inst); err != nil {
+		return err
+	}
+	resp := Message{Type: MsgTryPreAcceptResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, RecordStatus: rec.Status, ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
 	n.enqueueMessage(resp)
+	return nil
 }
 
-func (n *RawNode) handleTryPreAcceptResp(m Message) {
+func (n *RawNode) handleTryPreAcceptResp(m Message) error {
 	inst := n.instances[m.Ref]
 	if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) {
-		return
+		return nil
 	}
 	if m.Reject {
 		switch m.RejectReason {
 		case RejectStaleBallot, RejectNone:
 			if inst.rec.Ballot.Less(m.RejectHint) {
-				inst.rec.Ballot = m.RejectHint
-				n.startPrepare(inst)
+				return n.startPrepareFrom(inst, m.RejectHint)
 			}
+		case RejectAcceptedTarget:
+			if m.Ballot != inst.rec.Ballot {
+				return nil
+			}
+			evidence := InstanceRecord{
+				Ref:            m.Ref,
+				Ballot:         m.Ballot,
+				RecordBallot:   m.RecordBallot,
+				Status:         StatusAccepted,
+				Seq:            m.Seq,
+				Deps:           append([]InstanceNum(nil), m.Deps...),
+				AcceptSeq:      m.AcceptSeq,
+				AcceptDeps:     append([]InstanceNum(nil), m.AcceptDeps...),
+				AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence),
+				Command:        m.Command.Clone(),
+				ProcessAt:      m.ProcessAt,
+				TimingDomain:   timingDomainFromMessage(m),
+			}
+			evidence.Checksum = ChecksumRecord(evidence)
+			if err := n.startPrepare(inst); err != nil {
+				return err
+			}
+			if inst.prepareEvidence == nil {
+				inst.prepareEvidence = make(map[ReplicaID]InstanceRecord, 1)
+			}
+			inst.prepareEvidence[m.From] = evidence
 		case RejectCommittedConflict:
 			if m.ConflictStatus >= StatusCommitted && n.maybeStartTryEvidenceCheck(inst, m.ConflictRef) {
-				return
+				return nil
 			}
 			n.startAcceptAfterTryCommittedConflict(inst, m.ConflictRef)
 		case RejectUncommittedConflict:
@@ -1612,30 +3321,34 @@ func (n *RawNode) handleTryPreAcceptResp(m Message) {
 				if n.tryConflictForcesSlowAccept(inst, m.ConflictRef) {
 					attrs := n.computeAttrs(inst.rec.Command, inst.rec.Ref)
 					n.startAccept(inst, mergeAttrs(attrs, inst.rec.Attributes()))
-					return
+					return nil
 				}
 				if inst.tryDeferred == nil {
 					inst.tryDeferred = make(map[InstanceRef]struct{}, 1)
 				}
 				inst.tryDeferred[m.ConflictRef] = struct{}{}
-				n.ensureDependencyRecovery(m.ConflictRef)
+				n.maybeStartDependencyRecovery(m.ConflictRef)
 			}
 		}
-		return
+		return nil
 	}
-	if m.Ballot.Less(inst.rec.Ballot) {
-		return
+	if m.Ballot != inst.rec.Ballot ||
+		m.RecordStatus != StatusPreAccepted ||
+		m.Seq != inst.rec.Seq ||
+		!instanceNumsEqual(m.Deps, inst.rec.Deps) {
+		return nil
 	}
 	if inst.tryOK == nil {
 		inst.tryOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
 	}
 	if _, duplicate := inst.tryOK[m.From]; duplicate {
-		return
+		return nil
 	}
 	inst.tryOK[m.From] = struct{}{}
 	if len(inst.tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, inst.rec.Attributes())
 	}
+	return nil
 }
 
 func (n *RawNode) startAcceptAfterTryCommittedConflict(inst *instance, conflictRef InstanceRef) {
@@ -1659,18 +3372,35 @@ func (n *RawNode) maybeStartTryEvidenceCheck(inst *instance, conflictRef Instanc
 	if !n.attrsDependsOn(inst.rec.Attributes(), conflictRef, inst.rec.Ref.Conf) {
 		return false
 	}
-	if len(inst.tryIgnored) > 0 {
-		return false
-	}
-	if n.faultTolerance(inst.rec.Ref.Conf) <= 0 {
+	if len(inst.tryIgnored) > 0 || n.faultTolerance(inst.rec.Ref.Conf) <= 0 {
 		return false
 	}
 	key := tryEvidenceKey{target: inst.rec.Ref, conflict: conflictRef, ballot: inst.rec.Ballot}
+	for existingKey, records := range n.tryEvidenceChecks {
+		if existingKey.target != inst.rec.Ref {
+			continue
+		}
+		if existingKey == key {
+			return true
+		}
+		tuple, tupleOK := n.committedConflictTuple(existingKey.conflict, records)
+		if tupleOK {
+			tuple = tuple.Clone()
+		}
+		n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
+		if tupleOK {
+			n.startAcceptAfterTryCommittedConflictTuple(inst, tuple)
+		} else {
+			n.startAcceptAfterTryCommittedConflict(inst, existingKey.conflict)
+		}
+		return true
+	}
+	if len(n.tryEvidenceChecks) >= n.maxConcurrentRecoveries {
+		n.startAcceptAfterTryCommittedConflict(inst, conflictRef)
+		return true
+	}
 	if n.tryEvidenceChecks == nil {
 		n.tryEvidenceChecks = make(map[tryEvidenceKey]map[ReplicaID]InstanceRecord, 1)
-	}
-	if _, ok := n.tryEvidenceChecks[key]; ok {
-		return true
 	}
 	n.tryEvidenceChecks[key] = make(map[ReplicaID]InstanceRecord, n.faultTolerance(inst.rec.Ref.Conf))
 	n.broadcastTryEvidenceCheck(inst, conflictRef)
@@ -1688,7 +3418,10 @@ func (n *RawNode) broadcastTryEvidenceCheck(inst *instance, conflictRef Instance
 }
 
 func (n *RawNode) deleteTryEvidenceCheck(key tryEvidenceKey) {
-	delete(n.tryEvidenceChecks, key)
+	if records, ok := n.tryEvidenceChecks[key]; ok {
+		clearTryEvidenceRecords(records)
+		delete(n.tryEvidenceChecks, key)
+	}
 	if len(n.tryEvidenceChecks) == 0 {
 		n.tryEvidenceChecks = nil
 	}
@@ -1708,9 +3441,17 @@ func (n *RawNode) resolveTryEvidenceCheck(key tryEvidenceKey) {
 	if !authorized && !failClosed {
 		return
 	}
+	var tuple InstanceRecord
+	tupleOK := false
+	if failClosed {
+		tuple, tupleOK = n.committedConflictTuple(key.conflict, records)
+		if tupleOK {
+			tuple = tuple.Clone()
+		}
+	}
 	n.deleteTryEvidenceCheck(key)
 	if failClosed {
-		if tuple, ok := n.committedConflictTuple(key.conflict, records); ok {
+		if tupleOK {
 			n.startAcceptAfterTryCommittedConflictTuple(inst, tuple)
 		} else {
 			n.startAcceptAfterTryCommittedConflict(inst, key.conflict)
@@ -1805,7 +3546,7 @@ func (n *RawNode) tryEvidenceRecordDecision(inst *instance, tuple InstanceRecord
 }
 
 func sameValueTuple(a, b InstanceRecord) bool {
-	return a.Ref == b.Ref && a.Seq == b.Seq && instanceNumsEqual(a.Deps, b.Deps) && commandEqual(a.Command, b.Command)
+	return a.Ref == b.Ref && a.Seq == b.Seq && a.ProcessAt == b.ProcessAt && a.TimingDomain == b.TimingDomain && instanceNumsEqual(a.Deps, b.Deps) && commandEqual(a.Command, b.Command)
 }
 
 func (n *RawNode) allRemoteEvidenceResponses(confID ConfID, records map[ReplicaID]InstanceRecord) bool {
@@ -1837,7 +3578,7 @@ func (n *RawNode) failPendingTryEvidenceCheck(inst *instance) bool {
 			continue
 		}
 		if key.ballot != inst.rec.Ballot {
-			delete(n.tryEvidenceChecks, key)
+			n.deleteTryEvidenceCheck(key)
 			continue
 		}
 		keys = append(keys, key)
@@ -1862,13 +3603,21 @@ func (n *RawNode) failPendingTryEvidenceCheck(inst *instance) bool {
 }
 
 func (n *RawNode) dropTryEvidenceChecksForTarget(target InstanceRef) {
-	for key := range n.tryEvidenceChecks {
-		if key.target == target {
-			delete(n.tryEvidenceChecks, key)
+	for key, records := range n.tryEvidenceChecks {
+		if key.target != target {
+			continue
 		}
+		clearTryEvidenceRecords(records)
+		delete(n.tryEvidenceChecks, key)
 	}
 	if len(n.tryEvidenceChecks) == 0 {
 		n.tryEvidenceChecks = nil
+	}
+}
+func clearTryEvidenceRecords(records map[ReplicaID]InstanceRecord) {
+	for id := range records {
+		records[id] = InstanceRecord{}
+		delete(records, id)
 	}
 }
 func (n *RawNode) tryPreAcceptConflict(m Message) (InstanceRef, Status, bool) {
@@ -1976,18 +3725,16 @@ func (n *RawNode) attrsWithConflictDependencySeq(attrs Attributes, dep InstanceR
 	return attrs
 }
 
-func (n *RawNode) canCountInitialLeaderForTry(inst *instance) bool {
+func (n *RawNode) hasMatchingInitialLeaderTryRecord(inst *instance, attrs Attributes) bool {
 	if inst == nil || inst.rec.Ref.Replica == 0 {
 		return false
 	}
 	rec, ok := inst.prepareOK[inst.rec.Ref.Replica]
-	if !ok {
-		return n.confFor(inst.rec.Ref.Conf).Contains(inst.rec.Ref.Replica)
-	}
-	return rec.Status == StatusPreAccepted &&
+	return ok &&
+		rec.Status == StatusPreAccepted &&
 		rec.FastPathEligible &&
 		commandEqual(rec.Command, inst.rec.Command) &&
-		rec.Attributes().Equal(inst.rec.Attributes())
+		rec.Attributes().Equal(attrs)
 }
 
 func (n *RawNode) tryConflictForcesSlowAccept(inst *instance, conflictRef InstanceRef) bool {
@@ -2058,54 +3805,252 @@ func (n *RawNode) replicaCouldBeInCandidateFastQuorum(inst *instance, id Replica
 		rec.Attributes().Equal(inst.rec.Attributes())
 }
 
-func (n *RawNode) startPrepare(inst *instance) {
+func (n *RawNode) startPrepare(inst *instance) error {
+	return n.startPrepareFrom(inst, inst.rec.Ballot)
+}
+
+func (n *RawNode) startPrepareFrom(inst *instance, base Ballot) error {
+	if base.Less(inst.rec.Ballot) {
+		base = inst.rec.Ballot
+	}
+	next, err := base.Next(n.id)
+	if err != nil {
+		return err
+	}
+	if _, err := checkedLogicalDeadline(n.tick, n.recoveryTicks); err != nil {
+		return err
+	}
+	if inst.generation == ^uint64(0) {
+		return ErrLogicalTimeExhausted
+	}
+	n.cancelTimersForRef(inst.rec.Ref)
+	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
+	releaseInstanceVolatile(inst)
+	inst.waitDeadline = 0
 	inst.phase = phasePrepare
 	n.ensureRecordDeps(&inst.rec)
-	previous := inst.rec.Clone()
 	inst.tryDeferred = nil
-	inst.rec.Ballot = inst.rec.Ballot.Next(n.id)
+	inst.rec.Ballot = next
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
-	inst.prepareOK = map[ReplicaID]InstanceRecord{n.id: previous}
+	inst.prepareOK = map[ReplicaID]InstanceRecord{n.id: inst.rec.Clone()}
 	inst.generation++
 	n.enqueueRecord(inst.rec)
-	n.broadcast(MsgPrepare, inst.rec)
-	n.schedule(inst, timerPrepare, n.recoveryTicks)
+	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
+		if _, _, isControl := n.findBootstrapControl(inst.rec.Ref); isControl {
+			command, ok := n.membershipAllNoneCommand(inst.rec.Ref)
+			if !ok {
+				return ErrBootstrapControl
+			}
+			inst.rec.Command = command
+		} else {
+			inst.rec.Command = Command{Kind: CommandNoop}
+		}
+		inst.rec.ProcessAt = 0
+		inst.rec.TimingDomain = TimingDomainUntimed
+		inst.rec.TOQPending = false
+		inst.processAt = 0
+		n.startAccept(inst, Attributes{Seq: 1, Deps: n.depsForConf(inst.rec.Ref.Conf)})
+		return nil
+	}
+	n.broadcastPrepare(inst.rec)
+	return n.schedule(inst, timerPrepare, n.recoveryTicks)
 }
 
 func (n *RawNode) coordinatesInstance(inst *instance) bool {
-	return inst != nil && (inst.rec.Ref.Replica == n.id || (inst.rec.Ballot.Number > 0 && inst.rec.Ballot.Replica == n.id))
+	return inst != nil && (inst.rec.Ref.Replica == n.id || (inst.rec.Ballot.IsRecovery() && inst.rec.Ballot.Replica == n.id))
+}
+
+func (n *RawNode) recoveryCoordinatorAt(ref InstanceRef, tick uint64) ReplicaID {
+	conf := n.confFor(ref.Conf)
+	candidates := make([]ReplicaID, 0, len(conf.Voters))
+	for _, id := range conf.Voters {
+		if id != ref.Replica {
+			candidates = append(candidates, id)
+		}
+	}
+	if len(candidates) == 0 {
+		if len(conf.Voters) == 1 {
+			return conf.Voters[0]
+		}
+		return 0
+	}
+	round := uint64(0)
+	if tick > 0 && n.recoveryTicks > 0 {
+		round = (tick - 1) / n.recoveryTicks
+	}
+	return candidates[round%uint64(len(candidates))]
 }
 
 func (n *RawNode) recoveryCoordinator(ref InstanceRef) ReplicaID {
-	conf := n.confFor(ref.Conf)
-	for _, id := range conf.Voters {
-		if id != ref.Replica {
-			return id
-		}
-	}
-	if len(conf.Voters) == 1 {
-		return conf.Voters[0]
-	}
-	return 0
+	return n.recoveryCoordinatorAt(ref, n.tick)
 }
 
 func (n *RawNode) shouldCoordinateRecovery(ref InstanceRef) bool {
 	return n.recoveryCoordinator(ref) == n.id
 }
 
+func (n *RawNode) recoveryWouldExhaustAt(tick uint64) bool {
+	starts := n.maxDependencyRecoveriesPerDrive
+	if available := n.maxConcurrentRecoveries - n.activeRecoveryCount(); starts > available {
+		starts = available
+	}
+	if starts <= 0 {
+		return false
+	}
+	due := make(timerHeap, 0, starts)
+	for _, t := range n.timers {
+		if t.deadline > tick || t.kind != timerPrepare {
+			continue
+		}
+		inst := n.instances[t.ref]
+		if inst == nil ||
+			inst.generation != t.gen ||
+			inst.phase == phaseCommitted ||
+			inst.phase == phasePrepare ||
+			inst.rec.Status >= StatusCommitted ||
+			n.recoveryCoordinatorAt(inst.rec.Ref, tick) != n.id ||
+			(inst.rec.Ballot.IsRecovery() && inst.rec.Ballot.Replica != n.id && tick < inst.waitDeadline) {
+			continue
+		}
+		due = append(due, t)
+	}
+	sort.Slice(due, func(i, j int) bool { return due.Less(i, j) })
+	if len(due) > starts {
+		due = due[:starts]
+	}
+	for _, t := range due {
+		if _, err := n.instances[t.ref].rec.Ballot.Next(n.id); err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *RawNode) timerTransition(t timer, inst *instance, next uint64) (uint64, uint64, bool) {
+	switch t.kind {
+	case timerFastWait:
+		if inst.phase == phasePreAccept &&
+			!inst.rec.TOQPending &&
+			(inst.waitDeadline == 0 || next >= inst.waitDeadline) &&
+			len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			delta := n.startAcceptGenerationDelta(inst)
+			return delta, n.retryTicks, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
+		}
+	case timerPreAccept:
+		if inst.phase != phasePreAccept {
+			return 0, 0, false
+		}
+		if !inst.rec.TOQPending &&
+			(inst.waitDeadline == 0 || next >= inst.waitDeadline) &&
+			len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			delta := n.startAcceptGenerationDelta(inst)
+			return delta, n.retryTicks, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
+		}
+		return 0, n.retryTicks, next != ^uint64(0)
+	case timerAccept:
+		if inst.phase == phaseAccept {
+			return 0, n.retryTicks, next != ^uint64(0)
+		}
+	case timerTryPreAccept:
+		if inst.phase != phaseTryPreAccept {
+			return 0, 0, false
+		}
+		pendingEvidence := false
+		for key := range n.tryEvidenceChecks {
+			if key.target == inst.rec.Ref && key.ballot == inst.rec.Ballot {
+				pendingEvidence = true
+				break
+			}
+		}
+		if pendingEvidence {
+			delta := n.startAcceptGenerationDelta(inst)
+			return delta, n.retryTicks, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
+		}
+		return 0, n.retryTicks, next != ^uint64(0)
+	case timerPrepare:
+		if inst.phase == phasePrepare {
+			return 0, n.recoveryTicks, next != ^uint64(0)
+		}
+		if inst.rec.Status >= StatusCommitted ||
+			(inst.rec.Status != StatusNone && inst.rec.Status != StatusPreAccepted && inst.rec.Status != StatusAccepted) {
+			return 0, 0, false
+		}
+		promised := inst.rec.Ballot.IsRecovery() && inst.rec.Ballot.Replica != n.id && next < inst.waitDeadline
+		if n.recoveryCoordinatorAt(inst.rec.Ref, next) == n.id && !promised {
+			return 1, n.recoveryTicks, next != ^uint64(0)
+		}
+		if inst.waitDeadline <= next {
+			return 0, n.recoveryTicks, next != ^uint64(0)
+		}
+	}
+	return 0, 0, false
+}
+
+func (n *RawNode) preflightDueTimers(next uint64) error {
+	for _, t := range n.timers {
+		if t.deadline > next {
+			continue
+		}
+		inst := n.instances[t.ref]
+		if inst == nil || inst.generation != t.gen || inst.phase == phaseCommitted {
+			continue
+		}
+		delta, after, schedules := n.timerTransition(t, inst, next)
+		if delta > ^uint64(0)-inst.generation {
+			return ErrLogicalTimeExhausted
+		}
+		if schedules {
+			if _, err := checkedLogicalDeadline(next, after); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (n *RawNode) scheduleRecovery(inst *instance) error {
+	if inst == nil || inst.rec.Status >= StatusCommitted || inst.phase == phasePrepare {
+		return nil
+	}
+	if inst.waitDeadline > n.tick {
+		return nil
+	}
+	deadline, err := checkedLogicalDeadline(n.tick, n.recoveryTicks)
+	if err != nil {
+		return err
+	}
+	if err := n.schedule(inst, timerPrepare, n.recoveryTicks); err != nil {
+		return err
+	}
+	inst.waitDeadline = deadline
+	return nil
+}
+
 func (n *RawNode) promisedToOtherCoordinator(inst *instance) bool {
-	return inst != nil && inst.rec.Ballot.Number > 0 && inst.rec.Ballot.Replica != n.id && n.tick < inst.waitDeadline
+	return inst != nil && inst.rec.Ballot.IsRecovery() && inst.rec.Ballot.Replica != n.id && n.tick < inst.waitDeadline
+}
+
+func (n *RawNode) cancelTimersForRef(ref InstanceRef) {
+	for i := len(n.timers) - 1; i >= 0; i-- {
+		if n.timers[i].ref == ref {
+			heap.Remove(&n.timers, i)
+		}
+	}
 }
 
 func (n *RawNode) commit(inst *instance, attrs Attributes) {
 	if inst.phase == phaseCommitted && inst.rec.Status >= StatusCommitted {
 		return
 	}
+	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
+	n.cancelTimersForRef(inst.rec.Ref)
+	n.removeDeferredPreAccepts(inst.rec.Ref)
 	if inst.rec.Seq != attrs.Seq || !instanceNumsEqual(inst.rec.Deps, attrs.Deps) {
 		clearRecordAcceptEvidence(&inst.rec)
 	}
 	inst.phase = phaseCommitted
 	inst.rec.Status = StatusCommitted
+	n.noteCommitted(inst.rec.Ref)
 	inst.rec.Seq = attrs.Seq
 	inst.rec.Deps = append([]InstanceNum(nil), attrs.Deps...)
 	inst.rec.FastPathEligible = false
@@ -2115,66 +4060,109 @@ func (n *RawNode) commit(inst *instance, attrs Attributes) {
 	n.indexConflicts(inst.rec)
 	n.enqueueRecord(inst.rec)
 	n.broadcast(MsgCommit, inst.rec)
+	releaseInstanceVolatile(inst)
 	n.tryExecute()
 }
 
-func (n *RawNode) onTimer(inst *instance, kind timerKind) {
+func (n *RawNode) onTimer(inst *instance, kind timerKind) error {
 	switch kind {
 	case timerFastWait:
-		if inst.phase == phasePreAccept && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+		if inst.phase == phasePreAccept && !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			n.startAccept(inst, attrsFromVotes(inst.preOK))
 		}
 	case timerPreAccept:
 		if inst.phase == phasePreAccept {
+			if !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+				n.startAccept(inst, attrsFromVotes(inst.preOK))
+				return nil
+			}
 			n.broadcastPreAccept(inst)
-			n.schedule(inst, timerPreAccept, n.retryTicks)
+			if n.tick != ^uint64(0) {
+				return n.schedule(inst, timerPreAccept, n.retryTicks)
+			}
 		}
 	case timerAccept:
 		if inst.phase == phaseAccept {
 			n.broadcast(MsgAccept, inst.rec)
-			n.schedule(inst, timerAccept, n.retryTicks)
+			if n.tick != ^uint64(0) {
+				return n.schedule(inst, timerAccept, n.retryTicks)
+			}
 		}
 	case timerTryPreAccept:
 		if inst.phase == phaseTryPreAccept {
 			if n.failPendingTryEvidenceCheck(inst) {
-				return
+				return nil
 			}
 			n.broadcastTryPreAccept(inst)
-			n.schedule(inst, timerTryPreAccept, n.retryTicks)
+			if n.tick != ^uint64(0) {
+				return n.schedule(inst, timerTryPreAccept, n.retryTicks)
+			}
 		}
 	case timerPrepare:
 		if inst.phase == phasePrepare {
-			n.broadcast(MsgPrepare, inst.rec)
-			n.schedule(inst, timerPrepare, n.recoveryTicks)
-			return
+			n.broadcastPrepare(inst.rec)
+			if n.tick != ^uint64(0) {
+				return n.schedule(inst, timerPrepare, n.recoveryTicks)
+			}
+			return nil
 		}
-		if inst.rec.Status < StatusCommitted && (inst.rec.Status == StatusNone || inst.rec.Status == StatusPreAccepted || inst.rec.Status == StatusAccepted) && n.shouldCoordinateRecovery(inst.rec.Ref) && !n.promisedToOtherCoordinator(inst) {
-			n.startPrepare(inst)
+		if inst.rec.Status < StatusCommitted && (inst.rec.Status == StatusNone || inst.rec.Status == StatusPreAccepted || inst.rec.Status == StatusAccepted) {
+			if n.shouldCoordinateRecovery(inst.rec.Ref) && !n.promisedToOtherCoordinator(inst) {
+				if n.dependencyRecoveryStartsLeft <= 0 || n.activeRecoveryCount() >= n.maxConcurrentRecoveries {
+					return n.scheduleRecovery(inst)
+				}
+				if err := n.startPrepare(inst); err != nil {
+					return err
+				}
+				n.dependencyRecoveryStartsLeft--
+				return nil
+			}
+			return n.scheduleRecovery(inst)
 		}
 	}
+	return nil
 }
 
-func (n *RawNode) schedule(inst *instance, kind timerKind, after uint64) {
-	if after == 0 {
-		after = 1
+func (n *RawNode) schedule(inst *instance, kind timerKind, after uint64) error {
+	deadline, err := checkedLogicalDeadline(n.tick, after)
+	if err != nil {
+		return err
 	}
-	heap.Push(&n.timers, timer{deadline: n.tick + after, ref: inst.rec.Ref, kind: kind, gen: inst.generation})
+	for i := range n.timers {
+		if n.timers[i].ref != inst.rec.Ref || n.timers[i].kind != kind {
+			continue
+		}
+		n.timers[i] = timer{deadline: deadline, ref: inst.rec.Ref, kind: kind, gen: inst.generation, index: i}
+		heap.Fix(&n.timers, i)
+		return nil
+	}
+	heap.Push(&n.timers, timer{deadline: deadline, ref: inst.rec.Ref, kind: kind, gen: inst.generation})
+	return nil
 }
 
 func (n *RawNode) broadcastPreAccept(inst *instance) {
 	processAt := inst.processAt
-	toq := n.toqEnabled && inst.rec.Ref.Replica == n.id && inst.rec.Ballot.Number == 0 && inst.rec.Ballot.Replica == inst.rec.Ref.Replica
+	toq := recordUsesTOQ(inst.rec) && inst.rec.Ref.Replica == n.id && inst.rec.Ballot.IsInitialFor(inst.rec.Ref.Replica)
 	for _, to := range n.votersForConf(inst.rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: MsgPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, Command: inst.rec.Command.Borrow(), RecordStatus: inst.rec.Status, ProcessAt: processAt}
+		m := Message{Type: MsgPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, Command: inst.rec.Command.Borrow(), ProcessAt: processAt, TOQ: recordUsesTOQ(inst.rec)}
 		if toq {
 			m.TOQ = true
 			m.Seq = 0
 			m.Deps = nil
 		}
 		n.enqueueMessage(m)
+	}
+}
+
+func (n *RawNode) broadcastPrepare(rec InstanceRecord) {
+	for _, to := range n.votersForConf(rec.Ref.Conf) {
+		if to == n.id {
+			continue
+		}
+		n.enqueueMessage(Message{Type: MsgPrepare, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot})
 	}
 }
 
@@ -2198,7 +4186,7 @@ func (n *RawNode) broadcastTryPreAcceptIgnore(inst *instance, ignore InstanceRef
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: MsgTryPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, RecordBallot: recordTupleBallot(inst.rec), Seq: inst.rec.Seq, Deps: inst.rec.Deps, IgnoreDependency: TryPreAcceptIgnore{Ref: ignore}, Command: inst.rec.Command.Borrow(), RecordStatus: inst.rec.Status}
+		m := Message{Type: MsgTryPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, IgnoreDependency: TryPreAcceptIgnore{Ref: ignore}, Command: inst.rec.Command.Borrow(), ProcessAt: inst.rec.ProcessAt, TOQ: recordUsesTOQ(inst.rec)}
 		n.enqueueMessage(m)
 	}
 }
@@ -2208,7 +4196,10 @@ func (n *RawNode) broadcast(t MessageType, rec InstanceRecord) {
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: t, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command.Borrow(), RecordStatus: rec.Status}
+		m := Message{Type: t, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command.Borrow(), ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
+		if t == MsgCommit {
+			m.RecordBallot = recordTupleBallot(rec)
+		}
 		if t == MsgAccept || t == MsgCommit {
 			m.AcceptSeq = rec.AcceptSeq
 			m.AcceptDeps = rec.AcceptDeps
@@ -2228,16 +4219,52 @@ func (n *RawNode) sendReject(t MessageType, to ReplicaID, ref InstanceRef, hint 
 }
 
 func (n *RawNode) sendCommitTo(to ReplicaID, rec InstanceRecord) {
-	m := Message{Type: MsgCommit, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, AcceptSeq: rec.AcceptSeq, AcceptDeps: rec.AcceptDeps, AcceptEvidence: rec.AcceptEvidence, Command: rec.Command.Borrow(), RecordStatus: rec.Status}
+	m := Message{Type: MsgCommit, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, AcceptSeq: rec.AcceptSeq, AcceptDeps: rec.AcceptDeps, AcceptEvidence: rec.AcceptEvidence, Command: rec.Command.Borrow(), ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
 	n.enqueueMessage(m)
+}
+
+func (n *RawNode) readyTarget() *Ready {
+	if n.awaitAdvance {
+		return &n.nextReady
+	}
+	return &n.pendingReady
+}
+
+func mergeReadyQueue[T any](dst, src []T) ([]T, []T) {
+	if len(src) == 0 {
+		return dst, src
+	}
+	dst = append(dst, src...)
+	clear(src)
+	return dst, src[:0]
+}
+
+func (n *RawNode) mergeNextReady() {
+	n.pendingReady.ConfigHistory, n.nextReady.ConfigHistory = mergeReadyQueue(n.pendingReady.ConfigHistory, n.nextReady.ConfigHistory)
+	n.pendingReady.Records, n.nextReady.Records = mergeReadyQueue(n.pendingReady.Records, n.nextReady.Records)
+	n.pendingReady.BootstrapRecords, n.nextReady.BootstrapRecords = mergeReadyQueue(n.pendingReady.BootstrapRecords, n.nextReady.BootstrapRecords)
+	if n.nextReady.LocalVoterState != nil {
+		state := n.nextReady.LocalVoterState.Clone()
+		n.pendingReady.LocalVoterState = &state
+		n.nextReady.LocalVoterState = nil
+	}
+	n.pendingReady.FrontierUpdates, n.nextReady.FrontierUpdates = mergeReadyQueue(n.pendingReady.FrontierUpdates, n.nextReady.FrontierUpdates)
+	n.pendingReady.AllocatorFloor = maxInstanceNum(n.pendingReady.AllocatorFloor, n.nextReady.AllocatorFloor)
+	n.nextReady.AllocatorFloor = 0
+	n.pendingReady.Messages, n.nextReady.Messages = mergeReadyQueue(n.pendingReady.Messages, n.nextReady.Messages)
+	n.pendingReady.BootstrapMessages, n.nextReady.BootstrapMessages = mergeReadyQueue(n.pendingReady.BootstrapMessages, n.nextReady.BootstrapMessages)
+	n.pendingReady.Committed, n.nextReady.Committed = mergeReadyQueue(n.pendingReady.Committed, n.nextReady.Committed)
+	n.pendingReady.MustSync = readyHasDurableUpdate(n.pendingReady)
+	n.nextReady.MustSync = false
 }
 
 func (n *RawNode) enqueueRecord(rec InstanceRecord) {
 	if rec.Checksum == ([32]byte{}) {
 		rec.Checksum = ChecksumRecord(rec)
 	}
-	n.pendingReady.Records = append(n.pendingReady.Records, n.readyRecord(rec))
-	n.pendingReady.MustSync = true
+	target := n.readyTarget()
+	target.Records = append(target.Records, n.readyRecord(rec))
+	target.MustSync = true
 }
 
 func (n *RawNode) enqueueMessage(m Message) {
@@ -2245,16 +4272,22 @@ func (n *RawNode) enqueueMessage(m Message) {
 		m.Deps = n.depsForConf(m.Ref.Conf)
 	}
 	m.Checksum = ChecksumMessage(m)
-	n.pendingReady.Messages = append(n.pendingReady.Messages, m.Clone())
+	target := n.readyTarget()
+	target.Messages = append(target.Messages, m.Clone())
 }
 
 func (n *RawNode) enqueueCommitted(c CommittedCommand) {
-	n.pendingReady.Committed = append(n.pendingReady.Committed, c.Clone())
+	target := n.readyTarget()
+	target.Committed = append(target.Committed, c.Clone())
 }
 
 func (n *RawNode) readyRecord(rec InstanceRecord) InstanceRecord {
 	out := rec
+	out.ConfChangeResult.Conf = rec.ConfChangeResult.Conf.Clone()
+	out.MembershipResult.Successor = rec.MembershipResult.Successor.Clone()
 	out.Deps = append([]InstanceNum(nil), rec.Deps...)
+	out.AcceptDeps = append([]InstanceNum(nil), rec.AcceptDeps...)
+	out.AcceptEvidence = cloneAcceptEvidence(rec.AcceptEvidence)
 	if n.zeroCopy {
 		out.Command = rec.Command.Borrow()
 	} else {
@@ -2280,11 +4313,15 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 		if n.skipTimedConflict(cmd, exclude, processAt, timedPreAccept, ref, rec) {
 			return
 		}
-		if idx, ok := conf.Index(ref.Replica); ok && ref.Instance > deps[idx] {
+		idx, ok := conf.Index(ref.Replica)
+		if !ok {
+			return
+		}
+		if ref.Instance > deps[idx] {
 			deps[idx] = ref.Instance
-			if rec.Seq >= seq {
-				seq = rec.Seq + 1
-			}
+		}
+		if rec.Seq >= seq {
+			seq = saturatingSeqIncrement(rec.Seq)
 		}
 	}
 	if cmd.Kind == CommandNoop {
@@ -2294,9 +4331,7 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 		for ref, inst := range n.instances {
 			addRef(ref, inst.rec)
 		}
-		return Attributes{Seq: seq, Deps: deps}
-	}
-	if timedPreAccept {
+	} else if timedPreAccept {
 		for ref, inst := range n.instances {
 			if cmd.ConflictsWith(inst.rec.Command) {
 				addRef(ref, inst.rec)
@@ -2308,11 +4343,12 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 				if ref == exclude || ref.Conf != exclude.Conf {
 					continue
 				}
-				if idx, ok := conf.Index(ref.Replica); ok && ref.Instance > deps[idx] {
+				idx, ok := conf.Index(ref.Replica)
+				if !ok {
+					continue
+				}
+				if ref.Instance > deps[idx] {
 					deps[idx] = ref.Instance
-					if inst := n.instances[ref]; inst != nil && inst.rec.Seq >= seq {
-						seq = inst.rec.Seq + 1
-					}
 				}
 			}
 		}
@@ -2322,6 +4358,18 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 			addRef(ref, inst.rec)
 		}
 	}
+	for ref, inst := range n.instances {
+		if ref == exclude || ref.Conf != exclude.Conf || inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop {
+			continue
+		}
+		idx, ok := conf.Index(ref.Replica)
+		if !ok || ref.Instance > deps[idx] {
+			continue
+		}
+		if inst.rec.Seq >= seq {
+			seq = saturatingSeqIncrement(inst.rec.Seq)
+		}
+	}
 	return Attributes{Seq: seq, Deps: deps}
 }
 
@@ -2329,14 +4377,17 @@ func (n *RawNode) skipTimedConflict(cmd Command, candidate InstanceRef, processA
 	if !timedPreAccept || cmd.Kind != CommandUser || rec.Command.Kind != CommandUser {
 		return false
 	}
+	candidateDomain := TimingDomainLogical
+	if n.toqEnabled {
+		candidateDomain = TimingDomainTOQ
+	}
 	inst := n.instances[ref]
-	if inst == nil || inst.rec.Status != StatusPreAccepted {
+	if inst == nil || inst.rec.Status != StatusPreAccepted ||
+		inst.rec.TimingDomain == TimingDomainUntimed ||
+		inst.rec.TimingDomain != candidateDomain {
 		return false
 	}
-	if inst.processAt == 0 && !n.toqEnabled {
-		return false
-	}
-	return preAcceptOrderBefore(processAt, candidate, inst.processAt, ref)
+	return preAcceptOrderBefore(processAt, candidate, inst.rec.ProcessAt, ref)
 }
 
 func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
@@ -2344,7 +4395,7 @@ func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
 	if n.canFastCommitPreAccept(inst, localAttrs) {
 		return localAttrs, true
 	}
-	if !n.preAcceptOrderingEnabled() || (inst.processAt == 0 && !n.toqEnabled) || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != inst.rec.Ref.Replica {
+	if !inst.rec.Ballot.IsInitialFor(inst.rec.Ref.Replica) {
 		return Attributes{}, false
 	}
 	conf := n.confFor(inst.rec.Ref.Conf)
@@ -2357,7 +4408,7 @@ func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
 			continue
 		}
 		attrs := Attributes{Seq: vote.seq, Deps: vote.deps}
-		if attrs.Equal(localAttrs) {
+		if attrs.Equal(localAttrs) || !attrsCover(localAttrs, attrs) {
 			continue
 		}
 		if n.canFastCommitPreAccept(inst, attrs) {
@@ -2368,38 +4419,24 @@ func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
 }
 
 func (n *RawNode) canFastCommitPreAccept(inst *instance, attrs Attributes) bool {
-	if !inst.rec.FastPathEligible || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != inst.rec.Ref.Replica {
+	if !inst.rec.FastPathEligible || !inst.rec.Ballot.IsInitialFor(inst.rec.Ref.Replica) {
 		return false
 	}
 	localAttrs := inst.rec.Attributes()
-	localMatches := attrs.Equal(localAttrs)
-	if !localMatches {
-		if !n.preAcceptOrderingEnabled() || (inst.processAt == 0 && !n.toqEnabled) || inst.rec.Ballot.Number != 0 || inst.rec.Ballot.Replica != inst.rec.Ref.Replica {
-			return false
-		}
-		if !attrsCover(localAttrs, attrs) {
-			return false
-		}
+	if !attrs.Equal(localAttrs) && !attrsCover(localAttrs, attrs) {
+		return false
 	}
 	count := 1
-	matchingRemotes := 0
 	covered := n.committedDepsMask(attrs, inst.rec.Ref.Conf)
 	for id, vote := range inst.preOK {
 		if id == n.id {
 			continue
 		}
-		if !(Attributes{Seq: vote.seq, Deps: vote.deps}).Equal(attrs) {
-			continue
-		}
-		if (localMatches || n.toqEnabled) && !vote.fastPathEligible {
+		if !(Attributes{Seq: vote.seq, Deps: vote.deps}).Equal(attrs) || !vote.fastPathEligible {
 			continue
 		}
 		count++
-		matchingRemotes++
 		covered |= vote.depsCommitted
-	}
-	if !localMatches && !n.toqEnabled && matchingRemotes < len(n.confFor(inst.rec.Ref.Conf).Voters)-1 {
-		return false
 	}
 	return count >= n.fastQuorumForConf(inst.rec.Ref.Conf) && dependencyMask(attrs.Deps)&^covered == 0
 }
@@ -2440,18 +4477,12 @@ func (n *RawNode) committedDepsMask(attrs Attributes, confID ConfID) uint64 {
 	return mask
 }
 func (n *RawNode) committedPrefix(replica ReplicaID, through InstanceNum, confID ConfID) bool {
-	for inst := InstanceNum(1); inst <= through; inst++ {
-		ref := InstanceRef{Replica: replica, Instance: inst, Conf: confID}
-		if existing := n.instances[ref]; existing == nil || existing.rec.Status < StatusCommitted {
-			return false
-		}
-	}
-	return true
+	return through == 0 || n.committedThrough[instanceLane{conf: confID, replica: replica}] >= through
 }
 
 func addTryCandidate(candidates []tryCandidate, rec InstanceRecord, voter ReplicaID) []tryCandidate {
 	for i := range candidates {
-		if commandEqual(candidates[i].rec.Command, rec.Command) && candidates[i].rec.Attributes().Equal(rec.Attributes()) {
+		if candidates[i].rec.ProcessAt == rec.ProcessAt && candidates[i].rec.TimingDomain == rec.TimingDomain && commandEqual(candidates[i].rec.Command, rec.Command) && candidates[i].rec.Attributes().Equal(rec.Attributes()) {
 			candidates[i].voters[voter] = struct{}{}
 			return candidates
 		}
@@ -2530,164 +4561,416 @@ func (n *RawNode) rebroadcastCommits() {
 	}
 }
 
-func (n *RawNode) tryExecute() {
-	for {
-		progress := false
-		components := n.executionComponents()
-		for _, comp := range components {
-			if n.componentReady(comp) {
-				sort.Slice(comp, func(i, j int) bool {
-					a := n.instances[comp[i]].rec
-					b := n.instances[comp[j]].rec
-					if a.Seq != b.Seq {
-						return a.Seq < b.Seq
-					}
-					return lessRef(a.Ref, b.Ref)
-				})
-				for _, ref := range comp {
-					inst := n.instances[ref]
-					n.executed[ref] = struct{}{}
-					inst.rec.Status = StatusExecuted
-					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					switch inst.rec.Command.Kind {
-					case CommandUser:
-						n.enqueueCommitted(CommittedCommand{Ref: ref, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), Command: inst.rec.Command.Clone()})
-					case CommandConfChange:
-						n.applyConfChange(ref, inst.rec.Command)
-						n.enqueueRecord(inst.rec)
-					default:
-						n.enqueueRecord(inst.rec)
-					}
-					progress = true
-				}
-			}
+func (n *RawNode) wouldReplaceInstance(m Message, current *instance, ordered bool) bool {
+	switch m.Type {
+	case MsgPreAccept:
+		if current == nil {
+			return true
 		}
-		if !progress {
-			return
+		if current.rec.Status >= StatusCommitted || m.Ballot.Less(current.rec.Ballot) {
+			return false
 		}
+		if m.Ballot == current.rec.Ballot &&
+			(!commandEqual(current.rec.Command, m.Command) || current.rec.ProcessAt != m.ProcessAt || current.rec.TimingDomain != timingDomainFromMessage(m)) {
+			return false
+		}
+		if current.rec.Status == StatusAccepted {
+			return false
+		}
+		if current.rec.Status == StatusPreAccepted && m.Ballot == current.rec.Ballot && current.rec.TimingDomain == timingDomainFromMessage(m) {
+			return false
+		}
+		rec, _ := n.preAcceptRecord(m, ordered)
+		return current.rec.Status != StatusPreAccepted || !instanceRecordEqual(current.rec, rec)
+	case MsgAccept:
+		if current == nil {
+			return true
+		}
+		if current.rec.Status >= StatusCommitted || m.Ballot.Less(current.rec.Ballot) {
+			return false
+		}
+		if current.rec.Status == StatusPreAccepted && current.rec.RecordBallot == m.Ballot && !phaseMessageValueEqual(current.rec, m) {
+			return false
+		}
+		if current.rec.Status == StatusAccepted && m.Ballot == current.rec.Ballot && current.rec.RecordBallot == m.Ballot {
+			return false
+		}
+		rec := n.acceptRecord(m, current)
+		return current.rec.Status != StatusAccepted || !instanceRecordEqual(current.rec, rec)
+	default:
+		return false
 	}
 }
 
-func (n *RawNode) executionComponents() [][]InstanceRef {
-	refs := make([]InstanceRef, 0)
-	for ref, inst := range n.instances {
-		if inst.rec.Status >= StatusCommitted {
-			if _, ok := n.executed[ref]; !ok {
-				refs = append(refs, ref)
-			}
+func (n *RawNode) tryCommittedConflictResponseWouldAdvance(inst *instance, conflictRef InstanceRef) bool {
+	if conflictRef.IsZero() ||
+		conflictRef.Conf != inst.rec.Ref.Conf ||
+		!n.attrsDependsOn(inst.rec.Attributes(), conflictRef, inst.rec.Ref.Conf) ||
+		len(inst.tryIgnored) > 0 ||
+		n.faultTolerance(inst.rec.Ref.Conf) <= 0 {
+		return true
+	}
+	key := tryEvidenceKey{target: inst.rec.Ref, conflict: conflictRef, ballot: inst.rec.Ballot}
+	for existingKey := range n.tryEvidenceChecks {
+		if existingKey.target != inst.rec.Ref {
+			continue
+		}
+		return existingKey != key
+	}
+	return len(n.tryEvidenceChecks) >= n.maxConcurrentRecoveries
+}
+
+func (n *RawNode) startAcceptGenerationDelta(inst *instance) uint64 {
+	if inst != nil && n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
+		return 2
+	}
+	return 1
+}
+
+func (n *RawNode) prepareResponseGenerationDelta(m Message, inst *instance) uint64 {
+	if inst == nil || m.Reject || inst.rec.Ballot.Less(m.Ballot) {
+		return 1
+	}
+	temp := *inst
+	temp.prepareOK = make(map[ReplicaID]InstanceRecord, len(inst.prepareOK)+1)
+	for id, rec := range inst.prepareOK {
+		temp.prepareOK[id] = rec
+	}
+	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
+	n.ensureRecordDeps(&rec)
+	temp.prepareOK[m.From] = rec
+	responders := make([]ReplicaID, 0, len(temp.prepareOK)+len(temp.prepareEvidence))
+	for id := range temp.prepareOK {
+		responders = append(responders, id)
+	}
+	for id := range temp.prepareEvidence {
+		if _, fresh := temp.prepareOK[id]; !fresh {
+			responders = append(responders, id)
 		}
 	}
-	sortRefs(refs)
-	index := make(map[InstanceRef]int, len(refs))
-	low := make(map[InstanceRef]int, len(refs))
-	onStack := make(map[InstanceRef]bool, len(refs))
-	stack := make([]InstanceRef, 0, len(refs))
-	var comps [][]InstanceRef
-	var next int
-	var visit func(InstanceRef)
-	visit = func(v InstanceRef) {
-		index[v] = next
-		low[v] = next
-		next++
-		stack = append(stack, v)
-		onStack[v] = true
-		for _, w := range n.dependencyRefs(v) {
-			if _, executed := n.executed[w]; executed {
-				continue
-			}
-			wi := n.instances[w]
-			if wi == nil || wi.rec.Status < StatusCommitted {
-				continue
-			}
-			if n.dependencyKnownAfter(v, w, StatusCommitted) {
-				continue
-			}
-			if _, seen := index[w]; !seen {
-				visit(w)
-				if low[w] < low[v] {
-					low[v] = low[w]
-				}
-			} else if onStack[w] && index[w] < low[v] {
-				low[v] = index[w]
-			}
+	sort.Slice(responders, func(i, j int) bool { return responders[i] < responders[j] })
+	for _, id := range responders {
+		if prepareResponseRecord(&temp, id).Status >= StatusCommitted {
+			return 1
 		}
-		if low[v] == index[v] {
-			var comp []InstanceRef
-			for {
-				w := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				onStack[w] = false
-				comp = append(comp, w)
-				if w == v {
+	}
+	for _, id := range responders {
+		if prepareResponseRecord(&temp, id).Status == StatusAccepted {
+			return n.startAcceptGenerationDelta(inst)
+		}
+	}
+	foundPreAccepted := false
+	var highestPreAccepted Ballot
+	for _, id := range responders {
+		rec := prepareResponseRecord(&temp, id)
+		if rec.Status != StatusPreAccepted {
+			continue
+		}
+		if ballot := recordTupleBallot(rec); !foundPreAccepted || highestPreAccepted.Less(ballot) {
+			highestPreAccepted = ballot
+			foundPreAccepted = true
+		}
+	}
+	if !foundPreAccepted {
+		return n.startAcceptGenerationDelta(inst)
+	}
+	var candidates []tryCandidate
+	for _, id := range responders {
+		rec := prepareResponseRecord(&temp, id)
+		if rec.Status == StatusPreAccepted && recordTupleBallot(rec) == highestPreAccepted && rec.FastPathEligible {
+			candidates = addTryCandidate(candidates, rec, id)
+		}
+	}
+	for _, candidate := range candidates {
+		if len(candidate.voters) < n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
+			continue
+		}
+		tryOK := make(map[ReplicaID]struct{}, len(candidate.voters)+2)
+		for id := range candidate.voters {
+			tryOK[id] = struct{}{}
+		}
+		tryOK[inst.rec.Ref.Replica] = struct{}{}
+		if local, ok := temp.prepareOK[n.id]; ok &&
+			local.FastPathEligible &&
+			commandEqual(local.Command, candidate.rec.Command) &&
+			local.Attributes().Equal(candidate.rec.Attributes()) {
+			tryOK[n.id] = struct{}{}
+		}
+		delta := uint64(1)
+		if len(tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			delta += n.startAcceptGenerationDelta(inst)
+		}
+		return delta
+	}
+	return n.startAcceptGenerationDelta(inst)
+}
+
+func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bool) {
+	inst := n.instances[m.Ref]
+	switch m.Type {
+	case MsgPreAcceptResp:
+		if inst == nil || inst.phase != phasePreAccept || m.Ref.Replica != n.id || inst.rec.Ballot.Replica != n.id {
+			return inst, false, false, false
+		}
+		if m.Reject {
+			advance := inst.rec.Ballot.Less(m.RejectHint)
+			return inst, advance, false, advance
+		}
+		if m.Ballot != inst.rec.Ballot {
+			return inst, false, false, false
+		}
+		if _, duplicate := inst.preOK[m.From]; duplicate {
+			return inst, false, false, false
+		}
+		temp := *inst
+		temp.preOK = make(map[ReplicaID]attrVote, len(inst.preOK)+1)
+		for id, vote := range inst.preOK {
+			temp.preOK[id] = vote
+		}
+		temp.preOK[m.From] = attrVote{seq: m.Seq, deps: m.Deps, depsCommitted: m.DepsCommitted, fastPathEligible: m.FastPathEligible}
+		advance, retry := n.preAcceptVotesWouldAdvance(&temp)
+		return inst, advance, retry, false
+	case MsgAcceptResp:
+		if inst == nil || inst.phase != phaseAccept || !n.coordinatesInstance(inst) {
+			return inst, false, false, false
+		}
+		if m.Reject {
+			advance := inst.rec.Ballot.Less(m.RejectHint)
+			return inst, advance, false, advance
+		}
+		if m.Ballot != inst.rec.Ballot ||
+			m.RecordBallot != inst.rec.RecordBallot ||
+			m.RecordStatus != StatusAccepted ||
+			m.Seq != inst.rec.Seq ||
+			!instanceNumsEqual(m.Deps, inst.rec.Deps) {
+			return inst, false, false, false
+		}
+		if _, duplicate := inst.accOK[m.From]; duplicate {
+			return inst, false, false, false
+		}
+		return inst, len(inst.accOK)+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf), false, false
+	case MsgPrepareResp:
+		if inst == nil || inst.phase != phasePrepare || !inst.rec.Ballot.IsRecovery() || inst.rec.Ballot.Replica != n.id {
+			return inst, false, false, false
+		}
+		if m.Reject {
+			advance := inst.rec.Ballot.Less(m.RejectHint)
+			return inst, advance, false, advance
+		}
+		if m.Ballot.Less(inst.rec.Ballot) {
+			return inst, false, false, false
+		}
+		if inst.rec.Ballot.Less(m.Ballot) {
+			return inst, true, false, true
+		}
+		if _, duplicate := inst.prepareOK[m.From]; duplicate {
+			return inst, false, false, false
+		}
+		if recordHasValue(m.RecordStatus) && m.RecordBallot == (Ballot{}) {
+			return inst, false, false, false
+		}
+		if len(inst.prepareOK)+1 < n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			return inst, false, false, false
+		}
+		retry := n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
+		if m.RecordStatus >= StatusCommitted {
+			retry = false
+		}
+		if retry {
+			for _, rec := range inst.prepareOK {
+				if rec.Status >= StatusCommitted {
+					retry = false
 					break
 				}
 			}
-			comps = append(comps, comp)
 		}
-	}
-	for _, ref := range refs {
-		if _, ok := index[ref]; !ok {
-			visit(ref)
+		if retry {
+			for _, rec := range inst.prepareEvidence {
+				if rec.Status >= StatusCommitted {
+					retry = false
+					break
+				}
+			}
 		}
+		return inst, true, retry, false
+	case MsgTryPreAcceptResp:
+		if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) {
+			return inst, false, false, false
+		}
+		if m.Reject {
+			switch m.RejectReason {
+			case RejectStaleBallot, RejectNone:
+				advance := inst.rec.Ballot.Less(m.RejectHint)
+				return inst, advance, false, advance
+			case RejectAcceptedTarget:
+				advance := m.Ballot == inst.rec.Ballot
+				return inst, advance, false, advance
+			case RejectCommittedConflict:
+				advance := m.ConflictStatus < StatusCommitted || n.tryCommittedConflictResponseWouldAdvance(inst, m.ConflictRef)
+				return inst, advance, advance, false
+			case RejectUncommittedConflict:
+				advance := !m.ConflictRef.IsZero() && n.tryConflictForcesSlowAccept(inst, m.ConflictRef)
+				return inst, advance, advance, false
+			}
+			return inst, false, false, false
+		}
+		if m.Ballot != inst.rec.Ballot ||
+			m.RecordStatus != StatusPreAccepted ||
+			m.Seq != inst.rec.Seq ||
+			!instanceNumsEqual(m.Deps, inst.rec.Deps) {
+			return inst, false, false, false
+		}
+		if _, duplicate := inst.tryOK[m.From]; duplicate {
+			return inst, false, false, false
+		}
+		advance := len(inst.tryOK)+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf)
+		return inst, advance, advance, false
+	case MsgEvidenceResp:
+		key := tryEvidenceKey{target: m.ConflictRef, conflict: m.Ref, ballot: m.Ballot}
+		records, ok := n.tryEvidenceChecks[key]
+		if !ok {
+			return nil, false, false, false
+		}
+		inst = n.instances[key.target]
+		if inst == nil || inst.phase != phaseTryPreAccept || !n.coordinatesInstance(inst) || inst.rec.Ballot != key.ballot {
+			return inst, false, false, false
+		}
+		if _, duplicate := records[m.From]; duplicate {
+			return inst, false, false, false
+		}
+		prospective := make(map[ReplicaID]InstanceRecord, len(records)+1)
+		for id, rec := range records {
+			prospective[id] = rec
+		}
+		prospective[m.From] = InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
+		_, failClosed := n.tryEvidenceDecision(inst, key, prospective)
+		return inst, failClosed, failClosed, false
+	default:
+		return inst, false, false, false
 	}
-	return comps
 }
 
-func (n *RawNode) componentReady(comp []InstanceRef) bool {
-	inside := make(map[InstanceRef]struct{}, len(comp))
-	for _, ref := range comp {
-		inside[ref] = struct{}{}
+func (n *RawNode) preflightTimingStep(m Message) error {
+	if n.preAcceptWouldDefer(m) {
+		return nil
 	}
-	for _, ref := range comp {
-		if n.hasUnresolvedKnownConflict(ref, inside) {
-			return false
+	inst := n.instances[m.Ref]
+	advanceGeneration := false
+	retryTimer := false
+	recoveryTimer := false
+	switch m.Type {
+	case MsgPreAccept, MsgAccept:
+		recoveryTimer = n.wouldReplaceInstance(m, inst, false)
+		advanceGeneration = inst != nil && recoveryTimer
+	case MsgPrepare:
+		recoveryTimer = (inst == nil || !inst.rec.TOQPending) &&
+			m.Ballot.IsRecovery() && m.Ballot.Replica != n.id &&
+			(inst == nil || inst.rec.Ballot.Less(m.Ballot))
+		advanceGeneration = inst != nil &&
+			!inst.rec.TOQPending &&
+			inst.rec.Ballot.Less(m.Ballot) &&
+			m.Ballot.Replica != n.id
+	case MsgTryPreAccept:
+		switch {
+		case inst == nil:
+			recoveryTimer = true
+		case inst.rec.Status >= StatusCommitted || m.Ballot.Less(inst.rec.Ballot):
+		case inst.rec.Status == StatusAccepted:
+			advanceGeneration = inst.rec.Ballot.Less(m.Ballot) && m.Ballot.Replica != n.id
+			recoveryTimer = advanceGeneration
+		case inst.rec.Status == StatusPreAccepted && m.Ballot == inst.rec.Ballot && inst.rec.RecordBallot == m.Ballot:
+		default:
+			if _, _, conflict := n.tryPreAcceptConflict(m); !conflict {
+				rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.Ballot, Status: StatusPreAccepted, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), Command: inboundCommand(m.Command), ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
+				rec.Checksum = ChecksumRecord(rec)
+				advanceGeneration = inst.rec.Status != StatusPreAccepted || !instanceRecordEqual(inst.rec, rec)
+				recoveryTimer = advanceGeneration
+			}
 		}
-		for _, dep := range n.dependencyRefs(ref) {
-			if _, ok := inside[dep]; ok {
-				continue
+	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp:
+		inst, advanceGeneration, retryTimer, recoveryTimer = n.responseTimingTransition(m)
+	}
+	generationDelta := uint64(0)
+	if advanceGeneration {
+		generationDelta = 1
+		switch m.Type {
+		case MsgPrepareResp:
+			generationDelta = n.prepareResponseGenerationDelta(m, inst)
+		case MsgPreAcceptResp, MsgTryPreAcceptResp, MsgEvidenceResp:
+			if retryTimer {
+				generationDelta = n.startAcceptGenerationDelta(inst)
 			}
-			if _, ok := n.executed[dep]; ok {
-				continue
-			}
-			inst := n.instances[dep]
-			if inst == nil || inst.rec.Status < StatusCommitted {
-				n.ensureDependencyRecovery(dep)
-				return false
-			}
-			if n.dependencyKnownAfter(ref, dep, StatusCommitted) {
-				continue
-			}
-			return false
 		}
 	}
-	return true
+	if !advanceGeneration && !retryTimer && !recoveryTimer {
+		return nil
+	}
+	if inst != nil && generationDelta > ^uint64(0)-inst.generation {
+		return ErrLogicalTimeExhausted
+	}
+	if retryTimer {
+		if _, err := checkedLogicalDeadline(n.tick, n.retryTicks); err != nil {
+			return err
+		}
+	}
+	if recoveryTimer {
+		if _, err := checkedLogicalDeadline(n.tick, n.recoveryTicks); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (n *RawNode) ensureDependencyRecovery(ref InstanceRef) {
-	if ref.IsZero() {
-		return
-	}
-	if _, ok := n.executed[ref]; ok {
-		return
-	}
-	inst := n.instances[ref]
+func (n *RawNode) preflightRecoveryStep(m Message) error {
+	inst := n.instances[m.Ref]
 	if inst == nil {
-		rec := InstanceRecord{Ref: ref, Status: StatusNone, Deps: n.depsForConf(ref.Conf)}
-		rec.Checksum = ChecksumRecord(rec)
-		inst = &instance{rec: rec, phase: phaseIdle}
-		n.instances[ref] = inst
+		return nil
 	}
-	n.observeInstanceRef(ref)
-	if inst.rec.Status >= StatusCommitted {
-		return
+	base := Ballot{}
+	switch m.Type {
+	case MsgPreAcceptResp:
+		if m.Reject &&
+			inst.phase == phasePreAccept &&
+			m.Ref.Replica == n.id &&
+			inst.rec.Ballot.Replica == n.id &&
+			inst.rec.Ballot.Less(m.RejectHint) {
+			base = m.RejectHint
+		}
+	case MsgAcceptResp:
+		if m.Reject &&
+			inst.phase == phaseAccept &&
+			n.coordinatesInstance(inst) &&
+			inst.rec.Ballot.Less(m.RejectHint) {
+			base = m.RejectHint
+		}
+	case MsgPrepareResp:
+		if inst.phase == phasePrepare &&
+			inst.rec.Ballot.IsRecovery() &&
+			inst.rec.Ballot.Replica == n.id {
+			if m.Reject && inst.rec.Ballot.Less(m.RejectHint) {
+				base = m.RejectHint
+			} else if !m.Reject && inst.rec.Ballot.Less(m.Ballot) {
+				base = m.Ballot
+			}
+		}
+	case MsgTryPreAcceptResp:
+		if inst.phase == phaseTryPreAccept && n.coordinatesInstance(inst) {
+			if (m.RejectReason == RejectStaleBallot || m.RejectReason == RejectNone) &&
+				m.Reject &&
+				inst.rec.Ballot.Less(m.RejectHint) {
+				base = m.RejectHint
+			} else if m.Reject &&
+				m.RejectReason == RejectAcceptedTarget &&
+				m.Ballot == inst.rec.Ballot {
+				base = inst.rec.Ballot
+			}
+		}
 	}
-	if (inst.phase == phasePreAccept || inst.phase == phaseAccept || inst.phase == phasePrepare) && n.coordinatesInstance(inst) {
-		return
+	if base == (Ballot{}) {
+		return nil
 	}
-	if n.promisedToOtherCoordinator(inst) {
-		return
-	}
-	n.startPrepare(inst)
+	_, err := base.Next(n.id)
+	return err
 }
 
 func (n *RawNode) dependencyKnownAfter(base, other InstanceRef, minStatus Status) bool {
@@ -2710,74 +4993,47 @@ func (n *RawNode) dependencyKnownAfter(base, other InstanceRef, minStatus Status
 	return otherInst.rec.Deps[idx] >= base.Instance
 }
 
-func (n *RawNode) hasUnresolvedKnownConflict(ref InstanceRef, inside map[InstanceRef]struct{}) bool {
-	inst := n.instances[ref]
-	if inst == nil {
-		return false
-	}
-	for otherRef, other := range n.instances {
-		if otherRef == ref {
-			continue
-		}
-		if _, ok := inside[otherRef]; ok {
-			continue
-		}
-		if _, ok := n.executed[otherRef]; ok {
-			continue
-		}
-		if other.rec.Status == StatusNone || other.rec.Status >= StatusCommitted {
-			continue
-		}
-		if inst.rec.Command.ConflictsWith(other.rec.Command) && !n.dependencyKnownAfter(ref, otherRef, StatusPreAccepted) {
-			return true
-		}
-	}
-	return false
-}
-
-func (n *RawNode) dependencyRefs(ref InstanceRef) []InstanceRef {
-	inst := n.instances[ref]
-	if inst == nil {
-		return nil
-	}
-	conf := n.confFor(ref.Conf)
-	out := make([]InstanceRef, 0, len(inst.rec.Deps))
-	for i, dep := range inst.rec.Deps {
-		if dep == 0 || i >= len(conf.Voters) {
-			continue
-		}
-		replica := conf.Voters[i]
-		for num := InstanceNum(1); ; num++ {
-			other := InstanceRef{Replica: replica, Instance: num, Conf: ref.Conf}
-			if other != ref {
-				out = append(out, other)
-			}
-			if num == dep {
-				break
-			}
-		}
-	}
-	sortRefs(out)
-	return out
-}
-
-func (n *RawNode) applyConfChange(ref InstanceRef, cmd Command) {
+func (n *RawNode) applyConfChange(ref InstanceRef, cmd Command) ConfChangeResult {
 	defer n.refreshPendingConf()
-	if len(cmd.Payload) != 9 {
-		return
+	base, known := n.confHistory[ref.Conf]
+	if !known {
+		return ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
 	}
-	cc := ConfChange{Type: ConfChangeType(cmd.Payload[0]), Replica: ReplicaID(binary.LittleEndian.Uint64(cmd.Payload[1:]))}
-	base := n.confFor(ref.Conf)
-	q, err := confChangeQuorumFrom(base, cc)
+	rec := InstanceRecord{Ref: ref, Command: cmd}
+	successor, valid := confChangeSuccessor(rec, base)
+	if !valid {
+		return ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
+	}
+	if _, applied := n.appliedConfByBase[ref.Conf]; applied {
+		return ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}
+	}
+	if _, exists := n.confHistory[successor.ID]; exists {
+		return ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}
+	}
+	q, err := newQuorum(successor.Voters)
 	if err != nil {
-		return
+		return ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
 	}
-	q.conf.ID = ref.Conf + 1
-	if _, exists := n.confHistory[q.conf.ID]; exists {
-		return
-	}
-	n.confHistory[q.conf.ID] = q.conf.Clone()
+	q.conf.ID = successor.ID
+	n.confHistory[successor.ID] = successor.Clone()
+	n.appliedConfByBase[ref.Conf] = ref
 	if ref.Conf == n.q.conf.ID {
 		n.q = q
+		n.activateTOQRuntime(successor)
+		n.currentHardState.Conf = successor.Clone()
+		n.localVoter.Conf = successor.Clone()
+		if successor.Contains(n.id) {
+			n.localVoter.Status = LocalVoterStatusEligible
+		} else {
+			n.localVoter.Status = LocalVoterStatusIneligible
+		}
+		if n.cluster != (ClusterID{}) {
+			local := n.localVoter.Clone()
+			target := n.readyTarget()
+			target.LocalVoterState = &local
+			target.ConfigHistory = append(target.ConfigHistory, ConfigHistoryEntry{Conf: successor.Clone(), AppliedRef: ref})
+			target.MustSync = true
+		}
 	}
+	return ConfChangeResult{Outcome: ConfChangeApplied, Conf: successor.Clone()}
 }

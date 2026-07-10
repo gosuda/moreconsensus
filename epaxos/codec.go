@@ -11,26 +11,32 @@ const (
 	maxWireDeps           = 128
 	maxWireConflictKeys   = 128
 	maxWireAcceptEvidence = 128
+	maxWireCommandPayload  = 1 << 20
+	maxWireConflictKey     = 1 << 16
 )
 
 // DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
 //
-// The decoded message's Deps and ConflictKeys slice header alias these buffers
-// until the scratch is reused. Command payload and conflict-key bytes still
-// alias the input buffer.
+// The decoded message's Deps, AcceptDeps, AcceptEvidence, and ConflictKeys
+// slice headers alias these buffers until the scratch is reused.
+// AcceptEvidence dependency slices partition AcceptEvidenceDeps. Command payload
+// and conflict-key bytes still alias the input buffer.
 type DecodeScratch struct {
-	Deps         []InstanceNum
-	AcceptDeps   []InstanceNum
-	ConflictKeys [][]byte
+	Deps               []InstanceNum
+	AcceptDeps         []InstanceNum
+	AcceptEvidence     []AcceptEvidence
+	AcceptEvidenceDeps []InstanceNum
+	ConflictKeys       [][]byte
 }
 
 // Reset clears references retained by the scratch while keeping buffer capacity.
 func (s *DecodeScratch) Reset() {
-	for i := range s.ConflictKeys {
-		s.ConflictKeys[i] = nil
-	}
+	clear(s.AcceptEvidence[:cap(s.AcceptEvidence)])
+	clear(s.ConflictKeys[:cap(s.ConflictKeys)])
 	s.Deps = s.Deps[:0]
 	s.AcceptDeps = s.AcceptDeps[:0]
+	s.AcceptEvidence = s.AcceptEvidence[:0]
+	s.AcceptEvidenceDeps = s.AcceptEvidenceDeps[:0]
 	s.ConflictKeys = s.ConflictKeys[:0]
 }
 
@@ -52,6 +58,26 @@ func (s *DecodeScratch) acceptDeps(n int) []InstanceNum {
 	return s.AcceptDeps
 }
 
+func (s *DecodeScratch) acceptEvidence(n int) []AcceptEvidence {
+	if cap(s.AcceptEvidence) < n {
+		clear(s.AcceptEvidence[:cap(s.AcceptEvidence)])
+		s.AcceptEvidence = make([]AcceptEvidence, n)
+	} else {
+		clear(s.AcceptEvidence[n:cap(s.AcceptEvidence)])
+		s.AcceptEvidence = s.AcceptEvidence[:n]
+	}
+	return s.AcceptEvidence
+}
+
+func (s *DecodeScratch) acceptEvidenceDeps(n int) []InstanceNum {
+	if cap(s.AcceptEvidenceDeps) < n {
+		s.AcceptEvidenceDeps = make([]InstanceNum, n)
+	} else {
+		s.AcceptEvidenceDeps = s.AcceptEvidenceDeps[:n]
+	}
+	return s.AcceptEvidenceDeps
+}
+
 func (s *DecodeScratch) conflictKeys(n int) [][]byte {
 	if cap(s.ConflictKeys) < n {
 		for i := range s.ConflictKeys {
@@ -69,8 +95,14 @@ func (s *DecodeScratch) conflictKeys(n int) [][]byte {
 
 // EncodeMessage appends the canonical wire representation of m to dst.
 func EncodeMessage(dst []byte, m Message) ([]byte, error) {
-	if len(m.Deps) > maxWireDeps || len(m.AcceptDeps) > maxWireDeps || len(m.AcceptEvidence) > maxWireAcceptEvidence || len(m.Command.ConflictKeys) > maxWireConflictKeys {
+	if len(m.Deps) > maxWireDeps || len(m.AcceptDeps) > maxWireDeps || len(m.AcceptEvidence) > maxWireAcceptEvidence ||
+		len(m.Command.Payload) > maxWireCommandPayload || len(m.Command.ConflictKeys) > maxWireConflictKeys {
 		return dst, ErrInvalidMessage
+	}
+	for _, key := range m.Command.ConflictKeys {
+		if len(key) > maxWireConflictKey {
+			return dst, ErrInvalidMessage
+		}
 	}
 	for _, ev := range m.AcceptEvidence {
 		if len(ev.Deps) > maxWireDeps {
@@ -153,8 +185,8 @@ func DecodeMessage(src []byte, m *Message) error {
 // DecodeMessageWithScratch decodes a message using scratch-owned metadata buffers.
 //
 // A nil scratch behaves like DecodeMessage. With a non-nil scratch, the decoded
-// Deps and ConflictKeys slice header are valid until the scratch is reused.
-// Command payload and conflict-key bytes alias src.
+// Deps, AcceptDeps, AcceptEvidence, and ConflictKeys slice headers are valid
+// until the scratch is reused. Command payload and conflict-key bytes alias src.
 func DecodeMessageWithScratch(src []byte, m *Message, scratch *DecodeScratch) error {
 	return decodeMessage(src, m, scratch)
 }
@@ -203,19 +235,32 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	if evidence > maxWireAcceptEvidence {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
-	if evidence > 0 {
-		m.AcceptEvidence = make([]AcceptEvidence, int(evidence))
-		for i := range m.AcceptEvidence {
-			m.AcceptEvidence[i].Sender = ReplicaID(p.uvarint())
-			m.AcceptEvidence[i].Seq = p.uvarint()
-			deps := p.uvarint()
-			if deps > maxWireDeps {
-				return decodeMessageError(m, scratch, ErrInvalidMessage)
-			}
-			m.AcceptEvidence[i].Deps = make([]InstanceNum, int(deps))
-			for j := range m.AcceptEvidence[i].Deps {
-				m.AcceptEvidence[i].Deps[j] = InstanceNum(p.uvarint())
-			}
+	evidenceCount := int(evidence)
+	evidenceDeps, ok := scanAcceptEvidence(p, evidenceCount)
+	if !ok {
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
+	}
+	var evidenceArena []InstanceNum
+	if scratch != nil {
+		m.AcceptEvidence = scratch.acceptEvidence(evidenceCount)
+		evidenceArena = scratch.acceptEvidenceDeps(evidenceDeps)
+	} else if evidenceCount > 0 {
+		m.AcceptEvidence = make([]AcceptEvidence, evidenceCount)
+	}
+	evidenceOffset := 0
+	for i := range m.AcceptEvidence {
+		m.AcceptEvidence[i].Sender = ReplicaID(p.uvarint())
+		m.AcceptEvidence[i].Seq = p.uvarint()
+		deps := int(p.uvarint())
+		if scratch != nil {
+			end := evidenceOffset + deps
+			m.AcceptEvidence[i].Deps = evidenceArena[evidenceOffset:end:end]
+			evidenceOffset = end
+		} else {
+			m.AcceptEvidence[i].Deps = make([]InstanceNum, deps)
+		}
+		for j := range m.AcceptEvidence[i].Deps {
+			m.AcceptEvidence[i].Deps[j] = InstanceNum(p.uvarint())
 		}
 	}
 	m.IgnoreDependency.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
@@ -236,6 +281,26 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 		return decodeMessageError(m, scratch, ErrChecksumMismatch)
 	}
 	return nil
+}
+
+func scanAcceptEvidence(p parser, count int) (int, bool) {
+	totalDeps := 0
+	for range count {
+		p.uvarint()
+		p.uvarint()
+		deps := p.uvarint()
+		if p.err || deps > maxWireDeps {
+			return 0, false
+		}
+		totalDeps += int(deps)
+		for range deps {
+			p.uvarint()
+		}
+		if p.err {
+			return 0, false
+		}
+	}
+	return totalDeps, true
 }
 
 func decodeMessageError(m *Message, scratch *DecodeScratch, err error) error {
@@ -289,9 +354,9 @@ func (p *parser) byte() byte {
 	return v
 }
 
-func (p *parser) bytes() []byte {
+func (p *parser) bytesBound(max uint64) []byte {
 	n := p.uvarint()
-	if n > uint64(len(p.b)) {
+	if n > max || n > uint64(len(p.b)) {
 		p.err = true
 		return nil
 	}
@@ -299,10 +364,14 @@ func (p *parser) bytes() []byte {
 	p.b = p.b[n:]
 	return out
 }
+func (p *parser) bytes() []byte {
+	return p.bytesBound(^uint64(0))
+}
+
 
 func (p *parser) command() Command {
 	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: CommandKind(p.uvarint())}
-	c.Payload = p.bytes()
+	c.Payload = p.bytesBound(maxWireCommandPayload)
 	keys := p.uvarint()
 	if keys > maxWireConflictKeys {
 		p.err = true
@@ -314,7 +383,7 @@ func (p *parser) command() Command {
 		c.ConflictKeys = make([][]byte, int(keys))
 	}
 	for i := range c.ConflictKeys {
-		c.ConflictKeys[i] = p.bytes()
+		c.ConflictKeys[i] = p.bytesBound(maxWireConflictKey)
 	}
 	return c
 }

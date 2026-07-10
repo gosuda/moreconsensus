@@ -2,7 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/binary"
+	"encoding/json"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
+	"gosuda.org/moreconsensus/epaxos"
 	kv "gosuda.org/moreconsensus/examples/kv"
 )
 
@@ -47,6 +53,12 @@ func TestRunUsagePathsReturnDocumentedExitCodes(t *testing.T) {
 		{
 			name:       "verify arity",
 			args:       []string{"verify", "checkpoint", "extra"},
+			wantExit:   2,
+			wantOutput: []string{"usage:"},
+		},
+		{
+			name:       "legacy verify arity",
+			args:       []string{"verify", "--legacy"},
 			wantExit:   2,
 			wantOutput: []string{"usage:"},
 		},
@@ -232,6 +244,8 @@ func TestRunWritesOperationReportsForSuccessfulCommands(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("KVNODE_CHECKPOINT_REPORT", "")
+			t.Setenv("KVNODE_CHECKPOINT_SOURCE_IDENTITY", "")
+			t.Setenv("KVNODE_RELEASE_CHECKSUM", "")
 			args, reportDataDir, reportCheckpointDir := tc.setupCommand(t)
 
 			reportPath := filepath.Join(t.TempDir(), "report.env")
@@ -517,7 +531,7 @@ func TestRestoreRejectsCorruptCheckpointWithoutReplacingLiveData(t *testing.T) {
 	closeCluster(t, cluster)
 
 	corruptCheckpointPayload(t, checkpointDir, []byte("checkpoint-value"))
-	requireRun(t, []string{"restore", dataDir, checkpointDir}, 1, "kvcheckpoint restore failed: verify checkpoint before restore")
+	requireRun(t, []string{"restore", dataDir, checkpointDir}, 1, "kvcheckpoint restore failed:", "staged checkpoint verification failed")
 
 	live := openTestCluster(t, dataDir)
 	defer closeCluster(t, live)
@@ -578,6 +592,277 @@ func TestRepairRejectsCorruptCheckpointWithoutReplacingLiveData(t *testing.T) {
 	}
 }
 
+func TestCheckpointCommandAuthenticatesSourceAndReleaseMetadata(t *testing.T) {
+	dataDir := t.TempDir()
+	checkpointDir := filepath.Join(t.TempDir(), "checkpoint")
+	cluster := openTestCluster(t, dataDir)
+	if err := cluster.Put([]byte("metadata-key"), []byte("metadata-value")); err != nil {
+		_ = cluster.Close()
+		t.Fatal(err)
+	}
+	closeCluster(t, cluster)
+
+	reportPath := filepath.Join(t.TempDir(), "report.env")
+	t.Setenv("KVNODE_CHECKPOINT_REPORT", reportPath)
+	t.Setenv("KVNODE_CHECKPOINT_SOURCE_IDENTITY", "replica-1@darwin")
+	t.Setenv("KVNODE_RELEASE_CHECKSUM", "sha256:release")
+	requireRun(t, []string{"checkpoint", dataDir, checkpointDir}, 0, "")
+
+	info, err := kv.VerifyCheckpointWithInfo(checkpointDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.SourceIdentity != "replica-1@darwin" || info.ReleaseChecksum != "sha256:release" || !info.CurrentTarget {
+		t.Fatalf("checkpoint info=%#v, want authenticated source and release metadata", info)
+	}
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`source_identity="replica-1@darwin"`,
+		`release_checksum="sha256:release"`,
+		"current_target_claim=true",
+		"manifest_identity=\"",
+		"hard_state_digest=\"",
+	} {
+		if !strings.Contains(string(report), want) {
+			t.Fatalf("report=%q, want containing %q", report, want)
+		}
+	}
+}
+
+func TestVerifyLegacyCommandIsExplicitAndNonClaiming(t *testing.T) {
+	legacyDir := t.TempDir()
+	db, err := kv.Open(legacyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	requireRun(t, []string{"verify", legacyDir}, 1, "explicit legacy verification")
+
+	reportPath := filepath.Join(t.TempDir(), "legacy-report.env")
+	t.Setenv("KVNODE_CHECKPOINT_REPORT", reportPath)
+	requireRun(t, []string{"verify", "--legacy", legacyDir}, 0, "")
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"checkpoint_format=legacy",
+		"manifest_version=0",
+		`manifest_identity=""`,
+		"current_target_claim=false",
+	} {
+		if !strings.Contains(string(report), want) {
+			t.Fatalf("legacy report=%q, want containing %q", report, want)
+		}
+	}
+}
+
+func TestInspectCommandExportsDeterministicReadOnlyMetadata(t *testing.T) {
+	t.Setenv("KVNODE_CHECKPOINT_SOURCE_IDENTITY", "target/cluster/node1")
+	t.Setenv("KVNODE_RELEASE_CHECKSUM", "sha256:"+strings.Repeat("a", 64))
+	_, checkpointDir := createCheckpointedDataDir(t, "inspect-key", "inspect-value")
+	before := checkpointTreeFingerprint(t, checkpointDir)
+
+	oldStdout := inspectStdout
+	t.Cleanup(func() { inspectStdout = oldStdout })
+	var first bytes.Buffer
+	inspectStdout = &first
+	requireRun(t, []string{"inspect", checkpointDir}, 0, "")
+	afterFirst := checkpointTreeFingerprint(t, checkpointDir)
+
+	var second bytes.Buffer
+	inspectStdout = &second
+	requireRun(t, []string{"inspect", checkpointDir}, 0, "")
+	afterSecond := checkpointTreeFingerprint(t, checkpointDir)
+	if first.String() != second.String() {
+		t.Fatalf("inspect output changed across identical reads:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+	if before != afterFirst || before != afterSecond {
+		t.Fatalf("inspect mutated checkpoint: before=%s after-first=%s after-second=%s", before, afterFirst, afterSecond)
+	}
+
+	var inspection checkpointInspection
+	if err := json.Unmarshal(first.Bytes(), &inspection); err != nil {
+		t.Fatalf("decode inspect output: %v; output=%q", err, first.String())
+	}
+	if inspection.Schema != checkpointInspectionSchema || inspection.CheckpointFormat != "manifest-v1" ||
+		inspection.ManifestVersion != 1 || !inspection.CurrentTargetClaim {
+		t.Fatalf("inspection identity=%#v, want current manifest-v1 metadata", inspection)
+	}
+	if inspection.SourceIdentity != "target/cluster/node1" ||
+		inspection.ReleaseChecksum != "sha256:"+strings.Repeat("a", 64) {
+		t.Fatalf("inspection authenticated metadata=%#v", inspection)
+	}
+	if len(inspection.ManifestIdentity) != 64 || len(inspection.SemanticStateDigest) != 64 ||
+		len(inspection.HardState.Digest) != 64 {
+		t.Fatalf("inspection digests=%#v, want canonical 64-hex digests", inspection)
+	}
+	if inspection.RecordCount != 1 || inspection.AppliedCount != 1 ||
+		inspection.HardState.CodecVersion != 1 ||
+		inspection.HardState.CurrentConfigurationGeneration != 1 ||
+		len(inspection.HardState.CurrentVoters) != 1 || inspection.HardState.CurrentVoters[0] != 1 {
+		t.Fatalf("inspection state=%#v, want one-voter fixture state", inspection)
+	}
+	if len(inspection.ConfigurationHistory) != 1 ||
+		inspection.ConfigurationHistory[0].Generation != 1 ||
+		len(inspection.ConfigurationHistory[0].Voters) != 1 ||
+		inspection.ConfigurationHistory[0].Voters[0] != 1 {
+		t.Fatalf("inspection configuration history=%#v, want full generation-one history", inspection.ConfigurationHistory)
+	}
+}
+
+func TestInspectRestoreIntentRejectsAuthenticatedMetadataMismatchWithoutOutput(t *testing.T) {
+	t.Setenv("KVNODE_CHECKPOINT_SOURCE_IDENTITY", "target/cluster/node1")
+	t.Setenv("KVNODE_RELEASE_CHECKSUM", "sha256:"+strings.Repeat("b", 64))
+	_, checkpointDir := createCheckpointedDataDir(t, "inspect-metadata-key", "inspect-metadata-value")
+	before := checkpointTreeFingerprint(t, checkpointDir)
+
+	oldStdout := inspectStdout
+	t.Cleanup(func() { inspectStdout = oldStdout })
+	var stdout bytes.Buffer
+	inspectStdout = &stdout
+	requireRun(
+		t,
+		[]string{
+			"inspect",
+			"--intent", "restore",
+			"--require-source-identity", "different/cluster/node1",
+			"--require-release-checksum", "sha256:" + strings.Repeat("b", 64),
+			checkpointDir,
+		},
+		1,
+		"kvcheckpoint inspect failed:",
+		"restore source identity mismatch",
+	)
+	if stdout.Len() != 0 {
+		t.Fatalf("rejected inspect wrote unauthenticated metadata: %q", stdout.String())
+	}
+	if after := checkpointTreeFingerprint(t, checkpointDir); after != before {
+		t.Fatalf("rejected metadata preflight mutated checkpoint: before=%s after=%s", before, after)
+	}
+
+	stdout.Reset()
+	requireRun(
+		t,
+		[]string{
+			"inspect",
+			"--intent", "restore",
+			"--require-source-identity", "target/cluster/node1",
+			"--require-release-checksum", "sha256:" + strings.Repeat("b", 64),
+			checkpointDir,
+		},
+		0,
+		"",
+	)
+	if stdout.Len() == 0 {
+		t.Fatal("matching restore preflight omitted deterministic metadata")
+	}
+	requireRun(t, []string{"inspect", "--require-source-identity", "target/cluster/node1", checkpointDir}, 2, "metadata expectations require --intent restore")
+}
+
+func TestInspectReconstructsFullConfigurationHistory(t *testing.T) {
+	configurationCommand := func(change epaxos.ConfChangeType, voter epaxos.ReplicaID) epaxos.Command {
+		payload := make([]byte, 9)
+		payload[0] = byte(change)
+		binary.LittleEndian.PutUint64(payload[1:], uint64(voter))
+		return epaxos.Command{Kind: epaxos.CommandConfChange, Payload: payload}
+	}
+	records := []epaxos.InstanceRecord{
+		{
+			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1},
+			Status:  epaxos.StatusExecuted,
+			Command: configurationCommand(epaxos.ConfChangeAddVoter, 3),
+			ConfChangeResult: epaxos.ConfChangeResult{
+				Outcome: epaxos.ConfChangeApplied,
+				Conf:    epaxos.ConfState{ID: 2, Voters: []epaxos.ReplicaID{1, 2, 3}},
+			},
+		},
+		{
+			Ref:     epaxos.InstanceRef{Replica: 3, Instance: 7, Conf: 2},
+			Status:  epaxos.StatusExecuted,
+			Command: configurationCommand(epaxos.ConfChangeRemoveVoter, 2),
+			ConfChangeResult: epaxos.ConfChangeResult{
+				Outcome: epaxos.ConfChangeApplied,
+				Conf:    epaxos.ConfState{ID: 3, Voters: []epaxos.ReplicaID{1, 3}},
+			},
+		},
+	}
+	history, err := reconstructConfigurationHistory(
+		epaxos.HardState{Conf: epaxos.ConfState{ID: 3, Voters: []epaxos.ReplicaID{1, 3}}, Tick: 42},
+		records,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 3 {
+		t.Fatalf("configuration history=%#v, want three generations", history)
+	}
+	if history[0].Generation != 1 || !equalUint64s(history[0].Voters, []uint64{1, 2}) {
+		t.Fatalf("generation one=%#v", history[0])
+	}
+	if history[1].Generation != 2 || history[1].BaseGeneration != 1 ||
+		history[1].Change != "add-voter" || history[1].Voter != 3 ||
+		history[1].Outcome != "applied" || history[1].SourceRecord != "conf1-replica1-instance4" ||
+		!equalUint64s(history[1].Voters, []uint64{1, 2, 3}) {
+		t.Fatalf("generation two=%#v", history[1])
+	}
+	if history[2].Generation != 3 || history[2].BaseGeneration != 2 ||
+		history[2].Change != "remove-voter" || history[2].Voter != 2 ||
+		history[2].Outcome != "applied" || history[2].SourceRecord != "conf2-replica3-instance7" ||
+		!equalUint64s(history[2].Voters, []uint64{1, 3}) {
+		t.Fatalf("generation three=%#v", history[2])
+	}
+}
+
+func equalUint64s(left, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func checkpointTreeFingerprint(t *testing.T, root string) string {
+	t.Helper()
+	hash := sha256.New()
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		_, _ = io.WriteString(hash, relative)
+		_, _ = io.WriteString(hash, "\x00"+info.Mode().String()+"\x00")
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, _ = hash.Write(payload)
+		return nil
+	}); err != nil {
+		t.Fatalf("fingerprint checkpoint tree: %v", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
 func requireRun(t *testing.T, args []string, wantExit int, wantStderr ...string) {
 	t.Helper()
 	requireRunOutput(t, args, wantExit, wantStderr...)
@@ -625,14 +910,42 @@ func requireOperationReport(t *testing.T, reportPath string, operation string, d
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "status=example-operator-report\n" +
-		"operation=" + operation + "\n" +
-		"result=success\n" +
-		"data_dir=" + strconv.Quote(dataDir) + "\n" +
-		"checkpoint_dir=" + strconv.Quote(checkpointDir) + "\n" +
-		"release_claim=none-target-environment-data-lifecycle-drill-still-required\n"
-	if string(report) != want {
-		t.Fatalf("report %s = %q, want %q", reportPath, report, want)
+	fields := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSuffix(string(report), "\n"), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			t.Fatalf("report %s has malformed line %q", reportPath, line)
+		}
+		if _, duplicate := fields[key]; duplicate {
+			t.Fatalf("report %s has duplicate field %q", reportPath, key)
+		}
+		fields[key] = value
+	}
+	want := map[string]string{
+		"status":               "example-operator-report",
+		"operation":            operation,
+		"result":               "success",
+		"data_dir":             strconv.Quote(dataDir),
+		"checkpoint_dir":       strconv.Quote(checkpointDir),
+		"checkpoint_format":    "manifest-v1",
+		"manifest_version":     "1",
+		"record_count":         "1",
+		"applied_count":        "1",
+		"source_identity":      `""`,
+		"release_checksum":     `""`,
+		"current_target_claim": "true",
+		"release_claim":        "none-target-environment-data-lifecycle-drill-still-required",
+	}
+	for key, value := range want {
+		if fields[key] != value {
+			t.Fatalf("report %s field %s=%q, want %q; report=%q", reportPath, key, fields[key], value, report)
+		}
+	}
+	for _, key := range []string{"manifest_identity", "semantic_state_digest", "hard_state_digest"} {
+		value, err := strconv.Unquote(fields[key])
+		if err != nil || len(value) != 64 {
+			t.Fatalf("report %s field %s=%q, want quoted 64-character digest", reportPath, key, fields[key])
+		}
 	}
 }
 

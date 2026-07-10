@@ -196,13 +196,13 @@ func (s *stressTransportCluster) churn(steps int) {
 	}
 }
 
-func (s *stressTransportCluster) driveUntilApplied(want int) {
+func (s *stressTransportCluster) driveUntilResolved(proposals []stressProposal) {
 	s.t.Helper()
 	for range 4000 {
 		for _, id := range s.readyIDs() {
 			s.captureReady(id)
 		}
-		if s.appliedAtLeast(want) {
+		if s.resolvedAll(proposals) {
 			return
 		}
 		if m, ok := s.takePending(); ok {
@@ -213,13 +213,16 @@ func (s *stressTransportCluster) driveUntilApplied(want int) {
 			s.nodes[id].Tick()
 		}
 	}
-	s.t.Fatalf("cluster did not apply %d commands: counts=%#v pending=%d", want, s.appCounts(), len(s.pending))
+	s.t.Fatalf("cluster did not resolve %d proposed instances: counts=%#v pending=%d", len(proposals), s.appCounts(), len(s.pending))
 }
 
-func (s *stressTransportCluster) appliedAtLeast(want int) bool {
+func (s *stressTransportCluster) resolvedAll(proposals []stressProposal) bool {
 	for _, id := range s.ids {
-		if len(s.apps[id]) < want {
-			return false
+		for _, proposal := range proposals {
+			inst := s.nodes[id].instances[proposal.ref]
+			if inst == nil || inst.rec.Status != StatusExecuted {
+				return false
+			}
 		}
 	}
 	return true
@@ -257,7 +260,7 @@ func TestDeterministicRandomizedCoreSimulationConverges(t *testing.T) {
 				}
 			}
 			s.churn(200)
-			s.driveUntilApplied(len(proposals))
+			s.driveUntilResolved(proposals)
 			assertStressConvergence(t, s, proposals)
 		})
 	}
@@ -280,6 +283,28 @@ func stressCommand(size, index int, rng *stressRNG) Command {
 
 func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals []stressProposal) {
 	t.Helper()
+	resolvedRefs := make([]InstanceRef, 0, len(proposals))
+	chosen := make([]stressProposal, 0, len(proposals))
+	for _, proposal := range proposals {
+		resolvedRefs = append(resolvedRefs, proposal.ref)
+		base := s.nodes[s.ids[0]].instances[proposal.ref]
+		if base == nil || base.rec.Status != StatusExecuted {
+			t.Fatalf("base node did not execute proposed instance %s: %#v", proposal.ref, base)
+		}
+		for _, id := range s.ids[1:] {
+			inst := s.nodes[id].instances[proposal.ref]
+			if inst == nil || inst.rec.Status != StatusExecuted || !sameValueTuple(inst.rec, base.rec) {
+				t.Fatalf("node %d decided %#v for %s, want base tuple %#v", id, inst, proposal.ref, base.rec)
+			}
+		}
+		switch {
+		case commandEqual(base.rec.Command, proposal.cmd):
+			chosen = append(chosen, proposal)
+		case base.rec.Command.Kind != CommandNoop:
+			t.Fatalf("proposed instance %s chose unexpected command %#v instead of %#v or no-op", proposal.ref, base.rec.Command, proposal.cmd)
+		}
+	}
+	proposals = chosen
 	wantByID := make(map[CommandID]stressProposal, len(proposals))
 	for _, p := range proposals {
 		wantByID[p.cmd.ID] = p
@@ -311,8 +336,8 @@ func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals 
 			gotByID[c.Command.ID] = c
 		}
 		status := s.nodes[id].Status()
-		if !sameExecutedRefs(status.Executed, refs(app)) {
-			t.Fatalf("node %d executed refs = %v, want app refs %v", id, status.Executed, refs(app))
+		if !sameExecutedRefs(status.Executed, resolvedRefs) {
+			t.Fatalf("node %d executed refs = %v, want all resolved refs %v", id, status.Executed, resolvedRefs)
 		}
 		for _, p := range proposals {
 			stored, ok := s.stores[id].Instance(p.ref)
@@ -334,11 +359,31 @@ func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals 
 				baseLess := baseOrder[left.ID] < baseOrder[right.ID]
 				gotLess := order[left.ID] < order[right.ID]
 				if gotLess != baseLess {
-					t.Fatalf("node %d conflict order for %#v and %#v differs from node %d: node positions %d/%d, base positions %d/%d", id, left.ID, right.ID, s.ids[0], order[left.ID], order[right.ID], baseOrder[left.ID], baseOrder[right.ID])
+					t.Fatalf("node %d conflict order for %#v and %#v differs from node %d: node positions %d/%d, base positions %d/%d, final tuples=%#v", id, left.ID, right.ID, s.ids[0], order[left.ID], order[right.ID], baseOrder[left.ID], baseOrder[right.ID], stressTuplePairs(s, wantByID[left.ID].ref, wantByID[right.ID].ref))
 				}
 			}
 		}
 	}
+}
+
+type stressTuple struct {
+	Ref  InstanceRef
+	ID   CommandID
+	Seq  uint64
+	Deps []InstanceNum
+}
+
+func stressTuplePairs(s *stressTransportCluster, left, right InstanceRef) map[ReplicaID][2]stressTuple {
+	pairs := make(map[ReplicaID][2]stressTuple, len(s.ids))
+	for _, id := range s.ids {
+		leftRecord := s.nodes[id].instances[left].rec
+		rightRecord := s.nodes[id].instances[right].rec
+		pairs[id] = [2]stressTuple{
+			{Ref: leftRecord.Ref, ID: leftRecord.Command.ID, Seq: leftRecord.Seq, Deps: append([]InstanceNum(nil), leftRecord.Deps...)},
+			{Ref: rightRecord.Ref, ID: rightRecord.Command.ID, Seq: rightRecord.Seq, Deps: append([]InstanceNum(nil), rightRecord.Deps...)},
+		}
+	}
+	return pairs
 }
 
 func commandIndexes(app []CommittedCommand) map[CommandID]int {

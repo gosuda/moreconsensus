@@ -31,11 +31,13 @@ func TestRevisitedChainPruningExecutesBaseBeforeLaterDependencyChain(t *testing.
 		Command: revisitedCommand(3, "C", shared),
 	})
 
-	comp := revisitedComponentContaining(rn.executionComponents(), a)
+	view := rn.newExecutionView()
+	comp := revisitedComponentContaining(rn.executionComponents(&view), a)
 	if len(comp) != 1 || comp[0] != a {
 		t.Fatalf("component containing %s = %v, want singleton after pruning %s -> %s", a, comp, a, b)
 	}
-	if !rn.componentReady(comp) {
+	var candidates []recoveryCandidate
+	if !rn.componentReady(&view, comp, &candidates) {
 		t.Fatalf("component containing %s was not ready after pruning %s, despite %s proving Seq(%s) > Seq(%s)", a, b, b, b, a)
 	}
 
@@ -75,7 +77,9 @@ func TestRevisitedChainPruningIgnoresKnownUncommittedConflictAfterBase(t *testin
 				Command: revisitedCommand(11, "B", shared),
 			})
 
-			if !rn.componentReady([]InstanceRef{a}) {
+			view := rn.newExecutionView()
+			var candidates []recoveryCandidate
+			if !rn.componentReady(&view, []InstanceRef{a}, &candidates) {
 				t.Fatalf("%s should not block %s: %s records %s in deps and has higher sequence", b, a, b, a)
 			}
 			rn.tryExecute()
@@ -210,7 +214,33 @@ func TestRevisitedChainPruningDoesNotBypassUnknownDependency(t *testing.T) {
 			if rn.instances[a].rec.Status == StatusExecuted {
 				t.Fatalf("unknown dependency executed %s in %s case", a, tt.name)
 			}
+
 		})
+	}
+}
+
+func TestRevisitedSparseMaxPrefixPrunesOnlyExactWitness(t *testing.T) {
+	rn := revisitedRawNode(t)
+	max := ^InstanceNum(0)
+	base := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+	witness := InstanceRef{Conf: 1, Replica: 2, Instance: max}
+	revisitedInstall(rn, InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, max, 0}, Command: Command{Kind: CommandNoop}})
+	revisitedInstall(rn, InstanceRecord{Ref: witness, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}})
+	view := rn.newExecutionView()
+	component := revisitedComponentContaining(rn.executionComponents(&view), base)
+	if len(component) != 1 || component[0] != base {
+		t.Fatalf("exact high witness did not prune only its materialized SCC edge: %v", component)
+	}
+	var candidates []recoveryCandidate
+	if rn.componentReady(&view, component, &candidates) {
+		t.Fatal("exact high witness incorrectly waived absent lower prefix")
+	}
+	want := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
+	if len(candidates) != 1 || candidates[0].ref != want {
+		t.Fatalf("exact high witness recovery candidates = %v, want %s", candidates, want)
+	}
+	if rn.executed.prefix(laneFor(witness)) != 0 {
+		t.Fatal("exact pruning advanced executed coverage")
 	}
 }
 
@@ -225,12 +255,9 @@ func revisitedRawNode(t *testing.T) *RawNode {
 
 func revisitedInstall(rn *RawNode, rec InstanceRecord) {
 	rec = checkedRecord(rec)
-	rn.instances[rec.Ref] = &instance{rec: rec, phase: phaseFromStatus(rec.Status)}
+	rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status)})
 	if rec.Status >= StatusPreAccepted {
 		rn.indexConflicts(rec)
-	}
-	if rec.Status == StatusExecuted {
-		rn.executed[rec.Ref] = struct{}{}
 	}
 }
 

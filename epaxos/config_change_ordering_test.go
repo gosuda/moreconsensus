@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func configOrderingAdvanceInitial(t *testing.T, rn *RawNode, store *MemoryStorage) {
+	t.Helper()
+	rd := rn.Ready()
+	want := HardState{Conf: rn.Status().Conf, Tick: rn.tick}
+	if !rd.HardState.Equal(want) || !rd.MustSync ||
+		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+		t.Fatalf("initial Ready = %#v, want hard-state-only %#v", rd, want)
+	}
+	if store != nil {
+		if err := store.ApplyReady(rd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	advanceOK(t, rn, rd)
+}
+
 func TestInboundPendingConfChangeRejectsLocalUserProposeUntilExecuted(t *testing.T) {
 	rn, err := NewRawNode(Config{ID: 2, Voters: makeIDs(3)})
 	if err != nil {
@@ -73,6 +89,7 @@ func TestPendingConfChangeDependencyIncludedInUserPreAcceptResp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	configOrderingAdvanceInitial(t, rn, nil)
 
 	confRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	confCmd := confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4})
@@ -226,28 +243,30 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 }
 
 func TestSingleVoterConfChangeClearsPendingBarrierAfterImmediateExecution(t *testing.T) {
-	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1)})
+	f := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, f)
+	seal := sealBootstrapPlan(t, f, plan)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	ready := readyBootstrapTarget(t, f, plan, snapshot)
+
+	confRef, err := f.node.ActivateVoter(plan, snapshot, ready)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if f.node.pendingConf {
+		t.Fatalf("single-voter certified activation %s executed immediately but left pending configuration barrier set", confRef)
+	}
+	if got := f.node.instances[confRef].rec.Status; got != StatusExecuted {
+		t.Fatalf("single-voter certified activation %s status=%s, want %s", confRef, got, StatusExecuted)
+	}
+	persistBootstrapReady(t, f)
 
-	confRef, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 2})
+	userRef, err := f.node.Propose(configOrderingUserCommand(30, "after-single-conf"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Propose after immediately executed certified activation %s err=%v", confRef, err)
 	}
-	if rn.pendingConf {
-		t.Fatalf("single-voter config change %s executed immediately but left pending configuration barrier set", confRef)
-	}
-	if got := rn.instances[confRef].rec.Status; got != StatusExecuted {
-		t.Fatalf("single-voter config change %s status=%s, want %s", confRef, got, StatusExecuted)
-	}
-
-	userRef, err := rn.Propose(configOrderingUserCommand(30, "after-single-conf"))
-	if err != nil {
-		t.Fatalf("Propose after immediately executed config change %s err=%v", confRef, err)
-	}
-	if userRef.Conf != confRef.Conf+1 {
-		t.Fatalf("user proposal ref=%s, want configuration %d after %s", userRef, confRef.Conf+1, confRef)
+	if userRef.Conf != plan.Successor.ID {
+		t.Fatalf("proposal after single-voter certified activation used ref=%s, want config %d", userRef, plan.Successor.ID)
 	}
 }
 
@@ -306,8 +325,8 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 
 	assertConfigOrderingDepsWidth(t, restarted, oldRef, 3)
 	assertConfigOrderingDepsWidth(t, restarted, midRef, 4)
-	assertConfigOrderingDependencyRefs(t, restarted, oldRef, []InstanceRef{{Replica: 3, Instance: 1, Conf: 1}})
-	assertConfigOrderingDependencyRefs(t, restarted, midRef, []InstanceRef{{Replica: 3, Instance: 1, Conf: 2}})
+	assertConfigOrderingDependencyLane(t, restarted, oldRef, InstanceRef{Replica: 3, Instance: 1, Conf: 1})
+	assertConfigOrderingDependencyLane(t, restarted, midRef, InstanceRef{Replica: 3, Instance: 1, Conf: 2})
 
 	if err := restarted.Step(Message{
 		Type:    MsgPreAccept,
@@ -351,8 +370,8 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 	if _, err := removed.Propose(configOrderingUserCommand(45, "removed-user")); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("removed voter Propose err=%v, want %v", err, ErrMessageRejected)
 	}
-	if _, err := removed.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 5}); !errors.Is(err, ErrMessageRejected) {
-		t.Fatalf("removed voter ProposeConfChange err=%v, want %v", err, ErrMessageRejected)
+	if _, err := removed.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 5}); !errors.Is(err, ErrVoterCertificateRequired) {
+		t.Fatalf("removed voter legacy AddVoter err=%v, want %v", err, ErrVoterCertificateRequired)
 	}
 }
 
@@ -405,7 +424,7 @@ func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
 	if _, err := restarted.Propose(configOrderingUserCommand(46, "blocked-by-replayed-pending-conf")); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("Propose with replayed pending config change %s err=%v, want %v", pendingRef, err, ErrMessageRejected)
 	}
-	if _, err := restarted.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 6}); !errors.Is(err, ErrMessageRejected) {
+	if _, err := restarted.ProposeConfChange(ConfChange{Type: ConfChangeRemoveVoter, Replica: 4}); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("ProposeConfChange with replayed pending config change %s err=%v, want %v", pendingRef, err, ErrMessageRejected)
 	}
 }
@@ -490,7 +509,31 @@ func TestConflictingDuplicateStoredConfigsRejectedOnRestart(t *testing.T) {
 	}
 }
 
-func TestConfigReplayIgnoresMalformedConfChangeOnRestart(t *testing.T) {
+func TestRestartSelectsHighestConfigurationIndependentOfHistoryOrder(t *testing.T) {
+	conf2 := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}
+	conf3 := ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}}
+	for _, tc := range []struct {
+		name    string
+		hard    HardState
+		configs []ConfState
+	}{
+		{name: "reversed history", configs: []ConfState{conf3, conf2}},
+		{name: "hard state newer than history", hard: HardState{Conf: conf3}, configs: []ConfState{conf2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStorage()
+			store.Hard = tc.hard
+			store.Configs = append([]ConfState(nil), tc.configs...)
+			restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, restarted.Status().Conf, conf3)
+		})
+	}
+}
+
+func TestConfigReplayMigratesMalformedConfChangeToRejectedInvalid(t *testing.T) {
 	store := NewMemoryStorage()
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
@@ -504,12 +547,22 @@ func TestConfigReplayIgnoresMalformedConfChangeOnRestart(t *testing.T) {
 
 	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
 	if err != nil {
-		t.Fatalf("NewRawNode replaying malformed config change err=%v", err)
+		t.Fatal(err)
 	}
-	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: makeIDs(3)})
+	got := restarted.instances[ref].rec.ConfChangeResult
+	if got.Outcome != ConfChangeRejectedInvalid || !confStateIsZero(got.Conf) {
+		t.Fatalf("malformed durable config result=%#v, want RejectedInvalid with zero config", got)
+	}
+	rd := restarted.Ready()
+	if len(rd.Records) != 1 || rd.Records[0].Ref != ref ||
+		rd.Records[0].ConfChangeResult.Outcome != ConfChangeRejectedInvalid ||
+		!VerifyRecordChecksum(rd.Records[0]) {
+		t.Fatalf("malformed durable config migration Ready=%#v", rd)
+	}
 }
 
-func TestInvalidConfChangeConfigReplayIgnoredOnRestart(t *testing.T) {
+func TestInvalidConfChangeConfigReplayBecomesRejectedInvalid(t *testing.T) {
 	store := NewMemoryStorage()
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
@@ -523,9 +576,627 @@ func TestInvalidConfChangeConfigReplayIgnoredOnRestart(t *testing.T) {
 
 	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
 	if err != nil {
-		t.Fatalf("NewRawNode replaying invalid config change err=%v", err)
+		t.Fatal(err)
 	}
-	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: []ReplicaID{1, 2, 3}})
+	assertConfState(t, restarted.Status().Conf, ConfState{ID: 1, Voters: makeIDs(3)})
+	got := restarted.instances[ref].rec.ConfChangeResult
+	if got.Outcome != ConfChangeRejectedInvalid || !confStateIsZero(got.Conf) {
+		t.Fatalf("invalid durable config result=%#v, want RejectedInvalid with zero config", got)
+	}
+}
+
+type configOutcomeReplayStorage struct {
+	hard    HardState
+	configs []ConfState
+	records []InstanceRecord
+	reverse bool
+}
+
+func (s *configOutcomeReplayStorage) InitialState() (StorageState, error) {
+	history := make([]ConfigHistoryEntry, len(s.configs))
+	for i := range s.configs {
+		history[i] = ConfigHistoryEntry{Conf: s.configs[i].Clone()}
+	}
+	return StorageState{HardState: HardState{Conf: s.hard.Conf.Clone(), Tick: s.hard.Tick}, ConfigHistory: history}, nil
+}
+
+func (s *configOutcomeReplayStorage) LoadInstances(fn func(InstanceRecord) error) error {
+	for i := range s.records {
+		index := i
+		if s.reverse {
+			index = len(s.records) - 1 - i
+		}
+		if err := fn(s.records[index].Clone()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestConcurrentSameGenerationConfigOutcomesReplayExecutionWinner(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		withConfigs bool
+		reverse     bool
+	}{
+		{name: "records only live iteration"},
+		{name: "records only reversed iteration", reverse: true},
+		{name: "stored configs live iteration", withConfigs: true},
+		{name: "stored configs reversed iteration", withConfigs: true, reverse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			configOrderingAdvanceInitial(t, rn, nil)
+			add4Ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+			add5Ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+			add5 := checkedRecord(InstanceRecord{
+				Ref:          add5Ref,
+				Ballot:       Ballot{Replica: 2},
+				RecordBallot: Ballot{Replica: 2},
+				Status:       StatusCommitted,
+				Seq:          1,
+				Deps:         []InstanceNum{0, 0, 0},
+				Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5}),
+			})
+			add4 := checkedRecord(InstanceRecord{
+				Ref:          add4Ref,
+				Ballot:       Ballot{Replica: 1},
+				RecordBallot: Ballot{Replica: 1},
+				Status:       StatusCommitted,
+				Seq:          2,
+				Deps:         []InstanceNum{0, 1, 0},
+				Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			})
+			// Insert in reference order even though the dependency requires Add5
+			// to execute first.
+			rn.instances[add4Ref] = &instance{rec: add4, phase: phaseCommitted}
+			rn.instances[add5Ref] = &instance{rec: add5, phase: phaseCommitted}
+			rn.markPendingConf(add4)
+			rn.markPendingConf(add5)
+			rn.tryExecute()
+
+			wantConf2 := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 5}}
+			assertConfState(t, rn.Status().Conf, wantConf2)
+			winner := rn.instances[add5Ref].rec
+			loser := rn.instances[add4Ref].rec
+			if winner.ConfChangeResult.Outcome != ConfChangeApplied {
+				t.Fatalf("Add5 outcome=%v, want Applied", winner.ConfChangeResult.Outcome)
+			}
+			assertConfState(t, winner.ConfChangeResult.Conf, wantConf2)
+			if loser.ConfChangeResult.Outcome != ConfChangeRejectedSuperseded ||
+				!confStateIsZero(loser.ConfChangeResult.Conf) {
+				t.Fatalf("Add4 result=%#v, want RejectedSuperseded with zero config", loser.ConfChangeResult)
+			}
+			if rn.pendingConf {
+				t.Fatal("terminal concurrent configuration outcomes left pending barrier set")
+			}
+
+			rd := rn.Ready()
+			if !rd.HardState.Equal(HardState{Conf: wantConf2}) || !rd.MustSync {
+				t.Fatalf("executed configuration Ready hard state=%#v, want current configuration %#v", rd.HardState, wantConf2)
+			}
+			if len(rd.Records) != 2 || rd.Records[0].Ref != add5Ref || rd.Records[1].Ref != add4Ref {
+				t.Fatalf("executed configuration Ready order=%#v, want Add5 winner then Add4 loser", rd.Records)
+			}
+			for _, rec := range rd.Records {
+				if !VerifyRecordChecksum(rec) {
+					t.Fatalf("executed result for %s has invalid checksum", rec.Ref)
+				}
+			}
+			durable := NewMemoryStorage()
+			if err := durable.ApplyReady(rd); err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, durable.Hard.Conf, wantConf2)
+			if len(durable.Configs) != 1 {
+				t.Fatalf("durable configuration checkpoints=%#v, want exactly Conf2", durable.Configs)
+			}
+			assertConfState(t, durable.Configs[0], wantConf2)
+			if err := durable.ApplyReady(rd); err != nil {
+				t.Fatalf("idempotent Ready reapply: %v", err)
+			}
+			if len(durable.Configs) != 1 {
+				t.Fatalf("idempotent Ready reapply duplicated configurations: %#v", durable.Configs)
+			}
+			if err := rn.Advance(rd); err != nil {
+				t.Fatal(err)
+			}
+
+			replay := &configOutcomeReplayStorage{
+				records: []InstanceRecord{
+					durable.Records[add5Ref].Clone(),
+					durable.Records[add4Ref].Clone(),
+				},
+				reverse: tc.reverse,
+			}
+			if tc.withConfigs {
+				replay.hard = durable.Hard
+				replay.configs = append([]ConfState(nil), durable.Configs...)
+			}
+			restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: replay})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConfState(t, restarted.Status().Conf, wantConf2)
+			replayedWinner := restarted.instances[add5Ref].rec
+			replayedLoser := restarted.instances[add4Ref].rec
+			if replayedWinner.ConfChangeResult.Outcome != ConfChangeApplied ||
+				replayedLoser.ConfChangeResult.Outcome != ConfChangeRejectedSuperseded {
+				t.Fatalf("replayed outcomes winner=%#v loser=%#v", replayedWinner.ConfChangeResult, replayedLoser.ConfChangeResult)
+			}
+			assertConfState(t, replayedWinner.ConfChangeResult.Conf, wantConf2)
+			if tc.withConfigs {
+				if restarted.HasReady() {
+					t.Fatalf("matching persisted hard state was re-emitted: %#v", restarted.Ready())
+				}
+			} else {
+				initial := restarted.Ready()
+				wantHard := HardState{Conf: wantConf2}
+				if !initial.HardState.Equal(wantHard) || !initial.MustSync ||
+					len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Committed) != 0 {
+					t.Fatalf("legacy restart initial Ready = %#v, want hard-state-only %#v", initial, wantHard)
+				}
+				restartDurable := NewMemoryStorage()
+				if err := restartDurable.ApplyReady(initial); err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, restarted, initial)
+				if restarted.HasReady() {
+					t.Fatalf("initial hard-state acknowledgement left Ready: %#v", restarted.Ready())
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyDuplicateConfigOutcomesMigrateInExecutionOrder(t *testing.T) {
+	add5 := confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5})
+	tests := []struct {
+		name      string
+		records   []InstanceRecord
+		winnerRef InstanceRef
+		loserRef  InstanceRef
+	}{
+		{
+			name: "dependency order overrides reference order",
+			records: []InstanceRecord{
+				checkedRecord(InstanceRecord{
+					Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+					Ballot:       Ballot{Replica: 1},
+					RecordBallot: Ballot{Replica: 1},
+					Status:       StatusExecuted,
+					Seq:          2,
+					Deps:         []InstanceNum{0, 1, 0},
+					Command:      add5,
+				}),
+				checkedRecord(InstanceRecord{
+					Ref:          InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+					Ballot:       Ballot{Replica: 2},
+					RecordBallot: Ballot{Replica: 2},
+					Status:       StatusExecuted,
+					Seq:          1,
+					Deps:         []InstanceNum{0, 0, 0},
+					Command:      add5,
+				}),
+			},
+			winnerRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+			loserRef:  InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		},
+		{
+			name: "equal sequence SCC uses reference tie",
+			records: []InstanceRecord{
+				checkedRecord(InstanceRecord{
+					Ref:          InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+					Ballot:       Ballot{Replica: 1},
+					RecordBallot: Ballot{Replica: 1},
+					Status:       StatusExecuted,
+					Seq:          2,
+					Deps:         []InstanceNum{0, 1, 0},
+					Command:      add5,
+				}),
+				checkedRecord(InstanceRecord{
+					Ref:          InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+					Ballot:       Ballot{Replica: 2},
+					RecordBallot: Ballot{Replica: 2},
+					Status:       StatusExecuted,
+					Seq:          2,
+					Deps:         []InstanceNum{1, 0, 0},
+					Command:      add5,
+				}),
+			},
+			winnerRef: InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+			loserRef:  InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		},
+	}
+	for _, tc := range tests {
+		for _, reverse := range []bool{false, true} {
+			name := "forward storage iteration"
+			if reverse {
+				name = "reversed storage iteration"
+			}
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				store := &configOutcomeReplayStorage{records: tc.records, reverse: reverse}
+				restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 5}}
+				assertConfState(t, restarted.Status().Conf, want)
+				winner := restarted.instances[tc.winnerRef].rec
+				loser := restarted.instances[tc.loserRef].rec
+				if winner.ConfChangeResult.Outcome != ConfChangeApplied {
+					t.Fatalf("legacy winner %s result=%#v, want Applied", tc.winnerRef, winner.ConfChangeResult)
+				}
+				assertConfState(t, winner.ConfChangeResult.Conf, want)
+				if loser.ConfChangeResult.Outcome != ConfChangeRejectedSuperseded ||
+					!confStateIsZero(loser.ConfChangeResult.Conf) {
+					t.Fatalf("legacy loser %s result=%#v, want RejectedSuperseded", tc.loserRef, loser.ConfChangeResult)
+				}
+
+				rd := restarted.Ready()
+				if !rd.HardState.Equal(HardState{Conf: want}) || len(rd.Records) != 2 ||
+					rd.Records[0].Ref != tc.winnerRef || rd.Records[1].Ref != tc.loserRef {
+					t.Fatalf("legacy migration Ready=%#v, want winner then loser and Conf2 hard state", rd)
+				}
+				for _, rec := range rd.Records {
+					if !VerifyRecordChecksum(rec) {
+						t.Fatalf("migrated legacy result for %s has invalid checksum", rec.Ref)
+					}
+				}
+				durable := NewMemoryStorage()
+				if err := durable.ApplyReady(rd); err != nil {
+					t.Fatal(err)
+				}
+				advanceOK(t, restarted, rd)
+				again, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: durable})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertConfState(t, again.Status().Conf, want)
+				if again.HasReady() {
+					t.Fatalf("persisted migrated outcomes produced restart Ready: %#v", again.Ready())
+				}
+			})
+		}
+	}
+}
+
+func TestLegacyInvalidBeforeValidConfigMigrationDoesNotConsumeGeneration(t *testing.T) {
+	invalidRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	validRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	records := []InstanceRecord{
+		checkedRecord(InstanceRecord{
+			Ref:          invalidRef,
+			Ballot:       Ballot{Replica: 1},
+			RecordBallot: Ballot{Replica: 1},
+			Status:       StatusExecuted,
+			Seq:          1,
+			Deps:         []InstanceNum{0, 0, 0},
+			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+		}),
+		checkedRecord(InstanceRecord{
+			Ref:          validRef,
+			Ballot:       Ballot{Replica: 2},
+			RecordBallot: Ballot{Replica: 2},
+			Status:       StatusExecuted,
+			Seq:          2,
+			Deps:         []InstanceNum{1, 0, 0},
+			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		}),
+	}
+	for _, reverse := range []bool{false, true} {
+		store := &configOutcomeReplayStorage{records: records, reverse: reverse}
+		restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		invalidResult := restarted.instances[invalidRef].rec.ConfChangeResult
+		if invalidResult.Outcome != ConfChangeRejectedInvalid || !confStateIsZero(invalidResult.Conf) {
+			t.Fatalf("legacy invalid-first result=%#v, want RejectedInvalid", invalidResult)
+		}
+		want := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}
+		validResult := restarted.instances[validRef].rec.ConfChangeResult
+		if validResult.Outcome != ConfChangeApplied {
+			t.Fatalf("legacy later-valid result=%#v, want Applied", validResult)
+		}
+		assertConfState(t, validResult.Conf, want)
+		rd := restarted.Ready()
+		if len(rd.Records) != 2 || rd.Records[0].Ref != invalidRef || rd.Records[1].Ref != validRef {
+			t.Fatalf("legacy invalid-first migration Ready=%#v", rd.Records)
+		}
+		for _, rec := range rd.Records {
+			if !VerifyRecordChecksum(rec) {
+				t.Fatalf("legacy invalid-first migrated record %s has invalid checksum", rec.Ref)
+			}
+		}
+		durable := NewMemoryStorage()
+		if err := durable.ApplyReady(rd); err != nil {
+			t.Fatal(err)
+		}
+		advanceOK(t, restarted, rd)
+		again, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: durable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertConfState(t, again.Status().Conf, want)
+		if again.HasReady() {
+			t.Fatalf("persisted invalid-first migration produced restart Ready: %#v", again.Ready())
+		}
+	}
+}
+
+func TestConfigReplayRejectsInvalidExplicitOutcomeChains(t *testing.T) {
+	baseRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	record := func(ref InstanceRef, change ConfChange, result ConfChangeResult) InstanceRecord {
+		return checkedRecord(InstanceRecord{
+			Ref:              ref,
+			Ballot:           Ballot{Replica: ref.Replica},
+			RecordBallot:     Ballot{Replica: ref.Replica},
+			Status:           StatusExecuted,
+			Seq:              1,
+			Deps:             []InstanceNum{0, 0, 0},
+			Command:          confChangeCommand(change),
+			ConfChangeResult: result,
+		})
+	}
+	applied4 := record(baseRef,
+		ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+		ConfChangeResult{Outcome: ConfChangeApplied, Conf: ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}})
+	for _, tc := range []struct {
+		name    string
+		records []InstanceRecord
+	}{
+		{
+			name: "two applied results",
+			records: []InstanceRecord{
+				applied4,
+				record(InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+					ConfChange{Type: ConfChangeAddVoter, Replica: 5},
+					ConfChangeResult{Outcome: ConfChangeApplied, Conf: ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 5}}}),
+			},
+		},
+		{
+			name: "applied voters disagree with command",
+			records: []InstanceRecord{
+				record(baseRef,
+					ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+					ConfChangeResult{Outcome: ConfChangeApplied, Conf: ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 6}}}),
+			},
+		},
+		{
+			name: "valid command labeled rejected invalid",
+			records: []InstanceRecord{
+				record(baseRef,
+					ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+					ConfChangeResult{Outcome: ConfChangeRejectedInvalid}),
+			},
+		},
+		{
+			name: "invalid command labeled superseded",
+			records: []InstanceRecord{
+				record(baseRef,
+					ConfChange{Type: ConfChangeAddVoter, Replica: 2},
+					ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}),
+			},
+		},
+		{
+			name: "superseded without winner or checkpoint",
+			records: []InstanceRecord{
+				record(baseRef,
+					ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+					ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}),
+			},
+		},
+		{
+			name: "rejection carries configuration",
+			records: []InstanceRecord{
+				record(baseRef,
+					ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+					ConfChangeResult{Outcome: ConfChangeRejectedSuperseded, Conf: ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &configOutcomeReplayStorage{records: tc.records}
+			if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store}); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("NewRawNode invalid outcome chain err=%v, want ErrInvalidConfig", err)
+			}
+		})
+	}
+}
+
+func TestConfChangeResultReadyFencesSuccessorMessages(t *testing.T) {
+	store := NewMemoryStorage()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configOrderingAdvanceInitial(t, rn, store)
+	confRef, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := rn.instances[confRef]
+	if err := rn.Step(Message{
+		Type: MsgPreAcceptResp, From: 2, To: 1, Ref: confRef,
+		Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...),
+		FastPathEligible: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	successorRef, err := rn.Propose(configOrderingUserCommand(70, "successor-before-advance"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if successorRef.Conf != 2 {
+		t.Fatalf("successor proposal ref=%s, want configuration 2", successorRef)
+	}
+	rd := rn.Ready()
+	configResultIndex := -1
+	successorRecordIndex := -1
+	for i, rec := range rd.Records {
+		if rec.Ref == confRef && rec.Status == StatusExecuted {
+			if rec.ConfChangeResult.Outcome != ConfChangeApplied {
+				t.Fatalf("configuration execution result=%#v, want Applied", rec.ConfChangeResult)
+			}
+			configResultIndex = i
+		}
+		if rec.Ref == successorRef {
+			successorRecordIndex = i
+		}
+	}
+	if configResultIndex < 0 || successorRecordIndex <= configResultIndex {
+		t.Fatalf("Ready records do not fence successor after applied result: config=%d successor=%d records=%#v", configResultIndex, successorRecordIndex, rd.Records)
+	}
+	hasSuccessorMessage := false
+	for _, message := range rd.Messages {
+		if message.Ref == successorRef {
+			hasSuccessorMessage = true
+		}
+	}
+	if !hasSuccessorMessage {
+		t.Fatalf("Ready has no successor message for %s: %#v", successorRef, rd.Messages)
+	}
+	if err := rn.Advance(Ready{HardState: rd.HardState, Messages: rd.Messages, MustSync: rd.MustSync}); !errors.Is(err, ErrInvalidReady) {
+		t.Fatalf("Advance successor messages without applied result record err=%v, want ErrInvalidReady", err)
+	}
+	retry := rn.Ready()
+	if len(retry.Records) != len(rd.Records) || retry.Records[configResultIndex].ConfChangeResult.Outcome != ConfChangeApplied {
+		t.Fatalf("failed successor-only Advance changed durable result prefix: %#v", retry.Records)
+	}
+	if err := store.ApplyReady(rd); err != nil {
+		t.Fatal(err)
+	}
+	if err := rn.Advance(rd); err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, store.Hard.Conf, ConfState{ID: 2, Voters: []ReplicaID{1, 2}})
+}
+
+func TestInvalidExecutedConfChangeDoesNotConsumeGeneration(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configOrderingAdvanceInitial(t, rn, nil)
+	invalidRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	validRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	invalid := checkedRecord(InstanceRecord{
+		Ref:          invalidRef,
+		Ballot:       Ballot{Replica: 1},
+		RecordBallot: Ballot{Replica: 1},
+		Status:       StatusCommitted,
+		Seq:          1,
+		Deps:         []InstanceNum{0, 0, 0},
+		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+	})
+	valid := checkedRecord(InstanceRecord{
+		Ref:          validRef,
+		Ballot:       Ballot{Replica: 2},
+		RecordBallot: Ballot{Replica: 2},
+		Status:       StatusCommitted,
+		Seq:          2,
+		Deps:         []InstanceNum{1, 0, 0},
+		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+	})
+	rn.instances[invalidRef] = &instance{rec: invalid, phase: phaseCommitted}
+	rn.instances[validRef] = &instance{rec: valid, phase: phaseCommitted}
+	rn.markPendingConf(invalid)
+	rn.markPendingConf(valid)
+	rn.tryExecute()
+
+	invalidResult := rn.instances[invalidRef].rec.ConfChangeResult
+	if invalidResult.Outcome != ConfChangeRejectedInvalid || !confStateIsZero(invalidResult.Conf) {
+		t.Fatalf("invalid-first result=%#v, want RejectedInvalid", invalidResult)
+	}
+	want := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}
+	validResult := rn.instances[validRef].rec.ConfChangeResult
+	if validResult.Outcome != ConfChangeApplied {
+		t.Fatalf("later valid result=%#v, want Applied", validResult)
+	}
+	assertConfState(t, validResult.Conf, want)
+	assertConfState(t, rn.Status().Conf, want)
+	if rn.pendingConf {
+		t.Fatal("terminal invalid and applied configuration commands left pending barrier set")
+	}
+	rd := rn.Ready()
+	if len(rd.Records) != 2 || rd.Records[0].Ref != invalidRef || rd.Records[1].Ref != validRef {
+		t.Fatalf("invalid-first Ready order=%#v", rd.Records)
+	}
+}
+
+func TestConfigReplayAcceptsSupersededWithStoredWinnerCheckpoint(t *testing.T) {
+	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	loser := checkedRecord(InstanceRecord{
+		Ref:          ref,
+		Ballot:       Ballot{Replica: 1},
+		RecordBallot: Ballot{Replica: 1},
+		Status:       StatusExecuted,
+		Seq:          2,
+		Deps:         []InstanceNum{0, 0, 0},
+		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		ConfChangeResult: ConfChangeResult{
+			Outcome: ConfChangeRejectedSuperseded,
+		},
+	})
+	winnerCheckpoint := ConfState{ID: 2, Voters: []ReplicaID{1, 2, 3, 5}}
+	store := &configOutcomeReplayStorage{
+		hard:    HardState{Conf: winnerCheckpoint},
+		configs: []ConfState{winnerCheckpoint},
+		records: []InstanceRecord{loser},
+	}
+	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConfState(t, restarted.Status().Conf, winnerCheckpoint)
+	if got := restarted.instances[ref].rec.ConfChangeResult.Outcome; got != ConfChangeRejectedSuperseded {
+		t.Fatalf("checkpointed loser outcome=%v, want RejectedSuperseded", got)
+	}
+}
+
+func TestMemoryStorageRejectsConflictingAppliedSuccessorAtomically(t *testing.T) {
+	appliedRecord := func(ref InstanceRef, replica ReplicaID) InstanceRecord {
+		voters := []ReplicaID{1, 2, 3, replica}
+		return checkedRecord(InstanceRecord{
+			Ref:          ref,
+			Ballot:       Ballot{Replica: ref.Replica},
+			RecordBallot: Ballot{Replica: ref.Replica},
+			Status:       StatusExecuted,
+			Seq:          1,
+			Deps:         []InstanceNum{0, 0, 0},
+			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: replica}),
+			ConfChangeResult: ConfChangeResult{
+				Outcome: ConfChangeApplied,
+				Conf:    ConfState{ID: 2, Voters: voters},
+			},
+		})
+	}
+	store := NewMemoryStorage()
+	firstRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	first := appliedRecord(firstRef, 4)
+	if err := store.ApplyReady(Ready{HardState: HardState{Conf: first.ConfChangeResult.Conf}, Records: []InstanceRecord{first}, MustSync: true}); err != nil {
+		t.Fatal(err)
+	}
+	want := first.ConfChangeResult.Conf
+	assertConfState(t, store.Hard.Conf, want)
+
+	conflictRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	conflict := appliedRecord(conflictRef, 5)
+	if err := store.ApplyReady(Ready{HardState: HardState{Conf: conflict.ConfChangeResult.Conf}, Records: []InstanceRecord{conflict}, MustSync: true}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("ApplyReady conflicting successor err=%v, want ErrInvalidConfig", err)
+	}
+	assertConfState(t, store.Hard.Conf, want)
+	if _, exists := store.Records[conflictRef]; exists {
+		t.Fatalf("conflicting ApplyReady partially persisted record %s", conflictRef)
+	}
+	if len(store.Configs) != 1 {
+		t.Fatalf("conflicting ApplyReady changed checkpoints: %#v", store.Configs)
+	}
+	assertConfState(t, store.Configs[0], want)
 }
 
 func assertConfigOrderingDepsWidth(t *testing.T, rn *RawNode, ref InstanceRef, want int) {
@@ -539,16 +1210,21 @@ func assertConfigOrderingDepsWidth(t *testing.T, rn *RawNode, ref InstanceRef, w
 	}
 }
 
-func assertConfigOrderingDependencyRefs(t *testing.T, rn *RawNode, ref InstanceRef, want []InstanceRef) {
+func assertConfigOrderingDependencyLane(t *testing.T, rn *RawNode, ref, want InstanceRef) {
 	t.Helper()
-	got := rn.dependencyRefs(ref)
-	if len(got) != len(want) {
-		t.Fatalf("dependencyRefs(%s)=%v, want %v", ref, got, want)
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatalf("missing instance %s", ref)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("dependencyRefs(%s)=%v, want %v", ref, got, want)
-		}
+	conf := rn.confFor(ref.Conf)
+	slot, ok := conf.Index(want.Replica)
+	if !ok || slot >= len(inst.rec.Deps) || inst.rec.Deps[slot] != want.Instance || want.Conf != ref.Conf {
+		t.Fatalf("compact dependency lane for %s = conf %#v deps %v, want through %s", ref, conf, inst.rec.Deps, want)
+	}
+	view := rn.newExecutionView()
+	iter := view.dependencyRefs(rn, ref)
+	if dependency, ok := iter.next(); ok {
+		t.Fatalf("absent compact dependency was materialized as graph ref %s", dependency)
 	}
 }
 

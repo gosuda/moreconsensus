@@ -1,0 +1,696 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gosuda.org/moreconsensus/schemas/target-incident-evidence-2.0.json",
+  "title": "Native Darwin target incident readiness evidence v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "verifier_version",
+    "record_kind",
+    "record_mode",
+    "claim",
+    "target",
+    "profile",
+    "topology",
+    "participants",
+    "release_provenance",
+    "opened_at",
+    "closed_at",
+    "recorded_at",
+    "valid_until",
+    "drills",
+    "raw_artifacts",
+    "operational_artifacts",
+    "sign_off",
+    "nonclaims"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "verifier_version": { "const": "target-incident-evidence-verifier/2.0" },
+    "record_kind": { "const": "target-incident-evidence" },
+    "record_mode": { "enum": ["target", "synthetic-test"] },
+    "claim": {
+      "enum": [
+        "target-darwin-incident-readiness-observed",
+        "synthetic-test-darwin-incident-readiness-observed"
+      ]
+    },
+    "target": { "$ref": "#/$defs/target" },
+    "profile": { "$ref": "#/$defs/profile" },
+    "topology": { "$ref": "#/$defs/topology" },
+    "participants": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/participant" }
+    },
+    "release_provenance": { "$ref": "#/$defs/releaseProvenance" },
+    "opened_at": { "$ref": "#/$defs/utcTimestamp" },
+    "closed_at": { "$ref": "#/$defs/utcTimestamp" },
+    "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
+    "valid_until": { "$ref": "#/$defs/utcTimestamp" },
+    "drills": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/processCrashRestartDrill" },
+          { "$ref": "#/$defs/oneNodeUnavailabilityDrill" },
+          { "$ref": "#/$defs/badConfigRollbackDrill" },
+          { "$ref": "#/$defs/certificateSecretRotationDrill" },
+          { "$ref": "#/$defs/storagePressureFailureDrill" },
+          { "$ref": "#/$defs/corruptedCheckpointDrill" }
+        ]
+      }
+    },
+    "raw_artifacts": {
+      "type": "array",
+      "minItems": 31,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/rawArtifact" }
+    },
+    "operational_artifacts": { "$ref": "#/$defs/operationalArtifacts" },
+    "sign_off": { "$ref": "#/$defs/signOff" },
+    "nonclaims": { "$ref": "#/$defs/nonclaims" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "record_mode": { "const": "target" } } },
+      "then": { "properties": { "claim": { "const": "target-darwin-incident-readiness-observed" } } }
+    },
+    {
+      "if": { "properties": { "record_mode": { "const": "synthetic-test" } } },
+      "then": { "properties": { "claim": { "const": "synthetic-test-darwin-incident-readiness-observed" } } }
+    }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "narrative": { "type": "string", "minLength": 20 },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "revision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "artifactReferences": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "environment", "service", "cluster_id"],
+      "properties": {
+        "name": { "const": "mc-kv-darwin24-arm64-launchd-3n-r1" },
+        "environment": { "const": "native-darwin24-arm64-launchd-system-domain-v1" },
+        "service": { "const": "kvnode" },
+        "cluster_id": { "const": "mc-kv-darwin24-3n-r1" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "os_version",
+        "os_build",
+        "architecture",
+        "binary_format",
+        "execution_mode",
+        "supervisor",
+        "launchd_domain",
+        "storage_filesystem",
+        "network_scope",
+        "tls_mode"
+      ],
+      "properties": {
+        "platform": { "const": "darwin" },
+        "os_version": { "type": "string", "pattern": "^24\\.[0-9]+\\.[0-9]+$" },
+        "os_build": { "$ref": "#/$defs/nonEmpty" },
+        "architecture": { "const": "arm64" },
+        "binary_format": { "const": "mach-o-64" },
+        "execution_mode": { "const": "native" },
+        "supervisor": { "const": "launchd" },
+        "launchd_domain": { "const": "system" },
+        "storage_filesystem": { "const": "apfs" },
+        "network_scope": { "const": "same-host-loopback" },
+        "tls_mode": { "const": "server-auth-only" }
+      }
+    },
+    "nodeBase": {
+      "type": "object",
+      "required": [
+        "name",
+        "node_id",
+        "launchd_label",
+        "client_endpoint",
+        "peer_endpoint",
+        "admin_endpoint",
+        "data_path",
+        "pid",
+        "binary_sha256",
+        "observed_at",
+        "evidence_artifact_id"
+      ],
+      "properties": {
+        "name": { "enum": ["node1", "node2", "node3"] },
+        "node_id": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "launchd_label": {
+          "enum": [
+            "org.gosuda.moreconsensus.kvnode.1",
+            "org.gosuda.moreconsensus.kvnode.2",
+            "org.gosuda.moreconsensus.kvnode.3"
+          ]
+        },
+        "client_endpoint": { "type": "string", "pattern": "^https://127\\.0\\.0\\.1:[0-9]+$" },
+        "peer_endpoint": { "type": "string", "pattern": "^https://127\\.0\\.0\\.1:[0-9]+$" },
+        "admin_endpoint": { "type": "string", "pattern": "^https://127\\.0\\.0\\.1:[0-9]+$" },
+        "data_path": { "type": "string", "pattern": "^/var/db/moreconsensus/.+/data/node[123]$" },
+        "pid": { "type": "integer", "minimum": 1 },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "observed_at": { "$ref": "#/$defs/utcTimestamp" },
+        "evidence_artifact_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "node1": {
+      "allOf": [
+        { "$ref": "#/$defs/nodeBase" },
+        {
+          "type": "object",
+          "properties": {
+            "name": { "const": "node1" },
+            "node_id": { "const": 1 },
+            "launchd_label": { "const": "org.gosuda.moreconsensus.kvnode.1" },
+            "client_endpoint": { "const": "https://127.0.0.1:19090" },
+            "peer_endpoint": { "const": "https://127.0.0.1:19091" },
+            "admin_endpoint": { "const": "https://127.0.0.1:19092" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "node2": {
+      "allOf": [
+        { "$ref": "#/$defs/nodeBase" },
+        {
+          "type": "object",
+          "properties": {
+            "name": { "const": "node2" },
+            "node_id": { "const": 2 },
+            "launchd_label": { "const": "org.gosuda.moreconsensus.kvnode.2" },
+            "client_endpoint": { "const": "https://127.0.0.1:19190" },
+            "peer_endpoint": { "const": "https://127.0.0.1:19191" },
+            "admin_endpoint": { "const": "https://127.0.0.1:19192" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "node3": {
+      "allOf": [
+        { "$ref": "#/$defs/nodeBase" },
+        {
+          "type": "object",
+          "properties": {
+            "name": { "const": "node3" },
+            "node_id": { "const": 3 },
+            "launchd_label": { "const": "org.gosuda.moreconsensus.kvnode.3" },
+            "client_endpoint": { "const": "https://127.0.0.1:19290" },
+            "peer_endpoint": { "const": "https://127.0.0.1:19291" },
+            "admin_endpoint": { "const": "https://127.0.0.1:19292" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_count", "nodes"],
+      "properties": {
+        "node_count": { "const": 3 },
+        "nodes": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            { "$ref": "#/$defs/node1" },
+            { "$ref": "#/$defs/node2" },
+            { "$ref": "#/$defs/node3" }
+          ],
+          "items": false
+        }
+      }
+    },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["participant_id", "name", "role", "organization"],
+      "properties": {
+        "participant_id": { "$ref": "#/$defs/identifier" },
+        "name": { "$ref": "#/$defs/nonEmpty" },
+        "role": { "enum": ["operator", "independent-reviewer", "incident-commander"] },
+        "organization": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "releaseProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_id",
+        "source_repository",
+        "source_revision",
+        "source_tree",
+        "binary_uri",
+        "binary_sha256",
+        "release_manifest_uri",
+        "release_manifest_sha256",
+        "built_at"
+      ],
+      "properties": {
+        "release_id": { "$ref": "#/$defs/identifier" },
+        "source_repository": { "$ref": "#/$defs/nonEmpty" },
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "source_tree": { "const": "clean" },
+        "binary_uri": { "type": "string", "pattern": "^file:binary/[A-Za-z0-9._/-]+$" },
+        "binary_sha256": { "$ref": "#/$defs/sha256" },
+        "release_manifest_uri": {
+          "type": "string",
+          "pattern": "^file:manifest/[A-Za-z0-9._/-]+$"
+        },
+        "release_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "built_at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "rawArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "drill_id", "kind", "uri", "sha256", "captured_at"],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/identifier" },
+        "drill_id": { "$ref": "#/$defs/identifier" },
+        "kind": {
+          "enum": [
+            "raw-log",
+            "raw-metric",
+            "raw-command-output",
+            "raw-communication",
+            "raw-alert",
+            "raw-runbook",
+            "raw-signoff"
+          ]
+        },
+        "uri": { "type": "string", "pattern": "^file:raw/[A-Za-z0-9._/-]+$" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "captured_at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "nonclaims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "multi_host",
+        "independent_failure_domains",
+        "mtls",
+        "client_authorization",
+        "peer_authorization",
+        "production_capacity",
+        "physical_storage_failure"
+      ],
+      "properties": {
+        "multi_host": { "const": false },
+        "independent_failure_domains": { "const": false },
+        "mtls": { "const": false },
+        "client_authorization": { "const": false },
+        "peer_authorization": { "const": false },
+        "production_capacity": { "const": false },
+        "physical_storage_failure": { "const": false }
+      }
+    },
+    "drillCommon": {
+      "type": "object",
+      "required": [
+        "drill_id",
+        "incident_class",
+        "affected_nodes",
+        "condition_source",
+        "injection_method",
+        "impact_boundary",
+        "expected_outcome",
+        "observed_outcome",
+        "rollback_plan",
+        "nonclaims",
+        "started_at",
+        "completed_at",
+        "executor_participant_id",
+        "approver_participant_id",
+        "approved_at",
+        "result",
+        "evidence_artifact_ids",
+        "observations"
+      ],
+      "properties": {
+        "drill_id": { "$ref": "#/$defs/identifier" },
+        "incident_class": {
+          "enum": [
+            "process_crash_restart",
+            "one_node_unavailability",
+            "bad_config_rollback",
+            "certificate_secret_rotation",
+            "storage_pressure_failure",
+            "corrupted_checkpoint"
+          ]
+        },
+        "affected_nodes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["node1", "node2", "node3"] }
+        },
+        "condition_source": { "$ref": "#/$defs/narrative" },
+        "injection_method": { "$ref": "#/$defs/narrative" },
+        "impact_boundary": { "$ref": "#/$defs/narrative" },
+        "expected_outcome": { "$ref": "#/$defs/narrative" },
+        "observed_outcome": { "$ref": "#/$defs/narrative" },
+        "rollback_plan": { "$ref": "#/$defs/narrative" },
+        "nonclaims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmpty" }
+        },
+        "started_at": { "$ref": "#/$defs/utcTimestamp" },
+        "completed_at": { "$ref": "#/$defs/utcTimestamp" },
+        "executor_participant_id": { "$ref": "#/$defs/identifier" },
+        "approver_participant_id": { "$ref": "#/$defs/identifier" },
+        "approved_at": { "$ref": "#/$defs/utcTimestamp" },
+        "result": { "const": "observed-pass" },
+        "evidence_artifact_ids": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "observations": { "type": "object" }
+      }
+    },
+    "processCrashRestartObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "launchd_label",
+        "crash_signal",
+        "old_pid",
+        "new_pid",
+        "supervisor_restart_observed",
+        "durable_canary_observed"
+      ],
+      "properties": {
+        "node": { "const": "node2" },
+        "launchd_label": { "const": "org.gosuda.moreconsensus.kvnode.2" },
+        "crash_signal": { "const": "SIGKILL" },
+        "old_pid": { "type": "integer", "minimum": 1 },
+        "new_pid": { "type": "integer", "minimum": 1 },
+        "supervisor_restart_observed": { "const": true },
+        "durable_canary_observed": { "const": true }
+      }
+    },
+    "oneNodeUnavailabilityObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unavailable_node",
+        "healthy_nodes",
+        "expected_voters",
+        "available_voters",
+        "quorum_write_observed",
+        "cross_node_read_observed"
+      ],
+      "properties": {
+        "unavailable_node": { "const": "node2" },
+        "healthy_nodes": { "const": ["node1", "node3"] },
+        "expected_voters": { "const": 3 },
+        "available_voters": { "const": 2 },
+        "quorum_write_observed": { "const": true },
+        "cross_node_read_observed": { "const": true }
+      }
+    },
+    "badConfigRollbackObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "launchd_label",
+        "invalid_config_sha256",
+        "last_known_good_sha256",
+        "validation_rejected",
+        "rollback_completed",
+        "service_restored"
+      ],
+      "properties": {
+        "node": { "const": "node2" },
+        "launchd_label": { "const": "org.gosuda.moreconsensus.kvnode.2" },
+        "invalid_config_sha256": { "$ref": "#/$defs/sha256" },
+        "last_known_good_sha256": { "$ref": "#/$defs/sha256" },
+        "validation_rejected": { "const": true },
+        "rollback_completed": { "const": true },
+        "service_restored": { "const": true }
+      }
+    },
+    "certificateSecretRotationObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodes_rotated",
+        "rotation_scope",
+        "reload_method",
+        "old_certificate_sha256",
+        "new_certificate_sha256",
+        "old_private_key_sha256",
+        "new_private_key_sha256",
+        "private_key_material_collected",
+        "tls_server_auth_verified",
+        "mtls_observed",
+        "client_authorization_observed"
+      ],
+      "properties": {
+        "nodes_rotated": { "const": ["node1", "node2", "node3"] },
+        "rotation_scope": { "const": "server-certificate-and-private-key" },
+        "reload_method": { "const": "rolling-launchd-restart" },
+        "old_certificate_sha256": { "$ref": "#/$defs/sha256" },
+        "new_certificate_sha256": { "$ref": "#/$defs/sha256" },
+        "old_private_key_sha256": { "$ref": "#/$defs/sha256" },
+        "new_private_key_sha256": { "$ref": "#/$defs/sha256" },
+        "private_key_material_collected": { "const": false },
+        "tls_server_auth_verified": { "const": true },
+        "mtls_observed": { "const": false },
+        "client_authorization_observed": { "const": false }
+      }
+    },
+    "storagePressureFailureObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "failure_mode",
+        "apfs_free_bytes_before",
+        "apfs_free_bytes_after",
+        "storage_fault_metric_observed",
+        "readiness_failed_observed",
+        "quorum_service_observed",
+        "physical_apfs_failure_observed",
+        "fault_gate_cleared"
+      ],
+      "properties": {
+        "node": { "const": "node2" },
+        "failure_mode": { "const": "logical-storage-unavailable-gate-with-apfs-free-space-observation" },
+        "apfs_free_bytes_before": { "type": "integer", "minimum": 1 },
+        "apfs_free_bytes_after": { "type": "integer", "minimum": 1 },
+        "storage_fault_metric_observed": { "const": true },
+        "readiness_failed_observed": { "const": true },
+        "quorum_service_observed": { "const": true },
+        "physical_apfs_failure_observed": { "const": false },
+        "fault_gate_cleared": { "const": true }
+      }
+    },
+    "corruptedCheckpointObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "checkpoint_mode",
+        "pristine_manifest_sha256",
+        "altered_manifest_sha256",
+        "node_stopped_before_copy",
+        "altered_copy_rejected",
+        "quarantine_path",
+        "pristine_reverified",
+        "suspect_copy_restored",
+        "service_restored_from_pristine"
+      ],
+      "properties": {
+        "node": { "const": "node2" },
+        "checkpoint_mode": { "const": "offline-altered-copy" },
+        "pristine_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "altered_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "node_stopped_before_copy": { "const": true },
+        "altered_copy_rejected": { "const": true },
+        "quarantine_path": {
+          "type": "string",
+          "pattern": "^/var/db/moreconsensus/.+/quarantine/.+$"
+        },
+        "pristine_reverified": { "const": true },
+        "suspect_copy_restored": { "const": false },
+        "service_restored_from_pristine": { "const": true }
+      }
+    },
+    "processCrashRestartDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "process_crash_restart" },
+            "affected_nodes": { "const": ["node2"] },
+            "observations": { "$ref": "#/$defs/processCrashRestartObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "oneNodeUnavailabilityDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "one_node_unavailability" },
+            "affected_nodes": { "const": ["node2"] },
+            "observations": { "$ref": "#/$defs/oneNodeUnavailabilityObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "badConfigRollbackDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "bad_config_rollback" },
+            "affected_nodes": { "const": ["node2"] },
+            "observations": { "$ref": "#/$defs/badConfigRollbackObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "certificateSecretRotationDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "certificate_secret_rotation" },
+            "affected_nodes": { "const": ["node1", "node2", "node3"] },
+            "observations": { "$ref": "#/$defs/certificateSecretRotationObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "storagePressureFailureDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "storage_pressure_failure" },
+            "affected_nodes": { "const": ["node2"] },
+            "observations": { "$ref": "#/$defs/storagePressureFailureObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "corruptedCheckpointDrill": {
+      "allOf": [
+        { "$ref": "#/$defs/drillCommon" },
+        {
+          "type": "object",
+          "properties": {
+            "incident_class": { "const": "corrupted_checkpoint" },
+            "affected_nodes": { "const": ["node2"] },
+            "observations": { "$ref": "#/$defs/corruptedCheckpointObservation" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "operationalArtifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "topology_artifact_ids",
+        "alert_artifact_ids",
+        "runbook_artifact_ids",
+        "signoff_artifact_ids"
+      ],
+      "properties": {
+        "topology_artifact_ids": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "alert_artifact_ids": { "$ref": "#/$defs/artifactReferences" },
+        "runbook_artifact_ids": { "$ref": "#/$defs/artifactReferences" },
+        "signoff_artifact_ids": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["participant_id", "role", "signed_at", "decision", "statement", "artifact_id"],
+      "properties": {
+        "participant_id": { "$ref": "#/$defs/identifier" },
+        "role": { "enum": ["operator", "independent-reviewer"] },
+        "signed_at": { "$ref": "#/$defs/utcTimestamp" },
+        "decision": { "const": "approved" },
+        "statement": { "$ref": "#/$defs/narrative" },
+        "artifact_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "signOff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator", "independent_reviewer"],
+      "properties": {
+        "operator": { "$ref": "#/$defs/signature" },
+        "independent_reviewer": { "$ref": "#/$defs/signature" }
+      }
+    }
+  }
+}

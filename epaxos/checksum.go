@@ -66,10 +66,28 @@ func sumHash(h *blake3.Hasher) [32]byte {
 
 // ChecksumRecord returns the canonical BLAKE3 checksum for a record.
 func ChecksumRecord(r InstanceRecord) [32]byte {
-	return checksumRecord(r, true, true, true, true, true)
+	return checksumRecordLayout(r, true, true, true, true, true, true, true, true)
 }
 
-func checksumRecord(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence bool) [32]byte {
+// ChecksumRecordWithoutMembershipResult returns the immediately previous
+// durable record layout. It is exposed only for exact storage migration.
+func ChecksumRecordWithoutMembershipResult(r InstanceRecord) [32]byte {
+	return checksumRecordLayout(r, true, true, true, true, true, true, true, false)
+}
+
+// ChecksumRecordWithoutTimingDomain returns the older pre-timing durable
+// record layout. It is exposed only for exact storage migration.
+func ChecksumRecordWithoutTimingDomain(r InstanceRecord) [32]byte {
+	return checksumRecord(r, true, true, true, true, true, true)
+}
+
+// checksumRecord retains the pre-TimingDomain private signature for the older
+// exact-layout migration verifiers.
+func checksumRecord(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult bool) [32]byte {
+	return checksumRecordLayout(r, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, false, false)
+}
+
+func checksumRecordLayout(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, includeTimingDomain, includeMembershipResult bool) [32]byte {
 	h := getHash()
 	defer putHash(h)
 	writeRef(h, r.Ref)
@@ -117,7 +135,45 @@ func checksumRecord(r InstanceRecord, includeFastPath, includeTOQ, includeAccept
 			writeByte(h, 0)
 		}
 	}
+	if includeTimingDomain {
+		writeByte(h, byte(r.TimingDomain))
+	}
+	if includeConfChangeResult {
+		writeByte(h, byte(r.ConfChangeResult.Outcome))
+		writeUint64(h, uint64(r.ConfChangeResult.Conf.ID))
+		writeUint64(h, uint64(len(r.ConfChangeResult.Conf.Voters)))
+		for _, voter := range r.ConfChangeResult.Conf.Voters {
+			writeUint64(h, uint64(voter))
+		}
+	}
+	if includeMembershipResult {
+		writeBytes(h, r.MembershipResult.Plan[:])
+		writeByte(h, byte(r.MembershipResult.Outcome))
+		writeRef(h, r.MembershipResult.ExitRef)
+		writeBytes(h, r.MembershipResult.CertificateDigest[:])
+		writeUint64(h, uint64(r.MembershipResult.Successor.ID))
+		writeUint64(h, uint64(len(r.MembershipResult.Successor.Voters)))
+		for _, voter := range r.MembershipResult.Successor.Voters {
+			writeUint64(h, uint64(voter))
+		}
+	}
 	return sumHash(h)
+}
+
+func recordTimingInvariant(r InstanceRecord) bool {
+	if r.Command.Kind == CommandNoop {
+		return r.ProcessAt == 0 && r.TimingDomain == TimingDomainUntimed && !r.TOQPending
+	}
+	switch r.TimingDomain {
+	case TimingDomainUntimed:
+		return r.ProcessAt == 0 && !r.TOQPending
+	case TimingDomainLogical:
+		return r.ProcessAt != 0 && !r.TOQPending
+	case TimingDomainTOQ:
+		return true
+	default:
+		return false
+	}
 }
 
 func recordChecksumInvariant(r InstanceRecord) bool {
@@ -127,44 +183,118 @@ func recordChecksumInvariant(r InstanceRecord) bool {
 	return r.RecordBallot == (Ballot{})
 }
 
+func confChangeResultAbsent(r InstanceRecord) bool {
+	return r.ConfChangeResult.Outcome == ConfChangeOutcomeUnspecified &&
+		r.ConfChangeResult.Conf.ID == 0 &&
+		len(r.ConfChangeResult.Conf.Voters) == 0
+}
+
+func membershipResultAbsent(r InstanceRecord) bool {
+	return r.MembershipResult.Plan == (BootstrapID{}) &&
+		r.MembershipResult.Outcome == BootstrapOutcomeUnspecified &&
+		r.MembershipResult.ExitRef.IsZero() &&
+		r.MembershipResult.CertificateDigest == (StateDigest{}) &&
+		confStateIsZero(r.MembershipResult.Successor)
+}
+
+func acceptEvidenceAbsent(r InstanceRecord) bool {
+	return r.AcceptSeq == 0 && len(r.AcceptDeps) == 0 && len(r.AcceptEvidence) == 0
+}
+
+func verifyCanonicalRecordChecksumBytes(r InstanceRecord) bool {
+	return recordChecksumInvariant(r) && r.Checksum == ChecksumRecord(r)
+}
+
 // VerifyRecordChecksum reports whether the record checksum matches its content.
 func VerifyRecordChecksum(r InstanceRecord) bool {
-	return recordChecksumInvariant(r) && r.Checksum == ChecksumRecord(r)
+	return recordTimingInvariant(r) && verifyCanonicalRecordChecksumBytes(r)
+}
+
+// VerifyRecordChecksumWithoutMembershipResult reports whether a record matches
+// the immediately previous canonical layout.
+func VerifyRecordChecksumWithoutMembershipResult(r InstanceRecord) bool {
+	return membershipResultAbsent(r) &&
+		recordTimingInvariant(r) &&
+		recordChecksumInvariant(r) &&
+		r.Checksum == ChecksumRecordWithoutMembershipResult(r)
+}
+
+// VerifyRecordChecksumWithoutTimingDomain reports whether a record matches the
+// immediately previous canonical layout that authenticated every current field
+// except TimingDomain.
+func VerifyRecordChecksumWithoutTimingDomain(r InstanceRecord) bool {
+	return r.TimingDomain == TimingDomainUntimed &&
+		recordChecksumInvariant(r) &&
+		r.Checksum == ChecksumRecordWithoutTimingDomain(r)
+}
+
+// VerifyRecordChecksumWithoutConfChangeResult reports whether a record matches
+// the checksum format used before durable configuration-command outcomes.
+func VerifyRecordChecksumWithoutConfChangeResult(r InstanceRecord) bool {
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		recordChecksumInvariant(r) &&
+		r.Checksum == checksumRecord(r, true, true, true, true, true, false)
 }
 
 // VerifyRecordChecksumWithoutAcceptEvidence reports whether a record matches
 // the checksum format used before durable Accept-Deps recovery evidence was
 // added. It exists only for decoding older on-disk example-KV records.
 func VerifyRecordChecksumWithoutAcceptEvidence(r InstanceRecord) bool {
-	return r.Checksum == checksumRecord(r, true, true, false, false, false)
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		r.RecordBallot == (Ballot{}) &&
+		acceptEvidenceAbsent(r) &&
+		r.Checksum == checksumRecord(r, true, true, false, false, false, false)
 }
 
 // VerifyRecordChecksumWithoutSenderAcceptEvidence reports whether a record
 // matches the checksum format used before sender-preserving Accept-Deps evidence.
 // It exists only for decoding older on-disk example-KV records.
 func VerifyRecordChecksumWithoutSenderAcceptEvidence(r InstanceRecord) bool {
-	return recordChecksumInvariant(r) && r.Checksum == checksumRecord(r, true, true, true, true, false)
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		len(r.AcceptEvidence) == 0 &&
+		recordChecksumInvariant(r) &&
+		r.Checksum == checksumRecord(r, true, true, true, true, false, false)
 }
 
 // VerifyRecordChecksumWithoutRecordBallot reports whether a record matches
 // the checksum format used before durable record/value ballots were added. It
 // exists only for decoding older on-disk example-KV records.
 func VerifyRecordChecksumWithoutRecordBallot(r InstanceRecord) bool {
-	return r.Checksum == checksumRecord(r, true, true, true, false, false)
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		r.RecordBallot == (Ballot{}) &&
+		len(r.AcceptEvidence) == 0 &&
+		r.Checksum == checksumRecord(r, true, true, true, false, false, false)
 }
 
 // VerifyRecordChecksumWithoutTOQ reports whether a record matches the checksum
 // format used before durable TOQ ProcessAt/pending metadata was added. It exists
 // only for decoding older on-disk example-KV records.
 func VerifyRecordChecksumWithoutTOQ(r InstanceRecord) bool {
-	return r.Checksum == checksumRecord(r, true, false, false, false, false)
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		r.RecordBallot == (Ballot{}) &&
+		acceptEvidenceAbsent(r) &&
+		r.ProcessAt == 0 &&
+		!r.TOQPending &&
+		r.Checksum == checksumRecord(r, true, false, false, false, false, false)
 }
 
 // VerifyRecordChecksumWithoutFastPathOrTOQ reports whether a record matches the
 // checksum format used before durable fast-path and TOQ metadata were added. It
 // exists only for decoding older on-disk example-KV records.
 func VerifyRecordChecksumWithoutFastPathOrTOQ(r InstanceRecord) bool {
-	return r.Checksum == checksumRecord(r, false, false, false, false, false)
+	return r.TimingDomain == TimingDomainUntimed &&
+		confChangeResultAbsent(r) &&
+		r.RecordBallot == (Ballot{}) &&
+		acceptEvidenceAbsent(r) &&
+		!r.FastPathEligible &&
+		r.ProcessAt == 0 &&
+		!r.TOQPending &&
+		r.Checksum == checksumRecord(r, false, false, false, false, false, false)
 }
 
 // ChecksumMessage returns the canonical BLAKE3 checksum for a message.

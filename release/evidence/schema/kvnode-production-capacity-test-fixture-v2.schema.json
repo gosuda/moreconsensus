@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-test-fixture-v2.json",
+  "title": "kvnode synthetic production-capacity contract fixture v2",
+  "description": "Closed schema for test-only synthetic exercises of the capacity certification verifier. It is explicitly not production evidence and carries no release claim.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "verifier_version",
+    "evidence_class",
+    "evidence_mode",
+    "production_capacity_certification",
+    "claim_scope",
+    "release_claim",
+    "operator_identity",
+    "target",
+    "native_environment",
+    "support_envelope",
+    "thresholds",
+    "repetition_count",
+    "repetition_summaries",
+    "raw_artifacts",
+    "campaign",
+    "binary",
+    "intermediate",
+    "approval"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-test-fixture-v2.json"
+    },
+    "verifier_version": {
+      "const": "2.0.0"
+    },
+    "evidence_class": {
+      "const": "synthetic-production-capacity-certification-test-only"
+    },
+    "evidence_mode": {
+      "const": "test-only-synthetic"
+    },
+    "production_capacity_certification": {
+      "const": false
+    },
+    "claim_scope": {
+      "const": "declared-native-darwin-same-host-support-envelope"
+    },
+    "release_claim": {
+      "const": "none-test-only-synthetic"
+    },
+    "operator_identity": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/identity"
+    },
+    "target": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/targetBinding"
+    },
+    "native_environment": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/nativeEnvironment"
+    },
+    "support_envelope": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/supportEnvelope"
+    },
+    "thresholds": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/thresholds"
+    },
+    "repetition_count": {
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 20
+    },
+    "repetition_summaries": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 20,
+      "items": {
+        "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/repetitionSummary"
+      }
+    },
+    "raw_artifacts": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 128,
+      "items": {
+        "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/artifact"
+      }
+    },
+    "campaign": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/artifact"
+    },
+    "binary": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/artifact"
+    },
+    "intermediate": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/artifact"
+    },
+    "approval": {
+      "$ref": "https://gosuda.org/moreconsensus/schemas/kvnode-production-capacity-certification-v2.json#/$defs/approval"
+    }
+  }
+}

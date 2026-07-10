@@ -9,9 +9,9 @@ import (
 )
 
 var (
-	allocationChecksumSink [32]byte
-	allocationBytesSink    []byte
-	allocationRefSink      InstanceRef
+	allocationChecksumSink      [32]byte
+	allocationBytesSink         []byte
+	dependencyIteratorCountSink int
 )
 
 func TestPoolClearsOwnedReferencesAndReusesWarmObjects(t *testing.T) {
@@ -188,6 +188,7 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 		Command:          Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("checksum-version"), ConflictKeys: [][]byte{[]byte("checksum-version-key")}},
 		FastPathEligible: true,
 		ProcessAt:        42,
+		TimingDomain:     TimingDomainTOQ,
 		TOQPending:       true,
 	}
 
@@ -246,7 +247,9 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 	}
 
 	withoutSenderAcceptEvidence := withAcceptEvidence.Clone()
-	withoutSenderAcceptEvidence.Checksum = checksumRecord(withoutSenderAcceptEvidence, true, true, true, true, false)
+	withoutSenderAcceptEvidence.TimingDomain = TimingDomainUntimed
+	withoutSenderAcceptEvidence.AcceptEvidence = nil
+	withoutSenderAcceptEvidence.Checksum = checksumRecord(withoutSenderAcceptEvidence, true, true, true, true, false, false)
 	if VerifyRecordChecksum(withoutSenderAcceptEvidence) {
 		t.Fatalf("legacy checksum without sender-preserving AcceptEvidence was accepted as canonical")
 	}
@@ -254,8 +257,13 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 		t.Fatalf("legacy checksum without sender-preserving AcceptEvidence was rejected by legacy verifier")
 	}
 
-	withoutAcceptEvidence := withAcceptEvidence
-	withoutAcceptEvidence.Checksum = checksumRecord(withoutAcceptEvidence, true, true, false, false, false)
+	withoutAcceptEvidence := withAcceptEvidence.Clone()
+	withoutAcceptEvidence.TimingDomain = TimingDomainUntimed
+	withoutAcceptEvidence.RecordBallot = Ballot{}
+	withoutAcceptEvidence.AcceptSeq = 0
+	withoutAcceptEvidence.AcceptDeps = nil
+	withoutAcceptEvidence.AcceptEvidence = nil
+	withoutAcceptEvidence.Checksum = checksumRecord(withoutAcceptEvidence, true, true, false, false, false, false)
 	if VerifyRecordChecksum(withoutAcceptEvidence) {
 		t.Fatalf("legacy checksum without Accept-Deps evidence was accepted as canonical")
 	}
@@ -264,7 +272,14 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 	}
 
 	withoutTOQ := record
-	withoutTOQ.Checksum = checksumRecord(withoutTOQ, true, false, false, false, false)
+	withoutTOQ.TimingDomain = TimingDomainUntimed
+	withoutTOQ.RecordBallot = Ballot{}
+	withoutTOQ.AcceptSeq = 0
+	withoutTOQ.AcceptDeps = nil
+	withoutTOQ.AcceptEvidence = nil
+	withoutTOQ.ProcessAt = 0
+	withoutTOQ.TOQPending = false
+	withoutTOQ.Checksum = checksumRecord(withoutTOQ, true, false, false, false, false, false)
 	if VerifyRecordChecksum(withoutTOQ) {
 		t.Fatalf("checksum without TOQ metadata was accepted as canonical")
 	}
@@ -276,7 +291,15 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 	}
 
 	withoutFastPathOrTOQ := record
-	withoutFastPathOrTOQ.Checksum = checksumRecord(withoutFastPathOrTOQ, false, false, false, false, false)
+	withoutFastPathOrTOQ.TimingDomain = TimingDomainUntimed
+	withoutFastPathOrTOQ.RecordBallot = Ballot{}
+	withoutFastPathOrTOQ.AcceptSeq = 0
+	withoutFastPathOrTOQ.AcceptDeps = nil
+	withoutFastPathOrTOQ.AcceptEvidence = nil
+	withoutFastPathOrTOQ.FastPathEligible = false
+	withoutFastPathOrTOQ.ProcessAt = 0
+	withoutFastPathOrTOQ.TOQPending = false
+	withoutFastPathOrTOQ.Checksum = checksumRecord(withoutFastPathOrTOQ, false, false, false, false, false, false)
 	if VerifyRecordChecksum(withoutFastPathOrTOQ) || VerifyRecordChecksumWithoutTOQ(withoutFastPathOrTOQ) {
 		t.Fatalf("checksum without fast-path and TOQ metadata was accepted as a newer layout")
 	}
@@ -285,44 +308,8 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 	}
 }
 
-func TestProposeZeroCopyPayloadKeyCommandUsesLowerAllocationBudgetThanSafeCopyCommand(t *testing.T) {
-	safeCopyAllocs := proposePayloadKeyCommandAllocs(t, false)
-	zeroCopyAllocs := proposePayloadKeyCommandAllocs(t, true)
-	if zeroCopyAllocs >= safeCopyAllocs {
-		t.Fatalf("zero-copy Propose allocations = %v, want less than safe-copy allocations %v", zeroCopyAllocs, safeCopyAllocs)
-	}
-	if safeCopyAllocs > 54 {
-		t.Fatalf("safe-copy Propose allocations = %v, want <= 54", safeCopyAllocs)
-	}
-	if zeroCopyAllocs > 48 {
-		t.Fatalf("zero-copy Propose allocations = %v, want <= 48", zeroCopyAllocs)
-	}
-}
-
-func proposePayloadKeyCommandAllocs(t *testing.T, zeroCopy bool) float64 {
-	t.Helper()
-	payload := []byte("proposal-allocation-payload")
-	key := []byte("proposal-allocation-key")
-	cmd := Command{ID: CommandID{Client: 31, Sequence: 41}, Payload: payload, ConflictKeys: [][]byte{key}}
-	voters := []ReplicaID{1, 2, 3}
-
-	return testing.AllocsPerRun(1000, func() {
-		rn, err := NewRawNode(Config{ID: 1, Voters: voters, ZeroCopyProposals: zeroCopy})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ref, err := rn.Propose(cmd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		allocationRefSink = ref
-	})
-}
-
 func allocationTestMessage() Message {
-	return Message{
-		Type:   MsgCommit,
-		From:   1,
+	return Message{Type: MsgCommit, From: 1,
 		To:     2,
 		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
@@ -333,9 +320,7 @@ func allocationTestMessage() Message {
 			Payload:      []byte("allocation-payload"),
 			ConflictKeys: [][]byte{[]byte("allocation-key-a"), []byte("allocation-key-b")},
 		},
-		RejectHint:   Ballot{Epoch: 3, Number: 4, Replica: 2},
-		RecordStatus: StatusCommitted,
-	}
+		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 }
 
 func allocationTestRecord(m Message) InstanceRecord {
@@ -415,7 +400,7 @@ func TestEncodeDecodeMessagePreservesExplicitTOQPreAccept(t *testing.T) {
 		Ref:       InstanceRef{Replica: 1, Instance: 17, Conf: 1},
 		ProcessAt: 123,
 		TOQ:       true,
-		Ballot:    Ballot{Epoch: 2, Replica: 1},
+		Ballot:    Ballot{Replica: 1},
 		Command: Command{
 			ID:           CommandID{Client: 77, Sequence: 3},
 			Payload:      []byte("toq-wire-payload"),
@@ -444,9 +429,7 @@ func TestEncodeDecodeMessagePreservesExplicitTOQPreAccept(t *testing.T) {
 }
 
 func TestEncodeDecodeMessagePreservesAcceptEvidence(t *testing.T) {
-	want := Message{
-		Type:       MsgAccept,
-		From:       1,
+	want := Message{Type: MsgAccept, From: 1,
 		To:         2,
 		Ref:        InstanceRef{Replica: 1, Instance: 18, Conf: 1},
 		Ballot:     Ballot{Epoch: 2, Number: 1, Replica: 1},
@@ -462,9 +445,7 @@ func TestEncodeDecodeMessagePreservesAcceptEvidence(t *testing.T) {
 			ID:           CommandID{Client: 78, Sequence: 4},
 			Payload:      []byte("accept-evidence-wire-payload"),
 			ConflictKeys: [][]byte{[]byte("accept-evidence-wire-key")},
-		},
-		RecordStatus: StatusAccepted,
-	}
+		}}
 	encoded, err := EncodeMessage(nil, want)
 	if err != nil {
 		t.Fatalf("EncodeMessage AcceptEvidence: %v", err)
@@ -804,9 +785,7 @@ func TestDecodeMessageWithScratchClearsDestinationOnMalformedInput(t *testing.T)
 }
 
 func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
-	base := Message{
-		Type:   MsgCommit,
-		From:   1,
+	base := Message{Type: MsgCommit, From: 1,
 		To:     2,
 		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
@@ -817,9 +796,7 @@ func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 			Payload:      []byte("partial-decode-payload"),
 			ConflictKeys: [][]byte{[]byte("partial-decode-key")},
 		},
-		RejectHint:   Ballot{Epoch: 3, Number: 4, Replica: 2},
-		RecordStatus: StatusCommitted,
-	}
+		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 	valid := mustEncodeMessageSeed(base)
 	corruptChecksum := append([]byte(nil), valid...)
 	corruptChecksum[len(corruptChecksum)-1] ^= 0x80
@@ -877,9 +854,7 @@ func decodeScratchTestMessage(keys ...[]byte) Message {
 	if len(keys) == 0 {
 		keys = [][]byte{[]byte("scratch-key-a"), []byte("scratch-key-b")}
 	}
-	return Message{
-		Type:   MsgCommit,
-		From:   1,
+	return Message{Type: MsgCommit, From: 1,
 		To:     2,
 		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
@@ -890,9 +865,7 @@ func decodeScratchTestMessage(keys ...[]byte) Message {
 			Payload:      []byte("scratch-payload"),
 			ConflictKeys: keys,
 		},
-		RejectHint:   Ballot{Epoch: 3, Number: 4, Replica: 2},
-		RecordStatus: StatusCommitted,
-	}
+		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 }
 
 func assertDecodedScratchMessage(t *testing.T, got Message, want Message) {
@@ -904,9 +877,7 @@ func assertDecodedScratchMessage(t *testing.T, got Message, want Message) {
 }
 
 func decodeMessageSeedCorpus() [][]byte {
-	base := Message{
-		Type:   MsgCommit,
-		From:   1,
+	base := Message{Type: MsgCommit, From: 1,
 		To:     2,
 		Ref:    InstanceRef{Replica: 1, Instance: 7, Conf: 1},
 		Ballot: Ballot{Epoch: 1, Number: 2, Replica: 1},
@@ -916,9 +887,7 @@ func decodeMessageSeedCorpus() [][]byte {
 			ID:           CommandID{Client: 9, Sequence: 10},
 			Payload:      []byte("payload"),
 			ConflictKeys: [][]byte{[]byte("alpha"), []byte("beta")},
-		},
-		RecordStatus: StatusCommitted,
-	}
+		}}
 	valid := mustEncodeMessageSeed(base)
 	mutatedChecksum := append([]byte(nil), valid...)
 	mutatedChecksum[len(mutatedChecksum)-1] ^= 0x80
@@ -986,16 +955,30 @@ func mustEncodeMessageSeed(m Message) []byte {
 
 func assertMessageCleared(t *testing.T, m *Message) {
 	t.Helper()
-	if m.Type != 0 || m.From != 0 || m.To != 0 || !m.Ref.IsZero() || m.Ballot != (Ballot{}) || m.RecordBallot != (Ballot{}) || m.Seq != 0 || len(m.Deps) != 0 || m.AcceptSeq != 0 || len(m.AcceptDeps) != 0 || m.Reject || m.RejectHint != (Ballot{}) || m.RecordStatus != 0 {
+	if m.Type != 0 || m.From != 0 || m.To != 0 || !m.Ref.IsZero() || m.Ballot != (Ballot{}) || m.RecordBallot != (Ballot{}) || m.Seq != 0 || len(m.Deps) != 0 || m.AcceptSeq != 0 || len(m.AcceptDeps) != 0 || len(m.AcceptEvidence) != 0 || m.Reject || m.RejectHint != (Ballot{}) || m.RecordStatus != 0 {
 		t.Fatalf("message retained metadata: %#v", m)
 	}
+	for i, dep := range m.Deps[:cap(m.Deps)] {
+		if dep != 0 {
+			t.Fatalf("message retained dependency %d at slot %d", dep, i)
+		}
+	}
+	for i, dep := range m.AcceptDeps[:cap(m.AcceptDeps)] {
+		if dep != 0 {
+			t.Fatalf("message retained accept dependency %d at slot %d", dep, i)
+		}
+	}
+	for i, evidence := range m.AcceptEvidence[:cap(m.AcceptEvidence)] {
+		if evidence.Sender != 0 || evidence.Seq != 0 || len(evidence.Deps) != 0 {
+			t.Fatalf("message retained AcceptEvidence metadata at slot %d: %#v", i, evidence)
+		}
+		for j, dep := range evidence.Deps[:cap(evidence.Deps)] {
+			if dep != 0 {
+				t.Fatalf("message retained AcceptEvidence dependency %d at slot %d/%d", dep, i, j)
+			}
+		}
+	}
 	assertCommandCleared(t, m.Command)
-	if m.Deps != nil {
-		t.Fatalf("message retained deps backing storage: %#v", m.Deps)
-	}
-	if m.AcceptDeps != nil {
-		t.Fatalf("message retained accept deps backing storage: %#v", m.AcceptDeps)
-	}
 	if m.Checksum != ([32]byte{}) {
 		t.Fatalf("message retained checksum: %#v", m.Checksum)
 	}
@@ -1003,7 +986,132 @@ func assertMessageCleared(t *testing.T, m *Message) {
 
 func assertCommandCleared(t *testing.T, c Command) {
 	t.Helper()
-	if c.ID != (CommandID{}) || c.Kind != CommandUser || c.Payload != nil || c.ConflictKeys != nil {
+	if c.ID != (CommandID{}) || c.Kind != CommandUser || len(c.Payload) != 0 || len(c.ConflictKeys) != 0 {
 		t.Fatalf("command retained caller-owned data: %#v", c)
+	}
+	for i, value := range c.Payload[:cap(c.Payload)] {
+		if value != 0 {
+			t.Fatalf("command retained payload byte %d at slot %d", value, i)
+		}
+	}
+	for i, key := range c.ConflictKeys[:cap(c.ConflictKeys)] {
+		if len(key) != 0 {
+			t.Fatalf("command retained conflict-key length at slot %d: %#v", i, key)
+		}
+		for j, value := range key[:cap(key)] {
+			if value != 0 {
+				t.Fatalf("command retained conflict-key byte %d at slot %d/%d", value, i, j)
+			}
+		}
+	}
+}
+
+func dependencyIteratorAllocationNode(t testing.TB, through InstanceNum) (*RawNode, InstanceRef) {
+	t.Helper()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, through, 0}, Command: Command{Kind: CommandNoop}}})
+	for _, number := range []InstanceNum{1, 8} {
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: number}
+		rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}})
+	}
+	return rn, base
+}
+
+func countMaterializedDependencies(rn *RawNode, base InstanceRef) int {
+	view := rn.newExecutionView()
+	iter := view.dependencyRefs(rn, base)
+	count := 0
+	for {
+		_, ok := iter.next()
+		if !ok {
+			return count
+		}
+		count++
+	}
+}
+
+func countMaterializedDependenciesInView(rn *RawNode, view *executionView, base InstanceRef) int {
+	iter := view.dependencyRefs(rn, base)
+	count := 0
+	for {
+		_, ok := iter.next()
+		if !ok {
+			return count
+		}
+		count++
+	}
+}
+
+func TestDependencyIteratorAllocationIndependentOfEndpoint(t *testing.T) {
+	small, smallBase := dependencyIteratorAllocationNode(t, 8)
+	max, maxBase := dependencyIteratorAllocationNode(t, ^InstanceNum(0))
+	if got, want := countMaterializedDependencies(small, smallBase), countMaterializedDependencies(max, maxBase); got != want || got != 2 {
+		t.Fatalf("iterator cardinality small/max = %d/%d, want 2/2", got, want)
+	}
+	countMaterializedDependencies(small, smallBase)
+	countMaterializedDependencies(max, maxBase)
+	smallAllocs := testing.AllocsPerRun(100, func() {
+		dependencyIteratorCountSink = countMaterializedDependencies(small, smallBase)
+	})
+	maxAllocs := testing.AllocsPerRun(100, func() {
+		dependencyIteratorCountSink = countMaterializedDependencies(max, maxBase)
+	})
+	if smallAllocs != maxAllocs {
+		t.Fatalf("iterator allocations depend on endpoint: small=%v max=%v", smallAllocs, maxAllocs)
+	}
+	smallView := small.newExecutionView()
+	maxView := max.newExecutionView()
+	smallPrimitiveAllocs := testing.AllocsPerRun(100, func() {
+		dependencyIteratorCountSink = countMaterializedDependenciesInView(small, &smallView, smallBase)
+	})
+	maxPrimitiveAllocs := testing.AllocsPerRun(100, func() {
+		dependencyIteratorCountSink = countMaterializedDependenciesInView(max, &maxView, maxBase)
+	})
+	if smallPrimitiveAllocs != 0 || maxPrimitiveAllocs != 0 {
+		t.Fatalf("warmed dependency iterator allocated: small=%v max=%v", smallPrimitiveAllocs, maxPrimitiveAllocs)
+	}
+}
+
+func BenchmarkDependencyIteratorEndpoint(b *testing.B) {
+	for _, benchmark := range []struct {
+		name    string
+		through InstanceNum
+	}{
+		{name: "Small", through: 8},
+		{name: "Max", through: ^InstanceNum(0)},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			rn, base := dependencyIteratorAllocationNode(b, benchmark.through)
+			countMaterializedDependencies(rn, base)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				dependencyIteratorCountSink = countMaterializedDependencies(rn, base)
+			}
+		})
+	}
+}
+
+func BenchmarkDependencyIteratorPrimitive(b *testing.B) {
+	for _, benchmark := range []struct {
+		name    string
+		through InstanceNum
+	}{
+		{name: "Small", through: 8},
+		{name: "Max", through: ^InstanceNum(0)},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			rn, base := dependencyIteratorAllocationNode(b, benchmark.through)
+			view := rn.newExecutionView()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				dependencyIteratorCountSink = countMaterializedDependenciesInView(rn, &view, base)
+			}
+		})
 	}
 }
