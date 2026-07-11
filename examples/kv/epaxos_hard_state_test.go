@@ -363,7 +363,7 @@ func TestPebbleHardStateStrictDecodeRejectsCorruptionAndMalformedVoters(t *testi
 			if err := db.pebble.Set(epaxosHardStateKey, encoded, pebble.Sync); err != nil {
 				t.Fatal(err)
 			}
-			got, configs, err := db.EPaxosStorage().InitialState()
+			got, err := db.EPaxosStorage().InitialState()
 			if err == nil {
 				t.Fatalf("InitialState accepted malformed value %x", encoded)
 			}
@@ -373,8 +373,8 @@ func TestPebbleHardStateStrictDecodeRejectsCorruptionAndMalformedVoters(t *testi
 			if tc.wantString != "" && !strings.Contains(err.Error(), tc.wantString) {
 				t.Fatalf("InitialState error=%v, want text %q", err, tc.wantString)
 			}
-			if !got.Empty() || len(configs) != 0 {
-				t.Fatalf("InitialState returned state on error: hard=%#v configs=%#v", got, configs)
+			if !got.HardState.Empty() || len(got.ConfigHistory) != 0 {
+				t.Fatalf("InitialState returned state on error: %#v", got)
 			}
 
 			ref := epaxos.InstanceRef{Replica: 1, Instance: 8, Conf: 3}
@@ -444,15 +444,15 @@ func hardStateTestRecord(ref epaxos.InstanceRef, command epaxos.Command) epaxos.
 
 func requirePebbleHardState(t *testing.T, storage *PebbleStorage, want epaxos.HardState) {
 	t.Helper()
-	got, configs, err := storage.InitialState()
+	got, err := storage.InitialState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Equal(want) {
-		t.Fatalf("hard state=%#v, want %#v", got, want)
+	if !got.HardState.Equal(want) {
+		t.Fatalf("hard state=%#v, want %#v", got.HardState, want)
 	}
-	if len(configs) != 0 {
-		t.Fatalf("configuration history=%#v, want empty", configs)
+	if len(got.ConfigHistory) != 0 {
+		t.Fatalf("configuration history=%#v, want empty", got.ConfigHistory)
 	}
 }
 

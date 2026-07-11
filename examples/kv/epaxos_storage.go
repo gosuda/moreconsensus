@@ -40,10 +40,13 @@ func (db *DB) EPaxosStorage() *PebbleStorage {
 	return &PebbleStorage{pebble: db.pebble}
 }
 
-// InitialState returns the stored hard state and configuration history.
-func (s *PebbleStorage) InitialState() (epaxos.HardState, []epaxos.ConfState, error) {
+// InitialState returns the complete stored durable consensus projection.
+func (s *PebbleStorage) InitialState() (epaxos.StorageState, error) {
 	hardState, _, err := loadEPaxosHardState(s.pebble)
-	return hardState, nil, err
+	if err != nil {
+		return epaxos.StorageState{}, err
+	}
+	return epaxos.StorageState{HardState: hardState}, nil
 }
 
 // LoadInstances loads persisted EPAXOS records in deterministic instance order.

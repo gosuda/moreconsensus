@@ -16,9 +16,8 @@ import (
 	kv "gosuda.org/moreconsensus/examples/kv"
 )
 
-
 var (
-	exitProcess   = os.Exit
+	exitProcess             = os.Exit
 	inspectStdout io.Writer = os.Stdout
 )
 
@@ -221,18 +220,18 @@ type inspectOptions struct {
 }
 
 type checkpointInspection struct {
-	Schema                string                       `json:"schema"`
-	CheckpointFormat      string                       `json:"checkpoint_format"`
-	ManifestVersion       uint8                        `json:"manifest_version"`
-	ManifestIdentity      string                       `json:"manifest_identity_blake3"`
-	SemanticStateDigest   string                       `json:"semantic_state_digest_blake3"`
-	RecordCount           uint64                       `json:"record_count"`
-	AppliedCount          uint64                       `json:"applied_count"`
-	HardState             checkpointInspectionHardState `json:"hard_state"`
-	ConfigurationHistory  []checkpointConfiguration    `json:"configuration_history"`
-	SourceIdentity        string                       `json:"source_identity"`
-	ReleaseChecksum       string                       `json:"release_checksum"`
-	CurrentTargetClaim    bool                         `json:"current_target_claim"`
+	Schema               string                        `json:"schema"`
+	CheckpointFormat     string                        `json:"checkpoint_format"`
+	ManifestVersion      uint8                         `json:"manifest_version"`
+	ManifestIdentity     string                        `json:"manifest_identity_blake3"`
+	SemanticStateDigest  string                        `json:"semantic_state_digest_blake3"`
+	RecordCount          uint64                        `json:"record_count"`
+	AppliedCount         uint64                        `json:"applied_count"`
+	HardState            checkpointInspectionHardState `json:"hard_state"`
+	ConfigurationHistory []checkpointConfiguration     `json:"configuration_history"`
+	SourceIdentity       string                        `json:"source_identity"`
+	ReleaseChecksum      string                        `json:"release_checksum"`
+	CurrentTargetClaim   bool                          `json:"current_target_claim"`
 }
 
 type checkpointInspectionHardState struct {
@@ -325,11 +324,12 @@ func inspectCheckpoint(checkpointDir string) (checkpointInspection, error) {
 		return checkpointInspection{}, fmt.Errorf("open inspection clone: %w", err)
 	}
 	storage := db.EPaxosStorage()
-	hardState, _, err := storage.InitialState()
+	state, err := storage.InitialState()
 	if err != nil {
 		_ = db.Close()
 		return checkpointInspection{}, fmt.Errorf("load hard state from inspection clone: %w", err)
 	}
+	hardState := state.HardState
 	var records []epaxos.InstanceRecord
 	if err := storage.LoadInstances(func(record epaxos.InstanceRecord) error {
 		records = append(records, record)
@@ -350,13 +350,13 @@ func inspectCheckpoint(checkpointDir string) (checkpointInspection, error) {
 		voters[index] = uint64(voter)
 	}
 	return checkpointInspection{
-		Schema:               checkpointInspectionSchema,
-		CheckpointFormat:     info.Format,
-		ManifestVersion:      info.ManifestVersion,
-		ManifestIdentity:     info.ManifestIdentity,
-		SemanticStateDigest:  info.SemanticStateDigest,
-		RecordCount:          info.RecordCount,
-		AppliedCount:         info.AppliedCount,
+		Schema:              checkpointInspectionSchema,
+		CheckpointFormat:    info.Format,
+		ManifestVersion:     info.ManifestVersion,
+		ManifestIdentity:    info.ManifestIdentity,
+		SemanticStateDigest: info.SemanticStateDigest,
+		RecordCount:         info.RecordCount,
+		AppliedCount:        info.AppliedCount,
 		HardState: checkpointInspectionHardState{
 			CodecVersion:                   1,
 			Digest:                         info.HardStateDigest,

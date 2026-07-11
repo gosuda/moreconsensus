@@ -363,12 +363,12 @@ func TestTimingDomainReadyPersistenceReplayAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	gotHardState, _, err := reopened.EPaxosStorage().InitialState()
+	gotState, err := reopened.EPaxosStorage().InitialState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !gotHardState.Equal(hardState) {
-		t.Fatalf("reopened hard state=%#v, want %#v", gotHardState, hardState)
+	if !gotState.HardState.Equal(hardState) {
+		t.Fatalf("reopened hard state=%#v, want %#v", gotState.HardState, hardState)
 	}
 	loaded := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
 	if err := reopened.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
@@ -403,12 +403,12 @@ func TestTimingDomainMalformedReadyDoesNotPartiallyWrite(t *testing.T) {
 	if err := db.EPaxosStorage().ApplyReady(epaxos.Ready{HardState: hardState, Records: []epaxos.InstanceRecord{staged, malformed}, MustSync: true}); !errors.Is(err, epaxos.ErrChecksumMismatch) {
 		t.Fatalf("malformed replay error=%v, want %v", err, epaxos.ErrChecksumMismatch)
 	}
-	gotHardState, _, err := db.EPaxosStorage().InitialState()
+	gotState, err := db.EPaxosStorage().InitialState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !gotHardState.Empty() {
-		t.Fatalf("malformed replay partially persisted hard state %#v", gotHardState)
+	if !gotState.HardState.Empty() {
+		t.Fatalf("malformed replay partially persisted hard state %#v", gotState.HardState)
 	}
 	loaded := make(map[epaxos.InstanceRef]struct{})
 	if err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
