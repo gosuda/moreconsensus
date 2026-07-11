@@ -177,16 +177,19 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 }
 
 // DecodeMessage decodes a message. Command payload and conflict-key byte slices
-// alias src; decoded metadata slices such as Deps are allocated.
+// alias src and expire when src is mutated or released; decoded metadata slices
+// such as Deps are allocated. Step copies any data it retains before returning.
 func DecodeMessage(src []byte, m *Message) error {
 	return decodeMessage(src, m, nil)
 }
 
 // DecodeMessageWithScratch decodes a message using scratch-owned metadata buffers.
 //
-// A nil scratch behaves like DecodeMessage. With a non-nil scratch, the decoded
-// Deps, AcceptDeps, AcceptEvidence, and ConflictKeys slice headers are valid
-// until the scratch is reused. Command payload and conflict-key bytes alias src.
+// A nil scratch behaves like DecodeMessage. With a non-nil scratch, decoded
+// Deps, AcceptDeps, AcceptEvidence, and ConflictKeys slice headers expire when
+// scratch is reset, returned to its pool, or reused. Command payload and
+// conflict-key bytes alias src and expire when src is mutated or released.
+// Step copies any data retained beyond the synchronous call before returning.
 func DecodeMessageWithScratch(src []byte, m *Message, scratch *DecodeScratch) error {
 	return decodeMessage(src, m, scratch)
 }

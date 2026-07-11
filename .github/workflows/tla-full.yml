@@ -1,0 +1,23 @@
+name: manual finite model checking
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  finite-model-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Run legacy manual finite model suite
+        run: bash tests/tla_model_check.sh

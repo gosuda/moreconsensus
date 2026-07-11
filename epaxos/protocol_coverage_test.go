@@ -106,7 +106,7 @@ func TestStartTryPreAcceptDoesNotReopenCommittedInstance(t *testing.T) {
 	inst := &instance{rec: committed, phase: phaseCommitted, generation: 11}
 	rn.instances[ref] = inst
 
-	rn.startTryPreAccept(inst, Attributes{Seq: 9, Deps: []InstanceNum{3, 3, 3}}, map[ReplicaID]struct{}{2: {}}, true)
+	rn.startTryPreAccept(inst, Attributes{Seq: 9, Deps: []InstanceNum{3, 3, 3}}, testVoterMask(t, rn.q.conf, 2), true)
 	if inst.phase != phaseCommitted || inst.rec.Status != StatusCommitted || inst.rec.Seq != committed.Seq || inst.generation != 11 {
 		t.Fatalf("TryPreAccept reopened committed instance: phase=%d record=%#v generation=%d", inst.phase, inst.rec, inst.generation)
 	}
@@ -220,7 +220,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 2, Replica: 1}, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
 			t.Fatal(err)
 		}
-		if inst.phase != phaseTryPreAccept || len(inst.tryOK) != 0 {
+		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 0 {
 			t.Fatalf("older-ballot TryPreAccept response changed recovery: phase=%d tryOK=%#v", inst.phase, inst.tryOK)
 		}
 		if rn.HasReady() {
@@ -230,14 +230,14 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 
 	t.Run("nil vote set records first response without quorum", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
-		inst.tryOK = nil
+		inst.tryOK = 0
 		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
 			t.Fatal(err)
 		}
-		if inst.phase != phaseTryPreAccept || len(inst.tryOK) != 1 {
+		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 1 {
 			t.Fatalf("first TryPreAccept response with nil vote set phase/tryOK = %d/%#v, want one recorded vote and no quorum", inst.phase, inst.tryOK)
 		}
-		if _, ok := inst.tryOK[2]; !ok {
+		if !inst.tryOK.has(rn.q.conf, 2) {
 			t.Fatalf("first TryPreAccept response was not recorded: %#v", inst.tryOK)
 		}
 		if rn.HasReady() {
@@ -247,11 +247,11 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 
 	t.Run("duplicate response does not count twice", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
-		inst.tryOK = map[ReplicaID]struct{}{2: {}}
+		inst.tryOK = testVoterMask(t, rn.q.conf, 2)
 		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
 			t.Fatal(err)
 		}
-		if inst.phase != phaseTryPreAccept || len(inst.tryOK) != 1 {
+		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 1 {
 			t.Fatalf("duplicate TryPreAccept response changed quorum state: phase=%d tryOK=%#v", inst.phase, inst.tryOK)
 		}
 		if rn.HasReady() {
@@ -290,14 +290,14 @@ func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
 	if inst.preOK == nil {
 		t.Fatal("PreAccept response left nil vote map")
 	}
-	vote, ok := inst.preOK[2]
+	vote, ok := inst.preOK.get(rn.q.conf, 2)
 	if !ok {
 		t.Fatalf("PreAccept response was not recorded: %#v", inst.preOK)
 	}
-	if vote.seq != 4 || !instanceNumsEqual(vote.deps, respDeps) || vote.depsCommitted != depsCommitted || !vote.fastPathEligible {
+	if vote.seq != 4 || !instanceNumsEqual(vote.attributes().Deps, respDeps) || vote.depsCommitted != depsCommitted || !vote.fastPathEligible {
 		t.Fatalf("recorded PreAccept vote = %#v, want seq 4 deps %v depsCommitted %03b fast-path eligible", vote, respDeps, depsCommitted)
 	}
-	if got := len(inst.preOK); got != 1 {
+	if got := inst.preOK.len(); got != 1 {
 		t.Fatalf("PreAccept vote count = %d, want only the remote response recorded", got)
 	}
 	if inst.phase != phasePreAccept {
@@ -1081,9 +1081,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 			Command: optimizedTestCommand("stale-duplicate-target", "stale-duplicate-key"),
 		}),
 		phase: phaseTryPreAccept,
-		tryOK: map[ReplicaID]struct{}{
-			1: {},
-		},
+		tryOK: testVoterMask(t, rn.q.conf, 1),
 	}
 	rn.instances[target] = inst
 	key := tryEvidenceKey{target: target, conflict: conflict, ballot: inst.rec.Ballot}
@@ -1200,7 +1198,7 @@ func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
 			Command: optimizedTestCommand("timeout-target", "timeout-key"),
 		}),
 		phase: phaseTryPreAccept,
-		tryOK: map[ReplicaID]struct{}{1: {}},
+		tryOK: testVoterMask(t, rn.q.conf, 1),
 	}
 	rn.instances[target] = inst
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: target, conflict: conflict, ballot: inst.rec.Ballot}: {}}
@@ -1336,10 +1334,10 @@ func TestTryEvidenceDecisionAndRecordValidationBranches(t *testing.T) {
 		t.Fatalf("all-remote evidence below f decision = authorized %v failClosed %v, want fail closed", authorized, failClosed)
 	}
 
-	inst.prepareOK = map[ReplicaID]InstanceRecord{
+	inst.prepareOK = testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{
 		4: {Ref: target, Status: StatusPreAccepted, FastPathEligible: false},
 		5: {Ref: target, Status: StatusPreAccepted, FastPathEligible: false},
-	}
+	})
 
 	for _, tc := range []struct {
 		name           string
@@ -1559,14 +1557,14 @@ func TestCommitAndPrepareResponsesWithoutRecordBallotFailClosed(t *testing.T) {
 	}
 
 	recoveryRef := InstanceRef{Replica: 1, Instance: 91, Conf: 1}
-	recovery := &instance{rec: checkedRecord(InstanceRecord{Ref: recoveryRef, Ballot: Ballot{Number: 2, Replica: 1}, Status: StatusNone, Deps: rn.q.deps()}), phase: phasePrepare, prepareOK: map[ReplicaID]InstanceRecord{}}
+	recovery := &instance{rec: checkedRecord(InstanceRecord{Ref: recoveryRef, Ballot: Ballot{Number: 2, Replica: 1}, Status: StatusNone, Deps: rn.q.deps()}), phase: phasePrepare, prepareOK: new(recordVoteSet)}
 	rn.instances[recoveryRef] = recovery
 	before := recovery.rec.Clone()
 	resp := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: recoveryRef, Ballot: recovery.rec.Ballot, RecordStatus: StatusCommitted, Seq: 2, Deps: rn.q.deps(), Command: optimizedTestCommand("prepare-zero-record-ballot", "zero-record-ballot-key")}
 	if err := rn.Step(resp); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("prepare response without RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
-	if len(recovery.prepareOK) != 0 || recovery.phase != phasePrepare ||
+	if recovery.prepareOK.len() != 0 || recovery.phase != phasePrepare ||
 		!instanceRecordEqual(recovery.rec, before) || rn.HasReady() {
 		t.Fatalf("prepare response without RecordBallot changed state: phase=%d record=%#v prepareOK=%#v ready=%v", recovery.phase, recovery.rec, recovery.prepareOK, rn.HasReady())
 	}
@@ -1664,7 +1662,7 @@ func protocolTryInstance(t *testing.T, voters int, ballotNumber uint64) (*RawNod
 		Deps:    rn.q.deps(),
 		Command: optimizedTestCommand("try-response", "try-response-key"),
 	})
-	inst := &instance{rec: rec, phase: phaseTryPreAccept, tryOK: map[ReplicaID]struct{}{}}
+	inst := &instance{rec: rec, phase: phaseTryPreAccept}
 	rn.instances[ref] = inst
 	return rn, inst, ref
 }
@@ -2164,7 +2162,7 @@ func TestTryPreAcceptResponseRequiresCurrentBallotAndExactTuple(t *testing.T) {
 			if err := rn.Step(msg); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Step error = %v, want %v for message %#v", err, tc.wantErr, msg)
 			}
-			if len(inst.tryOK) != 0 || inst.phase != phaseTryPreAccept || rn.HasReady() {
+			if inst.tryOK.len() != 0 || inst.phase != phaseTryPreAccept || rn.HasReady() {
 				t.Fatalf("invalid TryPreAccept response changed state: phase=%d tryOK=%#v ready=%#v", inst.phase, inst.tryOK, rn.Ready())
 			}
 		})
@@ -2187,7 +2185,7 @@ func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
 	inst := &instance{
 		rec:   rec,
 		phase: phaseAccept,
-		accOK: map[ReplicaID]struct{}{1: {}},
+		accOK: testVoterMask(t, rn.q.conf, 1),
 	}
 	rn.instances[ref] = inst
 
@@ -2232,7 +2230,7 @@ func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
 			if err := rn.Step(msg); err != nil {
 				t.Fatalf("well-formed mismatched AcceptResp rejected before handler: %v", err)
 			}
-			if inst.phase != phaseAccept || len(inst.accOK) != 1 || rn.HasReady() {
+			if inst.phase != phaseAccept || inst.accOK.len() != 1 || rn.HasReady() {
 				t.Fatalf("mismatched AcceptResp changed state: phase=%d accOK=%#v ready=%v", inst.phase, inst.accOK, rn.HasReady())
 			}
 		})
@@ -2243,14 +2241,14 @@ func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
 	if err := rn.Step(malformed); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("AcceptResp with non-echoed RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
-	if inst.phase != phaseAccept || len(inst.accOK) != 1 || rn.HasReady() {
+	if inst.phase != phaseAccept || inst.accOK.len() != 1 || rn.HasReady() {
 		t.Fatalf("malformed AcceptResp changed state: phase=%d accOK=%#v ready=%v", inst.phase, inst.accOK, rn.HasReady())
 	}
 
 	if err := rn.Step(exact); err != nil {
 		t.Fatal(err)
 	}
-	if inst.phase != phaseCommitted || inst.accOK != nil {
+	if inst.phase != phaseCommitted || inst.accOK != 0 {
 		t.Fatalf("exact AcceptResp phase/volatile votes = %d/%#v, want committed with votes released", inst.phase, inst.accOK)
 	}
 	rd := rn.Ready()
@@ -2364,21 +2362,23 @@ func TestTerminalCommitReleasesInstanceVolatileOwnership(t *testing.T) {
 		Command: optimizedTestCommand("volatile-terminal", "volatile-terminal-key"),
 	})
 	inst := &instance{
-		rec:             rec,
-		phase:           phaseAccept,
-		preOK:           map[ReplicaID]attrVote{1: {seq: 1, deps: []InstanceNum{1, 2, 3}}},
-		accOK:           map[ReplicaID]struct{}{1: {}},
-		prepareOK:       map[ReplicaID]InstanceRecord{1: rec.Clone()},
-		prepareEvidence: map[ReplicaID]InstanceRecord{2: rec.Clone()},
-		tryOK:           map[ReplicaID]struct{}{1: {}},
+		rec:   rec,
+		phase: phaseAccept,
+		preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
+			1: {seq: 1, deps: []InstanceNum{1, 2, 3}},
+		}),
+		accOK:           testVoterMask(t, rn.q.conf, 1),
+		prepareOK:       testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: rec.Clone()}),
+		prepareEvidence: testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{2: rec.Clone()}),
+		tryOK:           testVoterMask(t, rn.q.conf, 1),
 		tryDeferred:     map[InstanceRef]struct{}{{Conf: 1, Replica: 2, Instance: 1}: {}},
 		tryIgnored:      map[InstanceRef]struct{}{{Conf: 1, Replica: 3, Instance: 1}: {}},
 		waitDeadline:    99,
 	}
 	rn.installInstance(inst)
 	rn.commit(inst, rec.Attributes())
-	if inst.preOK != nil || inst.accOK != nil || inst.prepareOK != nil || inst.prepareEvidence != nil ||
-		inst.tryOK != nil || inst.tryDeferred != nil || inst.tryIgnored != nil || inst.waitDeadline != 0 {
+	if inst.preOK != nil || inst.accOK != 0 || inst.prepareOK != nil || inst.prepareEvidence != nil ||
+		inst.tryOK != 0 || inst.tryDeferred != nil || inst.tryIgnored != nil || inst.waitDeadline != 0 {
 		t.Fatalf("terminal instance retained volatile ownership: %#v", inst)
 	}
 }
@@ -2403,12 +2403,14 @@ func TestTryPreAcceptRetainsRequiredLocalPrepareWitness(t *testing.T) {
 			inst := &instance{
 				rec:       rec,
 				phase:     phasePrepare,
-				prepareOK: map[ReplicaID]InstanceRecord{1: local},
+				prepareOK: testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: local}),
 			}
 			rn.installInstance(inst)
-			witnesses := make(map[ReplicaID]struct{})
-			for id := ReplicaID(3); len(witnesses) < rn.slowQuorumForConf(1)-1; id++ {
-				witnesses[id] = struct{}{}
+			var witnesses voterMask
+			for id := ReplicaID(3); witnesses.len() < rn.slowQuorumForConf(1)-1; id++ {
+				if !witnesses.add(rn.q.conf, id) {
+					t.Fatalf("invalid witness %d", id)
+				}
 			}
 			rn.startTryPreAccept(inst, attrs, witnesses, false)
 			if inst.phase != phaseAccept {
@@ -2801,7 +2803,7 @@ func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
 			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 			ballot := Ballot{Number: 1, Replica: 1}
 			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
-			inst := &instance{rec: rec, phase: phasePreAccept, preOK: map[ReplicaID]attrVote{1: {seq: 1, deps: make([]InstanceNum, 3)}}}
+			inst := &instance{rec: rec, phase: phasePreAccept, preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{1: {seq: 1, deps: make([]InstanceNum, 3)}})}
 			rn.installInstance(inst)
 			return rn, inst, Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 3)}
 		},
@@ -2810,7 +2812,7 @@ func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
 			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 2}
 			ballot := Ballot{Number: 1, Replica: 1}
 			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
-			inst := &instance{rec: rec, phase: phaseAccept, accOK: map[ReplicaID]struct{}{1: {}}}
+			inst := &instance{rec: rec, phase: phaseAccept, accOK: testVoterMask(t, rn.q.conf, 1)}
 			rn.installInstance(inst)
 			return rn, inst, Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, RecordStatus: StatusAccepted, Seq: 2, Deps: make([]InstanceNum, 3)}
 		},
@@ -2820,7 +2822,7 @@ func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
 			ballot := Ballot{Number: 2, Replica: 1}
 			rec := InstanceRecord{Ref: ref, Ballot: ballot, Status: StatusNone, Deps: make([]InstanceNum, 3)}
 			rec.Checksum = ChecksumRecord(rec)
-			inst := &instance{rec: rec, phase: phasePrepare, prepareOK: map[ReplicaID]InstanceRecord{1: rec}}
+			inst := &instance{rec: rec, phase: phasePrepare, prepareOK: testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: rec})}
 			rn.installInstance(inst)
 			return rn, inst, Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, RecordStatus: StatusNone, Deps: make([]InstanceNum, 3)}
 		},
@@ -2829,7 +2831,7 @@ func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
 			ref := InstanceRef{Conf: 1, Replica: 2, Instance: 4}
 			ballot := Ballot{Number: 1, Replica: 1}
 			rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("ignored", "ignored-key")})
-			inst := &instance{rec: rec, phase: phaseTryPreAccept, tryOK: map[ReplicaID]struct{}{1: {}}}
+			inst := &instance{rec: rec, phase: phaseTryPreAccept, tryOK: testVoterMask(t, rn.q.conf, 1)}
 			rn.installInstance(inst)
 			return rn, inst, Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordStatus: StatusPreAccepted, Seq: 2, Deps: make([]InstanceNum, 3)}
 		},

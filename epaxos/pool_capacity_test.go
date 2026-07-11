@@ -300,3 +300,65 @@ func TestCloneIntoSelfDoesNotClearActiveDataAliasedByInactiveSlots(t *testing.T)
 		t.Fatalf("inactive Ready record retained a payload reference: %#v", got)
 	}
 }
+
+func TestConflictKeyPoolRetentionBoundariesAreAllOrNothing(t *testing.T) {
+	t.Run("per-key boundary retained and cleared", func(t *testing.T) {
+		key := make([]byte, maxPooledConflictKeyBytes)
+		for i := range key {
+			key[i] = 0xa5
+		}
+		command := &Command{ConflictKeys: [][]byte{key}}
+		resetCommandForPool(command)
+		if cap(command.ConflictKeys) != 1 || cap(command.ConflictKeys[:cap(command.ConflictKeys)][0]) != maxPooledConflictKeyBytes {
+			t.Fatalf("boundary key capacity was not retained: %#v", command.ConflictKeys)
+		}
+		for i, value := range command.ConflictKeys[:cap(command.ConflictKeys)][0][:maxPooledConflictKeyBytes] {
+			if value != 0 {
+				t.Fatalf("boundary key retained byte %x at %d", value, i)
+			}
+		}
+	})
+
+	t.Run("oversized key drops complete arena", func(t *testing.T) {
+		command := &Command{ConflictKeys: [][]byte{
+			make([]byte, 32),
+			make([]byte, maxPooledConflictKeyBytes+1),
+			make([]byte, 32),
+		}}
+		resetCommandForPool(command)
+		if command.ConflictKeys != nil {
+			t.Fatalf("oversized key retained partial arena: %#v", command.ConflictKeys)
+		}
+	})
+
+	t.Run("aggregate boundary retained", func(t *testing.T) {
+		keys := make([][]byte, 4)
+		for i := range keys {
+			keys[i] = make([]byte, maxPooledConflictKeyBytes)
+		}
+		command := &Command{ConflictKeys: keys}
+		resetCommandForPool(command)
+		if cap(command.ConflictKeys) != len(keys) {
+			t.Fatalf("aggregate boundary capacity=%d, want %d", cap(command.ConflictKeys), len(keys))
+		}
+	})
+
+	t.Run("many small keys over aggregate drops complete arena", func(t *testing.T) {
+		keys := make([][]byte, 65)
+		for i := range keys {
+			keys[i] = make([]byte, 4096)
+			keys[i][0] = 0x5a
+		}
+		aliases := append([][]byte(nil), keys...)
+		command := &Command{ConflictKeys: keys}
+		resetCommandForPool(command)
+		if command.ConflictKeys != nil {
+			t.Fatalf("aggregate overflow retained partial arena: %#v", command.ConflictKeys)
+		}
+		for i, key := range aliases {
+			if key[0] != 0 {
+				t.Fatalf("dropped key %d was not cleared", i)
+			}
+		}
+	})
+}

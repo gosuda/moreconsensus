@@ -100,6 +100,12 @@ PruningCases == {
 }
 CaseKinds == IF Scenario = "scc" THEN SCCCases ELSE PruningCases
 
+\* The required short profile isolates sparse-prefix safety and bounds partial
+\* execution depth.
+FastPruningBound ==
+    /\ caseKind = "sparse-prefix"
+    /\ \A r \in Replicas : Cardinality(executed[r]) <= 1
+
 ChosenFor(theCase) ==
     CASE theCase = "dag" -> DagChosen
       [] theCase = "cycle" -> CycleChosen

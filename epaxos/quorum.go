@@ -6,10 +6,9 @@ import (
 )
 
 type quorum struct {
-	conf  ConfState
-	index map[ReplicaID]int
-	slow  int
-	fast  int
+	conf ConfState
+	slow int
+	fast int
 }
 
 func newQuorum(voters []ReplicaID) (quorum, error) {
@@ -26,12 +25,8 @@ func newQuorum(voters []ReplicaID) (quorum, error) {
 			return quorum{}, fmt.Errorf("%w: duplicate replica", ErrInvalidConfig)
 		}
 	}
-	idx := make(map[ReplicaID]int, len(vv))
-	for i, id := range vv {
-		idx[id] = i
-	}
 	n := len(vv)
-	return quorum{conf: ConfState{ID: 1, Voters: vv}, index: idx, slow: slowQuorumSize(n), fast: fastQuorumSize(n)}, nil
+	return quorum{conf: ConfState{ID: 1, Voters: vv}, slow: slowQuorumSize(n), fast: fastQuorumSize(n)}, nil
 }
 
 func slowQuorumSize(n int) int { return n/2 + 1 }
@@ -54,7 +49,7 @@ func fastQuorumSize(n int) int {
 
 func tryWitnessQuorumSize(n int) int { return fastQuorumSize(n) + slowQuorumSize(n) - n }
 
-func (q quorum) contains(id ReplicaID) bool { _, ok := q.index[id]; return ok }
+func (q quorum) contains(id ReplicaID) bool { return q.conf.Contains(id) }
 
 func (q quorum) deps() []InstanceNum { return make([]InstanceNum, len(q.conf.Voters)) }
 

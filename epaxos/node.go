@@ -20,16 +20,9 @@ const (
 	phaseCommitted
 )
 
-type attrVote struct {
-	seq              uint64
-	deps             []InstanceNum
-	depsCommitted    uint64
-	fastPathEligible bool
-}
-
 type tryCandidate struct {
 	rec    InstanceRecord
-	voters map[ReplicaID]struct{}
+	voters voterMask
 }
 
 type tryEvidenceKey struct {
@@ -41,12 +34,12 @@ type tryEvidenceKey struct {
 type instance struct {
 	rec             InstanceRecord
 	phase           phase
-	preOK           map[ReplicaID]attrVote
-	accOK           map[ReplicaID]struct{}
-	prepareOK       map[ReplicaID]InstanceRecord
-	tryOK           map[ReplicaID]struct{}
+	preOK           *attrVoteSet
+	accOK           voterMask
+	prepareOK       *recordVoteSet
+	tryOK           voterMask
 	tryDeferred     map[InstanceRef]struct{}
-	prepareEvidence map[ReplicaID]InstanceRecord
+	prepareEvidence *recordVoteSet
 	tryIgnored      map[InstanceRef]struct{}
 	createdTick     uint64
 	waitDeadline    uint64
@@ -1068,28 +1061,29 @@ func (n *RawNode) seedLocalRestartVote(inst *instance) {
 			return
 		}
 		if inst.preOK == nil {
-			inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
+			inst.preOK = getAttrVoteSet()
 		}
 		attrs := inst.rec.Attributes()
 		// Restart cannot reconstruct volatile fast-quorum dependency coverage; count the durable owner vote only for the slow path.
-		inst.preOK[n.id] = attrVote{seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), depsCommitted: 0, fastPathEligible: false}
+		vote, ok := newAttrVote(n.confFor(inst.rec.Ref.Conf), attrs.Seq, attrs.Deps, 0, false)
+		if ok {
+			inst.preOK.add(n.confFor(inst.rec.Ref.Conf), n.id, vote)
+		}
 	case phaseAccept:
 		if inst.rec.Ref.Replica != n.id ||
 			inst.rec.Status != StatusAccepted ||
 			inst.rec.Ballot.Replica != n.id {
 			return
 		}
-		if inst.accOK == nil {
-			inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
-		}
-		inst.accOK[n.id] = struct{}{}
+		inst.accOK.add(n.confFor(inst.rec.Ref.Conf), n.id)
 	case phasePrepare:
 		if inst.rec.Status >= StatusCommitted ||
 			!inst.rec.Ballot.IsRecovery() ||
 			inst.rec.Ballot.Replica != n.id {
 			return
 		}
-		inst.prepareOK = map[ReplicaID]InstanceRecord{n.id: inst.rec.Clone()}
+		inst.prepareOK = getRecordVoteSet()
+		inst.prepareOK.add(n.confFor(inst.rec.Ref.Conf), n.id, inst.rec)
 	}
 }
 
@@ -1522,10 +1516,10 @@ func (n *RawNode) preAcceptVotesWouldAdvance(inst *instance) (bool, bool) {
 	if _, ok := n.fastCommitAttrsPreAccept(inst); ok {
 		return true, false
 	}
-	if len(inst.preOK) < n.slowQuorumForConf(inst.rec.Ref.Conf) {
+	if inst.preOK.len() < n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		return false, false
 	}
-	if len(inst.preOK) >= n.fastQuorumForConf(inst.rec.Ref.Conf) || !n.canStillFastCommitPreAccept(inst) {
+	if inst.preOK.len() >= n.fastQuorumForConf(inst.rec.Ref.Conf) || !n.canStillFastCommitPreAccept(inst) {
 		return true, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
 	}
 	return false, false
@@ -1546,11 +1540,15 @@ func (n *RawNode) localTOQPreAcceptWouldAdvance(m Message, inst *instance) (bool
 	temp.rec.TimingDomain = TimingDomainTOQ
 	temp.rec.TOQPending = false
 	temp.rec.RecordBallot = temp.rec.Ballot
-	temp.preOK = make(map[ReplicaID]attrVote, len(inst.preOK)+1)
-	for id, vote := range inst.preOK {
-		temp.preOK[id] = vote
+	var tempVotes attrVoteSet
+	if inst.preOK != nil {
+		tempVotes = *inst.preOK
 	}
-	temp.preOK[n.id] = attrVote{seq: temp.rec.Seq, deps: temp.rec.Deps, depsCommitted: n.committedDepsMask(temp.rec.Attributes(), temp.rec.Ref.Conf), fastPathEligible: true}
+	temp.preOK = &tempVotes
+	vote, ok := newAttrVote(n.confFor(temp.rec.Ref.Conf), temp.rec.Seq, temp.rec.Deps, n.committedDepsMask(temp.rec.Attributes(), temp.rec.Ref.Conf), true)
+	if !ok || !temp.preOK.add(n.confFor(temp.rec.Ref.Conf), n.id, vote) {
+		return false, false
+	}
 	if n.slowQuorumForConf(temp.rec.Ref.Conf) == 1 {
 		return true, false
 	}
@@ -1608,6 +1606,23 @@ func (n *RawNode) removeDeferredPreAcceptEntry(entry *deferredPreAccept) {
 	entry.message.Reset()
 }
 
+func (n *RawNode) detachDeferredPreAcceptEntry(entry *deferredPreAccept) (Message, bool) {
+	if entry == nil || n.deferredIndex[entry.key] != entry {
+		return Message{}, false
+	}
+	queue := &n.logicalPreAccepts
+	if entry.key.domain == preAcceptTOQ {
+		queue = &n.toqPreAccepts
+	}
+	if entry.index >= 0 {
+		heap.Remove(queue, entry.index)
+	}
+	delete(n.deferredIndex, entry.key)
+	message := entry.message
+	entry.message = Message{}
+	return message, true
+}
+
 func (n *RawNode) deferredPreAcceptStateError(m Message) error {
 	inst := n.instances[m.Ref]
 	if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
@@ -1645,7 +1660,10 @@ func (n *RawNode) processDeferredPreAccepts(domain preAcceptDomain, now uint64) 
 	var firstErr error
 	for queue.Len() > 0 && (*queue)[0].message.ProcessAt <= now {
 		entry := (*queue)[0]
-		m := entry.message.Clone()
+		m, ok := n.detachDeferredPreAcceptEntry(entry)
+		if !ok {
+			continue
+		}
 		err := n.deferredPreAcceptStateError(m)
 		if err == nil {
 			if m.TOQ && m.From == n.id && m.To == n.id && m.Ref.Replica == n.id {
@@ -1655,7 +1673,6 @@ func (n *RawNode) processDeferredPreAccepts(domain preAcceptDomain, now uint64) 
 			}
 		}
 		m.Reset()
-		n.removeDeferredPreAcceptEntry(entry)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1707,9 +1724,12 @@ func (n *RawNode) handleLocalTOQPreAccept(m Message) {
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
 	n.indexConflicts(inst.rec)
 	if inst.preOK == nil {
-		inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
+		inst.preOK = getAttrVoteSet()
 	}
-	inst.preOK[n.id] = attrVote{seq: inst.rec.Seq, deps: append([]InstanceNum(nil), inst.rec.Deps...), depsCommitted: n.committedDepsMask(inst.rec.Attributes(), inst.rec.Ref.Conf), fastPathEligible: inst.rec.FastPathEligible}
+	vote, ok := newAttrVote(n.confFor(inst.rec.Ref.Conf), inst.rec.Seq, inst.rec.Deps, n.committedDepsMask(inst.rec.Attributes(), inst.rec.Ref.Conf), inst.rec.FastPathEligible)
+	if !ok || !inst.preOK.add(n.confFor(inst.rec.Ref.Conf), n.id, vote) {
+		return
+	}
 	n.enqueueRecord(inst.rec)
 	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
 		n.commit(inst, inst.rec.Attributes())
@@ -1883,8 +1903,9 @@ func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
 	if n.toqEnabled && cmd.Kind != CommandNoop {
 		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, Status: StatusNone, Seq: 0, Deps: n.depsForConf(ref.Conf), Command: cmd, ProcessAt: processAt, TimingDomain: TimingDomainTOQ, TOQPending: true}
 		rec.Checksum = ChecksumRecord(rec)
-		inst := &instance{rec: rec, phase: phasePreAccept, preOK: make(map[ReplicaID]attrVote, n.fastQuorumForConf(ref.Conf)), createdTick: n.tick, processAt: processAt}
+		inst := &instance{rec: rec, phase: phasePreAccept, preOK: getAttrVoteSet(), createdTick: n.tick, processAt: processAt}
 		if _, err := n.admitDeferredPreAccept(preAcceptTOQ, n.localTOQPreAcceptMessage(inst)); err != nil {
+			putAttrVoteSet(inst.preOK)
 			return InstanceRef{}, err
 		}
 		n.toqSeen = true
@@ -1908,7 +1929,12 @@ func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
 	}
 	rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: n.id}, RecordBallot: Ballot{Replica: n.id}, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd, FastPathEligible: true, ProcessAt: processAt, TimingDomain: timingDomain}
 	rec.Checksum = ChecksumRecord(rec)
-	inst := &instance{rec: rec, phase: phasePreAccept, preOK: map[ReplicaID]attrVote{n.id: {seq: rec.Seq, deps: append([]InstanceNum(nil), rec.Deps...), depsCommitted: n.committedDepsMask(rec.Attributes(), ref.Conf), fastPathEligible: rec.FastPathEligible}}, createdTick: n.tick, processAt: processAt}
+	inst := &instance{rec: rec, phase: phasePreAccept, preOK: getAttrVoteSet(), createdTick: n.tick, processAt: processAt}
+	vote, ok := newAttrVote(n.confFor(ref.Conf), rec.Seq, rec.Deps, n.committedDepsMask(rec.Attributes(), ref.Conf), rec.FastPathEligible)
+	if !ok || !inst.preOK.add(n.confFor(ref.Conf), n.id, vote) {
+		putAttrVoteSet(inst.preOK)
+		return InstanceRef{}, ErrInvalidConfig
+	}
 	n.installInstance(inst)
 	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
@@ -2039,28 +2065,81 @@ func (n *RawNode) HasReady() bool {
 	return n.awaitAdvance || !n.pendingReady.Empty() || !n.currentHardState.Equal(n.acknowledgedHardState)
 }
 
-// Ready returns the next batch of hard state, persistent records, messages, and commands.
-// Until the entire frozen view is acknowledged, repeated Ready calls return
-// only the unacknowledged part of that view. Later work remains isolated.
+// IsExecuted reports whether ref has executed without allocating a status copy.
+func (n *RawNode) IsExecuted(ref InstanceRef) bool {
+	return n != nil && n.executed.contains(ref)
+}
+
+// RuntimeStats returns an allocation-free snapshot of resident runtime state.
+func (n *RawNode) RuntimeStats() RuntimeStats {
+	if n == nil {
+		return RuntimeStats{}
+	}
+	stats := RuntimeStats{
+		ResidentInstances:    len(n.instances),
+		ExecutedRefs:         len(n.executed.exact),
+		DeferredPreAccepts:   len(n.deferredIndex),
+		ActiveRecoveries:     n.activeRecoveryCount(),
+		FrozenReadyRecords:   len(n.frozenReady.Records) + len(n.frozenReady.BootstrapRecords),
+		FrozenReadyMessages:  len(n.frozenReady.Messages) + len(n.frozenReady.BootstrapMessages),
+		PendingReadyRecords:  len(n.pendingReady.Records) + len(n.pendingReady.BootstrapRecords),
+		PendingReadyMessages: len(n.pendingReady.Messages) + len(n.pendingReady.BootstrapMessages),
+		NextReadyRecords:     len(n.nextReady.Records) + len(n.nextReady.BootstrapRecords),
+		NextReadyMessages:    len(n.nextReady.Messages) + len(n.nextReady.BootstrapMessages),
+	}
+	for ref, inst := range n.instances {
+		if inst == nil || n.executed.contains(ref) || n.tick < inst.createdTick {
+			continue
+		}
+		age := n.tick - inst.createdTick
+		if age > stats.OldestUnexecutedAgeTicks {
+			stats.OldestUnexecutedAgeTicks = age
+		}
+	}
+	return stats
+}
+
+// Ready returns a safe ownership-independent copy of the next frozen batch.
+// Until the entire frozen view is acknowledged, repeated calls return only
+// the unacknowledged part of that view. Later work remains isolated.
 func (n *RawNode) Ready() Ready {
-	if n.awaitAdvance {
-		return n.frozenReady.Clone()
+	var rd Ready
+	_ = n.ReadyInto(&rd)
+	return rd
+}
+
+// ReadyInto freezes the same batch as Ready and clones it into caller-owned
+// capacity. It does not acknowledge work. dst must remain caller-owned and may
+// be reused for identical retries or later batches.
+func (n *RawNode) ReadyInto(dst *Ready) error {
+	if dst == nil {
+		return ErrInvalidReady
 	}
-	if n.pendingReady.Empty() && n.currentHardState.Equal(n.acknowledgedHardState) {
-		return Ready{}
+	if !n.awaitAdvance {
+		if n.pendingReady.Empty() && n.currentHardState.Equal(n.acknowledgedHardState) {
+			(Ready{}).CloneInto(dst)
+			return nil
+		}
+		n.freezeReady()
 	}
-	rd := n.pendingReady.Clone()
+	n.frozenReady.CloneInto(dst)
+	return nil
+}
+
+func (n *RawNode) freezeReady() {
+	n.frozenReady = n.pendingReady
+	n.pendingReady = Ready{}
 	if !n.currentHardState.Equal(n.acknowledgedHardState) {
-		rd.HardState = n.currentHardState.Clone()
+		n.frozenReady.HardState = n.currentHardState.Clone()
 	}
-	if n.maxReadyMessages > 0 && len(rd.Messages) > n.maxReadyMessages {
-		clear(rd.Messages[n.maxReadyMessages:])
-		rd.Messages = rd.Messages[:n.maxReadyMessages]
+	if n.maxReadyMessages > 0 && len(n.frozenReady.Messages) > n.maxReadyMessages {
+		messages := n.frozenReady.Messages
+		n.frozenReady.Messages = messages[:n.maxReadyMessages:n.maxReadyMessages]
+		n.pendingReady.Messages = messages[n.maxReadyMessages:]
 	}
-	rd.MustSync = readyHasDurableUpdate(rd)
-	n.frozenReady = rd
+	n.frozenReady.MustSync = readyHasDurableUpdate(n.frozenReady)
+	n.pendingReady.MustSync = readyHasDurableUpdate(n.pendingReady)
 	n.awaitAdvance = true
-	return n.frozenReady.Clone()
 }
 
 func consumeReadyPrefix[T any](items []T, count int) []T {
@@ -2114,25 +2193,12 @@ func (n *RawNode) Advance(rd Ready) error {
 	n.frozenReady.Committed = consumeReadyPrefix(n.frozenReady.Committed, len(rd.Committed))
 	n.frozenReady.MustSync = readyHasDurableUpdate(n.frozenReady)
 
-	n.pendingReady.ConfigHistory = consumeReadyPrefix(n.pendingReady.ConfigHistory, len(rd.ConfigHistory))
-	n.pendingReady.Records = consumeReadyPrefix(n.pendingReady.Records, len(rd.Records))
-	n.pendingReady.BootstrapRecords = consumeReadyPrefix(n.pendingReady.BootstrapRecords, len(rd.BootstrapRecords))
-	if rd.LocalVoterState != nil {
-		n.pendingReady.LocalVoterState = nil
-	}
-	n.pendingReady.FrontierUpdates = consumeReadyPrefix(n.pendingReady.FrontierUpdates, len(rd.FrontierUpdates))
-	if rd.AllocatorFloor != 0 {
-		n.pendingReady.AllocatorFloor = 0
-	}
-	n.pendingReady.Messages = consumeReadyPrefix(n.pendingReady.Messages, len(rd.Messages))
-	n.pendingReady.BootstrapMessages = consumeReadyPrefix(n.pendingReady.BootstrapMessages, len(rd.BootstrapMessages))
-	n.pendingReady.Committed = consumeReadyPrefix(n.pendingReady.Committed, len(rd.Committed))
-	n.pendingReady.MustSync = readyHasDurableUpdate(n.pendingReady)
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.applyBootstrapDurability(rd.BootstrapRecords)
 
 	if n.frozenReady.Empty() {
 		n.awaitAdvance = false
+		n.recycleFrozenReady()
 		n.mergeNextReady()
 	}
 	return nil
@@ -2454,13 +2520,17 @@ func (n *RawNode) handlePreAcceptResp(m Message) error {
 	if m.Ballot != inst.rec.Ballot {
 		return nil
 	}
+	conf := n.confFor(inst.rec.Ref.Conf)
 	if inst.preOK == nil {
-		inst.preOK = make(map[ReplicaID]attrVote, n.fastQuorumForConf(inst.rec.Ref.Conf))
+		inst.preOK = getAttrVoteSet()
 	}
-	if _, duplicate := inst.preOK[m.From]; duplicate {
+	if inst.preOK.has(conf, m.From) {
 		return nil
 	}
-	inst.preOK[m.From] = attrVote{seq: m.Seq, deps: append([]InstanceNum(nil), m.Deps...), depsCommitted: m.DepsCommitted, fastPathEligible: m.FastPathEligible}
+	vote, ok := newAttrVote(conf, m.Seq, m.Deps, m.DepsCommitted, m.FastPathEligible)
+	if !ok || !inst.preOK.add(conf, m.From, vote) {
+		return nil
+	}
 	n.maybeFinalizePreAccept(inst)
 	return nil
 }
@@ -2469,16 +2539,16 @@ func (n *RawNode) maybeFinalizePreAccept(inst *instance) {
 	if inst == nil || inst.rec.TOQPending {
 		return
 	}
-	attrs := attrsFromVotes(inst.preOK)
+	attrs := attrsFromVotes(n.confFor(inst.rec.Ref.Conf), inst.preOK)
 	if fastAttrs, ok := n.fastCommitAttrsPreAccept(inst); ok {
 		n.commit(inst, fastAttrs)
 		return
 	}
 	slowQuorum := n.slowQuorumForConf(inst.rec.Ref.Conf)
-	if len(inst.preOK) < slowQuorum {
+	if inst.preOK.len() < slowQuorum {
 		return
 	}
-	if len(inst.preOK) >= n.fastQuorumForConf(inst.rec.Ref.Conf) {
+	if inst.preOK.len() >= n.fastQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, attrs)
 		return
 	}
@@ -2488,7 +2558,7 @@ func (n *RawNode) maybeFinalizePreAccept(inst *instance) {
 	}
 	if n.timeOptimization {
 		deadline := inst.rec.ProcessAt
-		if n.tick < deadline && len(inst.preOK) < len(n.confFor(inst.rec.Ref.Conf).Voters) {
+		if n.tick < deadline && inst.preOK.len() < len(n.confFor(inst.rec.Ref.Conf).Voters) {
 			inst.waitDeadline = deadline
 			_ = n.schedule(inst, timerFastWait, deadline-n.tick)
 			return
@@ -2503,7 +2573,7 @@ func (n *RawNode) canStillFastCommitPreAccept(inst *instance) bool {
 		return false
 	}
 	conf := n.confFor(inst.rec.Ref.Conf)
-	unanswered := len(conf.Voters) - len(inst.preOK)
+	unanswered := len(conf.Voters) - inst.preOK.len()
 	if unanswered < 0 {
 		unanswered = 0
 	}
@@ -2514,28 +2584,26 @@ func (n *RawNode) canStillFastCommitPreAccept(inst *instance) bool {
 			return false
 		}
 		count := 1
-		for id, vote := range inst.preOK {
-			if id == n.id || !vote.fastPathEligible {
-				continue
-			}
-			if (Attributes{Seq: vote.seq, Deps: vote.deps}).Equal(candidate) {
+		inst.preOK.each(conf, func(id ReplicaID, vote *attrVote) bool {
+			if id != n.id && vote.fastPathEligible && vote.attributes().Equal(candidate) {
 				count++
 			}
-		}
+			return true
+		})
 		return count+unanswered >= fastQuorum
 	}
 	if canReach(localAttrs) {
 		return true
 	}
-	for id, vote := range inst.preOK {
-		if id == n.id || !vote.fastPathEligible {
-			continue
+	reachable := false
+	inst.preOK.each(conf, func(id ReplicaID, vote *attrVote) bool {
+		if id != n.id && vote.fastPathEligible && canReach(vote.attributes()) {
+			reachable = true
+			return false
 		}
-		if canReach(Attributes{Seq: vote.seq, Deps: vote.deps}) {
-			return true
-		}
-	}
-	return false
+		return true
+	})
+	return reachable
 }
 
 func phaseMessageTimingEqual(rec InstanceRecord, m Message) bool {
@@ -2648,13 +2716,13 @@ func (n *RawNode) handleAcceptResp(m Message) error {
 		!instanceNumsEqual(m.Deps, inst.rec.Deps) {
 		return nil
 	}
-	if inst.accOK == nil {
-		inst.accOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
-	}
-	if _, duplicate := inst.accOK[m.From]; duplicate {
+	conf := n.confFor(inst.rec.Ref.Conf)
+	if inst.accOK.has(conf, m.From) {
 		return nil
 	}
-	inst.accOK[m.From] = struct{}{}
+	if !inst.accOK.add(conf, m.From) {
+		return nil
+	}
 	changed := mergeAcceptEvidence(&inst.rec, acceptEvidenceFromMessage(m))
 	if mergeSenderAcceptEvidence(&inst.rec, m.AcceptEvidence) {
 		changed = true
@@ -2663,7 +2731,7 @@ func (n *RawNode) handleAcceptResp(m Message) error {
 		inst.rec.Checksum = ChecksumRecord(inst.rec)
 		n.enqueueRecord(inst.rec)
 	}
-	if len(inst.accOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+	if inst.accOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.commit(inst, inst.rec.Attributes())
 	}
 	return nil
@@ -2853,11 +2921,15 @@ func (n *RawNode) handleEvidenceResp(m Message) {
 	n.resolveTryEvidenceCheck(key)
 }
 
-func prepareResponseRecord(inst *instance, id ReplicaID) InstanceRecord {
-	if rec, ok := inst.prepareOK[id]; ok {
-		return rec
+func prepareResponseRecord(inst *instance, conf ConfState, id ReplicaID) InstanceRecord {
+	if rec, ok := inst.prepareOK.get(conf, id); ok {
+		return *rec
 	}
-	return inst.prepareEvidence[id]
+	rec, _ := inst.prepareEvidence.get(conf, id)
+	if rec == nil {
+		return InstanceRecord{}
+	}
+	return *rec
 }
 
 func (n *RawNode) handlePrepareResp(m Message) error {
@@ -2877,10 +2949,11 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	if inst.rec.Ballot.Less(m.Ballot) {
 		return n.startPrepareFrom(inst, m.Ballot)
 	}
+	conf := n.confFor(inst.rec.Ref.Conf)
 	if inst.prepareOK == nil {
-		inst.prepareOK = make(map[ReplicaID]InstanceRecord, n.slowQuorumForConf(inst.rec.Ref.Conf))
+		inst.prepareOK = getRecordVoteSet()
 	}
-	if _, duplicate := inst.prepareOK[m.From]; duplicate {
+	if _, duplicate := inst.prepareOK.get(conf, m.From); duplicate {
 		return nil
 	}
 	recordBallot := m.RecordBallot
@@ -2890,24 +2963,27 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: recordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 	n.ensureRecordDeps(&rec)
 	rec.Checksum = ChecksumRecord(rec)
-	inst.prepareOK[m.From] = rec
-	if len(inst.prepareOK) < n.slowQuorumForConf(inst.rec.Ref.Conf) {
+	if !inst.prepareOK.add(conf, m.From, rec) {
+		return nil
+	}
+	if inst.prepareOK.len() < n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		return nil
 	}
 
-	responders := make([]ReplicaID, 0, len(inst.prepareOK)+len(inst.prepareEvidence))
-	for id := range inst.prepareOK {
-		responders = append(responders, id)
-	}
-	for id := range inst.prepareEvidence {
-		if _, fresh := inst.prepareOK[id]; !fresh {
+	var responderStorage [7]ReplicaID
+	responders := responderStorage[:0]
+	for _, id := range conf.Voters {
+		if _, ok := inst.prepareOK.get(conf, id); ok {
+			responders = append(responders, id)
+			continue
+		}
+		if _, ok := inst.prepareEvidence.get(conf, id); ok {
 			responders = append(responders, id)
 		}
 	}
-	sort.Slice(responders, func(i, j int) bool { return responders[i] < responders[j] })
 
 	for _, id := range responders {
-		rec := prepareResponseRecord(inst, id)
+		rec := prepareResponseRecord(inst, conf, id)
 		if rec.Status >= StatusCommitted {
 			inst.rec = rec.Clone()
 			inst.rec.Status = StatusCommitted
@@ -2921,7 +2997,7 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	foundAccepted := false
 	var highestAccepted Ballot
 	for _, id := range responders {
-		rec := prepareResponseRecord(inst, id)
+		rec := prepareResponseRecord(inst, conf, id)
 		if rec.Status != StatusAccepted {
 			continue
 		}
@@ -2949,7 +3025,7 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	foundPreAccepted := false
 	var highestPreAccepted Ballot
 	for _, id := range responders {
-		rec := prepareResponseRecord(inst, id)
+		rec := prepareResponseRecord(inst, conf, id)
 		if rec.Status != StatusPreAccepted {
 			continue
 		}
@@ -2962,7 +3038,7 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	foundPreAccepted = false
 	var candidates []tryCandidate
 	for _, id := range responders {
-		rec := prepareResponseRecord(inst, id)
+		rec := prepareResponseRecord(inst, conf, id)
 		if rec.Status != StatusPreAccepted || recordTupleBallot(rec) != highestPreAccepted {
 			continue
 		}
@@ -2972,11 +3048,11 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 			foundPreAccepted = true
 		}
 		if rec.FastPathEligible {
-			candidates = addTryCandidate(candidates, rec, id)
+			candidates = addTryCandidate(candidates, conf, rec, id)
 		}
 	}
 	for _, candidate := range candidates {
-		if len(candidate.voters) >= n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
+		if candidate.voters.len() >= n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
 			inst.rec.Command = candidate.rec.Command.Clone()
 			inst.rec.ProcessAt = candidate.rec.ProcessAt
 			inst.rec.TimingDomain = candidate.rec.TimingDomain
@@ -3063,32 +3139,19 @@ func releaseInstanceVolatile(inst *instance) {
 	if inst == nil {
 		return
 	}
-	for id, vote := range inst.preOK {
-		clear(vote.deps)
-		vote.deps = nil
-		inst.preOK[id] = attrVote{}
-		delete(inst.preOK, id)
-	}
-	clear(inst.accOK)
-	for id := range inst.prepareOK {
-		inst.prepareOK[id] = InstanceRecord{}
-		delete(inst.prepareOK, id)
-	}
-	for id := range inst.prepareEvidence {
-		inst.prepareEvidence[id] = InstanceRecord{}
-		delete(inst.prepareEvidence, id)
-	}
-	clear(inst.tryOK)
+	putAttrVoteSet(inst.preOK)
+	putRecordVoteSet(inst.prepareOK)
+	putRecordVoteSet(inst.prepareEvidence)
 	clear(inst.tryDeferred)
 	clear(inst.tryIgnored)
 	inst.preOK = nil
-	inst.accOK = nil
+	inst.accOK = 0
 	inst.prepareOK = nil
 	inst.prepareEvidence = nil
-	inst.tryOK = nil
+	inst.tryOK = 0
 	inst.tryDeferred = nil
 	inst.tryIgnored = nil
-	inst.createdTick = 0
+	// createdTick spans phase changes and remains the logical age origin.
 	inst.waitDeadline = 0
 	inst.processAt = inst.rec.ProcessAt
 }
@@ -3114,7 +3177,7 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	mergeAcceptEvidence(&inst.rec, evidenceAttrs)
 	mergeOwnAcceptEvidence(&inst.rec, n.id, evidenceAttrs)
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
-	inst.accOK = map[ReplicaID]struct{}{n.id: {}}
+	inst.accOK.add(n.confFor(inst.rec.Ref.Conf), n.id)
 	inst.generation++
 	n.enqueueRecord(inst.rec)
 	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
@@ -3125,13 +3188,14 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	n.schedule(inst, timerAccept, n.retryTicks)
 }
 
-func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses map[ReplicaID]struct{}, countInitialLeader bool) {
+func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses voterMask, countInitialLeader bool) {
 	if inst.phase == phaseCommitted {
 		return
 	}
 	n.cancelTimersForRef(inst.rec.Ref)
+	conf := n.confFor(inst.rec.Ref.Conf)
 	localPrepareWitness := false
-	if rec, ok := inst.prepareOK[n.id]; ok {
+	if rec, ok := inst.prepareOK.get(conf, n.id); ok {
 		localPrepareWitness = rec.FastPathEligible && commandEqual(rec.Command, inst.rec.Command) && rec.Attributes().Equal(attrs)
 	}
 	n.removeDeferredPreAccepts(inst.rec.Ref)
@@ -3148,19 +3212,16 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 	inst.tryIgnored = nil
 	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
-	inst.tryOK = make(map[ReplicaID]struct{}, len(witnesses)+1)
-	for id := range witnesses {
-		inst.tryOK[id] = struct{}{}
-	}
+	inst.tryOK = witnesses
 	if countInitialLeader {
-		inst.tryOK[inst.rec.Ref.Replica] = struct{}{}
+		inst.tryOK.add(conf, inst.rec.Ref.Replica)
 	}
 	if localPrepareWitness {
-		inst.tryOK[n.id] = struct{}{}
+		inst.tryOK.add(conf, n.id)
 	}
 	inst.generation++
 	n.enqueueRecord(inst.rec)
-	if len(inst.tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+	if inst.tryOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, attrs)
 		return
 	}
@@ -3192,10 +3253,8 @@ func (n *RawNode) handleTryPreAccept(m Message) error {
 				old.rec.Checksum = ChecksumRecord(old.rec)
 				if m.Ballot.Replica != n.id {
 					n.cancelTimersForRef(old.rec.Ref)
+					releaseInstanceVolatile(old)
 					old.phase = phaseIdle
-					old.preOK = nil
-					old.accOK = nil
-					old.prepareOK = nil
 					old.generation++
 					deadline, err := checkedLogicalDeadline(n.tick, n.recoveryTicks)
 					if err != nil {
@@ -3308,9 +3367,9 @@ func (n *RawNode) handleTryPreAcceptResp(m Message) error {
 				return err
 			}
 			if inst.prepareEvidence == nil {
-				inst.prepareEvidence = make(map[ReplicaID]InstanceRecord, 1)
+				inst.prepareEvidence = getRecordVoteSet()
 			}
-			inst.prepareEvidence[m.From] = evidence
+			inst.prepareEvidence.add(n.confFor(inst.rec.Ref.Conf), m.From, evidence)
 		case RejectCommittedConflict:
 			if m.ConflictStatus >= StatusCommitted && n.maybeStartTryEvidenceCheck(inst, m.ConflictRef) {
 				return nil
@@ -3338,14 +3397,14 @@ func (n *RawNode) handleTryPreAcceptResp(m Message) error {
 		!instanceNumsEqual(m.Deps, inst.rec.Deps) {
 		return nil
 	}
-	if inst.tryOK == nil {
-		inst.tryOK = make(map[ReplicaID]struct{}, n.slowQuorumForConf(inst.rec.Ref.Conf))
-	}
-	if _, duplicate := inst.tryOK[m.From]; duplicate {
+	conf := n.confFor(inst.rec.Ref.Conf)
+	if inst.tryOK.has(conf, m.From) {
 		return nil
 	}
-	inst.tryOK[m.From] = struct{}{}
-	if len(inst.tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+	if !inst.tryOK.add(conf, m.From) {
+		return nil
+	}
+	if inst.tryOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 		n.startAccept(inst, inst.rec.Attributes())
 	}
 	return nil
@@ -3729,7 +3788,7 @@ func (n *RawNode) hasMatchingInitialLeaderTryRecord(inst *instance, attrs Attrib
 	if inst == nil || inst.rec.Ref.Replica == 0 {
 		return false
 	}
-	rec, ok := inst.prepareOK[inst.rec.Ref.Replica]
+	rec, ok := inst.prepareOK.get(n.confFor(inst.rec.Ref.Conf), inst.rec.Ref.Replica)
 	return ok &&
 		rec.Status == StatusPreAccepted &&
 		rec.FastPathEligible &&
@@ -3795,7 +3854,7 @@ func (n *RawNode) leaderMustBeInCandidateFastQuorum(inst *instance, leader Repli
 }
 
 func (n *RawNode) replicaCouldBeInCandidateFastQuorum(inst *instance, id ReplicaID) bool {
-	rec, ok := inst.prepareOK[id]
+	rec, ok := inst.prepareOK.get(n.confFor(inst.rec.Ref.Conf), id)
 	if !ok {
 		return true
 	}
@@ -3832,7 +3891,10 @@ func (n *RawNode) startPrepareFrom(inst *instance, base Ballot) error {
 	inst.tryDeferred = nil
 	inst.rec.Ballot = next
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
-	inst.prepareOK = map[ReplicaID]InstanceRecord{n.id: inst.rec.Clone()}
+	inst.prepareOK = getRecordVoteSet()
+	if !inst.prepareOK.add(n.confFor(inst.rec.Ref.Conf), n.id, inst.rec) {
+		return ErrInvalidConfig
+	}
 	inst.generation++
 	n.enqueueRecord(inst.rec)
 	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
@@ -3932,7 +3994,7 @@ func (n *RawNode) timerTransition(t timer, inst *instance, next uint64) (uint64,
 		if inst.phase == phasePreAccept &&
 			!inst.rec.TOQPending &&
 			(inst.waitDeadline == 0 || next >= inst.waitDeadline) &&
-			len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			inst.preOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			delta := n.startAcceptGenerationDelta(inst)
 			return delta, n.retryTicks, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
 		}
@@ -3942,7 +4004,7 @@ func (n *RawNode) timerTransition(t timer, inst *instance, next uint64) (uint64,
 		}
 		if !inst.rec.TOQPending &&
 			(inst.waitDeadline == 0 || next >= inst.waitDeadline) &&
-			len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			inst.preOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			delta := n.startAcceptGenerationDelta(inst)
 			return delta, n.retryTicks, n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
 		}
@@ -4067,13 +4129,13 @@ func (n *RawNode) commit(inst *instance, attrs Attributes) {
 func (n *RawNode) onTimer(inst *instance, kind timerKind) error {
 	switch kind {
 	case timerFastWait:
-		if inst.phase == phasePreAccept && !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
-			n.startAccept(inst, attrsFromVotes(inst.preOK))
+		if inst.phase == phasePreAccept && !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && inst.preOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+			n.startAccept(inst, attrsFromVotes(n.confFor(inst.rec.Ref.Conf), inst.preOK))
 		}
 	case timerPreAccept:
 		if inst.phase == phasePreAccept {
-			if !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && len(inst.preOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
-				n.startAccept(inst, attrsFromVotes(inst.preOK))
+			if !inst.rec.TOQPending && (inst.waitDeadline == 0 || n.tick >= inst.waitDeadline) && inst.preOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+				n.startAccept(inst, attrsFromVotes(n.confFor(inst.rec.Ref.Conf), inst.preOK))
 				return nil
 			}
 			n.broadcastPreAccept(inst)
@@ -4237,6 +4299,24 @@ func mergeReadyQueue[T any](dst, src []T) ([]T, []T) {
 	dst = append(dst, src...)
 	clear(src)
 	return dst, src[:0]
+}
+
+func reuseClearedReadyQueue[T any](dst, cleared []T) []T {
+	if len(dst) == 0 && cap(cleared) > cap(dst) {
+		return cleared[:0]
+	}
+	return dst
+}
+
+func (n *RawNode) recycleFrozenReady() {
+	n.pendingReady.ConfigHistory = reuseClearedReadyQueue(n.pendingReady.ConfigHistory, n.frozenReady.ConfigHistory)
+	n.pendingReady.Records = reuseClearedReadyQueue(n.pendingReady.Records, n.frozenReady.Records)
+	n.pendingReady.BootstrapRecords = reuseClearedReadyQueue(n.pendingReady.BootstrapRecords, n.frozenReady.BootstrapRecords)
+	n.pendingReady.FrontierUpdates = reuseClearedReadyQueue(n.pendingReady.FrontierUpdates, n.frozenReady.FrontierUpdates)
+	n.pendingReady.Messages = reuseClearedReadyQueue(n.pendingReady.Messages, n.frozenReady.Messages)
+	n.pendingReady.BootstrapMessages = reuseClearedReadyQueue(n.pendingReady.BootstrapMessages, n.frozenReady.BootstrapMessages)
+	n.pendingReady.Committed = reuseClearedReadyQueue(n.pendingReady.Committed, n.frozenReady.Committed)
+	n.frozenReady = Ready{}
 }
 
 func (n *RawNode) mergeNextReady() {
@@ -4403,11 +4483,11 @@ func (n *RawNode) fastCommitAttrsPreAccept(inst *instance) (Attributes, bool) {
 		if id == n.id {
 			continue
 		}
-		vote, ok := inst.preOK[id]
+		vote, ok := inst.preOK.get(conf, id)
 		if !ok {
 			continue
 		}
-		attrs := Attributes{Seq: vote.seq, Deps: vote.deps}
+		attrs := vote.attributes()
 		if attrs.Equal(localAttrs) || !attrsCover(localAttrs, attrs) {
 			continue
 		}
@@ -4428,16 +4508,14 @@ func (n *RawNode) canFastCommitPreAccept(inst *instance, attrs Attributes) bool 
 	}
 	count := 1
 	covered := n.committedDepsMask(attrs, inst.rec.Ref.Conf)
-	for id, vote := range inst.preOK {
-		if id == n.id {
-			continue
+	conf := n.confFor(inst.rec.Ref.Conf)
+	inst.preOK.each(conf, func(id ReplicaID, vote *attrVote) bool {
+		if id != n.id && vote.attributes().Equal(attrs) && vote.fastPathEligible {
+			count++
+			covered |= vote.depsCommitted
 		}
-		if !(Attributes{Seq: vote.seq, Deps: vote.deps}).Equal(attrs) || !vote.fastPathEligible {
-			continue
-		}
-		count++
-		covered |= vote.depsCommitted
-	}
+		return true
+	})
 	return count >= n.fastQuorumForConf(inst.rec.Ref.Conf) && dependencyMask(attrs.Deps)&^covered == 0
 }
 
@@ -4480,14 +4558,16 @@ func (n *RawNode) committedPrefix(replica ReplicaID, through InstanceNum, confID
 	return through == 0 || n.committedThrough[instanceLane{conf: confID, replica: replica}] >= through
 }
 
-func addTryCandidate(candidates []tryCandidate, rec InstanceRecord, voter ReplicaID) []tryCandidate {
+func addTryCandidate(candidates []tryCandidate, conf ConfState, rec InstanceRecord, voter ReplicaID) []tryCandidate {
 	for i := range candidates {
 		if candidates[i].rec.ProcessAt == rec.ProcessAt && candidates[i].rec.TimingDomain == rec.TimingDomain && commandEqual(candidates[i].rec.Command, rec.Command) && candidates[i].rec.Attributes().Equal(rec.Attributes()) {
-			candidates[i].voters[voter] = struct{}{}
+			candidates[i].voters.add(conf, voter)
 			return candidates
 		}
 	}
-	return append(candidates, tryCandidate{rec: rec.Clone(), voters: map[ReplicaID]struct{}{voter: {}}})
+	candidate := tryCandidate{rec: rec.Clone()}
+	candidate.voters.add(conf, voter)
+	return append(candidates, candidate)
 }
 
 func (n *RawNode) indexConflicts(rec InstanceRecord) {
@@ -4509,11 +4589,12 @@ func (n *RawNode) indexConflicts(rec InstanceRecord) {
 	}
 }
 
-func attrsFromVotes(votes map[ReplicaID]attrVote) Attributes {
+func attrsFromVotes(conf ConfState, votes *attrVoteSet) Attributes {
 	var out Attributes
-	for _, v := range votes {
-		out = mergeAttrs(out, Attributes{Seq: v.seq, Deps: v.deps})
-	}
+	votes.each(conf, func(_ ReplicaID, vote *attrVote) bool {
+		out = mergeAttrs(out, vote.attributes())
+		return true
+	})
 	return out
 }
 
@@ -4632,37 +4713,40 @@ func (n *RawNode) prepareResponseGenerationDelta(m Message, inst *instance) uint
 		return 1
 	}
 	temp := *inst
-	temp.prepareOK = make(map[ReplicaID]InstanceRecord, len(inst.prepareOK)+1)
-	for id, rec := range inst.prepareOK {
-		temp.prepareOK[id] = rec
+	conf := n.confFor(inst.rec.Ref.Conf)
+	var tempPrepare recordVoteSet
+	if inst.prepareOK != nil {
+		tempPrepare = *inst.prepareOK
 	}
+	temp.prepareOK = &tempPrepare
 	rec := InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 	n.ensureRecordDeps(&rec)
-	temp.prepareOK[m.From] = rec
-	responders := make([]ReplicaID, 0, len(temp.prepareOK)+len(temp.prepareEvidence))
-	for id := range temp.prepareOK {
-		responders = append(responders, id)
-	}
-	for id := range temp.prepareEvidence {
-		if _, fresh := temp.prepareOK[id]; !fresh {
+	temp.prepareOK.add(conf, m.From, rec)
+	var responderStorage [7]ReplicaID
+	responders := responderStorage[:0]
+	for _, id := range conf.Voters {
+		if _, ok := temp.prepareOK.get(conf, id); ok {
+			responders = append(responders, id)
+			continue
+		}
+		if _, ok := temp.prepareEvidence.get(conf, id); ok {
 			responders = append(responders, id)
 		}
 	}
-	sort.Slice(responders, func(i, j int) bool { return responders[i] < responders[j] })
 	for _, id := range responders {
-		if prepareResponseRecord(&temp, id).Status >= StatusCommitted {
+		if prepareResponseRecord(&temp, conf, id).Status >= StatusCommitted {
 			return 1
 		}
 	}
 	for _, id := range responders {
-		if prepareResponseRecord(&temp, id).Status == StatusAccepted {
+		if prepareResponseRecord(&temp, conf, id).Status == StatusAccepted {
 			return n.startAcceptGenerationDelta(inst)
 		}
 	}
 	foundPreAccepted := false
 	var highestPreAccepted Ballot
 	for _, id := range responders {
-		rec := prepareResponseRecord(&temp, id)
+		rec := prepareResponseRecord(&temp, conf, id)
 		if rec.Status != StatusPreAccepted {
 			continue
 		}
@@ -4676,28 +4760,25 @@ func (n *RawNode) prepareResponseGenerationDelta(m Message, inst *instance) uint
 	}
 	var candidates []tryCandidate
 	for _, id := range responders {
-		rec := prepareResponseRecord(&temp, id)
+		rec := prepareResponseRecord(&temp, conf, id)
 		if rec.Status == StatusPreAccepted && recordTupleBallot(rec) == highestPreAccepted && rec.FastPathEligible {
-			candidates = addTryCandidate(candidates, rec, id)
+			candidates = addTryCandidate(candidates, conf, rec, id)
 		}
 	}
 	for _, candidate := range candidates {
-		if len(candidate.voters) < n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
+		if candidate.voters.len() < n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
 			continue
 		}
-		tryOK := make(map[ReplicaID]struct{}, len(candidate.voters)+2)
-		for id := range candidate.voters {
-			tryOK[id] = struct{}{}
-		}
-		tryOK[inst.rec.Ref.Replica] = struct{}{}
-		if local, ok := temp.prepareOK[n.id]; ok &&
+		tryOK := candidate.voters
+		tryOK.add(conf, inst.rec.Ref.Replica)
+		if local, ok := temp.prepareOK.get(conf, n.id); ok &&
 			local.FastPathEligible &&
 			commandEqual(local.Command, candidate.rec.Command) &&
 			local.Attributes().Equal(candidate.rec.Attributes()) {
-			tryOK[n.id] = struct{}{}
+			tryOK.add(conf, n.id)
 		}
 		delta := uint64(1)
-		if len(tryOK) >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
+		if tryOK.len() >= n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			delta += n.startAcceptGenerationDelta(inst)
 		}
 		return delta
@@ -4719,15 +4800,20 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 		if m.Ballot != inst.rec.Ballot {
 			return inst, false, false, false
 		}
-		if _, duplicate := inst.preOK[m.From]; duplicate {
+		conf := n.confFor(inst.rec.Ref.Conf)
+		if inst.preOK.has(conf, m.From) {
 			return inst, false, false, false
 		}
 		temp := *inst
-		temp.preOK = make(map[ReplicaID]attrVote, len(inst.preOK)+1)
-		for id, vote := range inst.preOK {
-			temp.preOK[id] = vote
+		var tempVotes attrVoteSet
+		if inst.preOK != nil {
+			tempVotes = *inst.preOK
 		}
-		temp.preOK[m.From] = attrVote{seq: m.Seq, deps: m.Deps, depsCommitted: m.DepsCommitted, fastPathEligible: m.FastPathEligible}
+		temp.preOK = &tempVotes
+		vote, ok := newAttrVote(conf, m.Seq, m.Deps, m.DepsCommitted, m.FastPathEligible)
+		if !ok || !temp.preOK.add(conf, m.From, vote) {
+			return inst, false, false, false
+		}
 		advance, retry := n.preAcceptVotesWouldAdvance(&temp)
 		return inst, advance, retry, false
 	case MsgAcceptResp:
@@ -4745,10 +4831,11 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 			!instanceNumsEqual(m.Deps, inst.rec.Deps) {
 			return inst, false, false, false
 		}
-		if _, duplicate := inst.accOK[m.From]; duplicate {
+		conf := n.confFor(inst.rec.Ref.Conf)
+		if inst.accOK.has(conf, m.From) {
 			return inst, false, false, false
 		}
-		return inst, len(inst.accOK)+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf), false, false
+		return inst, inst.accOK.len()+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf), false, false
 	case MsgPrepareResp:
 		if inst == nil || inst.phase != phasePrepare || !inst.rec.Ballot.IsRecovery() || inst.rec.Ballot.Replica != n.id {
 			return inst, false, false, false
@@ -4763,13 +4850,14 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 		if inst.rec.Ballot.Less(m.Ballot) {
 			return inst, true, false, true
 		}
-		if _, duplicate := inst.prepareOK[m.From]; duplicate {
+		conf := n.confFor(inst.rec.Ref.Conf)
+		if _, duplicate := inst.prepareOK.get(conf, m.From); duplicate {
 			return inst, false, false, false
 		}
 		if recordHasValue(m.RecordStatus) && m.RecordBallot == (Ballot{}) {
 			return inst, false, false, false
 		}
-		if len(inst.prepareOK)+1 < n.slowQuorumForConf(inst.rec.Ref.Conf) {
+		if inst.prepareOK.len()+1 < n.slowQuorumForConf(inst.rec.Ref.Conf) {
 			return inst, false, false, false
 		}
 		retry := n.slowQuorumForConf(inst.rec.Ref.Conf) > 1
@@ -4777,20 +4865,22 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 			retry = false
 		}
 		if retry {
-			for _, rec := range inst.prepareOK {
+			inst.prepareOK.each(conf, func(_ ReplicaID, rec *InstanceRecord) bool {
 				if rec.Status >= StatusCommitted {
 					retry = false
-					break
+					return false
 				}
-			}
+				return true
+			})
 		}
 		if retry {
-			for _, rec := range inst.prepareEvidence {
+			inst.prepareEvidence.each(conf, func(_ ReplicaID, rec *InstanceRecord) bool {
 				if rec.Status >= StatusCommitted {
 					retry = false
-					break
+					return false
 				}
-			}
+				return true
+			})
 		}
 		return inst, true, retry, false
 	case MsgTryPreAcceptResp:
@@ -4820,10 +4910,11 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 			!instanceNumsEqual(m.Deps, inst.rec.Deps) {
 			return inst, false, false, false
 		}
-		if _, duplicate := inst.tryOK[m.From]; duplicate {
+		conf := n.confFor(inst.rec.Ref.Conf)
+		if inst.tryOK.has(conf, m.From) {
 			return inst, false, false, false
 		}
-		advance := len(inst.tryOK)+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf)
+		advance := inst.tryOK.len()+1 >= n.slowQuorumForConf(inst.rec.Ref.Conf)
 		return inst, advance, advance, false
 	case MsgEvidenceResp:
 		key := tryEvidenceKey{target: m.ConflictRef, conflict: m.Ref, ballot: m.Ballot}

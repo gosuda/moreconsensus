@@ -175,12 +175,12 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	rn.pendingReady = Ready{Records: []InstanceRecord{{}, {}}, Messages: []Message{{}, {}}, Committed: []CommittedCommand{{}, {}}, MustSync: true}
 	rd := rn.Ready()
 	advanceInvalid(t, rn, Ready{HardState: rd.HardState, Records: rd.Records[:1], Messages: rd.Messages[:1], Committed: rd.Committed[:1], MustSync: rd.MustSync})
-	if len(rn.pendingReady.Records) != 2 || len(rn.pendingReady.Messages) != 2 || len(rn.pendingReady.Committed) != 2 {
-		t.Fatal("barrier rejection changed pending ready")
+	if len(rn.frozenReady.Records) != 2 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Committed) != 2 {
+		t.Fatal("barrier rejection changed frozen ready")
 	}
 	advanceOK(t, rn, Ready{HardState: rd.HardState, Records: rd.Records[:1], MustSync: rd.MustSync})
-	if len(rn.pendingReady.Records) != 1 || len(rn.pendingReady.Messages) != 2 || len(rn.pendingReady.Committed) != 2 {
-		t.Fatal("partial record advance did not retain later work")
+	if len(rn.frozenReady.Records) != 1 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Committed) != 2 {
+		t.Fatal("partial record advance did not retain frozen work")
 	}
 	advanceOK(t, rn, rn.Ready())
 	if _, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}); err != nil {
@@ -533,7 +533,7 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 			t.Fatalf("step preaccept response from %d: %v", from, err)
 		}
 	}
-	if got, slow, fast := len(inst.preOK), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
+	if got, slow, fast := inst.preOK.len(), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
 		t.Fatalf("preaccept votes = %d, want slow quorum %d below fast quorum %d", got, slow, fast)
 	}
 	if inst.phase != phasePreAccept {
@@ -688,7 +688,7 @@ func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
 	for _, from := range []ReplicaID{2, 3, 4} {
 		stepMatchingPreAcceptResp(from)
 	}
-	if got, slow, fast := len(inst.preOK), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
+	if got, slow, fast := inst.preOK.len(), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
 		t.Fatalf("preaccept votes = %d, want slow quorum %d below fast quorum %d", got, slow, fast)
 	}
 	if inst.phase != phasePreAccept {
@@ -800,7 +800,7 @@ func TestFiveNodeOptimizedFastPathCommitsAtThreePreAcceptVotes(t *testing.T) {
 	}
 
 	stepMatchingPreAcceptResp(2)
-	if got := len(inst.preOK); got != 2 {
+	if got := inst.preOK.len(); got != 2 {
 		t.Fatalf("preaccept votes one below optimized quorum = %d, want 2", got)
 	}
 	if inst.phase != phasePreAccept {
@@ -921,7 +921,7 @@ func TestFiveNodeFastPathRequiresDepsCommittedEvidenceForDependency(t *testing.T
 	attrs := inst.rec.Attributes()
 
 	stepFiveNodeMatchingPreAcceptResp(t, rn, inst, ref, 2, 0)
-	if got := len(inst.preOK); got != 2 {
+	if got := inst.preOK.len(); got != 2 {
 		t.Fatalf("preaccept votes one below evidence-gated fast quorum = %d, want 2", got)
 	}
 	if rn.HasReady() {
@@ -1027,7 +1027,11 @@ func TestDepsCommittedPrefixEvidenceRequiresContiguousCommittedPrefix(t *testing
 			}
 
 			leader, inst, proposed := proposeFiveNodeCommandWithDependency(t, InstanceRef{Replica: 2, Instance: 2, Conf: 1}, StatusCommitted, tc.seedHole)
-			if got := inst.preOK[1].depsCommitted; got&(uint64(1)<<1) != 0 {
+			if vote, ok := inst.preOK.get(leader.q.conf, 1); !ok || vote.depsCommitted&(uint64(1)<<1) != 0 {
+				got := uint64(0)
+				if ok {
+					got = vote.depsCommitted
+				}
 				t.Fatalf("originator DepsCommitted=%05b, want replica 2 bit clear because %s is not committed", got, tc.wantCause)
 			}
 			attrs := inst.rec.Attributes()
@@ -1794,12 +1798,13 @@ func TestRemainingResponseBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := rn.instances[ref]
+	putAttrVoteSet(inst.preOK)
 	inst.preOK = nil
 	resp := Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Seq: inst.rec.Seq, Deps: inst.rec.Deps}
 	rn.handlePreAcceptResp(resp)
-	before := len(inst.preOK)
+	before := inst.preOK.len()
 	rn.handlePreAcceptResp(resp)
-	if len(inst.preOK) != before {
+	if inst.preOK.len() != before {
 		t.Fatal("duplicate preaccept response changed votes")
 	}
 	startPrepared := func(t *testing.T, voters int, rec InstanceRecord) (*RawNode, *instance, Ballot) {
@@ -1830,10 +1835,10 @@ func TestRemainingResponseBranches(t *testing.T) {
 		if prep.phase != phasePrepare {
 			t.Fatalf("single prepare response formed quorum: phase=%d", prep.phase)
 		}
-		votes := len(prep.prepareOK)
+		votes := prep.prepareOK.len()
 		rn.handlePrepareResp(resp)
-		if prep.phase != phasePrepare || len(prep.prepareOK) != votes {
-			t.Fatalf("duplicate prepare response changed recovery state: phase=%d votes=%d want phase=%d votes=%d", prep.phase, len(prep.prepareOK), phasePrepare, votes)
+		if prep.phase != phasePrepare || prep.prepareOK.len() != votes {
+			t.Fatalf("duplicate prepare response changed recovery state: phase=%d votes=%d want phase=%d votes=%d", prep.phase, prep.prepareOK.len(), phasePrepare, votes)
 		}
 		resp.From = 3
 		resp.Seq = 3

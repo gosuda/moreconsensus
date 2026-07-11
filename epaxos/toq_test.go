@@ -123,7 +123,7 @@ func TestTOQImmediateProcessAtProposeAssignsLocalAttrsAndValidatesMessages(t *te
 		}
 	}
 	inst := rn.instances[ref]
-	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.rec.ProcessAt != 0 || len(inst.preOK) != 1 {
+	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.rec.ProcessAt != 0 || inst.preOK.len() != 1 {
 		t.Fatalf("local immediate TOQ instance = %#v, want assigned local preaccept vote at ProcessAt 0", inst)
 	}
 	if got := rn.conflicts["toq-immediate-key"][1]; got != ref {
@@ -210,7 +210,7 @@ func TestTOQProposePersistsPendingAndSendsExplicitMessages(t *testing.T) {
 	if inst == nil {
 		t.Fatalf("missing local TOQ instance %s", ref)
 	}
-	if inst.rec.Status != StatusNone || !inst.rec.TOQPending || len(inst.preOK) != 0 {
+	if inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.preOK.len() != 0 {
 		t.Fatalf("local TOQ instance before ProcessAt = phase %d record %#v preOK %#v, want pending without local preaccept vote", inst.phase, inst.rec, inst.preOK)
 	}
 	if byReplica := rn.conflicts["toq-pending-key"]; len(byReplica) != 0 {
@@ -255,7 +255,7 @@ func TestTOQProcessAtAssignsLocalAttrsAndRetriesStayExplicit(t *testing.T) {
 		t.Fatalf("TOQ ProcessAt deps = %v, want no conflicts", assigned.Deps)
 	}
 	inst := rn.instances[ref]
-	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || len(inst.preOK) != 1 {
+	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.preOK.len() != 1 {
 		t.Fatalf("local TOQ instance after ProcessAt = %#v preOK %#v, want one local preaccept vote", inst, inst.preOK)
 	}
 	if got := rn.conflicts["toq-assign-key"][1]; got != ref {
@@ -305,7 +305,7 @@ func TestTOQPendingRetryCannotStartAcceptBeforeProcessAt(t *testing.T) {
 			t.Fatalf("step preaccept response from %d: %v", from, err)
 		}
 	}
-	if got, want := len(inst.preOK), rn.slowQuorumForConf(ref.Conf); got != want {
+	if got, want := inst.preOK.len(), rn.slowQuorumForConf(ref.Conf); got != want {
 		t.Fatalf("preaccept votes = %d, want slow quorum %d", got, want)
 	}
 
@@ -368,7 +368,7 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 	if inst == nil {
 		t.Fatalf("missing restarted local TOQ instance %s", ref)
 	}
-	if inst.phase != phasePreAccept || inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.rec.ProcessAt != processAt || !commandEqual(inst.rec.Command, cmd) || len(inst.preOK) != 0 {
+	if inst.phase != phasePreAccept || inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.rec.ProcessAt != processAt || !commandEqual(inst.rec.Command, cmd) || inst.preOK.len() != 0 {
 		t.Fatalf("restarted local TOQ instance before ProcessAt = %#v preOK %#v, want pending command without local preaccept vote", inst, inst.preOK)
 	}
 	if byReplica := restarted.conflicts["toq-restart-key"]; len(byReplica) != 1 || byReplica[2] != conflictRef {
@@ -855,7 +855,7 @@ func TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T
 		if inst == nil {
 			t.Fatalf("missing TOQ instance %s", ref)
 		}
-		if got := len(inst.preOK); got != 1 {
+		if got := inst.preOK.len(); got != 1 {
 			t.Fatalf("TOQ local assignment votes = %d, want exactly the local vote before remote responses", got)
 		}
 		return rn, store, ref, inst, localAttrs
@@ -1265,11 +1265,11 @@ func TestMaybeFinalizePreAcceptLeavesPendingTOQUnfinalized(t *testing.T) {
 		},
 		phase:     phasePreAccept,
 		processAt: 15,
-		preOK: map[ReplicaID]attrVote{
+		preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
 			1: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
 			2: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
 			3: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
-		},
+		}),
 	}
 	rn.instances[inst.rec.Ref] = inst
 	rn.maybeFinalizePreAccept(inst)

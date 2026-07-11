@@ -202,14 +202,14 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
-				if len(rd.Messages) != 1 || len(rn.pendingReady.Messages) != 2 {
-					t.Fatalf("ready messages = %#v pending=%#v, want one visible from two pending", rd.Messages, rn.pendingReady.Messages)
+				if len(rd.Messages) != 1 || len(rn.pendingReady.Messages) != 1 {
+					t.Fatalf("ready messages = %#v pending tail=%#v, want one visible and one retained", rd.Messages, rn.pendingReady.Messages)
 				}
 				return rn, rd
 			},
 			mismatched: func(rn *RawNode, rd Ready) Ready {
 				bad := cloneReady(rd)
-				bad.Messages = append(bad.Messages, rn.pendingReady.Messages[1].Clone())
+				bad.Messages = append(bad.Messages, rn.pendingReady.Messages[0].Clone())
 				return bad
 			},
 			verify: func(t *testing.T, rn *RawNode, rd Ready) {

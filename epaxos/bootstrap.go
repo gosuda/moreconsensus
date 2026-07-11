@@ -2056,10 +2056,11 @@ func (n *RawNode) proposeMembershipAt(ref InstanceRef, command Command) error {
 		FastPathEligible: true, TimingDomain: TimingDomainUntimed,
 	}
 	record.Checksum = ChecksumRecord(record)
-	inst := &instance{
-		rec: record, phase: phasePreAccept,
-		preOK:       map[ReplicaID]attrVote{n.id: {seq: record.Seq, deps: append([]InstanceNum(nil), record.Deps...), depsCommitted: n.committedDepsMask(record.Attributes(), ref.Conf), fastPathEligible: true}},
-		createdTick: n.tick,
+	inst := &instance{rec: record, phase: phasePreAccept, preOK: getAttrVoteSet(), createdTick: n.tick}
+	vote, ok := newAttrVote(n.confFor(ref.Conf), record.Seq, record.Deps, n.committedDepsMask(record.Attributes(), ref.Conf), true)
+	if !ok || !inst.preOK.add(n.confFor(ref.Conf), n.id, vote) {
+		putAttrVoteSet(inst.preOK)
+		return ErrInvalidConfig
 	}
 	n.installInstance(inst)
 	n.indexConflicts(record)

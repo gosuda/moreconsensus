@@ -49,13 +49,17 @@ func BenchmarkReadyRetry(b *testing.B) {
 			if _, err = n.Propose(benchmarkCommand(64)); err != nil {
 				b.Fatal(err)
 			}
-			_ = n.Ready()
 			var dst Ready
+			if err = n.ReadyInto(&dst); err != nil {
+				b.Fatal(err)
+			}
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				benchmarkReady = n.Ready()
-				benchmarkReady.CloneInto(&dst)
+			for range b.N {
+				if err = n.ReadyInto(&dst); err != nil {
+					b.Fatal(err)
+				}
+				benchmarkReady = dst
 			}
 		})
 	}

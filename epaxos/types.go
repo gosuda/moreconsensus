@@ -633,13 +633,13 @@ func (c CommittedCommand) Clone() CommittedCommand {
 
 // Ready batches records to persist, messages to send, and commands to apply.
 type Ready struct {
-	HardState        HardState
-	ConfigHistory    []ConfigHistoryEntry
-	Records          []InstanceRecord
-	BootstrapRecords []BootstrapRecord
-	LocalVoterState  *LocalVoterState
-	FrontierUpdates  []FrontierUpdate
-	AllocatorFloor   InstanceNum
+	HardState         HardState
+	ConfigHistory     []ConfigHistoryEntry
+	Records           []InstanceRecord
+	BootstrapRecords  []BootstrapRecord
+	LocalVoterState   *LocalVoterState
+	FrontierUpdates   []FrontierUpdate
+	AllocatorFloor    InstanceNum
 	Messages          []Message
 	BootstrapMessages []BootstrapMessage
 	Committed         []CommittedCommand
@@ -672,7 +672,6 @@ func (r Ready) CloneInto(dst *Ready) {
 		history[i] = sourceHistory[i].Clone()
 	}
 	clear(history[len(history):cap(history)])
-
 
 	sourceRecords := r.Records
 	if slicesPartiallyOverlap(dst.Records, sourceRecords) {
@@ -731,7 +730,6 @@ func (r Ready) CloneInto(dst *Ready) {
 	}
 	clear(frontiers[len(frontiers):cap(frontiers)])
 
-
 	sourceMessages := r.Messages
 	if slicesPartiallyOverlap(dst.Messages, sourceMessages) {
 		snapshot := make([]Message, len(sourceMessages))
@@ -771,7 +769,6 @@ func (r Ready) CloneInto(dst *Ready) {
 		bootstrapMessages[i] = sourceBootstrapMessages[i].Clone()
 	}
 	clear(bootstrapMessages[len(bootstrapMessages):cap(bootstrapMessages)])
-
 
 	sourceCommitted := r.Committed
 	if slicesPartiallyOverlap(dst.Committed, sourceCommitted) {
@@ -817,7 +814,8 @@ func (r Ready) Clone() Ready {
 	return out
 }
 
-// Release clears slice headers so a Ready value can be reused by the caller.
+// Release clears references and capacities held by a caller-owned Ready. It is
+// cleanup only: Ready values are not pooled or returned to package ownership.
 func (r *Ready) Release() {
 	for i := range r.Records {
 		r.Records[i] = InstanceRecord{}
@@ -854,6 +852,23 @@ func (r *Ready) Release() {
 	r.Committed = nil
 	r.BootstrapMessages = nil
 	r.MustSync = false
+}
+
+// RuntimeStats is an allocation-free snapshot of bounded runtime ownership.
+// Ready record/message counts include bootstrap records/messages in their
+// respective totals. Ages are measured only in deterministic logical ticks.
+type RuntimeStats struct {
+	ResidentInstances        int
+	ExecutedRefs             int
+	DeferredPreAccepts       int
+	ActiveRecoveries         int
+	FrozenReadyRecords       int
+	FrozenReadyMessages      int
+	PendingReadyRecords      int
+	PendingReadyMessages     int
+	NextReadyRecords         int
+	NextReadyMessages        int
+	OldestUnexecutedAgeTicks uint64
 }
 
 // StatusSnapshot is a copy-only view of node state for diagnostics and tests.

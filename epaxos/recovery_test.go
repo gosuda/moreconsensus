@@ -3246,7 +3246,7 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 			got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending || got.rec.Command.Kind != CommandNoop || !got.rec.FastPathEligible || !VerifyRecordChecksum(got.rec) {
 			t.Fatalf("TOQ-pending legacy no-op migration = %#v, want complete canonical local PreAccepted vote", got)
 		}
-		if _, selfVote := got.preOK[rn.id]; !selfVote {
+		if !got.preOK.has(rn.q.conf, rn.id) {
 			t.Fatalf("migrated local no-op did not restore self vote: %#v", got.preOK)
 		}
 		if len(rn.toqPreAccepts) != 0 || len(rn.deferredIndex) != 0 {
@@ -3442,7 +3442,7 @@ func TestDueTimerGenerationDeltaPreflightIsAtomic(t *testing.T) {
 		ballot := Ballot{Replica: 1}
 		command := optimizedTestCommand("timer-delta", "timer-delta-key")
 		rec := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 1), Command: command, FastPathEligible: true})
-		inst := &instance{rec: rec, phase: phasePreAccept, generation: generation, preOK: map[ReplicaID]attrVote{1: {seq: 1, deps: make([]InstanceNum, 1), fastPathEligible: true}}}
+		inst := &instance{rec: rec, phase: phasePreAccept, generation: generation, preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{1: {seq: 1, deps: make([]InstanceNum, 1), fastPathEligible: true}})}
 		rn.installInstance(inst)
 		if err := rn.schedule(inst, timerPreAccept, 1); err != nil {
 			t.Fatal(err)

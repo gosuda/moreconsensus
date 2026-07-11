@@ -7,11 +7,13 @@ var commandPool = sync.Pool{New: func() any { return new(Command) }}
 var decodeScratchPool = sync.Pool{New: func() any { return new(DecodeScratch) }}
 
 const (
-	maxPooledDependencyWidth = 7
-	maxPooledEvidenceEntries = 7
-	maxPooledConflictKeys    = 128
-	maxPooledPayloadBytes    = 64 << 10
-	maxPooledEvidenceDeps    = maxPooledDependencyWidth * maxPooledEvidenceEntries
+	maxPooledDependencyWidth       = 7
+	maxPooledEvidenceEntries       = 7
+	maxPooledConflictKeys          = 128
+	maxPooledPayloadBytes          = 64 << 10
+	maxPooledConflictKeyBytes      = 64 << 10
+	maxPooledConflictKeyArenaBytes = 256 << 10
+	maxPooledEvidenceDeps          = maxPooledDependencyWidth * maxPooledEvidenceEntries
 )
 
 func resetSliceForPool[T any](items []T, maxCapacity int) []T {
@@ -38,6 +40,33 @@ func resetNestedByteSlicesForPool(items [][]byte, maxOuterCapacity, maxInnerCapa
 	return full[:0]
 }
 
+func resetConflictKeysForPool(items [][]byte) [][]byte {
+	full := items[:cap(items)]
+	drop := cap(items) > maxPooledConflictKeys
+	aggregate := 0
+	for i := range full {
+		key := full[i]
+		clear(key[:cap(key)])
+		if cap(key) > maxPooledConflictKeyBytes || aggregate > maxPooledConflictKeyArenaBytes-cap(key) {
+			drop = true
+		}
+		aggregate += cap(key)
+	}
+	if aggregate > maxPooledConflictKeyArenaBytes {
+		drop = true
+	}
+	if drop {
+		for i := range full {
+			full[i] = nil
+		}
+		return nil
+	}
+	for i := range full {
+		full[i] = full[i][:0]
+	}
+	return full[:0]
+}
+
 func resetAcceptEvidenceForPool(items []AcceptEvidence) []AcceptEvidence {
 	full := items[:cap(items)]
 	if cap(items) > maxPooledEvidenceEntries {
@@ -56,7 +85,7 @@ func resetAcceptEvidenceForPool(items []AcceptEvidence) []AcceptEvidence {
 
 func resetCommandForPool(c *Command) {
 	payload := resetSliceForPool(c.Payload, maxPooledPayloadBytes)
-	conflictKeys := resetNestedByteSlicesForPool(c.ConflictKeys, maxPooledConflictKeys, maxPooledPayloadBytes)
+	conflictKeys := resetConflictKeysForPool(c.ConflictKeys)
 	*c = Command{Payload: payload, ConflictKeys: conflictKeys}
 }
 

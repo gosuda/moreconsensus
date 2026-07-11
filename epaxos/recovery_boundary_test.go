@@ -25,36 +25,24 @@ func cloneRecoveryBoundaryInstance(inst *instance) instance {
 	out := *inst
 	out.rec = inst.rec.Clone()
 	if inst.preOK != nil {
-		out.preOK = make(map[ReplicaID]attrVote, len(inst.preOK))
-		for id, vote := range inst.preOK {
-			vote.deps = append([]InstanceNum(nil), vote.deps...)
-			out.preOK[id] = vote
-		}
+		out.preOK = new(attrVoteSet)
+		*out.preOK = *inst.preOK
 	}
-	if inst.accOK != nil {
-		out.accOK = make(map[ReplicaID]struct{}, len(inst.accOK))
-		for id := range inst.accOK {
-			out.accOK[id] = struct{}{}
-		}
-	}
-	cloneRecords := func(records map[ReplicaID]InstanceRecord) map[ReplicaID]InstanceRecord {
+	cloneRecords := func(records *recordVoteSet) *recordVoteSet {
 		if records == nil {
 			return nil
 		}
-		cloned := make(map[ReplicaID]InstanceRecord, len(records))
-		for id, rec := range records {
-			cloned[id] = rec.Clone()
+		cloned := new(recordVoteSet)
+		cloned.mask = records.mask
+		for slot := range records.records {
+			if records.mask.hasSlot(slot) {
+				cloned.records[slot] = records.records[slot].Clone()
+			}
 		}
 		return cloned
 	}
 	out.prepareOK = cloneRecords(inst.prepareOK)
 	out.prepareEvidence = cloneRecords(inst.prepareEvidence)
-	if inst.tryOK != nil {
-		out.tryOK = make(map[ReplicaID]struct{}, len(inst.tryOK))
-		for id := range inst.tryOK {
-			out.tryOK[id] = struct{}{}
-		}
-	}
 	if inst.tryDeferred != nil {
 		out.tryDeferred = make(map[InstanceRef]struct{}, len(inst.tryDeferred))
 		for ref := range inst.tryDeferred {
@@ -163,7 +151,7 @@ func recoveryBoundaryRejectFixture(t *testing.T, typ MessageType, hint Ballot) (
 		inst.rec.Checksum = ChecksumRecord(inst.rec)
 	case MsgPrepareResp:
 		inst.phase = phasePrepare
-		inst.prepareOK = map[ReplicaID]InstanceRecord{1: inst.rec.Clone()}
+		inst.prepareOK = testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: inst.rec.Clone()})
 	default:
 		t.Fatalf("unsupported reject fixture %s", typ)
 	}
@@ -307,7 +295,7 @@ func TestEpochCarryBallotIsRecoveryAcrossValidationRestartAndFastGuard(t *testin
 	})
 	restarted := recoveryBoundaryNode(t, 1, 3, store)
 	inst := restarted.instances[ref]
-	if inst == nil || inst.phase != phasePrepare || len(inst.prepareOK) != 1 {
+	if inst == nil || inst.phase != phasePrepare || inst.prepareOK.len() != 1 {
 		t.Fatalf("carried recovery restart = %#v, want Prepare with durable self response", inst)
 	}
 	if restarted.canStillFastCommitPreAccept(inst) {
@@ -367,7 +355,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 			if recovered == nil || recovered.phase != phasePrepare || recovered.rec.Ballot != startedBallot {
 				t.Fatalf("restart phase/ballot = %#v, want Prepare/%#v", recovered, startedBallot)
 			}
-			self, ok := recovered.prepareOK[1]
+			self, ok := recovered.prepareOK.get(restarted.q.conf, 1)
 			if !ok || self.Ballot != startedBallot || self.RecordBallot != (Ballot{Replica: ref.Replica}) || self.Status != StatusPreAccepted || !commandEqual(self.Command, cmd) {
 				t.Fatalf("reconstructed self Prepare response = %#v", self)
 			}
@@ -399,8 +387,8 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 					Ref:          ref,
 					Ballot:       recovered.rec.Ballot,
 					RecordBallot: recovered.rec.RecordBallot,
-					Seq:           recovered.rec.Seq,
-					Deps:          append([]InstanceNum(nil), recovered.rec.Deps...),
+					Seq:          recovered.rec.Seq,
+					Deps:         append([]InstanceNum(nil), recovered.rec.Deps...),
 					RecordStatus: StatusAccepted,
 				}); err != nil {
 					t.Fatalf("Accept response from %d: %v", from, err)
@@ -451,7 +439,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 					Deps:             candidateDeps,
 					Command:          candidate,
 					FastPathEligible: false,
-				}), phase: phaseTryPreAccept, tryOK: map[ReplicaID]struct{}{1: {}}}
+				}), phase: phaseTryPreAccept, tryOK: testVoterMask(t, coordinator.q.conf, 1)}
 				coordinator.instances[ref] = candidateInst
 
 				acceptedDeps := follower.q.deps()
@@ -513,10 +501,10 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if candidateInst.phase != phasePrepare || candidateInst.rec.Ballot != wantPrepare || len(candidateInst.prepareOK) != 1 {
+				if candidateInst.phase != phasePrepare || candidateInst.rec.Ballot != wantPrepare || candidateInst.prepareOK.len() != 1 {
 					t.Fatalf("Accepted-target response phase/ballot/votes = %d/%#v/%#v", candidateInst.phase, candidateInst.rec.Ballot, candidateInst.prepareOK)
 				}
-				if evidence, ok := candidateInst.prepareEvidence[2]; !ok || evidence.Status != StatusAccepted || evidence.RecordBallot != acceptedRecordBallot || !commandEqual(evidence.Command, accepted) {
+				if evidence, ok := candidateInst.prepareEvidence.get(coordinator.q.conf, 2); !ok || evidence.Status != StatusAccepted || evidence.RecordBallot != acceptedRecordBallot || !commandEqual(evidence.Command, accepted) {
 					t.Fatalf("Accepted-target evidence not retained outside Prepare quorum: %#v", candidateInst.prepareEvidence)
 				}
 				beforeDuplicate := snapshotRecoveryBoundary(coordinator, candidateInst)
@@ -556,8 +544,8 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 						Ref:          ref,
 						Ballot:       candidateInst.rec.Ballot,
 						RecordBallot: candidateInst.rec.RecordBallot,
-						Seq:           candidateInst.rec.Seq,
-						Deps:          append([]InstanceNum(nil), candidateInst.rec.Deps...),
+						Seq:          candidateInst.rec.Seq,
+						Deps:         append([]InstanceNum(nil), candidateInst.rec.Deps...),
 						RecordStatus: StatusAccepted,
 					}); err != nil {
 						t.Fatalf("Accept response from surviving replica %d: %v", from, err)

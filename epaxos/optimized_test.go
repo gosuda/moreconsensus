@@ -743,7 +743,7 @@ func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
 		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 3, To: 1, Ref: ref, Ballot: ballot, Seq: attrs.Seq, Deps: attrs.Deps, RecordStatus: StatusPreAccepted}); err != nil {
 			t.Fatal(err)
 		}
-		if inst.phase != phaseTryPreAccept || len(inst.tryOK) != 2 {
+		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 2 {
 			t.Fatalf("after first actual witness phase/tryOK = %d/%#v, want try-preaccept with two total witnesses", inst.phase, inst.tryOK)
 		}
 		if rn.HasReady() {
@@ -894,7 +894,7 @@ func optimizedInstallTryRecoveryCandidate(t *testing.T, rn *RawNode, ref Instanc
 	}
 	rec := InstanceRecord{Ref: ref, Ballot: Ballot{Number: 1, Replica: rn.id}, RecordBallot: Ballot{Number: 1, Replica: rn.id}, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd}
 	rec.Checksum = ChecksumRecord(rec)
-	inst := &instance{rec: rec, phase: phaseTryPreAccept, prepareOK: prepareOK, tryOK: map[ReplicaID]struct{}{}}
+	inst := &instance{rec: rec, phase: phaseTryPreAccept, prepareOK: testRecordVoteSet(t, rn.q.conf, prepareOK)}
 	rn.instances[ref] = inst
 	return inst
 }

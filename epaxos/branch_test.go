@@ -14,7 +14,7 @@ func (f failingStorage) LoadInstances(func(InstanceRecord) error) error { return
 
 type loadFailStorage struct{ rec InstanceRecord }
 
-func (l loadFailStorage) InitialState() (StorageState, error)              { return StorageState{}, nil }
+func (l loadFailStorage) InitialState() (StorageState, error)               { return StorageState{}, nil }
 func (l loadFailStorage) LoadInstances(fn func(InstanceRecord) error) error { return fn(l.rec) }
 
 func TestConstructionAndReadyBranches(t *testing.T) {
@@ -136,7 +136,7 @@ func TestAcceptResponseAndConfigBranches(t *testing.T) {
 	inst.phase = phaseAccept
 	inst.rec.Status = StatusAccepted
 	inst.rec.RecordBallot = inst.rec.Ballot
-	inst.accOK = nil
+	inst.accOK = 0
 	rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()})
 	rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()})
 	rn.enqueueRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 99, Conf: 1}, Deps: rn.q.deps(), Command: Command{Kind: CommandNoop}})
@@ -320,7 +320,7 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 	currentBallot := inst.rec.Ballot
 	advanceOK(t, rn, rn.Ready())
 
-	inst.accOK = nil
+	inst.accOK = 0
 	if err := rn.Step(Message{
 		Type:         MsgAcceptResp,
 		From:         2,
@@ -334,7 +334,7 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if inst.accOK != nil || inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
+	if inst.accOK != 0 || inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("wrong-tuple accept response changed accept round: phase/status=%d/%s accOK=%#v", inst.phase, inst.rec.Status, inst.accOK)
 	}
 	if rn.HasReady() {
@@ -483,10 +483,10 @@ func TestCanFastCommitPreAcceptAdoptsCoveringTupleAtDefaultBallot(t *testing.T) 
 			},
 			phase:     phasePreAccept,
 			processAt: processAt,
-			preOK: map[ReplicaID]attrVote{
+			preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
 				2: {seq: remoteAttrs.Seq, deps: append([]InstanceNum(nil), remoteAttrs.Deps...), fastPathEligible: true},
 				3: {seq: remoteAttrs.Seq, deps: append([]InstanceNum(nil), remoteAttrs.Deps...), fastPathEligible: true},
-			},
+			}),
 		}
 		return rn, inst, remoteAttrs
 	}
@@ -529,10 +529,10 @@ func TestCanFastCommitPreAcceptRejectsIneligibleLocalRecordDespiteMatchingVotes(
 			FastPathEligible: false,
 		},
 		phase: phasePreAccept,
-		preOK: map[ReplicaID]attrVote{
+		preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
 			2: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
 			3: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
-		},
+		}),
 	}
 	if rn.canFastCommitPreAccept(inst, attrs) {
 		t.Fatalf("local attrs fast-committed even though local record is not FastPathEligible: candidate=%#v attrs=%#v", inst, attrs)
@@ -573,10 +573,10 @@ func TestTOQHigherAttrsFastCommitRejectsIneligibleLocalRecord(t *testing.T) {
 		},
 		phase:     phasePreAccept,
 		processAt: 15,
-		preOK: map[ReplicaID]attrVote{
+		preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
 			2: {seq: higherAttrs.Seq, deps: append([]InstanceNum(nil), higherAttrs.Deps...), fastPathEligible: true},
 			3: {seq: higherAttrs.Seq, deps: append([]InstanceNum(nil), higherAttrs.Deps...), fastPathEligible: true},
-		},
+		}),
 	}
 	if rn.canFastCommitPreAccept(inst, higherAttrs) {
 		t.Fatalf("TOQ higher attrs fast-committed while local record was not FastPathEligible: candidate=%#v attrs=%#v", inst, higherAttrs)
@@ -604,17 +604,19 @@ func TestCanFastCommitPreAcceptRejectsIneligibleRemoteVoteDespiteMatchingAttrs(t
 			FastPathEligible: true,
 		},
 		phase: phasePreAccept,
-		preOK: map[ReplicaID]attrVote{
+		preOK: testAttrVoteSet(t, rn.q.conf, map[ReplicaID]testAttrVote{
 			2: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: true},
 			3: {seq: attrs.Seq, deps: append([]InstanceNum(nil), attrs.Deps...), fastPathEligible: false},
-		},
+		}),
 	}
 	if rn.canFastCommitPreAccept(inst, attrs) {
 		t.Fatalf("local attrs fast-committed even though a matching remote vote is not FastPathEligible: candidate=%#v attrs=%#v", inst, attrs)
 	}
-	vote := inst.preOK[3]
+	vote, ok := inst.preOK.get(rn.q.conf, 3)
+	if !ok {
+		t.Fatal("missing remote vote")
+	}
 	vote.fastPathEligible = true
-	inst.preOK[3] = vote
 	if !rn.canFastCommitPreAccept(inst, attrs) {
 		t.Fatalf("matching fast-path-eligible remote votes were rejected; candidate=%#v attrs=%#v", inst, attrs)
 	}
