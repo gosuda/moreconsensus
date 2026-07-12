@@ -164,7 +164,7 @@ func writeOperationReport(operation, dataDir, checkpointDir string, info kv.Chec
 	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
 		return err
 	}
-	content := fmt.Sprintf("status=example-operator-report\noperation=%s\nresult=success\ndata_dir=%s\ncheckpoint_dir=%s\ncheckpoint_format=%s\nmanifest_version=%d\nmanifest_identity=%s\nsemantic_state_digest=%s\nrecord_count=%d\napplied_count=%d\nhard_state_digest=%s\nsource_identity=%s\nrelease_checksum=%s\ncurrent_target_claim=%t\nrelease_claim=none-target-environment-data-lifecycle-drill-still-required\n",
+	content := fmt.Sprintf("status=example-operator-report\noperation=%s\nresult=success\ndata_dir=%s\ncheckpoint_dir=%s\ncheckpoint_format=%s\nmanifest_version=%d\nmanifest_identity=%s\nsemantic_state_digest=%s\nrecord_count=%d\napplied_count=%d\nhard_state_digest=%s\nsource_identity=%s\nrelease_checksum=%s\ncurrent_target_claim=%t\nevidence_class=bounded-data-lifecycle\n",
 		operation,
 		strconv.Quote(dataDir),
 		strconv.Quote(checkpointDir),

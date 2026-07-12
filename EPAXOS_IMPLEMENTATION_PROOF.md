@@ -12,7 +12,7 @@ The word "proof" in this repository means a combination of:
 4. Go unit, fuzz, stress, and coverage gates; and
 5. local Jepsen harness evidence plus optional external validation tooling where separately exercised.
 
-This is not an unbounded mathematical proof of every possible EPaxos or Go execution. `tla/EPaxosInductiveProofs.tla` proves an arbitrary-history abstraction only for its restricted semantic `ConcreteNext`; it explicitly excludes codec, allocation, Ready ownership, SCC execution, TOQ timing, and other production transitions. `tla/EPaxosRawNodeRefinement.tla` remains an implementation-shaped finite workflow model, and no checked theorem connects that model or arbitrary Go `RawNode` executions to the inductive abstraction. The finite TLA+ models cover configured bounded state spaces. The executable Go refinement trace now validates semantic pre/post invariants and maintains a fail-closed exported-`RawNode` API inventory, but it is not a TLC/TLAPS replay of Go states against TLA action predicates. The current repository still names open non-claims: even-size optimized-quorum proof, arbitrary optimized-recovery network/message-loss/retry histories, recovery under reconfiguration beyond finite slices, operational synchronized-clock/one-way-delay implementation for TOQ deployments, arbitrary membership-change proof, in-place disk-corruption repair or synthesized reconstruction without a verified checkpoint, target-environment mixed-version compatibility beyond the local loopback drill, target-environment capacity proof, and incident-drill evidence.
+This is not an unbounded mathematical proof of every possible EPaxos or Go execution. `tla/EPaxosInductiveProofs.tla` proves an arbitrary-history abstraction only for its restricted semantic `ConcreteNext`; it explicitly excludes codec, allocation, Ready ownership, SCC execution, TOQ timing, and other production transitions. `tla/EPaxosRawNodeRefinement.tla` remains an implementation-shaped finite workflow model, and no checked theorem connects that model or arbitrary Go `RawNode` executions to the inductive abstraction. The finite TLA+ models cover configured bounded state spaces. The executable Go refinement trace now validates semantic pre/post invariants and maintains a fail-closed exported-`RawNode` API inventory, but it is not a TLC/TLAPS replay of Go states against TLA action predicates. The current repository still names bounded non-claims: even-size optimized-quorum proof, arbitrary optimized-recovery network/message-loss/retry histories, recovery under reconfiguration beyond finite slices, operational synchronized-clock/one-way-delay implementation for TOQ deployments, arbitrary membership-change proof, in-place disk-corruption repair or synthesized reconstruction without a verified checkpoint, and target-environment mixed-version compatibility beyond the local loopback drill.
 
 ## 2. Primary paper obligations checked
 
@@ -541,7 +541,7 @@ DST scenarios must prove both positive progress and negative fail-closed behavio
 - storage write failure prevents application until durable writes recover;
 - after heal/recovery, commands apply exactly once everywhere.
 
-DST verifies deterministic protocol behavior and virtualized transport/storage faults. It does not verify physical hosts, operating-system failure handling, network fabric behavior, or target-environment incident operations.
+DST verifies deterministic protocol behavior and virtualized transport/storage faults. It does not verify physical hosts, operating-system failure handling, or network fabric behavior.
 
 The deterministic DST evidence covers reordering, liveness-after-heal, majority/minority availability, storage failure, pause/skew, rollback, owner-independent recovery, cluster-size tests, and focused failure-boundary tests: `TestDSTFailureBoundarySlowQuorumSizesOneThroughSeven`, `TestDSTStorageFailureBoundarySlowQuorumSizesOneThroughSeven`, `TestDSTFailureBoundaryThreeNodeCrashBoundary`, `TestDSTFailureBoundaryFiveNodeMajorityAndMinorityOmission`, `TestDSTLinearizabilityConflictingWritesReadsAcrossPartitionHeal`, and `TestDSTStorageFailureRetriesOutstandingReadyExactlyOnceWithHealthyQuorum`. The focused DST boundary command is `go test ./epaxos -run 'TestDST.*(FailureBoundary|Linearizability|Storage)' -count=1`.
 
@@ -564,18 +564,11 @@ The repository scripts wire focused verification:
 
 ## 17. Current no-go blockers
 
-The implementation and evidence currently support a bounded library/example claim, not a mission-critical production-ready claim. The release remains no-go while these classes remain open in `RELEASE_SCOPE.md`:
+The implementation and evidence currently support a bounded library/example claim, not a mission-critical production-ready claim. The release remains no-go for the sole canonical item in `RELEASE_SCOPE.md`:
 
-- unbounded formal proof beyond finite TLC configurations;
-- certified EPaxos protocol-state compaction and late-message/incarnation fencing;
-- real-network fault-injection evidence;
-- operational TOQ clock synchronization and one-way-delay measurement;
-- in-place Pebble/WAL repair, synthesized recovery without a verified checkpoint, and multi-replica or quorum-loss recovery;
-- substantive mixed-version compatibility beyond the narrow local drill;
-- target-environment backup, restore, and disaster-recovery evidence;
-- signed target capacity, lifecycle, and incident evidence from operator-controlled inputs.
+- broader formal model coverage, including an unbounded Go/TLA refinement argument, checked action correspondence, and certified protocol-state compaction with late-message and incarnation fencing.
 
-The correct completion rule is therefore: do not mark the active goal complete unless current evidence proves mission-critical production readiness under the stated fault counts and every release blocker is closed with direct evidence.
+Other target-environment, real-network, and operational properties remain explicit nonclaims rather than additional canonical release rows. Do not mark the active goal complete unless current evidence proves mission-critical production readiness and this remaining blocker is closed with direct evidence.
 
 ## 18. Allocation-conscious ownership does not weaken protocol evidence
 

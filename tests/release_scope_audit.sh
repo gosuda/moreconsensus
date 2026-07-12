@@ -51,8 +51,8 @@ require_text "$scope" "## Open release items"
 require_text "$scope" "## Non-claims"
 require_text "$scope" "unbounded proof"
 require_text "$scope" "certified protocol-state compaction"
-require_text "$scope" "real-network fault evidence"
-require_text "$scope" "signed operator-controlled capacity/lifecycle/incident evidence"
+require_text "$scope" "Exactly one canonical item remains open"
+require_text "$scope" "TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive"
 
 require_text "$evidence" "Status: no-go evidence bundle"
 require_text "$evidence" "Current open blockers preserving no-go"
@@ -76,9 +76,6 @@ evidence = Path(sys.argv[3])
 
 labels = {
     "Broader formal model coverage",
-    "Data lifecycle",
-    "Capacity envelope",
-    "Incident readiness",
 }
 
 

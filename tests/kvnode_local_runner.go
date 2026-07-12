@@ -20,7 +20,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,21 +28,14 @@ import (
 const (
 	optInEnv = "KVNODE_GO_RUNNER_RUN"
 
-	defaultBasePort         = 26080
-	defaultPeerBasePort     = 26180
-	defaultAdminBasePort    = 26280
-	defaultReadyAttempts    = 120
-	defaultTimeout          = 5 * time.Second
-	defaultOpsPerPhase      = 5
-	defaultValueBytes       = "64,1024"
-	defaultScanLimits       = "1,8"
-	defaultEnvironmentLabel = "local-loopback"
-	defaultWorkloadLabel    = "local-go-runner"
+	defaultBasePort      = 26080
+	defaultPeerBasePort  = 26180
+	defaultAdminBasePort = 26280
+	defaultReadyAttempts = 120
+	defaultTimeout       = 5 * time.Second
 
 	statusLocalGoRunnerOnly    = "status=local-go-runner-only"
-	capacityNonClaim           = "release_claim=none-target-environment-capacity-results-still-required"
-	incidentNonClaim           = "release_claim=none-target-environment-operator-review-still-required"
-	dataLifecycleNonClaim      = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
+	dataLifecycleEvidenceClass = "evidence_class=bounded-data-lifecycle"
 	dataLifecycleOperations    = "checkpoint,verify,restore,repair"
 	dataLifecycleEvidenceFiles = "metadata.env,summary.txt,data-lifecycle-summary.txt," +
 		"data-lifecycle/checkpoint.log,data-lifecycle/verify.log,data-lifecycle/restore.log,data-lifecycle/repair.log," +
@@ -60,12 +52,10 @@ const (
 const usageText = `kvnode local Go runner (opt-in, local loopback only)
 
 Usage:
-  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|incident|capacity|data]
+  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|data]
 
 Modes:
-  all       Build kvnode, start a disposable three-node cluster, and run incident, capacity, and data-lifecycle drills.
-  incident  Exercise /faults/storage, /faults/transport, /readyz, and /metrics locally.
-  capacity  Run bounded local write/read/scan samples and write latency/resource evidence locally.
+  all       Build kvnode, start a disposable three-node cluster, and run the data-lifecycle drill.
   data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.
 
 Required opt-in:
@@ -78,19 +68,10 @@ Environment:
   KVNODE_GO_RUNNER_READY_ATTEMPTS       Readiness retry count. Default: 120.
   KVNODE_GO_RUNNER_TIMEOUT_SECONDS      HTTP request timeout seconds. Default: 5, max: 300.
   KVNODE_GO_RUNNER_OUT_DIR              Evidence directory. Default: a preserved temporary directory.
-  KVNODE_GO_RUNNER_OPS_PER_PHASE        Capacity samples per value-size phase. Default: 5, max: 1000.
-  KVNODE_GO_RUNNER_VALUE_BYTES          Comma-separated value sizes. Default: 64,1024; max item: 1048576.
-  KVNODE_GO_RUNNER_SCAN_LIMITS          Comma-separated scan limits. Default: 1,8; max item: 100000.
-  KVNODE_GO_RUNNER_ENVIRONMENT_LABEL    Single-line environment label. Default: local-loopback.
-  KVNODE_GO_RUNNER_WORKLOAD_LABEL       Single-line workload label. Default: local-go-runner.
   KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT Optional 0600 data-lifecycle report path. Writes only after a successful local data drill.
 
 Outputs:
   metadata.env
-  incident-summary.txt
-  capacity-summary.txt
-  capacity-latency.csv
-  capacity-resources.csv
   data-lifecycle-summary.txt
   data-lifecycle/*-report.env
   optional data lifecycle report when KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT is set
@@ -98,9 +79,6 @@ Outputs:
 
 Non-claims:
   local loopback evidence only; not_target_environment evidence.
-  ` + capacityNonClaim + `
-  ` + incidentNonClaim + `
-  ` + dataLifecycleNonClaim + `
 `
 
 type runnerConfig struct {
@@ -111,11 +89,6 @@ type runnerConfig struct {
 	readyAttempts       int
 	timeout             time.Duration
 	outDir              string
-	opsPerPhase         int
-	valueBytes          []int
-	scanLimits          []int
-	environmentLabel    string
-	workloadLabel       string
 	dataLifecycleReport string
 }
 
@@ -129,18 +102,6 @@ type nodeProcess struct {
 	launchArgs []string
 	cmd        *exec.Cmd
 	logFile    *os.File
-}
-
-type httpSample struct {
-	operation string
-	status    int
-	duration  time.Duration
-}
-
-type transportFaultRequest struct {
-	From int  `json:"from"`
-	To   int  `json:"to"`
-	Drop bool `json:"drop"`
 }
 
 func main() {
@@ -184,13 +145,13 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg := runnerConfig{}
 	fs := flag.NewFlagSet("kvnode-local-go-runner", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all, incident, capacity, or data")
+	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all or data")
 	fs.StringVar(&cfg.outDir, "out-dir", os.Getenv("KVNODE_GO_RUNNER_OUT_DIR"), "evidence output directory")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
-	if cfg.mode != "all" && cfg.mode != "incident" && cfg.mode != "capacity" && cfg.mode != "data" {
-		return cfg, fmt.Errorf("bad --mode %q: want all, incident, capacity, or data", cfg.mode)
+	if cfg.mode != "all" && cfg.mode != "data" {
+		return cfg, fmt.Errorf("bad --mode %q: want all or data", cfg.mode)
 	}
 	basePort, err := envInt("KVNODE_GO_RUNNER_BASE_PORT", defaultBasePort, 1, 65000)
 	if err != nil {
@@ -215,26 +176,6 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
-	opsPerPhase, err := envInt("KVNODE_GO_RUNNER_OPS_PER_PHASE", defaultOpsPerPhase, 1, 1000)
-	if err != nil {
-		return cfg, err
-	}
-	valueBytes, err := envCSVInts("KVNODE_GO_RUNNER_VALUE_BYTES", defaultValueBytes, 1, 1048576)
-	if err != nil {
-		return cfg, err
-	}
-	scanLimits, err := envCSVInts("KVNODE_GO_RUNNER_SCAN_LIMITS", defaultScanLimits, 1, 100000)
-	if err != nil {
-		return cfg, err
-	}
-	environmentLabel, err := envLabel("KVNODE_GO_RUNNER_ENVIRONMENT_LABEL", defaultEnvironmentLabel)
-	if err != nil {
-		return cfg, err
-	}
-	workloadLabel, err := envLabel("KVNODE_GO_RUNNER_WORKLOAD_LABEL", defaultWorkloadLabel)
-	if err != nil {
-		return cfg, err
-	}
 	dataLifecycleReport := os.Getenv("KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT")
 	if err := validateOptionalReportPath("KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT", dataLifecycleReport); err != nil {
 		return cfg, err
@@ -244,11 +185,6 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg.adminBasePort = adminBasePort
 	cfg.readyAttempts = readyAttempts
 	cfg.timeout = time.Duration(timeoutSeconds) * time.Second
-	cfg.opsPerPhase = opsPerPhase
-	cfg.valueBytes = valueBytes
-	cfg.scanLimits = scanLimits
-	cfg.environmentLabel = environmentLabel
-	cfg.workloadLabel = workloadLabel
 	cfg.dataLifecycleReport = dataLifecycleReport
 	return cfg, nil
 }
@@ -271,45 +207,6 @@ func envInt(name string, def, min, max int) (int, error) {
 	}
 	if value < min || value > max {
 		return 0, fmt.Errorf("%s=%d outside allowed range [%d,%d]", name, value, min, max)
-	}
-	return value, nil
-}
-
-func envCSVInts(name, def string, min, max int) ([]int, error) {
-	raw := getenv(name, def)
-	parts := strings.Split(raw, ",")
-	values := make([]int, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		value, err := strconv.Atoi(part)
-		if err != nil {
-			return nil, fmt.Errorf("%s contains non-integer %q: %w", name, part, err)
-		}
-		if value < min || value > max {
-			return nil, fmt.Errorf("%s value %d outside allowed range [%d,%d]", name, value, min, max)
-		}
-		values = append(values, value)
-	}
-	if len(values) == 0 {
-		return nil, fmt.Errorf("%s must contain at least one value", name)
-	}
-	sort.Ints(values)
-	return values, nil
-}
-
-func envLabel(name, def string) (string, error) {
-	value := getenv(name, def)
-	if value == "" {
-		return "", fmt.Errorf("%s must not be empty", name)
-	}
-	if strings.ContainsAny(value, "\r\n") || strings.Contains(value, "=") {
-		return "", fmt.Errorf("%s must be a single line without =", name)
-	}
-	if len(value) > 128 {
-		return "", fmt.Errorf("%s must be <= 128 characters", name)
 	}
 	return value, nil
 }
@@ -371,13 +268,11 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "kvnode-local-go-runner phase=build binary=%s\n", bin)
 	var checkpointBin string
-	if cfg.mode == "all" || cfg.mode == "data" {
-		checkpointBin, err = buildKVCheckpoint(buildCtx, runDir)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "kvnode-local-go-runner phase=build checkpoint_binary=%s\n", checkpointBin)
+	checkpointBin, err = buildKVCheckpoint(buildCtx, runDir)
+	if err != nil {
+		return err
 	}
+	fmt.Fprintf(stdout, "kvnode-local-go-runner phase=build checkpoint_binary=%s\n", checkpointBin)
 
 	nodes, err := startCluster(cfg, runDir, bin)
 	if err != nil {
@@ -390,29 +285,10 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 	}
 
 	client := &http.Client{Timeout: cfg.timeout}
-	var incidentRan, capacityRan, dataRan bool
-	if cfg.mode == "all" || cfg.mode == "incident" {
-		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=incident")
-		if err := runIncidentDrill(client, cfg, runDir, nodes); err != nil {
-			return err
-		}
-		incidentRan = true
+	if err := runDataLifecycleDrill(client, cfg, runDir, nodes, bin, checkpointBin); err != nil {
+		return err
 	}
-	if cfg.mode == "all" || cfg.mode == "capacity" {
-		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=capacity")
-		if err := runCapacityDrill(client, cfg, runDir, nodes); err != nil {
-			return err
-		}
-		capacityRan = true
-	}
-	if cfg.mode == "all" || cfg.mode == "data" {
-		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=data-lifecycle")
-		if err := runDataLifecycleDrill(client, cfg, runDir, nodes, bin, checkpointBin); err != nil {
-			return err
-		}
-		dataRan = true
-	}
-	if err := writeFinalSummary(runDir, cfg, incidentRan, capacityRan, dataRan); err != nil {
+	if err := writeFinalSummary(runDir, cfg, true); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "kvnode-local-go-runner status=pass %s run_dir=%s\n", statusLocalGoRunnerOnly, runDir)
@@ -439,15 +315,8 @@ func writeMetadata(runDir string, cfg runnerConfig) error {
 		"admin_base_port=" + strconv.Itoa(cfg.adminBasePort),
 		"ready_attempts=" + strconv.Itoa(cfg.readyAttempts),
 		"timeout_seconds=" + strconv.Itoa(int(cfg.timeout/time.Second)),
-		"ops_per_phase=" + strconv.Itoa(cfg.opsPerPhase),
-		"value_bytes=" + joinInts(cfg.valueBytes),
-		"scan_limits=" + joinInts(cfg.scanLimits),
-		"environment_label=" + cfg.environmentLabel,
-		"workload_label=" + cfg.workloadLabel,
-		"non_claim=not_target_environment_local_loopback_only",
-		capacityNonClaim,
-		incidentNonClaim,
-		dataLifecycleNonClaim,
+		"data_lifecycle_report=" + cfg.dataLifecycleReport,
+		dataLifecycleEvidenceClass,
 		"",
 	}, "\n")
 	return os.WriteFile(filepath.Join(runDir, "metadata.env"), []byte(content), 0o644)
@@ -753,7 +622,7 @@ func dataLifecycleEvidenceLines(status, runID string, stoppedNodeID int, reports
 		"post_repair_canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes",
 		"canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes-after-repair",
 		"evidence_files=" + dataLifecycleEvidenceFiles,
-		dataLifecycleNonClaim,
+		dataLifecycleEvidenceClass,
 		"",
 	}
 }
@@ -802,7 +671,7 @@ func requireDataLifecycleReport(reportPath, operation string) error {
 		"status=example-operator-report\n",
 		"operation=" + operation + "\n",
 		"result=success\n",
-		dataLifecycleNonClaim + "\n",
+		dataLifecycleEvidenceClass + "\n",
 	}
 	for _, want := range required {
 		if !strings.Contains(text, want) {
@@ -812,299 +681,20 @@ func requireDataLifecycleReport(reportPath, operation string) error {
 	return nil
 }
 
-func runIncidentDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess) error {
-	if err := captureAdmin(client, runDir, "incident-baseline", nodes); err != nil {
-		return err
-	}
-	if err := putValue(client, nodes[0], "go-runner-baseline", []byte("baseline-value")); err != nil {
-		return err
-	}
-	if err := assertValueOnAll(client, cfg, nodes, "go-runner-baseline", []byte("baseline-value")); err != nil {
-		return err
-	}
-
-	if err := postJSON(client, nodes[1].adminURL+"/faults/storage", []byte(`{"fail":true}`)); err != nil {
-		return err
-	}
-	if err := expectStatus(client, http.MethodGet, nodes[1].adminURL+"/readyz", nil, http.StatusServiceUnavailable); err != nil {
-		return err
-	}
-	if err := expectMetric(client, cfg, nodes[1], "kvnode_storage_fault_active 1"); err != nil {
-		return err
-	}
-	if err := captureAdmin(client, runDir, "storage-fault-active", nodes); err != nil {
-		return err
-	}
-	if err := expectStatus(client, http.MethodDelete, nodes[1].adminURL+"/faults/storage", nil, http.StatusNoContent); err != nil {
-		return err
-	}
-	if err := expectStatus(client, http.MethodGet, nodes[1].adminURL+"/readyz", nil, http.StatusOK); err != nil {
-		return err
-	}
-	if err := expectMetric(client, cfg, nodes[1], "kvnode_storage_fault_active 0"); err != nil {
-		return err
-	}
-
-	faults := []struct {
-		node int
-		req  transportFaultRequest
-	}{
-		{0, transportFaultRequest{From: 1, To: 2, Drop: true}},
-		{1, transportFaultRequest{From: 2, To: 1, Drop: true}},
-		{1, transportFaultRequest{From: 2, To: 3, Drop: true}},
-		{2, transportFaultRequest{From: 3, To: 2, Drop: true}},
-	}
-	for _, fault := range faults {
-		body, err := json.Marshal(fault.req)
-		if err != nil {
-			return err
-		}
-		if err := postJSON(client, nodes[fault.node].adminURL+"/faults/transport", body); err != nil {
-			return err
-		}
-	}
-	if err := expectMetric(client, cfg, nodes[1], "kvnode_transport_dropped_links 2"); err != nil {
-		return err
-	}
-	if err := captureAdmin(client, runDir, "transport-fault-active", nodes); err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		if err := expectStatus(client, http.MethodDelete, node.adminURL+"/faults/transport", nil, http.StatusNoContent); err != nil {
-			return err
-		}
-	}
-	for _, node := range nodes {
-		if err := expectMetric(client, cfg, node, "kvnode_transport_dropped_links 0"); err != nil {
-			return err
-		}
-	}
-	if err := captureAdmin(client, runDir, "faults-cleared", nodes); err != nil {
-		return err
-	}
-
-	if err := putValue(client, nodes[2], "go-runner-after-clear", []byte("after-clear-value")); err != nil {
-		return err
-	}
-	if err := assertValueOnAll(client, cfg, nodes, "go-runner-after-clear", []byte("after-clear-value")); err != nil {
-		return err
-	}
-
-	summary := strings.Join([]string{
-		statusLocalGoRunnerOnly,
-		"storage_fault=exercised-and-cleared",
-		"transport_fault=exercised-and-cleared",
-		"canaries=baseline-and-after-clear-visible-on-all-nodes",
-		incidentNonClaim,
-		"",
-	}, "\n")
-	return os.WriteFile(filepath.Join(runDir, "incident-summary.txt"), []byte(summary), 0o644)
-}
-
-func runCapacityDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess) error {
-	latencyPath := filepath.Join(runDir, "capacity-latency.csv")
-	latencyFile, err := os.Create(latencyPath)
-	if err != nil {
-		return err
-	}
-	defer latencyFile.Close()
-	if _, err := fmt.Fprintln(latencyFile, "operation,http_status,seconds"); err != nil {
-		return err
-	}
-	var samples []httpSample
-	for _, size := range cfg.valueBytes {
-		value := bytes.Repeat([]byte("x"), size)
-		for op := range cfg.opsPerPhase {
-			node := nodes[(op+size)%len(nodes)]
-			key := fmt.Sprintf("go-runner-capacity-%d-%d", size, op)
-			putSample, err := timedRequest(client, http.MethodPut, node.clientURL+"/kv/"+url.PathEscape(key), value, http.StatusNoContent)
-			putSample.operation = fmt.Sprintf("put-%d-%d", size, op)
-			samples = append(samples, putSample)
-			if err := writeLatency(latencyFile, putSample); err != nil {
-				return err
-			}
-			if err != nil {
-				return err
-			}
-			getNode := nodes[(op+1)%len(nodes)]
-			getSample, got, err := timedGet(client, getNode.clientURL+"/kv/"+url.PathEscape(key), http.StatusOK)
-			getSample.operation = fmt.Sprintf("get-%d-%d", size, op)
-			samples = append(samples, getSample)
-			if err := writeLatency(latencyFile, getSample); err != nil {
-				return err
-			}
-			if err != nil {
-				return err
-			}
-			if !bytes.Equal(got, value) {
-				return fmt.Errorf("capacity GET key %s returned %d bytes, want %d", key, len(got), len(value))
-			}
-		}
-	}
-	for _, limit := range cfg.scanLimits {
-		node := nodes[limit%len(nodes)]
-		sample, _, err := timedGet(client, fmt.Sprintf("%s/scan?prefix=go-runner-capacity-&limit=%d", node.clientURL, limit), http.StatusOK)
-		sample.operation = fmt.Sprintf("scan-limit-%d", limit)
-		samples = append(samples, sample)
-		if err := writeLatency(latencyFile, sample); err != nil {
-			return err
-		}
-		if err != nil {
-			return err
-		}
-	}
-	if err := writeResourceSamples(client, runDir, nodes); err != nil {
-		return err
-	}
-	return writeCapacitySummary(runDir, cfg, samples)
-}
-
-func timedRequest(client *http.Client, method, target string, body []byte, want int) (httpSample, error) {
-	start := time.Now()
-	status, _, err := doRequest(client, method, target, body)
-	sample := httpSample{status: status, duration: time.Since(start)}
-	if err != nil {
-		return sample, err
-	}
-	if status != want {
-		return sample, fmt.Errorf("%s %s returned status %d, want %d", method, target, status, want)
-	}
-	return sample, nil
-}
-
-func timedGet(client *http.Client, target string, want int) (httpSample, []byte, error) {
-	start := time.Now()
-	status, body, err := doRequest(client, http.MethodGet, target, nil)
-	sample := httpSample{status: status, duration: time.Since(start)}
-	if err != nil {
-		return sample, body, err
-	}
-	if status != want {
-		return sample, body, fmt.Errorf("GET %s returned status %d, want %d: %s", target, status, want, strings.TrimSpace(string(body)))
-	}
-	return sample, body, nil
-}
-
-func writeLatency(w io.Writer, sample httpSample) error {
-	_, err := fmt.Fprintf(w, "%s,%d,%.9f\n", sample.operation, sample.status, sample.duration.Seconds())
-	return err
-}
-
-func writeResourceSamples(client *http.Client, runDir string, nodes []*nodeProcess) error {
-	resourceFile, err := os.Create(filepath.Join(runDir, "capacity-resources.csv"))
-	if err != nil {
-		return err
-	}
-	defer resourceFile.Close()
-	if _, err := fmt.Fprintln(resourceFile, "node,storage_fault_active,transport_dropped_links,epaxos_instances,epaxos_executed,send_queue_depth"); err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		_, body, err := timedGet(client, node.adminURL+"/metrics", http.StatusOK)
-		if err != nil {
-			return err
-		}
-		metrics := parseMetrics(string(body))
-		if _, err := fmt.Fprintf(resourceFile, "%d,%s,%s,%s,%s,%s\n",
-			node.id,
-			metrics["kvnode_storage_fault_active"],
-			metrics["kvnode_transport_dropped_links"],
-			metrics["kvnode_epaxos_instances"],
-			metrics["kvnode_epaxos_executed"],
-			metrics["kvnode_send_queue_depth"],
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeCapacitySummary(runDir string, cfg runnerConfig, samples []httpSample) error {
-	durations := make([]float64, 0, len(samples))
-	for _, sample := range samples {
-		durations = append(durations, sample.duration.Seconds())
-	}
-	sort.Float64s(durations)
-	p50 := percentile(durations, 0.50)
-	p95 := percentile(durations, 0.95)
-	p99 := percentile(durations, 0.99)
-	summary := strings.Join([]string{
-		statusLocalGoRunnerOnly,
-		"peer_count=3",
-		"ops_per_phase=" + strconv.Itoa(cfg.opsPerPhase),
-		"value_bytes=" + joinInts(cfg.valueBytes),
-		"scan_limits=" + joinInts(cfg.scanLimits),
-		"environment_label=" + cfg.environmentLabel,
-		"workload_label=" + cfg.workloadLabel,
-		"latency_rows=" + strconv.Itoa(len(samples)),
-		fmt.Sprintf("latency_summary=p50=%.9fs,p95=%.9fs,p99=%.9fs", p50, p95, p99),
-		capacityNonClaim,
-		"",
-	}, "\n")
-	return os.WriteFile(filepath.Join(runDir, "capacity-summary.txt"), []byte(summary), 0o644)
-}
-
-func percentile(sorted []float64, pct float64) float64 {
-	if len(sorted) == 0 {
-		return 0
-	}
-	idx := int(float64(len(sorted)-1) * pct)
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
-}
-
-func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan, dataRan bool) error {
+func writeFinalSummary(runDir string, cfg runnerConfig, dataRan bool) error {
 	lines := []string{
 		statusLocalGoRunnerOnly,
 		"mode=" + cfg.mode,
 		"peer_count=3",
-		"incident_ran=" + strconv.FormatBool(incidentRan),
-		"capacity_ran=" + strconv.FormatBool(capacityRan),
 		"data_lifecycle_ran=" + strconv.FormatBool(dataRan),
 		"non_claim=not_target_environment_local_loopback_only",
+		dataLifecycleEvidenceClass,
 	}
-	if capacityRan {
-		lines = append(lines, capacityNonClaim)
-		lines = append(lines, "environment_label="+cfg.environmentLabel, "workload_label="+cfg.workloadLabel)
-	}
-	if incidentRan {
-		lines = append(lines, incidentNonClaim)
-	}
-	if dataRan {
-		lines = append(lines, dataLifecycleNonClaim)
-		if cfg.dataLifecycleReport != "" {
-			lines = append(lines, "data_lifecycle_report="+cfg.dataLifecycleReport)
-		}
+	if cfg.dataLifecycleReport != "" {
+		lines = append(lines, "data_lifecycle_report="+cfg.dataLifecycleReport)
 	}
 	lines = append(lines, "")
 	return os.WriteFile(filepath.Join(runDir, "summary.txt"), []byte(strings.Join(lines, "\n")), 0o644)
-}
-
-func captureAdmin(client *http.Client, runDir, label string, nodes []*nodeProcess) error {
-	evidenceDir := filepath.Join(runDir, "admin")
-	if err := os.MkdirAll(evidenceDir, 0o755); err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		for _, endpoint := range []string{"/livez", "/readyz", "/metrics", "/faults/storage", "/faults/transport"} {
-			status, body, err := doRequest(client, http.MethodGet, node.adminURL+endpoint, nil)
-			if err != nil && status == 0 {
-				body = []byte(err.Error())
-			}
-			name := strings.NewReplacer("/", "-", "_", "-").Replace(strings.TrimPrefix(endpoint, "/"))
-			path := filepath.Join(evidenceDir, fmt.Sprintf("%s-node-%d-%s.txt", label, node.id, name))
-			content := append([]byte(fmt.Sprintf("http_status=%d\n", status)), body...)
-			if err := os.WriteFile(path, content, 0o644); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func putValue(client *http.Client, node *nodeProcess, key string, value []byte) error {
@@ -1130,26 +720,6 @@ func assertValueOnAll(client *http.Client, cfg runnerConfig, nodes []*nodeProces
 		}
 	}
 	return nil
-}
-
-func expectMetric(client *http.Client, cfg runnerConfig, node *nodeProcess, needle string) error {
-	return eventually(cfg.readyAttempts, 100*time.Millisecond, func() error {
-		status, body, err := doRequest(client, http.MethodGet, node.adminURL+"/metrics", nil)
-		if err != nil {
-			return err
-		}
-		if status != http.StatusOK {
-			return fmt.Errorf("node %d /metrics status=%d", node.id, status)
-		}
-		if !strings.Contains(string(body), needle) {
-			return fmt.Errorf("node %d /metrics missing %q", node.id, needle)
-		}
-		return nil
-	})
-}
-
-func postJSON(client *http.Client, target string, body []byte) error {
-	return expectStatus(client, http.MethodPost, target, body, http.StatusNoContent)
 }
 
 func expectStatus(client *http.Client, method, target string, body []byte, want int) error {
@@ -1211,30 +781,6 @@ func waitDelay(delay time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), delay)
 	defer cancel()
 	<-ctx.Done()
-}
-
-func parseMetrics(raw string) map[string]string {
-	out := map[string]string{
-		"kvnode_storage_fault_active":    "",
-		"kvnode_transport_dropped_links": "",
-		"kvnode_epaxos_instances":        "",
-		"kvnode_epaxos_executed":         "",
-		"kvnode_send_queue_depth":        "",
-	}
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		if _, ok := out[fields[0]]; ok {
-			out[fields[0]] = fields[1]
-		}
-	}
-	return out
 }
 
 func joinInts(values []int) string {

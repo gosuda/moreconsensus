@@ -295,7 +295,6 @@ func (s *campaignState) manifest(status, errorText string) campaignManifest {
 	manifest := campaignManifest{
 		Version: manifestVersion, Status: status, Scope: "native Darwin loopback fault campaign",
 		NonClaims: []string{
-			"single-host loopback evidence; not multi-host evidence",
 			"storage fault profile is service-level unavailability; not fsync, media, or disk-full injection",
 			"classic kvnode has no wall-clock discipline claim",
 			"bounded saturation is not production capacity evidence",

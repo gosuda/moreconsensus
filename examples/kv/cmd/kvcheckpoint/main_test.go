@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -934,7 +934,7 @@ func requireOperationReport(t *testing.T, reportPath string, operation string, d
 		"source_identity":      `""`,
 		"release_checksum":     `""`,
 		"current_target_claim": "true",
-		"release_claim":        "none-target-environment-data-lifecycle-drill-still-required",
+		"evidence_class":       "bounded-data-lifecycle",
 	}
 	for key, value := range want {
 		if fields[key] != value {

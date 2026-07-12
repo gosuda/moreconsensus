@@ -2,6 +2,7 @@ package epaxos
 
 import (
 	"bytes"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -521,6 +522,177 @@ func TestDSTStorageFailureRetriesOutstandingReadyExactlyOnceWithHealthyQuorum(t 
 	s.stores[1].FailWrites = false
 	s.tickAll(18)
 	dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{proposal})
+}
+
+func TestDSTDataLifecycleCheckpointRestoreAndCorruptionRejection(t *testing.T) {
+	s := newSimCluster(t, 3, false)
+	first := dstPut(2501, 1, "lifecycle-before", "durable")
+	firstRef, err := s.nodes[1].Propose(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstProposal := dstProposal{ref: firstRef, cmd: first}
+	s.tickAll(20)
+	dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{firstProposal})
+
+	checkpointStore := cloneMemoryStorage(s.stores[3])
+	checkpointApp := cloneCommittedCommands(s.apps[3])
+	second := dstPut(2501, 2, "lifecycle-after", "restore")
+	secondRef, err := s.nodes[2].Propose(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProposal := dstProposal{ref: secondRef, cmd: second}
+	s.tickAll(20)
+	dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{firstProposal, secondProposal})
+
+	s.restart(3, checkpointStore)
+	s.apps[3] = checkpointApp
+	third := dstPut(2501, 3, "lifecycle-after", "recovered")
+	thirdRef, err := s.nodes[1].Propose(third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdProposal := dstProposal{ref: thirdRef, cmd: third}
+	s.tickAll(30)
+	dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{firstProposal, secondProposal, thirdProposal})
+
+	corrupt := cloneMemoryStorage(checkpointStore)
+	for ref, record := range corrupt.Records {
+		record.Checksum[0] ^= 0xff
+		corrupt.Records[ref] = record
+		break
+	}
+	if _, err := NewRawNode(Config{ID: 3, Voters: makeIDs(3), Storage: corrupt}); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("corrupt checkpoint restart err=%v, want %v", err, ErrChecksumMismatch)
+	}
+}
+
+func TestDSTTransientFaultCasesRemainAvailableAndRecover(t *testing.T) {
+	t.Run("transient_member_pause", func(t *testing.T) {
+		s := newSimCluster(t, 3, false)
+		s.pause(3)
+		cmd := dstPut(2601, 1, "transient-pause", "quorum")
+		ref, err := s.nodes[1].Propose(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal := dstProposal{ref: ref, cmd: cmd}
+		s.tickAll(8)
+		for _, id := range []ReplicaID{1, 2} {
+			dstRequireAppliedExactlyOnce(t, s.apps[id], id, proposal)
+		}
+		dstRequireAppliedCount(t, s.apps[3], 3, proposal, 0)
+		s.resume(3)
+		s.tickAll(20)
+		dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{proposal})
+	})
+
+	t.Run("storage_rejection_retry", func(t *testing.T) {
+		s := newSimCluster(t, 3, false)
+		s.stores[1].FailWrites = true
+		cmd := dstPut(2602, 1, "transient-storage", "retry")
+		ref, err := s.nodes[1].Propose(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal := dstProposal{ref: ref, cmd: cmd}
+		if blocked := dstTickAllAllowingStorageFailures(t, s, 8); blocked == 0 {
+			t.Fatal("storage failure did not reject a durable write")
+		}
+		dstRequireNoApplications(t, s)
+		s.stores[1].FailWrites = false
+		s.tickAll(24)
+		dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{proposal})
+	})
+}
+
+type dstPerformanceResult struct {
+	logicalTicks      uint64
+	deliveredMessages uint64
+	droppedMessages   uint64
+	deferredMessages  uint64
+	readyBatches      uint64
+	completedRound    uint64
+}
+
+func (r dstPerformanceResult) workUnits() uint64 {
+	return r.logicalTicks + r.deliveredMessages + r.droppedMessages + r.deferredMessages + r.readyBatches
+}
+
+func TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive(t *testing.T) {
+	baseline := dstRunPerformanceScenario(t, false)
+	degraded := dstRunPerformanceScenario(t, true)
+	const tickBudget = uint64(40)
+	if baseline.completedRound == 0 || baseline.completedRound > tickBudget {
+		t.Fatalf("baseline completed at round %d, want 1..%d: %#v", baseline.completedRound, tickBudget, baseline)
+	}
+	if degraded.completedRound == 0 || degraded.completedRound > tickBudget {
+		t.Fatalf("degraded run completed at round %d, want 1..%d: %#v", degraded.completedRound, tickBudget, degraded)
+	}
+	if degraded.deferredMessages == 0 {
+		t.Fatalf("degraded run did not exercise its one-round transient pause: %#v", degraded)
+	}
+	if degraded.workUnits() <= baseline.workUnits() {
+		t.Fatalf("degraded run did not cost more deterministic work: baseline=%#v degraded=%#v", baseline, degraded)
+	}
+}
+
+func dstRunPerformanceScenario(t *testing.T, degraded bool) dstPerformanceResult {
+	t.Helper()
+	s := newSimCluster(t, 3, false)
+	proposals := make([]dstProposal, 0, 6)
+	for i := 0; i < 6; i++ {
+		cmd := dstPut(2700+uint64(i), 1, "perf-"+strconv.Itoa(i), "value-"+strconv.Itoa(i))
+		ref, err := s.nodes[ReplicaID(i%3)+1].Propose(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposals = append(proposals, dstProposal{ref: ref, cmd: cmd})
+	}
+	if degraded {
+		// One replica pauses for exactly one logical round: a negligible fault schedule.
+		s.pause(3)
+	}
+	var completedRound uint64
+	for round := uint64(1); round <= 40; round++ {
+		if degraded && round == 2 {
+			s.resume(3)
+		}
+		s.tickAll(1)
+		if dstAllApplied(s, len(proposals)) {
+			completedRound = round
+			break
+		}
+	}
+	if s.paused[3] {
+		s.resume(3)
+	}
+	if completedRound == 0 {
+		t.Fatalf("performance scenario did not complete: degraded=%t metrics=%#v", degraded, s)
+	}
+	dstRequireProposalsExactlyOnceEverywhere(t, s, proposals)
+	dstAssertLinearizableApplications(t, s, []Command{
+		proposals[0].cmd, proposals[1].cmd, proposals[2].cmd,
+		proposals[3].cmd, proposals[4].cmd, proposals[5].cmd,
+	}, nil)
+	return dstPerformanceResult{
+		logicalTicks:      s.logicalTicks,
+		deliveredMessages: s.deliveredMessages,
+		droppedMessages:   s.droppedMessages,
+		deferredMessages:  s.deferredMessages,
+		readyBatches:      s.readyBatches,
+		completedRound:    completedRound,
+	}
+}
+
+func dstAllApplied(s *simCluster, want int) bool {
+	for _, app := range s.apps {
+		if len(app) != want {
+			return false
+		}
+	}
+	return true
 }
 
 func dstHighestReplicaIDs(n, count int) []ReplicaID {

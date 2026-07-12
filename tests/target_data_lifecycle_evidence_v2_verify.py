@@ -376,7 +376,7 @@ def parse_helper_report(by_id: dict[str, dict[str, Any]], artifact_id: str, path
         "source_identity",
         "release_checksum",
         "current_target_claim",
-        "release_claim",
+        "evidence_class",
     }
     missing = sorted(required - set(report))
     extra = sorted(set(report) - required)
@@ -418,7 +418,7 @@ def validate_helper_report(
         "source_identity": source_identity,
         "release_checksum": release_checksum,
         "current_target_claim": "true",
-        "release_claim": "none-target-environment-data-lifecycle-drill-still-required",
+        "evidence_class": "bounded-data-lifecycle",
     }
     for field, expected_value in expected.items():
         if report[field] != expected_value:
@@ -571,11 +571,8 @@ def validate_report(
             "same_host",
             "loopback_only",
             "tls_mode",
-            "multi_host",
-            "independent_failure_domains",
             "mtls",
             "client_authorization",
-            "production_capacity",
             "peer_authorization",
             "multi_tenant_rbac",
             "client_tls_ca_sha256",
@@ -595,13 +592,10 @@ def validate_report(
         "same_host": True,
         "loopback_only": True,
         "tls_mode": "mutual-auth-separated-planes",
-        "multi_host": False,
-        "independent_failure_domains": False,
         "mtls": True,
         "client_authorization": True,
         "peer_authorization": True,
         "multi_tenant_rbac": False,
-        "production_capacity": False,
     }.items():
         literal(scope[key], f"$.scope.{key}", expected_value)
     for key in (

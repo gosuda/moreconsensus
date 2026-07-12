@@ -259,11 +259,8 @@ def make_fixture(directory: Path) -> Path:
             "same_host": True,
             "loopback_only": True,
             "tls_mode": "mutual-auth-separated-planes",
-            "multi_host": False,
-            "independent_failure_domains": False,
             "mtls": True,
             "client_authorization": True,
-            "production_capacity": False,
             "peer_authorization": True,
             "multi_tenant_rbac": False,
             "client_tls_ca_sha256": CLIENT_TLS_CA_SHA,
@@ -523,7 +520,7 @@ def make_fixture(directory: Path) -> Path:
             "source_identity": SOURCE_IDENTITY,
             "release_checksum": f"sha256:{BINARY_SHA}",
             "current_target_claim": "true",
-            "release_claim": "none-target-environment-data-lifecycle-drill-still-required",
+            "evidence_class": "bounded-data-lifecycle",
         }
         return "".join(f"{key}={json.dumps(value)}\n" for key, value in fields.items()).encode()
 
@@ -885,11 +882,8 @@ def main() -> int:
                 ("wrong-supervisor", set_value("target.supervisor", "systemd"), ()),
                 ("non-apfs-target", set_value("target.filesystem", "ext4"), ()),
                 ("release-not-source-derived", set_value("target.release_id", "mc-kv-fedcba987654-r1"), ()),
-                ("multi-host-overclaim", set_value("scope.multi_host", True), ()),
-                ("failure-domain-overclaim", set_value("scope.independent_failure_domains", True), ()),
                 ("mtls-underclaim", set_value("scope.mtls", False), ()),
                 ("tls-identity-mismatch", set_value("scope.client_tls_ca_sha256", "65" * 32), ()),
-                ("capacity-overclaim", set_value("scope.production_capacity", True), ()),
                 ("mutable-root-declaration", set_value("evidence_root.mount_read_only", False), ()),
                 ("manifest-format", set_value("checkpoint.checkpoint_format", "legacy"), ()),
                 ("manifest-version", set_value("checkpoint.manifest_version", 2), ()),

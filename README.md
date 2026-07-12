@@ -25,14 +25,14 @@
 - [tla](tla) contains the finite model suite; [tests](tests) contains verification and release-audit commands.
 - [examples/kv](examples/kv) contains the key-value integration example.
 - [jepsen](jepsen) contains the workload harness for separately approved external validation.
-- The key-value example includes local lifecycle, capacity, and incident procedures under `tests`; these reports remain bounded and non-claim evidence.
+- The key-value example includes local lifecycle and deterministic fault procedures under `tests`; these reports remain bounded verification evidence.
 
 ## Support boundary
 
 - The production library surface is `gosuda.org/moreconsensus/epaxos`; the key-value service is an integration example and validation harness, not a multi-tenant product.
 - Voter sets support one through seven replicas. The core uses deterministic logical time; explicit TOQ inputs and operational clock discipline remain embedder responsibilities.
 - Formal evidence is finite model checking plus focused executable tests. It is not an exhaustive or unbounded proof, and it does not establish real-network production readiness.
-- Retention and checkpoint features provide bounded operational behavior; certified protocol-state compaction, target capacity, target data lifecycle, and signed incident evidence remain governed by [RELEASE_SCOPE.md](RELEASE_SCOPE.md).
+- Retention and checkpoint features provide bounded operational behavior; certified protocol-state compaction remains governed by [RELEASE_SCOPE.md](RELEASE_SCOPE.md).
 
 ## Module layout
 

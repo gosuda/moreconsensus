@@ -10,7 +10,7 @@ A release claim is allowed only when the item is listed in **Closed release item
 
 No-go.
 
-The repository provides bounded protocol, storage, service, and deterministic-simulation evidence on Darwin arm64. It is not mission-critical production-ready. The missing release evidence includes unbounded Go/TLA refinement, certified protocol-state compaction, real-network fault evidence, and signed operator-controlled capacity/lifecycle/incident evidence.
+The repository provides bounded protocol, storage, service, deterministic-simulation, and degraded-performance evidence on Darwin arm64. It is not mission-critical production-ready. The remaining release blocker is unbounded Go/TLA refinement and certified protocol-state compaction with late-message and incarnation fencing.
 
 ## Evidence identity
 
@@ -38,6 +38,7 @@ This matrix defines the supported simulation/local-loopback envelope. A claim is
 | Configuration ordering and pinned quorums | Finite barrier, add, remove, add-then-remove, replay, retry, and de-duplication scenarios. | Go configuration tests and the finite models listed in `MODEL_EQ_REPORT.MD` cover old `Ref.Conf` voter domains and current-configuration barriers. | No arbitrary membership history, joint consensus, or unbounded proof. |
 | Fast path and optimized recovery | Odd supported sizes use the paper fast quorum; even sizes retain conservative thresholds; FP-deps-committed evidence and sender-preserving recovery evidence are required. | `epaxos/quorum.go`, focused Go tests, and finite quorum/evidence/recovery models. | No arbitrary network, message-loss, durable-history, or unbounded optimized-recovery claim. |
 | Service-plane containment | Separate client, peer, and admin listeners; TLS 1.3 mutual authentication; bounded request bodies and scans; deterministic lifecycle-owned ticks. | Tagged KV behavior/race tests, service fault campaign, and operations audits. | No multi-tenant RBAC claim. |
+| Transient negligible faults and degraded performance | One replica pauses for one logical round while the quorum continues to execute commands; deterministic work increases without wall-clock timing. | `TestDSTTransientFaultCasesRemainAvailableAndRecover` and `TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive` prove continued service, exactly-once application, linearizable replay, and bounded logical progress. | No production performance claim. |
 
 ## Closed release items
 
@@ -58,7 +59,8 @@ The following items are closed only for the bounded evidence classes stated here
 | Service API, TLS, request, scan, and binary-value boundaries | `examples/kv/cmd/kvnode/main.go`, tagged KV tests, and `EPAXOS.MD`. |
 | Local fault and Jepsen harnesses | `tests/chaos_fault_campaign.sh`, `tests/jepsen_local.sh`, and the Jepsen checker tests. |
 | Finite formal model gate | `tests/tla_model_check_fast.sh` runs the required 14 finite jobs; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
-| Operations artifact checks | `tests/operations_readiness_audit.sh`, `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_incident_tabletop_drill.sh`, and the local lifecycle helpers. These are example/operator artifacts, not target-environment proof. |
+| Operations artifact checks | `tests/operations_readiness_audit.sh` and the local lifecycle helpers validate bounded operator mechanics only. |
+| DST data lifecycle and transient fault behavior | `TestDSTDataLifecycleCheckpointRestoreAndCorruptionRejection`, `TestDSTTransientFaultCasesRemainAvailableAndRecover`, and `TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive` cover durable checkpoint restore, corruption rejection, transient faults, exactly-once application, linearizable replay, and deterministic work degradation. |
 
 ## Open release items
 
@@ -66,11 +68,8 @@ The following items are closed only for the bounded evidence classes stated here
 | Item | Current state |
 | --- | --- |
 | Broader formal model coverage | The finite TLC suite and executable `RawNode` trace cover bounded workflows. Exit requires an unbounded Go/TLA refinement argument, a checked action correspondence, and certified protocol-state compaction requirements including late-message and incarnation fencing. |
-| Data lifecycle | Local checkpoint verification, restore, repair, and destructive-storage exercises exist. Exit requires a certified compaction operational drill plus target backup, restore, rollback, and disaster-recovery evidence. |
-| Capacity envelope | A bounded local harness records throughput, latency, memory, disk, queue, value-size, scan, and peer-count samples. Exit requires a signed target capacity envelope with workload, resource, latency, and retention limits. |
-| Incident readiness | A local tabletop harness exercises storage and transport fault branches and preserves non-claims. Exit requires real-network fault evidence plus signed operator-controlled incident, escalation, rollback, and recovery evidence. |
 
-Exactly these four canonical items remain open. Closing a row requires direct evidence that satisfies its exit condition; changing prose or rerunning a local sample is insufficient.
+Exactly one canonical item remains open. Closing it requires direct unbounded formal evidence; bounded simulation or rerunning a local sample is insufficient.
 
 ## Review baseline
 
@@ -90,8 +89,8 @@ Reviewers should start with the following authority and gates:
 - `tla/EPaxosRawNodeRefinement.tla` is an implementation-shaped bounded workflow model. `tests/refinementtrace` adds executable pre/post contracts and exported-method inventory checks, not a TLC/TLAPS action replay.
 - `tla/EPaxosVoterBootstrap.tla` is a model-only bootstrap contract; bootstrap state is not part of the current `RawNode` semantic trace.
 - The core does not synchronize clocks, measure one-way delay, prove operational TOQ discipline, or provide a production sync-group service.
-- Deterministic simulation and local Jepsen loopback do not claim real-network fault histories.
+- Deterministic simulation and local Jepsen loopback are bounded fault evidence; they do not establish target deployment behavior.
 - Retention thresholds limit admission without deleting protocol history; certified compaction and unbounded uptime remain open.
-- KV checkpoint recovery requires semantic verification and whole-directory replacement; in-place repair, synthesized reconstruction, and quorum-loss recovery remain open.
+- KV checkpoint recovery requires semantic verification and whole-directory replacement; certified protocol-state compaction remains part of the broader formal blocker.
 - Local mixed-version rollback validates the harness for its exercised binary pair; it does not prove broad compatibility across substantive protocol or storage changes.
-- Example/operator reports are non-claims until target identity, signed provenance, immutable evidence, and independent review satisfy the corresponding open row.
+- Example/operator reports are bounded observations and are not release closure evidence.

@@ -10,14 +10,20 @@ import (
 )
 
 type simCluster struct {
-	t       *testing.T
-	nodes   map[ReplicaID]*RawNode
-	stores  map[ReplicaID]*MemoryStorage
-	apps    map[ReplicaID][]CommittedCommand
-	drop    map[[2]ReplicaID]bool
-	paused  map[ReplicaID]bool
-	delayed []Message
-	opt     bool
+	t                 *testing.T
+	nodes             map[ReplicaID]*RawNode
+	stores            map[ReplicaID]*MemoryStorage
+	apps              map[ReplicaID][]CommittedCommand
+	drop              map[[2]ReplicaID]bool
+	paused            map[ReplicaID]bool
+	delayed           []Message
+	opt               bool
+	logicalTicks      uint64
+	deliveredMessages uint64
+	droppedMessages   uint64
+	deferredMessages  uint64
+	readyBatches      uint64
+	committedCommands uint64
 }
 
 func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
@@ -138,9 +144,11 @@ func (s *simCluster) drain() {
 			}
 			progress = true
 			rd := rn.Ready()
+			s.readyBatches++
 			if err := s.stores[id].ApplyReady(rd); err != nil {
 				s.t.Fatalf("apply ready %d: %v", id, err)
 			}
+			s.committedCommands += uint64(len(rd.Committed))
 			for _, c := range rd.Committed {
 				s.apps[id] = append(s.apps[id], c)
 			}
@@ -163,11 +171,14 @@ func (s *simCluster) drain() {
 func (s *simCluster) deliver(m Message) bool {
 	s.t.Helper()
 	if s.drop[[2]ReplicaID{m.From, m.To}] {
+		s.droppedMessages++
 		return true
 	}
 	if s.paused[m.From] || s.paused[m.To] {
+		s.deferredMessages++
 		return false
 	}
+	s.deliveredMessages++
 	if to := s.nodes[m.To]; to != nil {
 		if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
 			s.t.Fatalf("step %s %d->%d: %v", m.Type, m.From, m.To, err)
@@ -181,6 +192,7 @@ func (s *simCluster) tickAll(n int) {
 		for _, id := range s.ids() {
 			if !s.paused[id] {
 				s.nodes[id].Tick()
+				s.logicalTicks++
 			}
 		}
 		s.drain()

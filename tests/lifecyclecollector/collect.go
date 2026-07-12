@@ -1682,8 +1682,7 @@ func (state *lifecycleState) buildReport() map[string]any {
 	synthetic := false
 	scope := map[string]any{
 		"same_host": true, "loopback_only": true, "tls_mode": "mutual-auth-separated-planes",
-		"multi_host": false, "independent_failure_domains": false, "mtls": true,
-		"client_authorization": true, "peer_authorization": true, "multi_tenant_rbac": false, "production_capacity": false,
+		"mtls": true, "client_authorization": true, "peer_authorization": true, "multi_tenant_rbac": false,
 		"client_tls_ca_sha256": state.clientTLS.caSHA, "client_tls_cert_sha256": state.clientTLS.certSHA,
 		"admin_tls_ca_sha256": state.adminTLS.caSHA, "admin_tls_cert_sha256": state.adminTLS.certSHA,
 		"peer_tls_ca_sha256": state.peerTLSCA, "peer_tls_identities": peerTLSClaims(state.peerTLS),

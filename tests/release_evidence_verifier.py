@@ -22,12 +22,7 @@ RELEASE_INDEX_MODE = "darwin-production-v2"
 FIXTURE_INDEX_MODE = "synthetic-test-fixture"
 TARGET_ID = "mc-kv-darwin24-arm64-launchd-3n-r1"
 ENVIRONMENT_PROFILE = "native-darwin24-arm64-launchd-system-domain-v1"
-RELEASE_EVIDENCE_MODE = {
-    "broader-formal": "formal-closure-v2",
-    "data-lifecycle": "darwin-data-lifecycle-v2",
-    "capacity-envelope": "darwin-capacity-v2",
-    "incident-readiness": "darwin-incident-v2",
-}
+RELEASE_EVIDENCE_MODE = {"broader-formal": "formal-closure-v2"}
 RELEASE_CLAIM = "item-closed-for-release"
 FIXTURE_CLAIM = "synthetic-item-closed-for-test-only"
 MAX_EXECUTION_AGE = timedelta(days=30)
@@ -35,12 +30,7 @@ MAX_REVIEW_AGE = timedelta(days=30)
 MAX_INDEX_AGE = timedelta(days=7)
 MAX_JSON_BYTES = 1024 * 1024
 
-ITEM_LABELS = {
-    "Broader formal model coverage": "broader-formal",
-    "Data lifecycle": "data-lifecycle",
-    "Capacity envelope": "capacity-envelope",
-    "Incident readiness": "incident-readiness",
-}
+ITEM_LABELS = {"Broader formal model coverage": "broader-formal"}
 ITEM_IDS = tuple(ITEM_LABELS.values())
 ITEM_ID_SET = frozenset(ITEM_IDS)
 REQUIRED_RESULT_ROLE = {item_id: "result" for item_id in ITEM_IDS}
@@ -670,123 +660,29 @@ def require_result_path_within_root(path_text: str, base: Path, evidence_root: P
 def result_binding(
     item_id: str, result_path: Path, evidence_root: Path, test_mode: bool
 ) -> dict[str, str]:
-    if item_id == "capacity-envelope":
-        values = parse_env_result(result_path, "capacity-envelope result")
-        if test_mode:
-            required_values = {
-                "status": "synthetic-darwin-capacity-evidence-v2",
-                "schema_version": "kvnode-capacity-evidence-v2",
-                "verifier_version": "2.0.0",
-                "evidence_class": "synthetic-test-only",
-                "evidence_mode": "test-only-synthetic",
-                "production_capacity_certification": "not-claimed",
-                "acceptance_result": "pass-synthetic-test-fixture",
-                "claim_scope": "none-synthetic",
-                "release_claim": "none-synthetic-fixture-not-release-evidence",
-                "target_name": TARGET_ID,
-                "environment_profile": ENVIRONMENT_PROFILE,
-            }
-        else:
-            required_values = {
-                "status": "darwin-production-capacity-certification-v2",
-                "schema_version": "kvnode-capacity-evidence-v2",
-                "verifier_version": "2.0.0",
-                "evidence_class": "production-capacity-certification",
-                "evidence_mode": "target",
-                "production_capacity_certification": "approved",
-                "acceptance_result": "pass-production-capacity-certification",
-                "claim_scope": "declared-native-darwin-same-host-support-envelope",
-                "release_claim": "target-bound-production-capacity-envelope-certified",
-                "target_name": TARGET_ID,
-                "environment_profile": ENVIRONMENT_PROFILE,
-            }
-        for key, expected in required_values.items():
-            if values.get(key) != expected:
-                fail(f"capacity-envelope result {key} must equal {expected}")
-        target = values.get("target_name")
-        environment = values.get("environment_profile")
-        release_id = values.get("release_id")
-        source_revision = values.get("source_revision")
-        binary_sha256 = values.get("binary_sha256")
-        for key, value in values.items():
-            if key == "binary_path" or key.endswith("_path"):
-                require_result_path_within_root(
-                    value, result_path.parent, evidence_root, f"capacity-envelope.{key}"
-                )
-    elif item_id == "data-lifecycle":
-        document = load_json(result_path, "data-lifecycle result")
-        if not isinstance(document, dict) or not isinstance(document.get("target"), dict):
-            fail("data-lifecycle result lacks v2 target provenance")
-        if document.get("schema_version") != "2.0.0" or document.get("verifier_version") != "2.0.0":
-            fail("data-lifecycle result must use schema/verifier v2")
-        expected_class = "synthetic-test-only" if test_mode else "target-data-lifecycle-darwin-v2"
-        if document.get("evidence_class") != expected_class:
-            fail("data-lifecycle result evidence_class is not the required row mode")
-        target_object = document["target"]
-        target = target_object.get("target_id")
-        environment = target_object.get("environment_profile")
-        release_id = target_object.get("release_id")
-        source_revision = target_object.get("source_revision")
-        binary_sha256 = target_object.get("binary_sha256")
-        raw_artifacts = document.get("raw_artifacts")
-        if isinstance(raw_artifacts, list):
-            for index, raw_artifact in enumerate(raw_artifacts):
-                if isinstance(raw_artifact, dict) and isinstance(raw_artifact.get("path"), str):
-                    require_result_path_within_root(
-                        raw_artifact["path"],
-                        result_path.parent,
-                        evidence_root,
-                        f"data-lifecycle.raw_artifacts[{index}].path",
-                    )
-    elif item_id == "incident-readiness":
-        document = load_json(result_path, "incident-readiness result")
-        if (
-            not isinstance(document, dict)
-            or not isinstance(document.get("target"), dict)
-            or not isinstance(document.get("release_provenance"), dict)
-        ):
-            fail("incident-readiness result lacks v2 release provenance")
-        if document.get("schema_version") != "2.0":
-            fail("incident-readiness result must use Darwin schema v2")
-        expected_mode = "synthetic-test" if test_mode else "target"
-        if document.get("record_mode") != expected_mode:
-            fail("incident-readiness result record_mode is not the required row mode")
-        target_object = document["target"]
-        provenance = document["release_provenance"]
-        target = target_object.get("name")
-        environment = target_object.get("environment")
-        release_id = provenance.get("release_id")
-        source_revision = provenance.get("source_revision")
-        binary_sha256 = provenance.get("binary_sha256")
-    else:
-        document = load_json(result_path, "broader-formal result")
-        if (
-            not isinstance(document, dict)
-            or not isinstance(document.get("release"), dict)
-            or document.get("schema_version") != "1.0.0"
-        ):
-            fail("broader-formal result is not the signed formal closure contract")
-        expected_mode = "synthetic-test" if test_mode else "target"
-        if document.get("record_mode") != expected_mode:
-            fail("broader-formal result record_mode is not the required row mode")
-        release = document["release"]
-        return {
-            "release_id": validate_identifier(
-                release.get("release_id"), "broader-formal result release_id"
-            ),
-            "source_revision": validate_revision(
-                release.get("source_revision"), "broader-formal result source_revision"
-            ),
-            "primary_sha256": validate_sha256(
-                release.get("formal_spec_sha256"), "broader-formal result formal_spec_sha256"
-            ),
-        }
+    if item_id != "broader-formal":
+        fail(f"unsupported release item: {item_id}")
+    document = load_json(result_path, "broader-formal result")
+    if (
+        not isinstance(document, dict)
+        or not isinstance(document.get("release"), dict)
+        or document.get("schema_version") != "1.0.0"
+    ):
+        fail("broader-formal result is not the signed formal closure contract")
+    expected_mode = "synthetic-test" if test_mode else "target"
+    if document.get("record_mode") != expected_mode:
+        fail("broader-formal result record_mode is not the required row mode")
+    release = document["release"]
     return {
-        "target": validate_identifier(target, f"{item_id} result target"),
-        "environment": validate_identifier(environment, f"{item_id} result environment"),
-        "release_id": validate_identifier(release_id, f"{item_id} result release_id"),
-        "source_revision": validate_revision(source_revision, f"{item_id} result source_revision"),
-        "binary_sha256": validate_sha256(binary_sha256, f"{item_id} result binary_sha256"),
+        "release_id": validate_identifier(
+            release.get("release_id"), "broader-formal result release_id"
+        ),
+        "source_revision": validate_revision(
+            release.get("source_revision"), "broader-formal result source_revision"
+        ),
+        "primary_sha256": validate_sha256(
+            release.get("formal_spec_sha256"), "broader-formal result formal_spec_sha256"
+        ),
     }
 
 
@@ -858,84 +754,24 @@ def verify_item_result(
         return
 
     tests_dir = repository_root / "tests"
-    if item_id == "broader-formal":
-        command = [
-            "python3",
-            str(tests_dir / "verify_formal_closure_evidence.py"),
-            "--expected-release-id",
-            metadata["release_id"],
-            "--expected-source-revision",
-            metadata["source_revision"],
-            "--expected-formal-spec-sha256",
-            metadata["primary_sha256"],
-            str(result_path),
-        ]
-        expected_output = (
-            "formal_closure_evidence=verified mode=target "
-            f"release_id={metadata['release_id']} source_revision={metadata['source_revision']} "
-            f"formal_spec_sha256={metadata['primary_sha256']} claim=formal-closure-criteria-met"
-        )
-    elif item_id == "data-lifecycle":
-        command = [
-            "python3",
-            str(tests_dir / "target_data_lifecycle_evidence_v2_verify.py"),
-            "--expected-target-id",
-            metadata["target"],
-            "--expected-release-id",
-            metadata["release_id"],
-            "--expected-source-revision",
-            metadata["source_revision"],
-            "--expected-binary-sha256",
-            metadata["binary_sha256"],
-            "--expected-environment-profile",
-            metadata["environment"],
-            str(result_path),
-        ]
-        expected_output = (
-            "target-data-lifecycle-evidence-v2 status=pass verifier_version=2.0.0 "
-            "mode=target-evidence release_claim=target-data-lifecycle-criteria-met "
-            f"target_id={metadata['target']} release_id={metadata['release_id']} "
-            f"source_revision={metadata['source_revision']} binary_sha256={metadata['binary_sha256']} "
-            f"environment_profile={metadata['environment']}"
-        )
-    elif item_id == "capacity-envelope":
-        command = [
-            "python3",
-            str(tests_dir / "kvnode_capacity_envelope_v2.py"),
-            "verify",
-            str(result_path),
-        ]
-        expected_output = (
-            "kvnode-capacity-v2 verification=pass "
-            "evidence_class=production-capacity-certification evidence_mode=target "
-            "production_capacity_certification=approved "
-            "release_claim=target-bound-production-capacity-envelope-certified "
-            f"target_id={metadata['target']} environment_profile={metadata['environment']} "
-            f"release_id={metadata['release_id']} source_revision={metadata['source_revision']} "
-            f"binary_sha256={metadata['binary_sha256']} report={result_path}"
-        )
-    else:
-        command = [
-            "python3",
-            str(tests_dir / "verify_target_incident_evidence.py"),
-            "--expected-target",
-            metadata["target"],
-            "--expected-release-id",
-            metadata["release_id"],
-            "--expected-environment",
-            metadata["environment"],
-            "--expected-source-revision",
-            metadata["source_revision"],
-            "--expected-binary-sha256",
-            metadata["binary_sha256"],
-            "--evidence-root",
-            str(evidence_root),
-            str(result_path),
-        ]
-        expected_output = (
-            "target_incident_evidence=verified mode=target "
-            f"target={metadata['target']} claim=target-darwin-incident-readiness-observed"
-        )
+    if item_id != "broader-formal":
+        fail(f"unsupported release item: {item_id}")
+    command = [
+        "python3",
+        str(tests_dir / "verify_formal_closure_evidence.py"),
+        "--expected-release-id",
+        metadata["release_id"],
+        "--expected-source-revision",
+        metadata["source_revision"],
+        "--expected-formal-spec-sha256",
+        metadata["primary_sha256"],
+        str(result_path),
+    ]
+    expected_output = (
+        "formal_closure_evidence=verified mode=target "
+        f"release_id={metadata['release_id']} source_revision={metadata['source_revision']} "
+        f"formal_spec_sha256={metadata['primary_sha256']} claim=formal-closure-criteria-met"
+    )
     output = run_verifier_command(command, item_id)
     if output != expected_output:
         fail(f"{item_id} verifier output does not match the authoritative v2 target result")

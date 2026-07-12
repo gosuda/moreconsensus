@@ -132,7 +132,7 @@ report = {
     },
     "disaster": {
         "scenario": "single-node durable-volume loss",
-        "scope": "one voting member in west failure domain",
+        "scope": "one voting member in west",
         "occurred_at": stamp(240),
         "affected_node": "node-west-2",
         "result": "pass",
