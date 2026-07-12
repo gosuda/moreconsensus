@@ -10,7 +10,7 @@ kvnode mixed-version upgrade/rollback drill (local loopback harness only)
 
 Status: local evidence harness only. This script starts local loopback kvnode
 processes and does not assert production readiness, target-environment coverage,
-operator backup/restore readiness, or deployment safety.
+operator acceptance, or rollout safety.
 Binary rollback in this drill restarts the old binary on the node's current data.
 Pre-upgrade data checkpoints are captured as rollback inputs, but
 checkpoint restore is a separate data-lifecycle fallback and is not exercised by

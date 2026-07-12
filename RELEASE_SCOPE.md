@@ -10,7 +10,7 @@ A release claim is allowed only when the item is listed in **Closed release item
 
 No-go.
 
-The repository provides bounded protocol, storage, service, and deterministic-simulation evidence on Darwin arm64. It is not mission-critical production-ready. The missing release evidence includes unbounded Go/TLA refinement, certified protocol-state compaction, multi-host independent failure domains, real-network fault evidence, and signed operator-controlled deployment/capacity/lifecycle/incident evidence.
+The repository provides bounded protocol, storage, service, and deterministic-simulation evidence on Darwin arm64. It is not mission-critical production-ready. The missing release evidence includes unbounded Go/TLA refinement, certified protocol-state compaction, real-network fault evidence, and signed operator-controlled capacity/lifecycle/incident evidence.
 
 ## Evidence identity
 
@@ -37,7 +37,7 @@ This matrix defines the supported simulation/local-loopback envelope. A claim is
 | Checksum-detected corruption | One stopped or corrupt KV member; a healthy quorum and a verified checkpoint are required. | KV checkpoint verification and whole-directory replacement tests fail closed on corrupt records and preserve duplicate-free application. | No in-place WAL repair, checksum rewriting, synthesized recovery, or target drill. |
 | Configuration ordering and pinned quorums | Finite barrier, add, remove, add-then-remove, replay, retry, and de-duplication scenarios. | Go configuration tests and the finite models listed in `MODEL_EQ_REPORT.MD` cover old `Ref.Conf` voter domains and current-configuration barriers. | No arbitrary membership history, joint consensus, or unbounded proof. |
 | Fast path and optimized recovery | Odd supported sizes use the paper fast quorum; even sizes retain conservative thresholds; FP-deps-committed evidence and sender-preserving recovery evidence are required. | `epaxos/quorum.go`, focused Go tests, and finite quorum/evidence/recovery models. | No arbitrary network, message-loss, durable-history, or unbounded optimized-recovery claim. |
-| Service-plane containment | Separate client, peer, and admin listeners; TLS 1.3 mutual authentication; bounded request bodies and scans; deterministic lifecycle-owned ticks. | Tagged KV behavior/race tests, service fault campaign, and operations audits. | No multi-tenant RBAC or independent-host deployment claim. |
+| Service-plane containment | Separate client, peer, and admin listeners; TLS 1.3 mutual authentication; bounded request bodies and scans; deterministic lifecycle-owned ticks. | Tagged KV behavior/race tests, service fault campaign, and operations audits. | No multi-tenant RBAC or independent failure-domain claim. |
 
 ## Closed release items
 
@@ -58,7 +58,7 @@ The following items are closed only for the bounded evidence classes stated here
 | Service API, TLS, request, scan, and binary-value boundaries | `examples/kv/cmd/kvnode/main.go`, tagged KV tests, and `EPAXOS.MD`. |
 | Local fault and Jepsen harnesses | `tests/chaos_fault_campaign.sh`, `tests/jepsen_local.sh`, and the Jepsen checker tests. |
 | Finite formal model gate | `tests/tla_model_check_fast.sh` runs the required 14 finite jobs; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
-| Operations artifact checks | `tests/operations_readiness_audit.sh`, `tests/kvnode_systemd_manifest_audit.sh`, `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_incident_tabletop_drill.sh`, and the operations runbooks. These are example/operator artifacts, not target-environment proof. |
+| Operations artifact checks | `tests/operations_readiness_audit.sh`, `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_incident_tabletop_drill.sh`, and the local lifecycle helpers. These are example/operator artifacts, not target-environment proof. |
 
 ## Open release items
 
@@ -66,12 +66,11 @@ The following items are closed only for the bounded evidence classes stated here
 | Item | Current state |
 | --- | --- |
 | Broader formal model coverage | The finite TLC suite and executable `RawNode` trace cover bounded workflows. Exit requires an unbounded Go/TLA refinement argument, a checked action correspondence, and certified protocol-state compaction requirements including late-message and incarnation fencing. |
-| Deployment manifest | Example systemd files render and audit a local loopback launch. Exit requires reviewed target deployment under the selected orchestrator, multi-host independent failure domains, and signed target deployment evidence. |
 | Data lifecycle | Local checkpoint verification, restore, repair, and destructive-storage exercises exist. Exit requires a certified compaction operational drill plus target backup, restore, rollback, and disaster-recovery evidence. |
 | Capacity envelope | A bounded local harness records throughput, latency, memory, disk, queue, value-size, scan, and peer-count samples. Exit requires a signed target capacity envelope with workload, resource, latency, and retention limits. |
-| Incident readiness | A local tabletop harness exercises storage and transport fault branches and preserves non-claims. Exit requires real-network fault evidence and signed operator-controlled incident, escalation, rollback, and recovery evidence. |
+| Incident readiness | A local tabletop harness exercises storage and transport fault branches and preserves non-claims. Exit requires real-network fault evidence across multi-host independent failure domains plus signed operator-controlled incident, escalation, rollback, and recovery evidence. |
 
-Exactly these five canonical items remain open. Closing a row requires direct evidence that satisfies its exit condition; changing prose or rerunning a local sample is insufficient.
+Exactly these four canonical items remain open. Closing a row requires direct evidence that satisfies its exit condition; changing prose or rerunning a local sample is insufficient.
 
 ## Review baseline
 

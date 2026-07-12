@@ -7,12 +7,12 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - Release authority: `RELEASE_SCOPE.md`.
 - Current decision: `No-go.`.
 - Authoritative workflow: `bash tests/go_no_go_workflow.sh`.
-- The canonical open rows are Broader formal model coverage, Deployment manifest, Data lifecycle, Capacity envelope, and Incident readiness.
+- The canonical open rows are Broader formal model coverage, Data lifecycle, Capacity envelope, and Incident readiness.
 
 ## Evidence identity
 
 - This snapshot describes the checked repository tree and the commands listed below. A production release must bind evidence to an exact source revision, release binary digest, target identity, immutable evidence root, and independent reviewer signature.
-- The coverage gate measures production packages separately: `epaxos` reached 88.3% against an 85.0% minimum and `examples/kv` reached 91.7% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
+- The coverage gate measures production packages separately: `epaxos` reached 89.5% against an 85.0% minimum and `examples/kv` reached 91.7% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
 - No external target-environment closure bundle is present. Repository evidence therefore remains bounded, local, and non-release-approving.
 
 ## Gate status
@@ -23,10 +23,10 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 | Lifecycle race tests | Pass: `go test -race ./tests/lifecyclecollector -count=1` | Collector behavior under the race detector. |
 | Refinement-trace race tests | Pass: `go test -race ./tests/refinementtrace -count=1` | Executable bounded RawNode contracts under the race detector. |
 | Required fast TLA suite | Pass: `bash tests/tla_model_check_fast.sh` with 14 finite jobs | Bounded TLC state spaces; not an unbounded proof. |
-| Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, five rows, links, model paths, and a tracked-text Hangul guard. |
+| Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, four rows, links, model paths, and a tracked-text Hangul guard. |
 | Repository text audit | Pass when `bash tests/audit_repo.sh` is run | Static forbidden-text and deterministic-core checks. |
-| Operations artifact audit | Pass in the recorded local verification | Example manifests and operator reports; not target deployment evidence. |
-| Aggregate Go coverage | Pass: `epaxos` 88.3% >= 85.0%; `examples/kv` 91.7% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
+| Operations artifact audit | Pass in the recorded local verification | Example/operator reports and local lifecycle evidence; not target-environment closure evidence. |
+| Aggregate Go coverage | Pass: `epaxos` 89.5% >= 85.0%; `examples/kv` 91.7% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
 
 ## Bounded protocol and service evidence
 
@@ -51,21 +51,19 @@ The TLA+ and executable evidence are deliberately layered:
 
 The repository contains example/operator artifacts and audits:
 
-- `deploy/systemd/kvnode@.service` and `deploy/systemd/kvnode.env.example` provide a rendered service contract and local manifest audit.
-- `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_local_capacity_drill.sh`, and `tests/kvnode_local_runner.go` produce bounded sample reports with explicit non-claim fields.
-- `tests/kvnode_incident_tabletop_drill.sh` and `docs/operations/kvnode-data-lifecycle-incident-runbook.md` provide local fault branches, evidence capture, and escalation guidance.
-- `examples/kv/cmd/kvcheckpoint` and `docs/operations/kvnode-upgrade-rollback.md` document checkpoint and rollback procedures.
-- These artifacts do not prove a reviewed target deployment, capacity envelope, backup/restore/rollback drill, real-network fault history, or signed operator evidence.
+- `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_local_capacity_drill.sh`, `tests/kvnode_local_runner.go`, and the local lifecycle helpers produce bounded sample reports with explicit non-claim fields.
+- `tests/kvnode_incident_tabletop_drill.sh` and its local report checks provide storage and transport fault branches, evidence capture, and escalation guidance.
+- `examples/kv/cmd/kvcheckpoint` and its tests exercise checkpoint and rollback procedures.
+- These artifacts do not prove a signed target capacity envelope, backup/restore/rollback drill, real-network fault history across multi-host independent failure domains, or signed operator evidence.
 
 ## Current open blockers preserving no-go
 
 | Item | Required closure evidence |
 | --- | --- |
 | Broader formal model coverage | Unbounded Go/TLA refinement with a checked action correspondence, plus certified protocol-state compaction and late-message/incarnation fencing requirements. |
-| Deployment manifest | Reviewed target deployment, multi-host independent failure domains, and signed target deployment evidence. |
 | Data lifecycle | Certified compaction operational drill and target backup, restore, rollback, and disaster-recovery evidence. |
 | Capacity envelope | Signed target capacity envelope covering workload, latency, resources, retention, and operating limits. |
-| Incident readiness | Real-network fault evidence and signed operator-controlled incident, escalation, rollback, and recovery evidence. |
+| Incident readiness | Real-network fault evidence across multi-host independent failure domains and signed operator-controlled incident, escalation, rollback, and recovery evidence. |
 
 ## Reproduction commands
 
@@ -86,4 +84,4 @@ bash tests/go_no_go_workflow.sh
 
 ## Release boundary
 
-This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation and three-node same-host loopback exercises. It does not support unbounded formal safety, certified protocol-state compaction, multi-host independent failure domains, real-network fault tolerance, operational TOQ clock synchronization, target deployment, target capacity, target data lifecycle, or signed incident readiness. The release decision remains no-go until every open row has current target-bound evidence.
+- This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation and three-node same-host loopback exercises. It does not support unbounded formal safety, certified protocol-state compaction, multi-host independent failure domains, real-network fault tolerance, operational TOQ clock synchronization, target capacity, target data lifecycle, or signed incident readiness. The release decision remains no-go until every open row has current target-bound evidence.

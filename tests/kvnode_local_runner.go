@@ -40,11 +40,7 @@ const (
 	defaultEnvironmentLabel = "local-loopback"
 	defaultWorkloadLabel    = "local-go-runner"
 
-	statusLocalGoRunnerOnly      = "status=local-go-runner-only"
-	deploymentNonClaim           = "release_claim=none-target-environment-deployment-manifest-still-required"
-	deploymentLocalEvidenceFiles = "metadata.env,summary.txt,deployment-manifest-summary.txt," +
-		"systemd-manifest-report.env,systemd-manifest-audit.log,deployment-manifest-local-launch.env," +
-		"manifest-env/node-*.env,logs/node-*.log"
+	statusLocalGoRunnerOnly    = "status=local-go-runner-only"
 	capacityNonClaim           = "release_claim=none-target-environment-capacity-results-still-required"
 	incidentNonClaim           = "release_claim=none-target-environment-operator-review-still-required"
 	dataLifecycleNonClaim      = "release_claim=none-target-environment-data-lifecycle-drill-still-required"
@@ -53,25 +49,24 @@ const (
 		"data-lifecycle/checkpoint.log,data-lifecycle/verify.log,data-lifecycle/restore.log,data-lifecycle/repair.log," +
 		"data-lifecycle/checkpoint-report.env,data-lifecycle/verify-report.env,data-lifecycle/restore-report.env,data-lifecycle/repair-report.env"
 
-	deploymentRequestDeadlineMS  = 5000
-	deploymentPeerDeadlineMS     = 2000
-	deploymentMaxClientBodyBytes = 1048576
-	deploymentMaxPeerBodyBytes   = 1048576
-	deploymentMaxAdminBodyBytes  = 65536
-	deploymentMaxScanLimit       = 1000
+	localRequestDeadlineMS  = 5000
+	localPeerDeadlineMS     = 2000
+	localMaxClientBodyBytes = 1048576
+	localMaxPeerBodyBytes   = 1048576
+	localMaxAdminBodyBytes  = 65536
+	localMaxScanLimit       = 1000
 )
 
 const usageText = `kvnode local Go runner (opt-in, local loopback only)
 
 Usage:
-  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|deployment|incident|capacity|data]
+  KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go [--mode all|incident|capacity|data]
 
 Modes:
-  all         Build kvnode, start a disposable three-node cluster, run deployment, incident, capacity, and data-lifecycle drills.
-  deployment  Run the static systemd manifest audit, start a local manifest-derived substitution cluster, and write deployment non-claim evidence.
-  incident    Exercise /faults/storage, /faults/transport, /readyz, and /metrics locally.
-  capacity    Run bounded local write/read/scan samples and write latency/resource evidence locally.
-  data        Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.
+  all       Build kvnode, start a disposable three-node cluster, and run incident, capacity, and data-lifecycle drills.
+  incident  Exercise /faults/storage, /faults/transport, /readyz, and /metrics locally.
+  capacity  Run bounded local write/read/scan samples and write latency/resource evidence locally.
+  data      Stop one local node, checkpoint/verify/restore/repair its data offline, emit helper reports, restart it, and verify catch-up.
 
 Required opt-in:
   KVNODE_GO_RUNNER_RUN=yes
@@ -86,16 +81,12 @@ Environment:
   KVNODE_GO_RUNNER_OPS_PER_PHASE        Capacity samples per value-size phase. Default: 5, max: 1000.
   KVNODE_GO_RUNNER_VALUE_BYTES          Comma-separated value sizes. Default: 64,1024; max item: 1048576.
   KVNODE_GO_RUNNER_SCAN_LIMITS          Comma-separated scan limits. Default: 1,8; max item: 100000.
-  KVNODE_GO_RUNNER_ENVIRONMENT_LABEL   Single-line environment label. Default: local-loopback.
-  KVNODE_GO_RUNNER_WORKLOAD_LABEL      Single-line workload label. Default: local-go-runner.
+  KVNODE_GO_RUNNER_ENVIRONMENT_LABEL    Single-line environment label. Default: local-loopback.
+  KVNODE_GO_RUNNER_WORKLOAD_LABEL       Single-line workload label. Default: local-go-runner.
   KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT Optional 0600 data-lifecycle report path. Writes only after a successful local data drill.
 
 Outputs:
   metadata.env
-  deployment-manifest-summary.txt
-  systemd-manifest-report.env
-  systemd-manifest-audit.log
-  deployment-manifest-local-launch.env
   incident-summary.txt
   capacity-summary.txt
   capacity-latency.csv
@@ -107,7 +98,6 @@ Outputs:
 
 Non-claims:
   local loopback evidence only; not_target_environment evidence.
-  ` + deploymentNonClaim + `
   ` + capacityNonClaim + `
   ` + incidentNonClaim + `
   ` + dataLifecycleNonClaim + `
@@ -135,7 +125,6 @@ type nodeProcess struct {
 	peerURL    string
 	adminURL   string
 	dataDir    string
-	envPath    string
 	logPath    string
 	launchArgs []string
 	cmd        *exec.Cmd
@@ -195,13 +184,13 @@ func parseConfig(args []string, output io.Writer) (runnerConfig, error) {
 	cfg := runnerConfig{}
 	fs := flag.NewFlagSet("kvnode-local-go-runner", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all, deployment, incident, capacity, or data")
+	fs.StringVar(&cfg.mode, "mode", getenv("KVNODE_GO_RUNNER_MODE", "all"), "all, incident, capacity, or data")
 	fs.StringVar(&cfg.outDir, "out-dir", os.Getenv("KVNODE_GO_RUNNER_OUT_DIR"), "evidence output directory")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
-	if cfg.mode != "all" && cfg.mode != "deployment" && cfg.mode != "incident" && cfg.mode != "capacity" && cfg.mode != "data" {
-		return cfg, fmt.Errorf("bad --mode %q: want all, deployment, incident, capacity, or data", cfg.mode)
+	if cfg.mode != "all" && cfg.mode != "incident" && cfg.mode != "capacity" && cfg.mode != "data" {
+		return cfg, fmt.Errorf("bad --mode %q: want all, incident, capacity, or data", cfg.mode)
 	}
 	basePort, err := envInt("KVNODE_GO_RUNNER_BASE_PORT", defaultBasePort, 1, 65000)
 	if err != nil {
@@ -401,14 +390,7 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 	}
 
 	client := &http.Client{Timeout: cfg.timeout}
-	var deploymentRan, incidentRan, capacityRan, dataRan bool
-	if cfg.mode == "all" || cfg.mode == "deployment" {
-		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=deployment-manifest")
-		if err := runDeploymentManifestDrill(client, cfg, runDir, nodes); err != nil {
-			return err
-		}
-		deploymentRan = true
-	}
+	var incidentRan, capacityRan, dataRan bool
 	if cfg.mode == "all" || cfg.mode == "incident" {
 		fmt.Fprintln(stdout, "kvnode-local-go-runner phase=incident")
 		if err := runIncidentDrill(client, cfg, runDir, nodes); err != nil {
@@ -430,7 +412,7 @@ func runConfigured(cfg runnerConfig, stdout io.Writer) error {
 		}
 		dataRan = true
 	}
-	if err := writeFinalSummary(runDir, cfg, deploymentRan, incidentRan, capacityRan, dataRan); err != nil {
+	if err := writeFinalSummary(runDir, cfg, incidentRan, capacityRan, dataRan); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "kvnode-local-go-runner status=pass %s run_dir=%s\n", statusLocalGoRunnerOnly, runDir)
@@ -463,7 +445,6 @@ func writeMetadata(runDir string, cfg runnerConfig) error {
 		"environment_label=" + cfg.environmentLabel,
 		"workload_label=" + cfg.workloadLabel,
 		"non_claim=not_target_environment_local_loopback_only",
-		deploymentNonClaim,
 		capacityNonClaim,
 		incidentNonClaim,
 		dataLifecycleNonClaim,
@@ -511,14 +492,10 @@ func buildKVCheckpoint(ctx context.Context, runDir string) (string, error) {
 func startCluster(cfg runnerConfig, runDir, bin string) ([]*nodeProcess, error) {
 	logDir := filepath.Join(runDir, "logs")
 	dataRoot := filepath.Join(runDir, "data")
-	manifestDir := filepath.Join(runDir, "manifest-env")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(dataRoot, 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(manifestDir, 0o755); err != nil {
 		return nil, err
 	}
 	peers := peerArg(cfg)
@@ -530,23 +507,27 @@ func startCluster(cfg runnerConfig, runDir, bin string) ([]*nodeProcess, error) 
 			peerURL:   fmt.Sprintf("http://127.0.0.1:%d", cfg.peerBasePort+id),
 			adminURL:  fmt.Sprintf("http://127.0.0.1:%d", cfg.adminBasePort+id),
 			dataDir:   filepath.Join(dataRoot, fmt.Sprintf("node-%d", id)),
-			envPath:   filepath.Join(manifestDir, fmt.Sprintf("node-%d.env", id)),
 			logPath:   filepath.Join(logDir, fmt.Sprintf("node-%d.log", id)),
 		}
 		if err := os.MkdirAll(node.dataDir, 0o755); err != nil {
 			stopCluster(nodes)
 			return nil, err
 		}
-		if err := writeLocalManifestEnvFile(node, peers); err != nil {
-			stopCluster(nodes)
-			return nil, err
+		node.launchArgs = []string{
+			"-id", strconv.Itoa(id),
+			"-listen", strings.TrimPrefix(node.clientURL, "http://"),
+			"-peer-listen", strings.TrimPrefix(node.peerURL, "http://"),
+			"-admin-listen", strings.TrimPrefix(node.adminURL, "http://"),
+			"-data", node.dataDir,
+			"-peers", peers,
+			"-request-deadline-ms", strconv.Itoa(localRequestDeadlineMS),
+			"-peer-deadline-ms", strconv.Itoa(localPeerDeadlineMS),
+			"-max-client-body-bytes", strconv.Itoa(localMaxClientBodyBytes),
+			"-max-peer-body-bytes", strconv.Itoa(localMaxPeerBodyBytes),
+			"-max-admin-body-bytes", strconv.Itoa(localMaxAdminBodyBytes),
+			"-max-scan-limit", strconv.Itoa(localMaxScanLimit),
+			"-enable-fault-injection=true",
 		}
-		args, err := localManifestLaunchArgs(node.envPath)
-		if err != nil {
-			stopCluster(nodes)
-			return nil, err
-		}
-		node.launchArgs = args
 		if err := startNodeProcess(node, bin); err != nil {
 			stopCluster(nodes)
 			return nil, err
@@ -562,134 +543,6 @@ func peerArg(cfg runnerConfig) string {
 		parts = append(parts, fmt.Sprintf("%d=http://127.0.0.1:%d", id, cfg.peerBasePort+id))
 	}
 	return strings.Join(parts, ",")
-}
-
-func writeLocalManifestEnvFile(node *nodeProcess, peers string) error {
-	lines := []string{
-		"# Local loopback substitution for deploy/systemd/kvnode@.service.",
-		"# It preserves the manifest flag contract but replaces target paths and listeners.",
-		"KVNODE_ID=" + strconv.Itoa(node.id),
-		"KVNODE_CLIENT_LISTEN=" + strings.TrimPrefix(node.clientURL, "http://"),
-		"KVNODE_PEER_LISTEN=" + strings.TrimPrefix(node.peerURL, "http://"),
-		"KVNODE_ADMIN_LISTEN=" + strings.TrimPrefix(node.adminURL, "http://"),
-		"KVNODE_DATA_DIR=" + node.dataDir,
-		"KVNODE_PEERS=" + peers,
-		"KVNODE_REQUEST_DEADLINE_MS=" + strconv.Itoa(deploymentRequestDeadlineMS),
-		"KVNODE_PEER_DEADLINE_MS=" + strconv.Itoa(deploymentPeerDeadlineMS),
-		"KVNODE_MAX_CLIENT_BODY_BYTES=" + strconv.Itoa(deploymentMaxClientBodyBytes),
-		"KVNODE_MAX_PEER_BODY_BYTES=" + strconv.Itoa(deploymentMaxPeerBodyBytes),
-		"KVNODE_MAX_ADMIN_BODY_BYTES=" + strconv.Itoa(deploymentMaxAdminBodyBytes),
-		"KVNODE_MAX_SCAN_LIMIT=" + strconv.Itoa(deploymentMaxScanLimit),
-		"KVNODE_TLS_ARGS=",
-		"",
-	}
-	return os.WriteFile(node.envPath, []byte(strings.Join(lines, "\n")), 0o600)
-}
-
-func localManifestLaunchArgs(envPath string) ([]string, error) {
-	env, err := readLocalManifestEnvFile(envPath)
-	if err != nil {
-		return nil, err
-	}
-	for _, key := range []string{
-		"KVNODE_REQUEST_DEADLINE_MS",
-		"KVNODE_PEER_DEADLINE_MS",
-		"KVNODE_MAX_CLIENT_BODY_BYTES",
-		"KVNODE_MAX_PEER_BODY_BYTES",
-		"KVNODE_MAX_ADMIN_BODY_BYTES",
-		"KVNODE_MAX_SCAN_LIMIT",
-	} {
-		if err := validatePositiveManifestInt(env, key); err != nil {
-			return nil, err
-		}
-	}
-	if tlsArgs := strings.TrimSpace(env["KVNODE_TLS_ARGS"]); tlsArgs != "" {
-		return nil, fmt.Errorf("local manifest rehearsal does not execute KVNODE_TLS_ARGS; keep TLS target-environment-only")
-	}
-	id, err := requiredManifestValue(env, "KVNODE_ID")
-	if err != nil {
-		return nil, err
-	}
-	clientListen, err := requiredManifestValue(env, "KVNODE_CLIENT_LISTEN")
-	if err != nil {
-		return nil, err
-	}
-	peerListen, err := requiredManifestValue(env, "KVNODE_PEER_LISTEN")
-	if err != nil {
-		return nil, err
-	}
-	adminListen, err := requiredManifestValue(env, "KVNODE_ADMIN_LISTEN")
-	if err != nil {
-		return nil, err
-	}
-	dataDir, err := requiredManifestValue(env, "KVNODE_DATA_DIR")
-	if err != nil {
-		return nil, err
-	}
-	peers, err := requiredManifestValue(env, "KVNODE_PEERS")
-	if err != nil {
-		return nil, err
-	}
-	requestDeadlineMS, _ := requiredManifestValue(env, "KVNODE_REQUEST_DEADLINE_MS")
-	peerDeadlineMS, _ := requiredManifestValue(env, "KVNODE_PEER_DEADLINE_MS")
-	maxClientBodyBytes, _ := requiredManifestValue(env, "KVNODE_MAX_CLIENT_BODY_BYTES")
-	maxPeerBodyBytes, _ := requiredManifestValue(env, "KVNODE_MAX_PEER_BODY_BYTES")
-	maxAdminBodyBytes, _ := requiredManifestValue(env, "KVNODE_MAX_ADMIN_BODY_BYTES")
-	maxScanLimit, _ := requiredManifestValue(env, "KVNODE_MAX_SCAN_LIMIT")
-	return []string{
-		"-id", id,
-		"-listen", clientListen,
-		"-peer-listen", peerListen,
-		"-admin-listen", adminListen,
-		"-data", dataDir,
-		"-peers", peers,
-		"-request-deadline-ms", requestDeadlineMS,
-		"-peer-deadline-ms", peerDeadlineMS,
-		"-max-client-body-bytes", maxClientBodyBytes,
-		"-max-peer-body-bytes", maxPeerBodyBytes,
-		"-max-admin-body-bytes", maxAdminBodyBytes,
-		"-max-scan-limit", maxScanLimit,
-	}, nil
-}
-
-func readLocalManifestEnvFile(path string) (map[string]string, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	env := make(map[string]string, 16)
-	for lineNo, rawLine := range strings.Split(string(content), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || key == "" || strings.ContainsAny(key, " \t") {
-			return nil, fmt.Errorf("%s:%d: invalid EnvironmentFile assignment", path, lineNo+1)
-		}
-		env[key] = value
-	}
-	return env, nil
-}
-
-func requiredManifestValue(env map[string]string, key string) (string, error) {
-	value, ok := env[key]
-	if !ok || strings.TrimSpace(value) == "" {
-		return "", fmt.Errorf("local manifest EnvironmentFile missing %s", key)
-	}
-	return value, nil
-}
-
-func validatePositiveManifestInt(env map[string]string, key string) error {
-	value, err := requiredManifestValue(env, key)
-	if err != nil {
-		return err
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n <= 0 {
-		return fmt.Errorf("local manifest %s must be a positive integer", key)
-	}
-	return nil
 }
 
 func startNodeProcess(node *nodeProcess, bin string) error {
@@ -959,94 +812,6 @@ func requireDataLifecycleReport(reportPath, operation string) error {
 	return nil
 }
 
-func runDeploymentManifestDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess) error {
-	reportPath := filepath.Join(runDir, "systemd-manifest-report.env")
-	cmd := exec.Command("bash", "tests/kvnode_systemd_manifest_audit.sh")
-	cmd.Env = append(os.Environ(), "KVNODE_SYSTEMD_MANIFEST_REPORT="+reportPath, "KVNODE_SYSTEMD_ANALYZE=")
-	out, err := cmd.CombinedOutput()
-	log := bytes.NewBufferString("command=KVNODE_SYSTEMD_MANIFEST_REPORT=<run-dir>/systemd-manifest-report.env bash tests/kvnode_systemd_manifest_audit.sh\n")
-	log.Write(out)
-	_ = os.WriteFile(filepath.Join(runDir, "systemd-manifest-audit.log"), log.Bytes(), 0o644)
-	if err != nil {
-		return fmt.Errorf("systemd manifest audit failed: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	report, err := os.ReadFile(reportPath)
-	if err != nil {
-		return err
-	}
-	for _, required := range []string{
-		"status=example-operator-report\n",
-		"artifact=systemd-manifest-audit\n",
-		"rendered_exec=/usr/local/bin/kvnode -id 1 -listen",
-		"peer_count=3\n",
-		"required_env_vars=KVNODE_ID,KVNODE_CLIENT_LISTEN,KVNODE_PEER_LISTEN,KVNODE_ADMIN_LISTEN,KVNODE_DATA_DIR,KVNODE_PEERS,KVNODE_REQUEST_DEADLINE_MS,KVNODE_PEER_DEADLINE_MS,KVNODE_MAX_CLIENT_BODY_BYTES,KVNODE_MAX_PEER_BODY_BYTES,KVNODE_MAX_ADMIN_BODY_BYTES,KVNODE_MAX_SCAN_LIMIT,KVNODE_TLS_ARGS\n",
-		"exec_contract=env-file-rendered\n",
-		"evidence_files=deploy/systemd/kvnode@.service,deploy/systemd/kvnode.env.example\n",
-		"operator_review=not-performed\n",
-		"systemd_analyze=skipped\n",
-		deploymentNonClaim + "\n",
-	} {
-		if !bytes.Contains(report, []byte(required)) {
-			return fmt.Errorf("systemd manifest report missing %q", strings.TrimSpace(required))
-		}
-	}
-	if bytes.Contains(report, []byte(`rendered_exec=/usr/local/bin/kvnode\ -id`)) {
-		return fmt.Errorf("systemd manifest report double-escaped rendered_exec command prefix")
-	}
-	if err := putValue(client, nodes[0], "go-runner-deployment-manifest", []byte("deployment-manifest-value")); err != nil {
-		return err
-	}
-	if err := assertValueOnAll(client, cfg, nodes, "go-runner-deployment-manifest", []byte("deployment-manifest-value")); err != nil {
-		return err
-	}
-	if err := writeLocalManifestLaunchEvidence(runDir, nodes); err != nil {
-		return err
-	}
-	summary := strings.Join([]string{
-		statusLocalGoRunnerOnly,
-		"systemd_manifest_audit=passed",
-		"manifest_report=systemd-manifest-report.env",
-		"local_launch_report=deployment-manifest-local-launch.env",
-		"launch_path=manifest-derived-local-substitution",
-		"launch_defaults=request_deadline_ms=5000,peer_deadline_ms=2000,max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000",
-		"local_substitution=temp-binary-temp-data-loopback-listeners",
-		"canary=deployment-manifest-value-visible-on-all-nodes",
-		"non_claim=local-static-render-plus-manifest-derived-loopback-process-check-only",
-		deploymentNonClaim,
-		"",
-	}, "\n")
-	return os.WriteFile(filepath.Join(runDir, "deployment-manifest-summary.txt"), []byte(summary), 0o644)
-}
-
-func writeLocalManifestLaunchEvidence(runDir string, nodes []*nodeProcess) error {
-	lines := []string{
-		statusLocalGoRunnerOnly,
-		"artifact=systemd-manifest-local-launch",
-		"manifest_unit=deploy/systemd/kvnode@.service",
-		"environment_template=deploy/systemd/kvnode.env.example",
-		"systemd_exec_contract=rendered-then-substituted",
-		"peer_count=3",
-		"local_substitution=temp-binary-temp-data-loopback-listeners",
-		"deployment_canary=deployment-manifest-value-visible-on-all-nodes",
-		"evidence_files=" + deploymentLocalEvidenceFiles,
-		"non_claim=local-loopback-rehearsal-only",
-		deploymentNonClaim,
-	}
-	for _, node := range nodes {
-		argv := append([]string{node.cmd.Path}, node.launchArgs...)
-		argvJSON, err := json.Marshal(argv)
-		if err != nil {
-			return err
-		}
-		lines = append(lines,
-			fmt.Sprintf("node_%d_environment=%s", node.id, node.envPath),
-			fmt.Sprintf("node_%d_exec_argv_json=%s", node.id, argvJSON),
-		)
-	}
-	lines = append(lines, "")
-	return os.WriteFile(filepath.Join(runDir, "deployment-manifest-local-launch.env"), []byte(strings.Join(lines, "\n")), 0o644)
-}
-
 func runIncidentDrill(client *http.Client, cfg runnerConfig, runDir string, nodes []*nodeProcess) error {
 	if err := captureAdmin(client, runDir, "incident-baseline", nodes); err != nil {
 		return err
@@ -1293,19 +1058,15 @@ func percentile(sorted []float64, pct float64) float64 {
 	return sorted[idx]
 }
 
-func writeFinalSummary(runDir string, cfg runnerConfig, deploymentRan, incidentRan, capacityRan, dataRan bool) error {
+func writeFinalSummary(runDir string, cfg runnerConfig, incidentRan, capacityRan, dataRan bool) error {
 	lines := []string{
 		statusLocalGoRunnerOnly,
 		"mode=" + cfg.mode,
 		"peer_count=3",
-		"deployment_manifest_ran=" + strconv.FormatBool(deploymentRan),
 		"incident_ran=" + strconv.FormatBool(incidentRan),
 		"capacity_ran=" + strconv.FormatBool(capacityRan),
 		"data_lifecycle_ran=" + strconv.FormatBool(dataRan),
 		"non_claim=not_target_environment_local_loopback_only",
-	}
-	if deploymentRan {
-		lines = append(lines, deploymentNonClaim)
 	}
 	if capacityRan {
 		lines = append(lines, capacityNonClaim)

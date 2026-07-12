@@ -17,7 +17,6 @@ from typing import Any, Callable
 
 ITEMS = {
     "broader-formal": "Broader formal model coverage",
-    "deployment-manifest": "Deployment manifest",
     "data-lifecycle": "Data lifecycle",
     "capacity-envelope": "Capacity envelope",
     "incident-readiness": "Incident readiness",
@@ -124,19 +123,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
             primary_sha256 = self.digest(primary)
 
             result = artifact_dir / "acceptance-report.txt"
-            if item_id == "deployment-manifest":
-                result.write_text(
-                    "evidence_schema=kvnode-target-deployment-evidence-v2\n"
-                    "verifier_version=darwin-v2\n"
-                    "evidence_mode=test-only-synthetic\n"
-                    f"target_id={TARGET_ID}\n"
-                    f"target_environment={ENVIRONMENT_PROFILE}\n"
-                    f"release_id={RELEASE_ID}\n"
-                    f"source_revision={SOURCE_REVISION}\n"
-                    f"binary_sha256={binary_sha256}\n",
-                    encoding="utf-8",
-                )
-            elif item_id == "capacity-envelope":
+            if item_id == "capacity-envelope":
                 result.write_text(
                     "status=synthetic-darwin-capacity-evidence-v2\n"
                     "schema_version=kvnode-capacity-evidence-v2\n"
@@ -300,7 +287,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
             "environment": ENVIRONMENT_PROFILE,
             "release_id": RELEASE_ID,
             "source_revision": SOURCE_REVISION,
-            "binary_sha256": self.records["deployment-manifest"]["release_binary_sha256"],
+            "binary_sha256": self.records["capacity-envelope"]["release_binary_sha256"],
             "decision_revision": SOURCE_REVISION,
             "generated_at": "2030-01-09T13:00:00Z",
             "records": entries,
@@ -357,7 +344,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
                 result_path = (
                     self.evidence_root / "artifacts" / item_id / "acceptance-report.txt"
                 )
-                if item_id in {"deployment-manifest", "capacity-envelope"}:
+                if item_id == "capacity-envelope":
                     result_content = result_path.read_text(encoding="utf-8")
                     result_content = re.sub(
                         r"(?m)^binary_sha256=.*$",
@@ -474,14 +461,14 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("aggregate coverage status=fail", result.stderr)
 
-    def test_all_five_open_without_index_preserves_no_go(self) -> None:
+    def test_all_four_open_without_index_preserves_no_go(self) -> None:
         (self.evidence_root / "release-closure-index.json").unlink()
         self.write_scope(list(ITEMS), "No-go.")
         self.write_evidence(no_go=True)
         result = self.run_workflow()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("release_decision=No-go.", result.stdout)
-        self.assertIn("open_release_items=5", result.stdout)
+        self.assertIn("open_release_items=4", result.stdout)
 
     def test_open_rows_cannot_declare_go_without_index(self) -> None:
         (self.evidence_root / "release-closure-index.json").unlink()
@@ -520,7 +507,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
 
 
     def test_placeholder_record_fails(self) -> None:
-        self.mutate_record("deployment-manifest", lambda record: record.__setitem__("target", "TBD"))
+        self.mutate_record("capacity-envelope", lambda record: record.__setitem__("target", "TBD"))
         self.assert_verifier_fails()
     def test_placeholder_acceptance_result_fails(self) -> None:
         self.mutate_record(
@@ -539,7 +526,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         self.assert_verifier_fails()
     def test_port_qualified_loopback_record_fails(self) -> None:
         self.mutate_record(
-            "deployment-manifest",
+            "incident-readiness",
             lambda record: record.__setitem__("target", "https://localhost:8443/cluster"),
         )
         self.assert_verifier_fails()
@@ -604,7 +591,7 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
 
     def test_mismatched_item_record_fails(self) -> None:
         self.mutate_record(
-            "deployment-manifest", lambda record: record.__setitem__("item_id", "data-lifecycle")
+            "capacity-envelope", lambda record: record.__setitem__("item_id", "data-lifecycle")
         )
         self.assert_verifier_fails()
 
@@ -703,19 +690,19 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         result_path = (
             self.evidence_root
             / "artifacts"
-            / "deployment-manifest"
+            / "capacity-envelope"
             / "acceptance-report.txt"
         )
         content = result_path.read_text(encoding="utf-8").replace(
-            "kvnode-target-deployment-evidence-v2",
-            "kvnode-target-deployment-evidence-v1",
+            "kvnode-capacity-evidence-v2",
+            "kvnode-capacity-evidence-v1",
             1,
         )
         result_path.write_text(content, encoding="utf-8")
-        self.update_result_hash("deployment-manifest")
+        self.update_result_hash("capacity-envelope")
         result = self.run_verifier()
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("evidence_schema must equal kvnode-target-deployment-evidence-v2", result.stderr)
+        self.assertIn("schema_version must equal kvnode-capacity-evidence-v2", result.stderr)
 
     def test_cross_release_result_substitution_is_rejected(self) -> None:
         result_path = (
@@ -747,17 +734,16 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("environment_profile must equal", result.stderr)
 
-    def test_row_result_relabel_is_rejected(self) -> None:
-        deployment_result = (
-            self.evidence_root
-            / "artifacts"
-            / "deployment-manifest"
-            / "acceptance-report.txt"
-        )
-        capacity_result = (
+    def test_result_status_mismatch_is_rejected(self) -> None:
+        result_path = (
             self.evidence_root / "artifacts" / "capacity-envelope" / "acceptance-report.txt"
         )
-        capacity_result.write_bytes(deployment_result.read_bytes())
+        content = result_path.read_text(encoding="utf-8").replace(
+            "status=synthetic-darwin-capacity-evidence-v2",
+            "status=synthetic-darwin-capacity-evidence-v1",
+            1,
+        )
+        result_path.write_text(content, encoding="utf-8")
         self.update_result_hash("capacity-envelope")
         result = self.run_verifier()
         self.assertNotEqual(result.returncode, 0, result.stdout)

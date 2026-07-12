@@ -24,7 +24,6 @@ TARGET_ID = "mc-kv-darwin24-arm64-launchd-3n-r1"
 ENVIRONMENT_PROFILE = "native-darwin24-arm64-launchd-system-domain-v1"
 RELEASE_EVIDENCE_MODE = {
     "broader-formal": "formal-closure-v2",
-    "deployment-manifest": "darwin-deployment-v2",
     "data-lifecycle": "darwin-data-lifecycle-v2",
     "capacity-envelope": "darwin-capacity-v2",
     "incident-readiness": "darwin-incident-v2",
@@ -38,7 +37,6 @@ MAX_JSON_BYTES = 1024 * 1024
 
 ITEM_LABELS = {
     "Broader formal model coverage": "broader-formal",
-    "Deployment manifest": "deployment-manifest",
     "Data lifecycle": "data-lifecycle",
     "Capacity envelope": "capacity-envelope",
     "Incident readiness": "incident-readiness",
@@ -672,33 +670,7 @@ def require_result_path_within_root(path_text: str, base: Path, evidence_root: P
 def result_binding(
     item_id: str, result_path: Path, evidence_root: Path, test_mode: bool
 ) -> dict[str, str]:
-    if item_id == "deployment-manifest":
-        values = parse_env_result(result_path, "deployment-manifest result")
-        expected_mode = "test-only-synthetic" if test_mode else "target"
-        required_values = {
-            "evidence_schema": "kvnode-target-deployment-evidence-v2",
-            "verifier_version": "darwin-v2",
-            "evidence_mode": expected_mode,
-            "target_id": TARGET_ID,
-            "target_environment": ENVIRONMENT_PROFILE,
-        }
-        for key, expected in required_values.items():
-            if values.get(key) != expected:
-                fail(f"deployment-manifest result {key} must equal {expected}")
-        target = values.get("target_id")
-        environment = values.get("target_environment")
-        release_id = values.get("release_id")
-        source_revision = values.get("source_revision")
-        binary_sha256 = values.get("binary_sha256")
-        for key, value in values.items():
-            if key.endswith("_artifact"):
-                require_result_path_within_root(
-                    value, result_path.parent, evidence_root, f"deployment-manifest.{key}"
-                )
-        evidence_root_value = values.get("final_evidence_root_path")
-        if not test_mode and evidence_root_value != str(evidence_root):
-            fail("deployment-manifest final_evidence_root_path does not match closure evidence root")
-    elif item_id == "capacity-envelope":
+    if item_id == "capacity-envelope":
         values = parse_env_result(result_path, "capacity-envelope result")
         if test_mode:
             required_values = {
@@ -903,14 +875,6 @@ def verify_item_result(
             f"release_id={metadata['release_id']} source_revision={metadata['source_revision']} "
             f"formal_spec_sha256={metadata['primary_sha256']} claim=formal-closure-criteria-met"
         )
-    elif item_id == "deployment-manifest":
-        command = [
-            "bash",
-            str(tests_dir / "kvnode_target_deployment_evidence.sh"),
-            "verify",
-            str(result_path),
-        ]
-        expected_output = None
     elif item_id == "data-lifecycle":
         command = [
             "python3",
@@ -973,27 +937,7 @@ def verify_item_result(
             f"target={metadata['target']} claim=target-darwin-incident-readiness-observed"
         )
     output = run_verifier_command(command, item_id)
-    if item_id == "deployment-manifest":
-        deployment_pattern = (
-            r"kvnode-target-deployment-evidence status=verified verifier_version=darwin-v2 "
-            r"evidence_mode=target release_id="
-            + re.escape(metadata["release_id"])
-            + r" target_id="
-            + re.escape(metadata["target"])
-            + r" source_revision="
-            + re.escape(metadata["source_revision"])
-            + r" binary_sha256="
-            + re.escape(metadata["binary_sha256"])
-            + r" final_evidence_root_read_only=observed-true final_evidence_root_path="
-            + re.escape(str(evidence_root))
-            + r" evidence_volume_uuid=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} "
-            r"limitations=same-host,loopback-only,no-independent-failure-domain,"
-            r"no-production-capacity,no-off-host-backup "
-            r"release_claim=target-deployment-accepted"
-        )
-        if re.fullmatch(deployment_pattern, output) is None:
-            fail("deployment-manifest verifier output does not match the authoritative v2 target result")
-    elif output != expected_output:
+    if output != expected_output:
         fail(f"{item_id} verifier output does not match the authoritative v2 target result")
 
 

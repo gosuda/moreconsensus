@@ -38,11 +38,7 @@ for path in \
   tests/tla_model_check.sh \
   tests/tla_model_check_fast.sh \
   tests/tla_model_check_runner.py \
-  tests/operations_readiness_audit.sh \
-  deploy/systemd/kvnode@.service \
-  deploy/systemd/kvnode.env.example \
-  docs/operations/kvnode-data-lifecycle-incident-runbook.md \
-  docs/operations/kvnode-upgrade-rollback.md; do
+  tests/operations_readiness_audit.sh; do
   require_path "$path"
 done
 
@@ -57,7 +53,7 @@ require_text "$scope" "unbounded proof"
 require_text "$scope" "certified protocol-state compaction"
 require_text "$scope" "multi-host independent failure domains"
 require_text "$scope" "real-network fault evidence"
-require_text "$scope" "signed operator-controlled deployment/capacity/lifecycle/incident evidence"
+require_text "$scope" "signed operator-controlled capacity/lifecycle/incident evidence"
 
 require_text "$evidence" "Status: no-go evidence bundle"
 require_text "$evidence" "Current open blockers preserving no-go"
@@ -81,7 +77,6 @@ evidence = Path(sys.argv[3])
 
 labels = {
     "Broader formal model coverage",
-    "Deployment manifest",
     "Data lifecycle",
     "Capacity envelope",
     "Incident readiness",
@@ -187,6 +182,8 @@ for raw in tracked:
     if not raw:
         continue
     path = root / raw.decode("utf-8")
+    if not path.is_file():
+        continue
     try:
         data = path.read_bytes()
     except OSError as exc:

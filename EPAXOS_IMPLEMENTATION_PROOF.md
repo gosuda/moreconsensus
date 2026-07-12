@@ -572,7 +572,7 @@ The implementation and evidence currently support a bounded library/example clai
 - in-place Pebble/WAL repair, synthesized recovery without a verified checkpoint, and multi-replica or quorum-loss recovery;
 - substantive mixed-version compatibility beyond the narrow local drill;
 - target-environment backup, restore, and disaster-recovery evidence;
-- signed target deployment, capacity, lifecycle, and incident evidence from operator-controlled inputs.
+- signed target capacity, lifecycle, and incident evidence from operator-controlled inputs.
 
 The correct completion rule is therefore: do not mark the active goal complete unless current evidence proves mission-critical production readiness under the stated fault counts and every release blocker is closed with direct evidence.
 

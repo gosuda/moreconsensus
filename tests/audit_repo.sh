@@ -74,6 +74,8 @@ for raw in paths:
     if not raw:
         continue
     path = root / raw.decode("utf-8")
+    if not path.is_file():
+        continue
     data = path.read_bytes()
     if b"\0" in data:
         continue

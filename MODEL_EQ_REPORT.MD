@@ -118,7 +118,7 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
 - `bash tests/tla_model_check_fast.sh` passes all 14 configured jobs.
-- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 88.3% against 85.0% minimum and `examples/kv` 91.7% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
+- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 89.5% against 85.0% minimum and `examples/kv` 91.7% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - `tlapm` is not installed in the local environment, and no TLAPS proof artifact is part of the checked gate.
 
 ## Formal and release boundaries
@@ -127,8 +127,8 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 - `tla/EPaxosRawNodeRefinement.tla` is finite and implementation-shaped; its TLC property is not an unbounded theorem.
 - `tla/EPaxosVoterBootstrap.tla` is model-only and absent from the RawNode semantic trace.
 - Deterministic simulation and loopback Jepsen histories do not represent real-network or multi-host failure domains.
-- Certified protocol-state compaction, late-message/incarnation fencing, target deployment, target capacity, target data lifecycle, real-network fault evidence, and signed operator evidence remain open in `RELEASE_SCOPE.md`.
+- Certified protocol-state compaction, late-message/incarnation fencing, target capacity, target data lifecycle, real-network fault evidence, and signed operator evidence remain open in `RELEASE_SCOPE.md`.
 
 ## Release decision
 
-The correspondence evidence supports bounded implementation claims only. The authoritative decision is **No-go.** until the five canonical open rows have direct target-bound closure evidence and the aggregate verification gates are green.
+The correspondence evidence supports bounded implementation claims only. The authoritative decision is **No-go.** until the four canonical open rows have direct target-bound closure evidence and the aggregate verification gates are green.
