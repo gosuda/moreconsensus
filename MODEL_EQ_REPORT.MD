@@ -52,10 +52,10 @@ No checked theorem currently connects arbitrary Go executions to `EPaxosInductiv
 | `tla/EPaxosTimingDomain.tla` | Separation of untimed, logical, and TOQ timing domains at Ready/restart boundaries. | `epaxos/toq_test.go`, `tests/refinementtrace`. |
 | `tla/EPaxosRawNodeRefinement.tla` | Bounded normal, recovery, TOQ, and configuration workflows with durability, Ready, evidence, execution, and branch invariants. | `tests/refinementtrace`, exported-method inventory. |
 | `tla/EPaxosInductiveProofs.tla` | Parametric safety and `AbstractHistoryRefinement` for its restricted `ConcreteNext`. | Formal source only; no Go action bridge is checked. |
-| `tla/EPaxosVoterBootstrap.tla` | Model-only bootstrap seal, fence, activation, abort, crash-prefix, and fairness obligations. | No corresponding `RawNode` semantic trace; explicitly excluded. |
+| `tla/EPaxosVoterBootstrap.tla` | Finite bootstrap fencing, target readiness, activation, abort, crash-prefix, race, and fairness obligations. | `tests/tla_model_check_fast.sh` runs base sizes 1–6 (successor sizes 2–7) plus crash-prefix, race, and fairness configurations; no corresponding `RawNode` semantic action trace or unbounded theorem is claimed. |
 | `tla/KVTimestampStaleness.tla` and `tla/KVOmissionRecovery.tla` | Example KV timestamp and omission/recovery slices. | `examples/kv`, Jepsen checker tests. |
 
-The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 14 named finite jobs. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
+The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 23 named finite jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
 
 ## Paper-grounded claim map
 
@@ -117,8 +117,8 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 - `go test ./... -count=1` passes.
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
-- `bash tests/tla_model_check_fast.sh` passes all 14 configured jobs.
-- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 89.5% against 85.0% minimum and `examples/kv` 91.7% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
+- `bash tests/tla_model_check_fast.sh` passes all 23 configured jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
+- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 89.7% against 85.0% minimum and `examples/kv` 92.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - `tlapm` is not installed in the local environment, and no TLAPS proof artifact is part of the checked gate.
 
 ## Formal and release boundaries

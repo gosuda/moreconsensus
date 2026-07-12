@@ -12,7 +12,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 ## Evidence identity
 
 - This snapshot describes the checked repository tree and the commands listed below. A production release must bind evidence to an exact source revision, release binary digest, target identity, immutable evidence root, and independent reviewer signature.
-- The coverage gate measures production packages separately: `epaxos` reached 89.5% against an 85.0% minimum and `examples/kv` reached 92.5% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
+- The coverage gate measures production packages separately: `epaxos` reached 89.7% against an 85.0% minimum and `examples/kv` reached 92.5% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
 - No external target-environment closure bundle is present. Repository evidence therefore remains bounded, local, and non-release-approving.
 
 ## Gate status
@@ -22,11 +22,11 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 | Root Go tests | Pass: `go test ./... -count=1` | Deterministic repository tests. |
 | Lifecycle race tests | Pass: `go test -race ./tests/lifecyclecollector -count=1` | Collector behavior under the race detector. |
 | Refinement-trace race tests | Pass: `go test -race ./tests/refinementtrace -count=1` | Executable bounded RawNode contracts under the race detector. |
-| Required fast TLA suite | Pass: `bash tests/tla_model_check_fast.sh` with 14 finite jobs | Bounded TLC state spaces; not an unbounded proof. |
+| Required fast TLA suite | Pass: `bash tests/tla_model_check_fast.sh` with 23 finite jobs | Bounded TLC state spaces; not an unbounded proof. |
 | Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, one open row, links, model paths, and tracked-text guards. |
 | Repository text audit | Pass when `bash tests/audit_repo.sh` is run | Static forbidden-text and deterministic-core checks. |
 | Operations artifact audit | Pass in the recorded local verification | Example/operator reports and local lifecycle evidence; not target-environment closure evidence. |
-| Aggregate Go coverage | Pass: `epaxos` 89.5% >= 85.0%; `examples/kv` 92.5% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
+| Aggregate Go coverage | Pass: `epaxos` 89.7% >= 85.0%; `examples/kv` 92.5% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
 
 ## Bounded protocol and service evidence
 

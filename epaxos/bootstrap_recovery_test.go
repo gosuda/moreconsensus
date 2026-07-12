@@ -53,8 +53,7 @@ func newBootstrapNodeFromRecord(t *testing.T, fixture bootstrapTestFixture, loca
 	}
 	node, err := NewRawNode(Config{
 		ID: local, Voters: record.Plan.Request.Base.Voters, Cluster: fixture.cluster,
-		LocalIdentity: fixture.identities[local-1], VoterIdentities: fixture.identities,
-		BootstrapPrivateKey: fixture.private[local-1], Storage: store,
+		LocalIdentity: fixture.identities[local-1], VoterIdentities: fixture.identities, Storage: store,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -96,6 +95,185 @@ func TestAllNoneActivateRequiresDurableReadyCertificate(t *testing.T) {
 	after := fixture.node.Ready()
 	if len(after.Records) != len(before.Records) || len(after.Messages) != len(before.Messages) {
 		t.Fatalf("rejected Activate recovery mutated Ready: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestReadyCertificateRequiresDurableTargetReadyRecord(t *testing.T) {
+	fixture := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, fixture)
+	fence := fenceBootstrapPlan(t, fixture, plan)
+	snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
+	ready := readyBootstrapTarget(t, fixture, plan, snapshot)
+	state := fixture.node.bootstrapPlans[plan.Request.Plan]
+	record := state.record.Clone()
+	record.Phase = BootstrapPhaseFinalizing
+	record.SnapshotCertificate = snapshot.Clone()
+	record.TargetReady = TargetReadyRecord{Plan: plan.Request.Plan, Proof: ready.Proof.Clone()}
+	record.ReadyCertificate = ready.Clone()
+	record.Digest = DigestBootstrapRecord(record)
+	if err := validateBootstrapRecord(record); err != nil {
+		t.Fatalf("valid durable target-ready record rejected: %v", err)
+	}
+	record.TargetReady = TargetReadyRecord{}
+	record.Digest = DigestBootstrapRecord(record)
+	if !errors.Is(validateBootstrapRecord(record), ErrBootstrapCertificate) {
+		t.Fatal("ready certificate accepted without durable target-ready record")
+	}
+}
+
+func TestBootstrapRecordRejectsUndigestedOptionalProofPayloads(t *testing.T) {
+	fixture := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, fixture)
+	fence := fenceBootstrapPlan(t, fixture, plan)
+	snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
+	ready := readyBootstrapTarget(t, fixture, plan, snapshot)
+	state := fixture.node.bootstrapPlans[plan.Request.Plan]
+	valid := state.record.Clone()
+	valid.Phase = BootstrapPhaseFinalizing
+	valid.SnapshotCertificate = snapshot.Clone()
+	valid.TargetReady = TargetReadyRecord{Plan: plan.Request.Plan, Proof: ready.Proof.Clone()}
+	valid.ReadyCertificate = ready.Clone()
+	valid.Digest = DigestBootstrapRecord(valid)
+	if err := validateBootstrapRecord(valid); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*BootstrapRecord)
+	}{
+		{name: "local fence", mutate: func(record *BootstrapRecord) {
+			record.LocalFence.Digest = StateDigest{}
+		}},
+		{name: "fence quorum", mutate: func(record *BootstrapRecord) {
+			record.FenceQuorum.Digest = StateDigest{}
+		}},
+		{name: "snapshot certificate", mutate: func(record *BootstrapRecord) {
+			record.SnapshotCertificate.Digest = StateDigest{}
+		}},
+		{name: "ready certificate", mutate: func(record *BootstrapRecord) {
+			record.ReadyCertificate.Digest = StateDigest{}
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			mutated := valid.Clone()
+			testCase.mutate(&mutated)
+			mutated.Digest = DigestBootstrapRecord(mutated)
+			if !errors.Is(validateBootstrapRecord(mutated), ErrBootstrapCertificate) {
+				t.Fatal("undigested optional proof payload accepted")
+			}
+		})
+	}
+}
+
+func TestReadyResponsePersistsTargetReadyProofBeforeFinalizing(t *testing.T) {
+	fixture, plan := standaloneBootstrapPlan(t, 3)
+	frontier := standaloneFrontier(plan, 0)
+	fence1 := standaloneAdmissionFence(t, plan, fixture.identities[0], frontier)
+	fence2 := standaloneAdmissionFence(t, plan, fixture.identities[1], frontier)
+	fenceQuorum, err := BuildFenceQuorum(plan, []LocalAdmissionFence{fence1, fence2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := standaloneSnapshotDescriptor(plan, fenceQuorum)
+	snapshotDigest := DigestSnapshotDescriptor(descriptor)
+	ack1, err := BuildVoterAcknowledgement(snapshotDigest, fixture.identities[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack2, err := BuildVoterAcknowledgement(snapshotDigest, fixture.identities[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := BuildSnapshotCertificate(plan, descriptor, []VoterAcknowledgement{ack1, ack2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := BuildVoterReadyProof(VoterReadyProof{
+		Cluster: fixture.cluster, Plan: plan.Request.Plan, Target: plan.Request.Target.Clone(),
+		SnapshotDigest: snapshot.Digest, InstalledStateDigest: descriptor.InstalledStateDigest,
+		AllocatorFloor: descriptor.TargetAllocatorFloor, TOQClosedThrough: descriptor.TOQClosedThrough,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyDigest := DigestVoterReadyProof(proof)
+	readyAck1, err := BuildVoterAcknowledgement(readyDigest, fixture.identities[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyAck2, err := BuildVoterAcknowledgement(readyDigest, fixture.identities[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := BuildReadyCertificate(plan, proof, []VoterAcknowledgement{readyAck1, readyAck2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requesterRecord := preparedBootstrapRecord(plan)
+	requesterRecord.Phase = BootstrapPhaseCertified
+	requesterRecord.FenceQuorum = fenceQuorum.Clone()
+	requesterRecord.SnapshotCertificate = snapshot.Clone()
+	requesterRecord.Digest = DigestBootstrapRecord(requesterRecord)
+	responderRecord := requesterRecord.Clone()
+	responderRecord.Phase = BootstrapPhaseFinalizing
+	responderRecord.TargetReady = TargetReadyRecord{Plan: plan.Request.Plan, Proof: proof.Clone()}
+	responderRecord.ReadyCertificate = ready.Clone()
+	responderRecord.Digest = DigestBootstrapRecord(responderRecord)
+	requester, requesterStore := newBootstrapNodeFromRecord(t, fixture, 2, requesterRecord)
+	responder, responderStore := newBootstrapNodeFromRecord(t, fixture, 1, responderRecord)
+
+	query, err := BuildBootstrapMessage(BootstrapMessage{
+		Type: BootstrapMsgReadyQuery, Cluster: fixture.cluster, Plan: plan.Request.Plan,
+		From: 2, FromIncarnation: 1, To: 1, BaseID: plan.Request.Base.ID,
+		BaseDigest: plan.RequestDigest, Payload: []byte("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := responder.StepBootstrapAuthenticated(query, query.From, query.FromIncarnation); err != nil {
+		t.Fatalf("ReadyQuery: %v", err)
+	}
+	responderReady := responder.Ready()
+	if len(responderReady.BootstrapMessages) != 1 || responderReady.BootstrapMessages[0].Type != BootstrapMsgReadyResponse {
+		t.Fatalf("ReadyQuery response=%#v", responderReady)
+	}
+	response := responderReady.BootstrapMessages[0]
+	if err := responderStore.ApplyReady(responderReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := responder.Advance(responderReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := requester.StepBootstrapAuthenticated(response, response.From, response.FromIncarnation); err != nil {
+		t.Fatalf("ReadyResponse: %v", err)
+	}
+	requesterReady := requester.Ready()
+	if !requesterReady.MustSync || len(requesterReady.BootstrapRecords) != 1 {
+		t.Fatalf("ReadyResponse Ready=%#v", requesterReady)
+	}
+	durable := requesterReady.BootstrapRecords[0]
+	if durable.TargetReady.Plan != plan.Request.Plan ||
+		DigestVoterReadyProof(durable.TargetReady.Proof) != DigestVoterReadyProof(ready.Proof) ||
+		durable.ReadyCertificate.Digest != ready.Digest ||
+		validateBootstrapRecord(durable) != nil {
+		t.Fatalf("ReadyResponse durable record=%#v", durable)
+	}
+	if err := requesterStore.ApplyReady(requesterReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := requester.Advance(requesterReady); err != nil {
+		t.Fatal(err)
+	}
+	persisted := requester.BootstrapStatus().Plans[0]
+	if persisted.TargetReady.Plan != plan.Request.Plan || persisted.ReadyCertificate.Digest != ready.Digest {
+		t.Fatalf("persisted ReadyResponse record=%#v", persisted)
+	}
+	if err := requester.StepBootstrapAuthenticated(response, response.From, response.FromIncarnation); err != nil {
+		t.Fatalf("duplicate ReadyResponse: %v", err)
+	}
+	if requester.HasReady() {
+		t.Fatal("duplicate ReadyResponse enqueued durable work")
 	}
 }
 
@@ -154,8 +332,8 @@ func runBootstrapExitOrder(t *testing.T, reverse bool) (MembershipResult, Member
 	t.Helper()
 	fixture := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, fixture)
-	seal := sealBootstrapPlan(t, fixture, plan)
-	snapshot := certifyBootstrapSnapshot(t, fixture, plan, seal)
+	fence := fenceBootstrapPlan(t, fixture, plan)
+	snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
 	ready := readyBootstrapTarget(t, fixture, plan, snapshot)
 	state := fixture.node.bootstrapPlans[plan.Request.Plan]
 	state.record.Phase = BootstrapPhaseFinalizing
@@ -166,12 +344,12 @@ func runBootstrapExitOrder(t *testing.T, reverse bool) (MembershipResult, Member
 	state.durablePhase = state.record.Phase
 	state.durableDigest = state.record.Digest
 	activate, err := encodeMembershipCommand(membershipCommandWire{
-		Operation: membershipActivate, Plan: plan.Clone(), Snapshot: snapshot.Clone(), Ready: ready.Clone(), SealDigest: seal.Digest,
+		Operation: membershipActivate, Plan: plan.Clone(), Snapshot: snapshot.Clone(), Ready: ready.Clone(), FenceDigest: fence.Digest,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	abort, err := encodeMembershipCommand(membershipCommandWire{Operation: membershipAbort, Plan: plan.Clone(), SealDigest: seal.Digest})
+	abort, err := encodeMembershipCommand(membershipCommandWire{Operation: membershipAbort, Plan: plan.Clone(), FenceDigest: fence.Digest})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +375,8 @@ func TestActivateAndAbortHaveOneDeterministicTerminalWinner(t *testing.T) {
 func TestBootstrapReadyCausallyFencesSuccessorMessages(t *testing.T) {
 	fixture := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, fixture)
-	seal := sealBootstrapPlan(t, fixture, plan)
-	snapshot := certifyBootstrapSnapshot(t, fixture, plan, seal)
+	fence := fenceBootstrapPlan(t, fixture, plan)
+	snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
 	ready := readyBootstrapTarget(t, fixture, plan, snapshot)
 	if _, err := fixture.node.ActivateVoter(plan, snapshot, ready); err != nil {
 		t.Fatal(err)
@@ -230,7 +408,7 @@ func restartBootstrapFixture(t *testing.T, fixture bootstrapTestFixture, voters 
 	t.Helper()
 	node, err := NewRawNode(Config{
 		ID: 1, Voters: voters, Cluster: fixture.cluster, LocalIdentity: fixture.identities[0],
-		VoterIdentities: identities, BootstrapPrivateKey: fixture.private[0], Storage: fixture.store,
+		VoterIdentities: identities, Storage: fixture.store,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +416,7 @@ func restartBootstrapFixture(t *testing.T, fixture bootstrapTestFixture, voters 
 	return node
 }
 
-func TestBootstrapReplayRestoresPreparedSealedActivatedAndAbortedStates(t *testing.T) {
+func TestBootstrapReplayRestoresPreparedFencedActivatedAndAbortedStates(t *testing.T) {
 	t.Run("prepared", func(t *testing.T) {
 		fixture := newBootstrapTestFixture(t, 1, 1)
 		plan := prepareBootstrapPlan(t, fixture)
@@ -248,21 +426,21 @@ func TestBootstrapReplayRestoresPreparedSealedActivatedAndAbortedStates(t *testi
 			t.Fatalf("prepared replay=%#v", status)
 		}
 	})
-	t.Run("sealed", func(t *testing.T) {
+	t.Run("fenced", func(t *testing.T) {
 		fixture := newBootstrapTestFixture(t, 1, 1)
 		plan := prepareBootstrapPlan(t, fixture)
-		sealBootstrapPlan(t, fixture, plan)
+		fenceBootstrapPlan(t, fixture, plan)
 		restarted := restartBootstrapFixture(t, fixture, plan.Request.Base.Voters, fixture.identities)
 		status := restarted.BootstrapStatus()
-		if len(status.Plans) != 1 || status.Plans[0].Phase != BootstrapPhaseSealed || len(status.Closed) != 1 {
-			t.Fatalf("sealed replay=%#v", status)
+		if len(status.Plans) != 1 || status.Plans[0].Phase != BootstrapPhaseFenced || len(status.Closed) != 1 {
+			t.Fatalf("fenced replay=%#v", status)
 		}
 	})
 	t.Run("activated", func(t *testing.T) {
 		fixture := newBootstrapTestFixture(t, 1, 1)
 		plan := prepareBootstrapPlan(t, fixture)
-		seal := sealBootstrapPlan(t, fixture, plan)
-		snapshot := certifyBootstrapSnapshot(t, fixture, plan, seal)
+		fence := fenceBootstrapPlan(t, fixture, plan)
+		snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
 		ready := readyBootstrapTarget(t, fixture, plan, snapshot)
 		if _, err := fixture.node.ActivateVoter(plan, snapshot, ready); err != nil {
 			t.Fatal(err)
@@ -293,8 +471,8 @@ func TestBootstrapReplayRestoresPreparedSealedActivatedAndAbortedStates(t *testi
 func TestAddedVoterNeverCountsForOldPinnedRecoveryAfterCertifiedActivation(t *testing.T) {
 	fixture := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, fixture)
-	seal := sealBootstrapPlan(t, fixture, plan)
-	snapshot := certifyBootstrapSnapshot(t, fixture, plan, seal)
+	fence := fenceBootstrapPlan(t, fixture, plan)
+	snapshot := certifyBootstrapSnapshot(t, fixture, plan, fence)
 	ready := readyBootstrapTarget(t, fixture, plan, snapshot)
 	if _, err := fixture.node.ActivateVoter(plan, snapshot, ready); err != nil {
 		t.Fatal(err)
@@ -317,8 +495,7 @@ func TestAddedVoterNeverCountsForOldPinnedRecoveryAfterCertifiedActivation(t *te
 	identities := append(cloneVoterIdentities(fixture.identities), fixture.target.Clone())
 	target, err := NewRawNode(Config{
 		ID: fixture.target.Replica, Voters: plan.Request.Base.Voters, Cluster: fixture.cluster,
-		LocalIdentity: fixture.target, VoterIdentities: identities,
-		BootstrapPrivateKey: fixture.targetKey, Storage: targetStore,
+		LocalIdentity: fixture.target, VoterIdentities: identities, Storage: targetStore,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -378,8 +555,7 @@ func TestNewRawNodeRejectsCurrentMembershipWithoutDurableEligibility(t *testing.
 	store.ConfigHistory = []ConfigHistoryEntry{{Conf: store.Hard.Conf.Clone()}}
 	if _, err := NewRawNode(Config{
 		ID: 1, Voters: []ReplicaID{1}, Cluster: fixture.cluster,
-		LocalIdentity: fixture.identities[0], VoterIdentities: fixture.identities,
-		BootstrapPrivateKey: fixture.private[0], Storage: store,
+		LocalIdentity: fixture.identities[0], VoterIdentities: fixture.identities, Storage: store,
 	}); !errors.Is(err, ErrBootstrapEligibility) {
 		t.Fatalf("startup without durable eligibility err=%v", err)
 	}
@@ -459,8 +635,7 @@ func newTOQBootstrapFixture(t *testing.T) bootstrapTestFixture {
 	runtime := TOQRuntimeConfig{Conf: base.Clone(), OneWayDelay: map[ReplicaID]uint64{1: 0}}
 	node, err := NewRawNode(Config{
 		ID: 1, Voters: base.Voters, Cluster: fixture.cluster,
-		LocalIdentity: fixture.identities[0], VoterIdentities: fixture.identities,
-		BootstrapPrivateKey: fixture.private[0], Storage: fixture.store,
+		LocalIdentity: fixture.identities[0], VoterIdentities: fixture.identities, Storage: fixture.store,
 		TOQ: true, TOQClock: func() uint64 { return 10 }, TOQRuntime: &runtime,
 	})
 	if err != nil {
@@ -510,7 +685,7 @@ func TestMemoryStorageBootstrapBatchValidationIsAtomic(t *testing.T) {
 	plan := prepareBootstrapPlan(t, fixture)
 	before := fixture.store.deepClone()
 	record := fixture.store.BootstrapRecords[0].Clone()
-	record.Phase = BootstrapPhaseLocalSealed
+	record.Phase = BootstrapPhaseLocalFenced
 	record.Digest = DigestBootstrapRecord(record)
 	err := fixture.store.ApplyReady(Ready{
 		BootstrapRecords: []BootstrapRecord{record},
@@ -526,8 +701,8 @@ func TestMemoryStorageBootstrapBatchValidationIsAtomic(t *testing.T) {
 
 	activatedFixture := newBootstrapTestFixture(t, 1, 1)
 	activatedPlan := prepareBootstrapPlan(t, activatedFixture)
-	seal := sealBootstrapPlan(t, activatedFixture, activatedPlan)
-	snapshot := certifyBootstrapSnapshot(t, activatedFixture, activatedPlan, seal)
+	fence := fenceBootstrapPlan(t, activatedFixture, activatedPlan)
+	snapshot := certifyBootstrapSnapshot(t, activatedFixture, activatedPlan, fence)
 	ready := readyBootstrapTarget(t, activatedFixture, activatedPlan, snapshot)
 	if _, err := activatedFixture.node.ActivateVoter(activatedPlan, snapshot, ready); err != nil {
 		t.Fatal(err)
@@ -595,19 +770,19 @@ func TestDueRecoveryTimersShareBoundedFairDriveBudget(t *testing.T) {
 	}
 }
 
-func TestLiveOldQuorumAfterSealSignerCrashesCanFinalizeButCannotChooseOrdinaryWork(t *testing.T) {
+func TestLiveOldQuorumAfterFencerCrashesCanFinalizeButCannotChooseOrdinaryWork(t *testing.T) {
 	for voters := 3; voters <= 6; voters++ {
 		t.Run(string(rune('0'+voters)), func(t *testing.T) {
 			fixture, plan := standaloneBootstrapPlan(t, voters)
 			frontier := standaloneFrontier(plan, 0)
 			quorum := slowQuorumSize(voters)
-			seals := make([]LocalSeal, quorum)
-			sealSet := make(map[ReplicaID]struct{}, quorum)
+			fences := make([]LocalAdmissionFence, quorum)
+			fenceSet := make(map[ReplicaID]struct{})
 			for i := 0; i < quorum; i++ {
-				seals[i] = signedStandaloneSeal(t, plan, fixture.identities[i], fixture.private[i], frontier)
-				sealSet[fixture.identities[i].Replica] = struct{}{}
+				fences[i] = standaloneAdmissionFence(t, plan, fixture.identities[i], frontier)
+				fenceSet[fixture.identities[i].Replica] = struct{}{}
 			}
-			certificate, err := BuildSealCertificate(plan, seals)
+			quorumCertificate, err := BuildFenceQuorum(plan, fences)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -618,31 +793,31 @@ func TestLiveOldQuorumAfterSealSignerCrashesCanFinalizeButCannotChooseOrdinaryWo
 				intersects := false
 				for index := 0; index < voters; index++ {
 					if mask&(1<<index) != 0 {
-						_, intersects = sealSet[ReplicaID(index+1)]
+						_, intersects = fenceSet[ReplicaID(index+1)]
 						if intersects {
 							break
 						}
 					}
 				}
 				if !intersects {
-					t.Fatalf("live old quorum %#x misses seal quorum", mask)
+					t.Fatalf("live old quorum %#x misses fence quorum", mask)
 				}
 			}
 			state := preparedBootstrapRecord(plan)
 			if err := fixture.node.restoreBootstrapRecord(state); err != nil {
 				t.Fatal(err)
 			}
-			if err := fixture.node.ApplySealCertificate(certificate); err != nil {
+			if err := fixture.node.ApplyFenceQuorum(quorumCertificate); err != nil {
 				t.Fatal(err)
 			}
 			ordinary := Message{
 				Type: MsgPreAccept, From: 1, To: 1,
 				Ref:    InstanceRef{Replica: 1, Instance: plan.Reservations.Abort.Instance + 1, Conf: plan.Request.Base.ID},
 				Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, voters),
-				Command: Command{Payload: []byte("post-seal")},
+				Command: Command{Payload: []byte("post-fence")},
 			}
-			if err := fixture.node.Step(ordinary); !errors.Is(err, ErrBootstrapSealed) {
-				t.Fatalf("post-seal ordinary admission err=%v", err)
+			if err := fixture.node.Step(ordinary); !errors.Is(err, ErrBootstrapFenced) {
+				t.Fatalf("post-fence ordinary admission err=%v", err)
 			}
 			if _, err := fixture.node.AbortVoter(plan); err != nil {
 				t.Fatalf("old-config exit could not be proposed: %v", err)

@@ -58,7 +58,7 @@ The following items are closed only for the bounded evidence classes stated here
 | KV checkpoint verification and repair boundaries | `examples/kv/backup.go`, `examples/kv/cluster.go`, `examples/kv/epaxos_storage.go`, and KV checkpoint tests. |
 | Service API, TLS, request, scan, and binary-value boundaries | `examples/kv/cmd/kvnode/main.go`, tagged KV tests, and `EPAXOS.MD`. |
 | Local fault and Jepsen harnesses | `tests/chaos_fault_campaign.sh`, `tests/jepsen_local.sh`, and the Jepsen checker tests. |
-| Finite formal model gate | `tests/tla_model_check_fast.sh` runs the required 14 finite jobs; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
+| Finite formal model gate | `tests/tla_model_check_fast.sh` runs 23 finite jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
 | Operations artifact checks | `tests/operations_readiness_audit.sh` and the local lifecycle helpers validate bounded operator mechanics only. |
 | DST data lifecycle and transient fault behavior | `TestDSTDataLifecycleCheckpointRestoreAndCorruptionRejection`, `TestDSTTransientFaultCasesRemainAvailableAndRecover`, and `TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive` cover durable checkpoint restore, corruption rejection, transient faults, exactly-once application, linearizable replay, and deterministic work degradation. |
 
@@ -87,7 +87,7 @@ Reviewers should start with the following authority and gates:
 - Finite TLC is bounded evidence, not an unbounded theorem over arbitrary Go executions.
 - `tla/EPaxosInductiveProofs.tla` proves only its restricted semantic `ConcreteNext`; it does not cover codec, allocation, `Ready` ownership, SCC execution, TOQ timing, or arbitrary `RawNode` executions.
 - `tla/EPaxosRawNodeRefinement.tla` is an implementation-shaped bounded workflow model. `tests/refinementtrace` adds executable pre/post contracts and exported-method inventory checks, not a TLC/TLAPS action replay.
-- `tla/EPaxosVoterBootstrap.tla` is a model-only bootstrap contract; bootstrap state is not part of the current `RawNode` semantic trace.
+- `tla/EPaxosVoterBootstrap.tla` is a finite bootstrap contract now executed by the 23-job TLC fast gate for base sizes 1–6 (successor sizes 2–7); bootstrap state is still not part of the `RawNode` semantic action trace.
 - The core does not synchronize clocks, measure one-way delay, prove operational TOQ discipline, or provide a production sync-group service.
 - Deterministic simulation and local Jepsen loopback are bounded fault evidence; they do not establish target deployment behavior.
 - Retention thresholds limit admission without deleting protocol history; certified compaction and unbounded uptime remain open.

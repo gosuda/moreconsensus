@@ -2,7 +2,6 @@ package epaxos
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
@@ -42,20 +41,13 @@ func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 	return s
 }
 
-func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, ClusterID, []VoterIdentity, []ed25519.PrivateKey) {
+func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, ClusterID, []VoterIdentity) {
 	t.Helper()
 	ids := makeIDs(voters)
 	cluster := ClusterID{0x51, byte(voters)}
 	identities := make([]VoterIdentity, voters+1)
-	privateKeys := make([]ed25519.PrivateKey, voters+1)
 	for i := range identities {
-		seed := make([]byte, ed25519.SeedSize)
-		seed[0] = byte(i + 41)
-		privateKeys[i] = ed25519.NewKeyFromSeed(seed)
-		identities[i] = VoterIdentity{
-			Replica: ReplicaID(i + 1), Incarnation: 1,
-			VerifyKey: append([]byte(nil), privateKeys[i].Public().(ed25519.PublicKey)...),
-		}
+		identities[i] = VoterIdentity{Replica: ReplicaID(i + 1), Incarnation: 1}
 	}
 	s := &simCluster{
 		t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage),
@@ -74,8 +66,7 @@ func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, Clu
 		}
 		node, err := NewRawNode(Config{
 			ID: id, Voters: ids, Cluster: cluster, LocalIdentity: identities[id-1],
-			VoterIdentities:     cloneVoterIdentities(identities[:voters]),
-			BootstrapPrivateKey: privateKeys[id-1], Storage: store,
+			VoterIdentities: cloneVoterIdentities(identities[:voters]), Storage: store,
 			RetryTicks: 2, RecoveryTicks: 5,
 		})
 		if err != nil {
@@ -84,7 +75,7 @@ func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, Clu
 		s.nodes[id] = node
 		s.stores[id] = store
 	}
-	return s, cluster, identities, privateKeys
+	return s, cluster, identities
 }
 
 func persistBootstrapSimNode(t *testing.T, s *simCluster, id ReplicaID) []BootstrapMessage {
@@ -573,7 +564,7 @@ func TestLogicalTicksRecoveryAndStorageFailure(t *testing.T) {
 }
 
 func TestConfChangeAndPools(t *testing.T) {
-	s, cluster, identities, privateKeys := newCertifiedBootstrapSimCluster(t, 3)
+	s, cluster, identities := newCertifiedBootstrapSimCluster(t, 3)
 	target := identities[3].Clone()
 	request := PrepareVoterRequest{
 		Cluster: cluster, Plan: BootstrapID{0x73, 0x69, 0x6d}, Base: s.nodes[1].Status().Conf,
@@ -590,26 +581,26 @@ func TestConfChangeAndPools(t *testing.T) {
 	}
 	s.drain()
 
-	sealAcks := make([]BootstrapMessage, 0, 3)
+	fenceAcks := make([]BootstrapMessage, 0, 3)
 	for _, id := range []ReplicaID{1, 2, 3} {
-		if err := s.nodes[id].BeginVoterSeal(plan); err != nil {
-			t.Fatalf("BeginVoterSeal node %d: %v", id, err)
+		if err := s.nodes[id].BeginVoterFence(plan); err != nil {
+			t.Fatalf("BeginVoterFence node %d: %v", id, err)
 		}
-		sealAcks = append(sealAcks, persistBootstrapSimNode(t, s, id)...)
+		fenceAcks = append(fenceAcks, persistBootstrapSimNode(t, s, id)...)
 	}
-	for _, ack := range sealAcks[:slowQuorumSize(len(plan.Request.Base.Voters))] {
-		if err := s.nodes[1].StepBootstrap(ack); err != nil {
-			t.Fatalf("SealAck from %d: %v", ack.From, err)
+	for _, ack := range fenceAcks[:slowQuorumSize(len(plan.Request.Base.Voters))] {
+		if err := s.nodes[1].StepBootstrapAuthenticated(ack, ack.From, ack.FromIncarnation); err != nil {
+			t.Fatalf("FenceAck from %d: %v", ack.From, err)
 		}
 	}
-	seal := s.nodes[1].BootstrapStatus().Plans[0].SealCertificate
-	if VerifySealCertificate(plan, seal) != nil {
-		t.Fatal("owner did not form a valid seal certificate")
+	fenceQuorum := s.nodes[1].BootstrapStatus().Plans[0].FenceQuorum
+	if ValidateFenceQuorum(plan, fenceQuorum) != nil {
+		t.Fatal("owner did not form a valid fence quorum")
 	}
 	persistBootstrapSimNode(t, s, 1)
 	for _, id := range []ReplicaID{2, 3} {
-		if err := s.nodes[id].ApplySealCertificate(seal); err != nil {
-			t.Fatalf("ApplySealCertificate node %d: %v", id, err)
+		if err := s.nodes[id].ApplyFenceQuorum(fenceQuorum); err != nil {
+			t.Fatalf("ApplyFenceQuorum node %d: %v", id, err)
 		}
 		persistBootstrapSimNode(t, s, id)
 	}
@@ -619,41 +610,41 @@ func TestConfChangeAndPools(t *testing.T) {
 		}
 	}
 
-	descriptor := standaloneSnapshotDescriptor(plan, seal)
+	descriptor := standaloneSnapshotDescriptor(plan, fenceQuorum)
 	descriptorDigest := DigestSnapshotDescriptor(descriptor)
-	attestations := make([]VoterAttestation, 2)
-	for i := range attestations {
-		attestations[i], err = SignVoterAttestation(descriptorDigest, identities[i], privateKeys[i])
+	acknowledgements := make([]VoterAcknowledgement, 2)
+	for i := range acknowledgements {
+		acknowledgements[i], err = BuildVoterAcknowledgement(descriptorDigest, identities[i])
 		if err != nil {
 			t.Fatal(err)
 		}
-		payload, marshalErr := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Attestation: attestations[i]})
+		payload, marshalErr := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Acknowledgement: acknowledgements[i]})
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
-		message, signErr := SignBootstrapMessage(BootstrapMessage{
+		message, buildErr := BuildBootstrapMessage(BootstrapMessage{
 			Type: BootstrapMsgSnapshotVote, Cluster: cluster, Plan: plan.Request.Plan,
 			From: identities[i].Replica, FromIncarnation: identities[i].Incarnation, To: 1,
 			BaseID: plan.Request.Base.ID, BaseDigest: plan.RequestDigest, Payload: payload,
-		}, identities[i], privateKeys[i])
-		if signErr != nil {
-			t.Fatal(signErr)
+		})
+		if buildErr != nil {
+			t.Fatal(buildErr)
 		}
-		if err := s.nodes[1].StepBootstrap(message); err != nil {
+		if err := s.nodes[1].StepBootstrapAuthenticated(message, message.From, message.FromIncarnation); err != nil {
 			t.Fatalf("SnapshotVote from %d: %v", message.From, err)
 		}
 	}
 	persistBootstrapSimNode(t, s, 1)
 	snapshot := s.nodes[1].BootstrapStatus().Plans[0].SnapshotCertificate
-	if VerifySnapshotCertificate(plan, snapshot) != nil {
+	if ValidateSnapshotCertificate(plan, snapshot) != nil {
 		t.Fatal("owner did not durably retain a valid snapshot certificate")
 	}
 
-	proof, err := SignVoterReadyProof(VoterReadyProof{
+	proof, err := BuildVoterReadyProof(VoterReadyProof{
 		Cluster: cluster, Plan: plan.Request.Plan, Target: target,
 		SnapshotDigest: snapshot.Digest, InstalledStateDigest: descriptor.InstalledStateDigest,
 		AllocatorFloor: descriptor.TargetAllocatorFloor, TOQClosedThrough: descriptor.TOQClosedThrough,
-	}, privateKeys[3])
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +659,7 @@ func TestConfChangeAndPools(t *testing.T) {
 	if _, err := NewRawNode(Config{
 		ID: target.Replica, Voters: plan.Request.Base.Voters, Cluster: cluster,
 		LocalIdentity: target, VoterIdentities: cloneVoterIdentities(identities[:3]),
-		BootstrapPrivateKey: privateKeys[3], Storage: targetStore,
+		Storage: targetStore,
 	}); !errors.Is(err, ErrBootstrapEligibility) {
 		t.Fatalf("staged target startup err=%v, want ErrBootstrapEligibility", err)
 	}
@@ -679,27 +670,27 @@ func TestConfChangeAndPools(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []ReplicaID{1, 2} {
-		message, signErr := SignBootstrapMessage(BootstrapMessage{
+		message, buildErr := BuildBootstrapMessage(BootstrapMessage{
 			Type: BootstrapMsgInstallProof, Cluster: cluster, Plan: plan.Request.Plan,
 			From: target.Replica, FromIncarnation: target.Incarnation, To: id,
 			BaseID: plan.Request.Base.ID, BaseDigest: plan.RequestDigest, Payload: installPayload,
-		}, target, privateKeys[3])
-		if signErr != nil {
-			t.Fatal(signErr)
+		})
+		if buildErr != nil {
+			t.Fatal(buildErr)
 		}
-		if err := s.nodes[id].StepBootstrap(message); err != nil {
+		if err := s.nodes[id].StepBootstrapAuthenticated(message, message.From, message.FromIncarnation); err != nil {
 			t.Fatalf("InstallProof node %d: %v", id, err)
 		}
 		readyAcks = append(readyAcks, persistBootstrapSimNode(t, s, id)...)
 	}
 	for _, ack := range readyAcks {
-		if err := s.nodes[1].StepBootstrap(ack); err != nil {
+		if err := s.nodes[1].StepBootstrapAuthenticated(ack, ack.From, ack.FromIncarnation); err != nil {
 			t.Fatalf("ReadyAck from %d: %v", ack.From, err)
 		}
 	}
 	persistBootstrapSimNode(t, s, 1)
 	readyCertificate := s.nodes[1].BootstrapStatus().Plans[0].ReadyCertificate
-	if VerifyReadyCertificate(plan, snapshot, readyCertificate) != nil {
+	if ValidateReadyCertificate(plan, snapshot, readyCertificate) != nil {
 		t.Fatal("owner did not durably retain a valid ready certificate")
 	}
 
@@ -738,7 +729,7 @@ func TestConfChangeAndPools(t *testing.T) {
 	targetNode, err := NewRawNode(Config{
 		ID: target.Replica, Voters: plan.Request.Base.Voters, Cluster: cluster,
 		LocalIdentity: target, VoterIdentities: cloneVoterIdentities(identities),
-		BootstrapPrivateKey: privateKeys[3], Storage: targetStore,
+		Storage: targetStore,
 	})
 	if err != nil {
 		t.Fatalf("start durably activated target: %v", err)

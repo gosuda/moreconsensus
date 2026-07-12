@@ -542,10 +542,6 @@ func validateLocalVoterTransition(current, next LocalVoterState) error {
 		next.AllocatorFloor < current.AllocatorFloor || next.TOQClosedThrough < current.TOQClosedThrough {
 		return fmt.Errorf("%w: local voter state regression", ErrInvalidConfig)
 	}
-	if next.Identity.Incarnation == current.Identity.Incarnation &&
-		!bytes.Equal(next.Identity.VerifyKey, current.Identity.VerifyKey) {
-		return fmt.Errorf("%w: voter key changed without incarnation", ErrInvalidConfig)
-	}
 	if current.Status == LocalVoterStatusEligible &&
 		(next.Conf.ID == current.Conf.ID || next.Status == LocalVoterStatusStaged) &&
 		next.Status != LocalVoterStatusEligible {

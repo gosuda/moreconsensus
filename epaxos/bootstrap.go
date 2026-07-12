@@ -3,7 +3,6 @@ package epaxos
 import (
 	"bytes"
 	"container/heap"
-	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,19 +12,19 @@ import (
 )
 
 const (
-	bootstrapWireVersion       = 1
+	bootstrapWireVersion       = 2
 	maxBootstrapPayload        = 1 << 20
 	maxBootstrapChunk          = 1 << 20
 	maxBootstrapTransfer       = 1 << 34
 	maxBootstrapChunks         = 1 << 16
-	maxBootstrapSigners        = 7
+	maxBootstrapVoters         = 7
 	maxBootstrapFrontierLanes  = 7
 	maxBootstrapSparseRefs     = 1 << 16
 	maxBootstrapHistoryEntries = 1 << 16
 )
 
-var bootstrapWireMagic = [...]byte{'E', 'P', 'X', 'B', 'O', 'O', 'T', '1'}
-var bootstrapChunkMagic = [...]byte{'E', 'P', 'X', 'C', 'H', 'N', 'K', '1'}
+var bootstrapWireMagic = [...]byte{'E', 'P', 'X', 'B', 'O', 'O', 'T', '2'}
+var bootstrapChunkMagic = [...]byte{'E', 'P', 'X', 'C', 'H', 'N', 'K', '2'}
 
 // ClusterID identifies one independently provisioned consensus cluster.
 type ClusterID [32]byte
@@ -36,22 +35,19 @@ type BootstrapID [32]byte
 // StateDigest authenticates a canonical state projection.
 type StateDigest [32]byte
 
-// VoterIdentity binds a replica number to one externally fenced incarnation and
-// its Ed25519 verification key.
+// VoterIdentity binds a replica number to one externally authenticated incarnation.
 type VoterIdentity struct {
 	Replica     ReplicaID
 	Incarnation uint64
-	VerifyKey   []byte
 }
 
 // Clone returns an ownership-independent identity.
 func (v VoterIdentity) Clone() VoterIdentity {
-	v.VerifyKey = append([]byte(nil), v.VerifyKey...)
 	return v
 }
 
 func (v VoterIdentity) valid() bool {
-	return v.Replica != 0 && v.Incarnation != 0 && len(v.VerifyKey) == ed25519.PublicKeySize
+	return v.Replica != 0 && v.Incarnation != 0
 }
 
 // ControlReservations are the consecutive old-configuration refs owned by the
@@ -191,50 +187,48 @@ func (p VoterPlan) Clone() VoterPlan {
 	return p
 }
 
-// LocalSeal is a signer's durable admission fence and sparse evidence.
-type LocalSeal struct {
+// LocalAdmissionFence is a voter's durable admission fence and sparse evidence.
+type LocalAdmissionFence struct {
 	Plan         BootstrapID
 	Base         ConfState
-	Signer       VoterIdentity
+	Voter        VoterIdentity
 	Reservations ControlReservations
 	Frontier     BootstrapFrontier
 	Digest       StateDigest
-	Signature    []byte
 }
 
-// Clone returns an ownership-independent seal.
-func (s LocalSeal) Clone() LocalSeal {
-	s.Base = s.Base.Clone()
-	s.Signer = s.Signer.Clone()
-	s.Frontier = s.Frontier.Clone()
-	s.Signature = append([]byte(nil), s.Signature...)
-	return s
+// Clone returns an ownership-independent admission fence.
+func (f LocalAdmissionFence) Clone() LocalAdmissionFence {
+	f.Base = f.Base.Clone()
+	f.Voter = f.Voter.Clone()
+	f.Frontier = f.Frontier.Clone()
+	return f
 }
 
-// SealCertificate is an exact old slow quorum of identical-plan local seals
-// together with their deterministic componentwise union frontier.
-type SealCertificate struct {
+// FenceQuorum is an exact old slow quorum of identical-plan admission fences
+// and their deterministic componentwise union frontier.
+type FenceQuorum struct {
 	Plan         BootstrapID
 	Base         ConfState
 	Reservations ControlReservations
 	Frontier     BootstrapFrontier
-	Seals        []LocalSeal
+	Fences       []LocalAdmissionFence
 	Digest       StateDigest
 }
 
-// Clone returns an ownership-independent certificate.
-func (c SealCertificate) Clone() SealCertificate {
-	c.Base = c.Base.Clone()
-	c.Frontier = c.Frontier.Clone()
-	out := make([]LocalSeal, len(c.Seals))
-	for i := range c.Seals {
-		out[i] = c.Seals[i].Clone()
+// Clone returns an ownership-independent fence quorum.
+func (q FenceQuorum) Clone() FenceQuorum {
+	q.Base = q.Base.Clone()
+	q.Frontier = q.Frontier.Clone()
+	out := make([]LocalAdmissionFence, len(q.Fences))
+	for i := range q.Fences {
+		out[i] = q.Fences[i].Clone()
 	}
-	c.Seals = out
-	return c
+	q.Fences = out
+	return q
 }
 
-// SnapshotDescriptor binds the finite sealed state installed by the target.
+// SnapshotDescriptor binds the finite fenced state installed by the target.
 type SnapshotDescriptor struct {
 	Cluster              ClusterID
 	Plan                 BootstrapID
@@ -243,7 +237,7 @@ type SnapshotDescriptor struct {
 	Target               VoterIdentity
 	Source               ReplicaID
 	Reservations         ControlReservations
-	SealDigest           StateDigest
+	FenceDigest          StateDigest
 	Frontier             BootstrapFrontier
 	ManifestDigest       StateDigest
 	DeltaFirst           uint64
@@ -272,35 +266,33 @@ func (d SnapshotDescriptor) Clone() SnapshotDescriptor {
 	return d
 }
 
-// VoterAttestation is one old voter signature over an exact digest.
-type VoterAttestation struct {
-	Signer         VoterIdentity
+// VoterAcknowledgement is one old-voter acknowledgement of an exact digest.
+type VoterAcknowledgement struct {
+	Voter          VoterIdentity
 	AttestedDigest StateDigest
-	Signature      []byte
 }
 
-// Clone returns an ownership-independent attestation.
-func (a VoterAttestation) Clone() VoterAttestation {
-	a.Signer = a.Signer.Clone()
-	a.Signature = append([]byte(nil), a.Signature...)
+// Clone returns an ownership-independent acknowledgement.
+func (a VoterAcknowledgement) Clone() VoterAcknowledgement {
+	a.Voter = a.Voter.Clone()
 	return a
 }
 
 // SnapshotCertificate is an exact old slow quorum certificate over Descriptor.
 type SnapshotCertificate struct {
-	Descriptor   SnapshotDescriptor
-	Attestations []VoterAttestation
-	Digest       StateDigest
+	Descriptor       SnapshotDescriptor
+	Acknowledgements []VoterAcknowledgement
+	Digest           StateDigest
 }
 
 // Clone returns an ownership-independent certificate.
 func (c SnapshotCertificate) Clone() SnapshotCertificate {
 	c.Descriptor = c.Descriptor.Clone()
-	c.Attestations = cloneVoterAttestations(c.Attestations)
+	c.Acknowledgements = cloneVoterAcknowledgements(c.Acknowledgements)
 	return c
 }
 
-// VoterReadyProof is signed only by the staged target after exact install.
+// VoterReadyProof is the structurally validated staged-target install proof.
 type VoterReadyProof struct {
 	Cluster              ClusterID
 	Plan                 BootstrapID
@@ -309,13 +301,11 @@ type VoterReadyProof struct {
 	InstalledStateDigest StateDigest
 	AllocatorFloor       InstanceNum
 	TOQClosedThrough     uint64
-	Signature            []byte
 }
 
 // Clone returns an ownership-independent proof.
 func (p VoterReadyProof) Clone() VoterReadyProof {
 	p.Target = p.Target.Clone()
-	p.Signature = append([]byte(nil), p.Signature...)
 	return p
 }
 
@@ -334,16 +324,16 @@ func (r TargetReadyRecord) Clone() TargetReadyRecord {
 // ReadyCertificate is an exact old slow quorum certificate that the target
 // proof was durably recorded.
 type ReadyCertificate struct {
-	Plan         BootstrapID
-	Proof        VoterReadyProof
-	Attestations []VoterAttestation
-	Digest       StateDigest
+	Plan             BootstrapID
+	Proof            VoterReadyProof
+	Acknowledgements []VoterAcknowledgement
+	Digest           StateDigest
 }
 
 // Clone returns an ownership-independent certificate.
 func (c ReadyCertificate) Clone() ReadyCertificate {
 	c.Proof = c.Proof.Clone()
-	c.Attestations = cloneVoterAttestations(c.Attestations)
+	c.Acknowledgements = cloneVoterAcknowledgements(c.Acknowledgements)
 	return c
 }
 
@@ -354,8 +344,8 @@ const (
 	BootstrapPhaseUnspecified BootstrapPhase = iota
 	BootstrapPhasePreparing
 	BootstrapPhasePrepared
-	BootstrapPhaseLocalSealed
-	BootstrapPhaseSealed
+	BootstrapPhaseLocalFenced
+	BootstrapPhaseFenced
 	BootstrapPhaseCertified
 	BootstrapPhaseTargetReady
 	BootstrapPhaseFinalizing
@@ -409,8 +399,8 @@ type BootstrapRecord struct {
 	Plan                VoterPlan
 	Phase               BootstrapPhase
 	Outcome             BootstrapOutcome
-	LocalSeal           LocalSeal
-	SealCertificate     SealCertificate
+	LocalFence          LocalAdmissionFence
+	FenceQuorum         FenceQuorum
 	SnapshotCertificate SnapshotCertificate
 	TargetReady         TargetReadyRecord
 	ReadyCertificate    ReadyCertificate
@@ -422,8 +412,8 @@ type BootstrapRecord struct {
 // Clone returns an ownership-independent record.
 func (r BootstrapRecord) Clone() BootstrapRecord {
 	r.Plan = r.Plan.Clone()
-	r.LocalSeal = r.LocalSeal.Clone()
-	r.SealCertificate = r.SealCertificate.Clone()
+	r.LocalFence = r.LocalFence.Clone()
+	r.FenceQuorum = r.FenceQuorum.Clone()
 	r.SnapshotCertificate = r.SnapshotCertificate.Clone()
 	r.TargetReady = r.TargetReady.Clone()
 	r.ReadyCertificate = r.ReadyCertificate.Clone()
@@ -542,9 +532,9 @@ const (
 type BootstrapMessageType uint8
 
 const (
-	BootstrapMsgSealRequest BootstrapMessageType = iota + 1
-	BootstrapMsgSealAck
-	BootstrapMsgCanonicalSeal
+	BootstrapMsgFenceRequest BootstrapMessageType = iota + 1
+	BootstrapMsgFenceAck
+	BootstrapMsgFenceQuorum
 	BootstrapMsgSnapshotVote
 	BootstrapMsgInstallProof
 	BootstrapMsgReadyAck
@@ -565,17 +555,16 @@ type BootstrapMessage struct {
 	BaseDigest      StateDigest
 	Payload         []byte
 	PayloadDigest   StateDigest
-	Signature       []byte
 }
 
 // Clone returns an ownership-independent message.
 func (m BootstrapMessage) Clone() BootstrapMessage {
 	m.Payload = append([]byte(nil), m.Payload...)
-	m.Signature = append([]byte(nil), m.Signature...)
 	return m
 }
 
-// BootstrapChunk is one independently authenticated snapshot stream frame.
+// BootstrapChunk is one snapshot stream frame. Its sender identity must be
+// authenticated by the lower transport layer.
 type BootstrapChunk struct {
 	Cluster         ClusterID
 	Plan            BootstrapID
@@ -588,13 +577,11 @@ type BootstrapChunk struct {
 	Total           uint64
 	Payload         []byte
 	PayloadDigest   StateDigest
-	Signature       []byte
 }
 
 // Clone returns an ownership-independent chunk.
 func (c BootstrapChunk) Clone() BootstrapChunk {
 	c.Payload = append([]byte(nil), c.Payload...)
-	c.Signature = append([]byte(nil), c.Signature...)
 	return c
 }
 
@@ -605,9 +592,10 @@ type BootstrapChunkSet struct {
 	chunks map[uint64]BootstrapChunk
 }
 
-// Add validates and retains one chunk. Exact duplicates stutter.
-func (s *BootstrapChunkSet) Add(chunk BootstrapChunk, identity VoterIdentity) error {
-	if err := VerifyBootstrapChunk(chunk, identity); err != nil {
+// AddAuthenticated validates and retains one chunk. Exact duplicates stutter.
+// The lower transport supplies the authenticated sender metadata.
+func (s *BootstrapChunkSet) AddAuthenticated(chunk BootstrapChunk, authenticatedReplica ReplicaID, authenticatedIncarnation uint64) error {
+	if err := ValidateBootstrapChunk(chunk, authenticatedReplica, authenticatedIncarnation); err != nil {
 		return err
 	}
 	limit := s.Limit
@@ -649,7 +637,7 @@ func bootstrapChunkEqual(a, b BootstrapChunk) bool {
 	return a.Cluster == b.Cluster && a.Plan == b.Plan && a.From == b.From &&
 		a.FromIncarnation == b.FromIncarnation && a.To == b.To && a.Manifest == b.Manifest &&
 		a.Index == b.Index && a.Offset == b.Offset && a.Total == b.Total &&
-		a.PayloadDigest == b.PayloadDigest && bytes.Equal(a.Payload, b.Payload) && bytes.Equal(a.Signature, b.Signature)
+		a.PayloadDigest == b.PayloadDigest && bytes.Equal(a.Payload, b.Payload)
 }
 
 func cloneVoterIdentities(in []VoterIdentity) []VoterIdentity {
@@ -660,8 +648,8 @@ func cloneVoterIdentities(in []VoterIdentity) []VoterIdentity {
 	return out
 }
 
-func cloneVoterAttestations(in []VoterAttestation) []VoterAttestation {
-	out := make([]VoterAttestation, len(in))
+func cloneVoterAcknowledgements(in []VoterAcknowledgement) []VoterAcknowledgement {
+	out := make([]VoterAcknowledgement, len(in))
 	for i := range in {
 		out[i] = in[i].Clone()
 	}
@@ -711,9 +699,7 @@ func appendConf(dst []byte, conf ConfState) []byte {
 
 func appendIdentity(dst []byte, identity VoterIdentity) []byte {
 	dst = binary.AppendUvarint(dst, uint64(identity.Replica))
-	dst = binary.AppendUvarint(dst, identity.Incarnation)
-	dst = binary.AppendUvarint(dst, uint64(len(identity.VerifyKey)))
-	return append(dst, identity.VerifyKey...)
+	return binary.AppendUvarint(dst, identity.Incarnation)
 }
 
 func appendReservations(dst []byte, refs ControlReservations) []byte {
@@ -796,7 +782,7 @@ func appendSnapshotDescriptor(dst []byte, descriptor SnapshotDescriptor) []byte 
 	dst = appendIdentity(dst, descriptor.Target)
 	dst = binary.AppendUvarint(dst, uint64(descriptor.Source))
 	dst = appendReservations(dst, descriptor.Reservations)
-	dst = appendFixed(dst, [32]byte(descriptor.SealDigest))
+	dst = appendFixed(dst, [32]byte(descriptor.FenceDigest))
 	dst = appendFrontier(dst, descriptor.Frontier)
 	dst = appendFixed(dst, [32]byte(descriptor.ManifestDigest))
 	dst = binary.AppendUvarint(dst, descriptor.DeltaFirst)
@@ -816,26 +802,19 @@ func appendSnapshotDescriptor(dst []byte, descriptor SnapshotDescriptor) []byte 
 	return appendFixed(dst, [32]byte(descriptor.ReleaseDigest))
 }
 
-func appendAttestation(dst []byte, attestation VoterAttestation) []byte {
-	dst = appendIdentity(dst, attestation.Signer)
-	dst = appendFixed(dst, [32]byte(attestation.AttestedDigest))
-	dst = binary.AppendUvarint(dst, uint64(len(attestation.Signature)))
-	return append(dst, attestation.Signature...)
+func appendAcknowledgement(dst []byte, acknowledgement VoterAcknowledgement) []byte {
+	dst = appendIdentity(dst, acknowledgement.Voter)
+	return appendFixed(dst, [32]byte(acknowledgement.AttestedDigest))
 }
 
-func appendReadyProof(dst []byte, proof VoterReadyProof, signature bool) []byte {
+func appendReadyProof(dst []byte, proof VoterReadyProof) []byte {
 	dst = appendFixed(dst, [32]byte(proof.Cluster))
 	dst = appendFixed(dst, [32]byte(proof.Plan))
 	dst = appendIdentity(dst, proof.Target)
 	dst = appendFixed(dst, [32]byte(proof.SnapshotDigest))
 	dst = appendFixed(dst, [32]byte(proof.InstalledStateDigest))
 	dst = binary.AppendUvarint(dst, uint64(proof.AllocatorFloor))
-	dst = binary.AppendUvarint(dst, proof.TOQClosedThrough)
-	if signature {
-		dst = binary.AppendUvarint(dst, uint64(len(proof.Signature)))
-		dst = append(dst, proof.Signature...)
-	}
-	return dst
+	return binary.AppendUvarint(dst, proof.TOQClosedThrough)
 }
 
 func domainDigest(domain string, canonical []byte) StateDigest {
@@ -850,87 +829,75 @@ func domainDigest(domain string, canonical []byte) StateDigest {
 func DigestVoterPlan(plan VoterPlan) StateDigest {
 	copyPlan := plan.Clone()
 	copyPlan.RequestDigest = StateDigest{}
-	return domainDigest("epaxos/bootstrap/plan/v1", appendVoterPlan(nil, copyPlan))
+	return domainDigest("epaxos/bootstrap/plan/v2", appendVoterPlan(nil, copyPlan))
 }
 
-// DigestLocalSeal returns the digest signed by a seal signer.
-func DigestLocalSeal(seal LocalSeal) StateDigest {
-	canonical := appendFixed(nil, [32]byte(seal.Plan))
-	canonical = appendConf(canonical, seal.Base)
-	canonical = appendIdentity(canonical, seal.Signer)
-	canonical = appendReservations(canonical, seal.Reservations)
-	canonical = appendFrontier(canonical, seal.Frontier)
-	return domainDigest("epaxos/bootstrap/local-seal/v1", canonical)
+// DigestVoterFrontier returns the canonical admission-frontier digest.
+func DigestVoterFrontier(fence LocalAdmissionFence) StateDigest {
+	canonical := appendFixed(nil, [32]byte(fence.Plan))
+	canonical = appendConf(canonical, fence.Base)
+	canonical = appendIdentity(canonical, fence.Voter)
+	canonical = appendReservations(canonical, fence.Reservations)
+	canonical = appendFrontier(canonical, fence.Frontier)
+	return domainDigest("epaxos/bootstrap/voter-frontier/v2", canonical)
 }
 
-// DigestSealCertificate returns the canonical certificate digest.
-func DigestSealCertificate(certificate SealCertificate) StateDigest {
-	canonical := appendFixed(nil, [32]byte(certificate.Plan))
-	canonical = appendConf(canonical, certificate.Base)
-	canonical = appendReservations(canonical, certificate.Reservations)
-	canonical = appendFrontier(canonical, certificate.Frontier)
-	canonical = binary.AppendUvarint(canonical, uint64(len(certificate.Seals)))
-	for _, seal := range certificate.Seals {
-		canonical = appendFixed(canonical, [32]byte(seal.Digest))
-		canonical = binary.AppendUvarint(canonical, uint64(len(seal.Signature)))
-		canonical = append(canonical, seal.Signature...)
+// DigestFenceQuorum returns the canonical old-quorum fence digest.
+func DigestFenceQuorum(quorum FenceQuorum) StateDigest {
+	canonical := appendFixed(nil, [32]byte(quorum.Plan))
+	canonical = appendConf(canonical, quorum.Base)
+	canonical = appendReservations(canonical, quorum.Reservations)
+	canonical = appendFrontier(canonical, quorum.Frontier)
+	canonical = binary.AppendUvarint(canonical, uint64(len(quorum.Fences)))
+	for _, fence := range quorum.Fences {
+		canonical = appendFixed(canonical, [32]byte(fence.Digest))
 	}
-	return domainDigest("epaxos/bootstrap/seal-certificate/v1", canonical)
+	return domainDigest("epaxos/bootstrap/fence-quorum/v2", canonical)
 }
 
 // DigestSnapshotDescriptor returns the canonical descriptor digest.
 func DigestSnapshotDescriptor(descriptor SnapshotDescriptor) StateDigest {
-	return domainDigest("epaxos/bootstrap/snapshot/v1", appendSnapshotDescriptor(nil, descriptor))
+	return domainDigest("epaxos/bootstrap/snapshot/v2", appendSnapshotDescriptor(nil, descriptor))
 }
 
 // DigestSnapshotCertificate returns the canonical certificate digest.
 func DigestSnapshotCertificate(certificate SnapshotCertificate) StateDigest {
 	canonical := appendSnapshotDescriptor(nil, certificate.Descriptor)
-	canonical = binary.AppendUvarint(canonical, uint64(len(certificate.Attestations)))
-	for _, attestation := range certificate.Attestations {
-		canonical = appendAttestation(canonical, attestation)
+	canonical = binary.AppendUvarint(canonical, uint64(len(certificate.Acknowledgements)))
+	for _, acknowledgement := range certificate.Acknowledgements {
+		canonical = appendAcknowledgement(canonical, acknowledgement)
 	}
-	return domainDigest("epaxos/bootstrap/snapshot-certificate/v1", canonical)
+	return domainDigest("epaxos/bootstrap/snapshot-certificate/v2", canonical)
 }
 
-// DigestVoterReadyProof returns the target proof digest.
+// DigestVoterReadyProof returns the canonical target-ready proof digest.
 func DigestVoterReadyProof(proof VoterReadyProof) StateDigest {
-	return domainDigest("epaxos/bootstrap/target-ready/v1", appendReadyProof(nil, proof, false))
+	return domainDigest("epaxos/bootstrap/target-ready/v2", appendReadyProof(nil, proof))
 }
 
 // DigestReadyCertificate returns the canonical ready certificate digest.
 func DigestReadyCertificate(certificate ReadyCertificate) StateDigest {
 	canonical := appendFixed(nil, [32]byte(certificate.Plan))
-	canonical = appendReadyProof(canonical, certificate.Proof, true)
-	canonical = binary.AppendUvarint(canonical, uint64(len(certificate.Attestations)))
-	for _, attestation := range certificate.Attestations {
-		canonical = appendAttestation(canonical, attestation)
+	canonical = appendReadyProof(canonical, certificate.Proof)
+	canonical = binary.AppendUvarint(canonical, uint64(len(certificate.Acknowledgements)))
+	for _, acknowledgement := range certificate.Acknowledgements {
+		canonical = appendAcknowledgement(canonical, acknowledgement)
 	}
-	return domainDigest("epaxos/bootstrap/ready-certificate/v1", canonical)
+	return domainDigest("epaxos/bootstrap/ready-certificate/v2", canonical)
 }
 
-func publicKeyMatches(identity VoterIdentity, private ed25519.PrivateKey) bool {
-	if !identity.valid() || len(private) != ed25519.PrivateKeySize {
-		return false
+// BuildLocalAdmissionFence computes a voter's canonical admission-frontier digest.
+func BuildLocalAdmissionFence(fence LocalAdmissionFence) (LocalAdmissionFence, error) {
+	if !fence.Voter.valid() {
+		return LocalAdmissionFence{}, ErrBootstrapEligibility
 	}
-	public, ok := private.Public().(ed25519.PublicKey)
-	return ok && bytes.Equal(public, identity.VerifyKey)
+	fence.Digest = DigestVoterFrontier(fence)
+	return fence, nil
 }
 
-// SignLocalSeal signs a canonical local seal.
-func SignLocalSeal(seal LocalSeal, private ed25519.PrivateKey) (LocalSeal, error) {
-	if !publicKeyMatches(seal.Signer, private) {
-		return LocalSeal{}, ErrBootstrapEligibility
-	}
-	seal.Digest = DigestLocalSeal(seal)
-	seal.Signature = ed25519.Sign(private, seal.Digest[:])
-	return seal, nil
-}
-
-// VerifyLocalSeal verifies one canonical local seal.
-func VerifyLocalSeal(seal LocalSeal) error {
-	if !seal.Signer.valid() || len(seal.Signature) != ed25519.SignatureSize || seal.Digest != DigestLocalSeal(seal) ||
-		!ed25519.Verify(ed25519.PublicKey(seal.Signer.VerifyKey), seal.Digest[:], seal.Signature) {
+// ValidateLocalAdmissionFence validates one admission fence structurally.
+func ValidateLocalAdmissionFence(fence LocalAdmissionFence) error {
+	if !fence.Voter.valid() || fence.Digest != DigestVoterFrontier(fence) {
 		return ErrBootstrapCertificate
 	}
 	return nil
@@ -946,7 +913,7 @@ func identityFor(plan VoterPlan, replica ReplicaID) (VoterIdentity, bool) {
 }
 
 func validatePlanIdentities(plan VoterPlan) error {
-	if len(plan.Request.OldVoters) != len(plan.Request.Base.Voters) || len(plan.Request.OldVoters) > maxBootstrapSigners {
+	if len(plan.Request.OldVoters) != len(plan.Request.Base.Voters) || len(plan.Request.OldVoters) > maxBootstrapVoters {
 		return ErrBootstrapCertificate
 	}
 	for i, voter := range plan.Request.Base.Voters {
@@ -958,16 +925,16 @@ func validatePlanIdentities(plan VoterPlan) error {
 	return nil
 }
 
-func unionSealFrontier(base ConfState, seals []LocalSeal) (BootstrapFrontier, error) {
+func unionFrontier(base ConfState, fences []LocalAdmissionFence) (BootstrapFrontier, error) {
 	frontier := BootstrapFrontier{Conf: base.ID, Lanes: make([]BootstrapLaneFrontier, len(base.Voters))}
 	for i, voter := range base.Voters {
 		frontier.Lanes[i].Replica = voter
 	}
-	for _, seal := range seals {
-		if err := validateBootstrapFrontier(seal.Frontier, base); err != nil {
+	for _, fence := range fences {
+		if err := validateBootstrapFrontier(fence.Frontier, base); err != nil {
 			return BootstrapFrontier{}, err
 		}
-		for i, lane := range seal.Frontier.Lanes {
+		for i, lane := range fence.Frontier.Lanes {
 			out := &frontier.Lanes[i]
 			if lane.ObservedThrough > out.ObservedThrough {
 				out.ObservedThrough = lane.ObservedThrough
@@ -997,73 +964,75 @@ func unionSealFrontier(base ConfState, seals []LocalSeal) (BootstrapFrontier, er
 	return frontier, nil
 }
 
-// BuildSealCertificate verifies and canonicalizes exactly one old slow quorum.
-func BuildSealCertificate(plan VoterPlan, seals []LocalSeal) (SealCertificate, error) {
+// BuildFenceQuorum structurally validates and canonicalizes one old quorum.
+func BuildFenceQuorum(plan VoterPlan, fences []LocalAdmissionFence) (FenceQuorum, error) {
 	if err := validateVoterPlan(plan); err != nil {
-		return SealCertificate{}, err
+		return FenceQuorum{}, err
 	}
 	quorum := slowQuorumSize(len(plan.Request.Base.Voters))
-	if len(seals) != quorum || len(seals) > maxBootstrapSigners {
-		return SealCertificate{}, ErrBootstrapCertificate
+	if len(fences) != quorum || len(fences) > maxBootstrapVoters {
+		return FenceQuorum{}, ErrBootstrapCertificate
 	}
-	seals = append([]LocalSeal(nil), seals...)
-	sort.Slice(seals, func(i, j int) bool { return seals[i].Signer.Replica < seals[j].Signer.Replica })
-	for i := range seals {
-		seal := seals[i]
-		identity, ok := identityFor(plan, seal.Signer.Replica)
-		if !ok || !voterIdentityEqual(identity, seal.Signer) || (i > 0 && seals[i-1].Signer.Replica == seal.Signer.Replica) ||
-			seal.Plan != plan.Request.Plan || !confStateEqual(seal.Base, plan.Request.Base) || seal.Reservations != plan.Reservations {
-			return SealCertificate{}, ErrBootstrapCertificate
+	fences = append([]LocalAdmissionFence(nil), fences...)
+	sort.Slice(fences, func(i, j int) bool { return fences[i].Voter.Replica < fences[j].Voter.Replica })
+	for i := range fences {
+		fence := fences[i]
+		identity, ok := identityFor(plan, fence.Voter.Replica)
+		if !ok || !voterIdentityEqual(identity, fence.Voter) || (i > 0 && fences[i-1].Voter.Replica == fence.Voter.Replica) ||
+			fence.Plan != plan.Request.Plan || !confStateEqual(fence.Base, plan.Request.Base) || fence.Reservations != plan.Reservations {
+			return FenceQuorum{}, ErrBootstrapCertificate
 		}
-		if err := VerifyLocalSeal(seal); err != nil {
-			return SealCertificate{}, err
+		if err := ValidateLocalAdmissionFence(fence); err != nil {
+			return FenceQuorum{}, err
 		}
 	}
-	frontier, err := unionSealFrontier(plan.Request.Base, seals)
+	frontier, err := unionFrontier(plan.Request.Base, fences)
 	if err != nil {
-		return SealCertificate{}, err
+		return FenceQuorum{}, err
 	}
-	certificate := SealCertificate{Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Reservations: plan.Reservations, Frontier: frontier, Seals: seals}
-	certificate.Digest = DigestSealCertificate(certificate)
-	return certificate, nil
+	quorumCertificate := FenceQuorum{
+		Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Reservations: plan.Reservations,
+		Frontier: frontier, Fences: fences,
+	}
+	quorumCertificate.Digest = DigestFenceQuorum(quorumCertificate)
+	return quorumCertificate, nil
 }
 
-// VerifySealCertificate verifies exact old quorum, signer uniqueness, union, and digest.
-func VerifySealCertificate(plan VoterPlan, certificate SealCertificate) error {
-	canonical, err := BuildSealCertificate(plan, certificate.Seals)
+// ValidateFenceQuorum structurally validates an old-quorum fence.
+func ValidateFenceQuorum(plan VoterPlan, quorum FenceQuorum) error {
+	canonical, err := BuildFenceQuorum(plan, quorum.Fences)
 	if err != nil {
 		return err
 	}
-	if canonical.Digest != certificate.Digest || !frontierEqual(canonical.Frontier, certificate.Frontier) ||
-		canonical.Plan != certificate.Plan || !confStateEqual(canonical.Base, certificate.Base) || canonical.Reservations != certificate.Reservations {
+	if canonical.Digest != quorum.Digest || !frontierEqual(canonical.Frontier, quorum.Frontier) ||
+		canonical.Plan != quorum.Plan || !confStateEqual(canonical.Base, quorum.Base) || canonical.Reservations != quorum.Reservations {
 		return ErrBootstrapCertificate
 	}
 	return nil
 }
 
-// SignVoterAttestation signs one exact digest.
-func SignVoterAttestation(digest StateDigest, signer VoterIdentity, private ed25519.PrivateKey) (VoterAttestation, error) {
-	if !publicKeyMatches(signer, private) {
-		return VoterAttestation{}, ErrBootstrapEligibility
+// BuildVoterAcknowledgement builds a transport-neutral voter acknowledgement.
+func BuildVoterAcknowledgement(digest StateDigest, voter VoterIdentity) (VoterAcknowledgement, error) {
+	if digest == (StateDigest{}) || !voter.valid() {
+		return VoterAcknowledgement{}, ErrBootstrapEligibility
 	}
-	return VoterAttestation{Signer: signer.Clone(), AttestedDigest: digest, Signature: ed25519.Sign(private, digest[:])}, nil
+	return VoterAcknowledgement{Voter: voter.Clone(), AttestedDigest: digest}, nil
 }
 
-func verifyAttestations(plan VoterPlan, digest StateDigest, attestations []VoterAttestation, requireSource bool) error {
-	if len(attestations) != slowQuorumSize(len(plan.Request.Base.Voters)) || len(attestations) > maxBootstrapSigners {
+func validateAcknowledgements(plan VoterPlan, digest StateDigest, acknowledgements []VoterAcknowledgement, requireSource bool) error {
+	if len(acknowledgements) != slowQuorumSize(len(plan.Request.Base.Voters)) || len(acknowledgements) > maxBootstrapVoters {
 		return ErrBootstrapCertificate
 	}
 	seenSource := false
 	last := ReplicaID(0)
-	for _, attestation := range attestations {
-		identity, ok := identityFor(plan, attestation.Signer.Replica)
-		if !ok || !voterIdentityEqual(identity, attestation.Signer) || attestation.Signer.Replica <= last ||
-			attestation.AttestedDigest != digest || len(attestation.Signature) != ed25519.SignatureSize ||
-			!ed25519.Verify(ed25519.PublicKey(attestation.Signer.VerifyKey), digest[:], attestation.Signature) {
+	for _, acknowledgement := range acknowledgements {
+		identity, ok := identityFor(plan, acknowledgement.Voter.Replica)
+		if !ok || !voterIdentityEqual(identity, acknowledgement.Voter) || acknowledgement.Voter.Replica <= last ||
+			acknowledgement.AttestedDigest != digest {
 			return ErrBootstrapCertificate
 		}
-		last = attestation.Signer.Replica
-		seenSource = seenSource || attestation.Signer.Replica == plan.Request.Source
+		last = acknowledgement.Voter.Replica
+		seenSource = seenSource || acknowledgement.Voter.Replica == plan.Request.Source
 	}
 	if requireSource && !seenSource {
 		return ErrBootstrapCertificate
@@ -1071,25 +1040,25 @@ func verifyAttestations(plan VoterPlan, digest StateDigest, attestations []Voter
 	return nil
 }
 
-// BuildSnapshotCertificate verifies and canonicalizes a descriptor quorum.
-func BuildSnapshotCertificate(plan VoterPlan, descriptor SnapshotDescriptor, attestations []VoterAttestation) (SnapshotCertificate, error) {
+// BuildSnapshotCertificate structurally validates and canonicalizes a descriptor quorum.
+func BuildSnapshotCertificate(plan VoterPlan, descriptor SnapshotDescriptor, acknowledgements []VoterAcknowledgement) (SnapshotCertificate, error) {
 	if err := validateSnapshotDescriptor(plan, descriptor); err != nil {
 		return SnapshotCertificate{}, err
 	}
-	attestations = append([]VoterAttestation(nil), attestations...)
-	sort.Slice(attestations, func(i, j int) bool { return attestations[i].Signer.Replica < attestations[j].Signer.Replica })
+	acknowledgements = append([]VoterAcknowledgement(nil), acknowledgements...)
+	sort.Slice(acknowledgements, func(i, j int) bool { return acknowledgements[i].Voter.Replica < acknowledgements[j].Voter.Replica })
 	digest := DigestSnapshotDescriptor(descriptor)
-	if err := verifyAttestations(plan, digest, attestations, true); err != nil {
+	if err := validateAcknowledgements(plan, digest, acknowledgements, true); err != nil {
 		return SnapshotCertificate{}, err
 	}
-	certificate := SnapshotCertificate{Descriptor: descriptor.Clone(), Attestations: attestations}
+	certificate := SnapshotCertificate{Descriptor: descriptor.Clone(), Acknowledgements: acknowledgements}
 	certificate.Digest = DigestSnapshotCertificate(certificate)
 	return certificate, nil
 }
 
-// VerifySnapshotCertificate verifies an exact old quorum snapshot certificate.
-func VerifySnapshotCertificate(plan VoterPlan, certificate SnapshotCertificate) error {
-	canonical, err := BuildSnapshotCertificate(plan, certificate.Descriptor, certificate.Attestations)
+// ValidateSnapshotCertificate structurally validates an old quorum certificate.
+func ValidateSnapshotCertificate(plan VoterPlan, certificate SnapshotCertificate) error {
+	canonical, err := BuildSnapshotCertificate(plan, certificate.Descriptor, certificate.Acknowledgements)
 	if err != nil {
 		return err
 	}
@@ -1099,73 +1068,67 @@ func VerifySnapshotCertificate(plan VoterPlan, certificate SnapshotCertificate) 
 	return nil
 }
 
-// SignVoterReadyProof signs an exact staged-target install proof.
-func SignVoterReadyProof(proof VoterReadyProof, private ed25519.PrivateKey) (VoterReadyProof, error) {
-	if !publicKeyMatches(proof.Target, private) {
-		return VoterReadyProof{}, ErrBootstrapEligibility
+// BuildVoterReadyProof structurally builds a staged-target install proof.
+func BuildVoterReadyProof(proof VoterReadyProof) (VoterReadyProof, error) {
+	if !proof.Target.valid() || proof.Cluster == (ClusterID{}) || proof.Plan == (BootstrapID{}) ||
+		proof.SnapshotDigest == (StateDigest{}) || proof.InstalledStateDigest == (StateDigest{}) ||
+		proof.AllocatorFloor == 0 {
+		return VoterReadyProof{}, ErrBootstrapSnapshot
 	}
-	digest := DigestVoterReadyProof(proof)
-	proof.Signature = ed25519.Sign(private, digest[:])
 	return proof, nil
 }
 
-// VerifyVoterReadyProof verifies target identity, install binding, floor, and signature.
-func VerifyVoterReadyProof(plan VoterPlan, snapshot SnapshotCertificate, proof VoterReadyProof) error {
+// ValidateVoterReadyProof structurally validates target identity and install binding.
+func ValidateVoterReadyProof(plan VoterPlan, snapshot SnapshotCertificate, proof VoterReadyProof) error {
 	if proof.Cluster != plan.Request.Cluster || proof.Plan != plan.Request.Plan || !voterIdentityEqual(proof.Target, plan.Request.Target) ||
 		proof.SnapshotDigest != snapshot.Digest || proof.InstalledStateDigest == (StateDigest{}) ||
 		proof.InstalledStateDigest != snapshot.Descriptor.InstalledStateDigest ||
 		proof.AllocatorFloor != snapshot.Descriptor.TargetAllocatorFloor ||
-		proof.TOQClosedThrough != snapshot.Descriptor.TOQClosedThrough || proof.AllocatorFloor == 0 ||
-		len(proof.Signature) != ed25519.SignatureSize {
+		proof.TOQClosedThrough != snapshot.Descriptor.TOQClosedThrough || proof.AllocatorFloor == 0 {
 		return ErrBootstrapSnapshot
-	}
-	digest := DigestVoterReadyProof(proof)
-	if !ed25519.Verify(ed25519.PublicKey(proof.Target.VerifyKey), digest[:], proof.Signature) {
-		return ErrBootstrapCertificate
 	}
 	return nil
 }
 
-// BuildReadyCertificate verifies and canonicalizes an exact old slow quorum.
-func BuildReadyCertificate(plan VoterPlan, proof VoterReadyProof, attestations []VoterAttestation) (ReadyCertificate, error) {
+// BuildReadyCertificate structurally validates and canonicalizes an old quorum.
+func BuildReadyCertificate(plan VoterPlan, proof VoterReadyProof, acknowledgements []VoterAcknowledgement) (ReadyCertificate, error) {
 	proofDigest := DigestVoterReadyProof(proof)
 	if proof.Cluster != plan.Request.Cluster || proof.Plan != plan.Request.Plan ||
 		!voterIdentityEqual(proof.Target, plan.Request.Target) ||
 		proof.SnapshotDigest == (StateDigest{}) || proof.InstalledStateDigest == (StateDigest{}) ||
-		proof.AllocatorFloor != plan.Request.TargetAllocatorFloor || proof.AllocatorFloor == 0 ||
-		len(proof.Signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(ed25519.PublicKey(proof.Target.VerifyKey), proofDigest[:], proof.Signature) {
+		proof.AllocatorFloor != plan.Request.TargetAllocatorFloor || proof.AllocatorFloor == 0 {
 		return ReadyCertificate{}, ErrBootstrapCertificate
 	}
-	attestations = append([]VoterAttestation(nil), attestations...)
-	sort.Slice(attestations, func(i, j int) bool { return attestations[i].Signer.Replica < attestations[j].Signer.Replica })
-	if err := verifyAttestations(plan, proofDigest, attestations, false); err != nil {
+	acknowledgements = append([]VoterAcknowledgement(nil), acknowledgements...)
+	sort.Slice(acknowledgements, func(i, j int) bool { return acknowledgements[i].Voter.Replica < acknowledgements[j].Voter.Replica })
+	if err := validateAcknowledgements(plan, proofDigest, acknowledgements, false); err != nil {
 		return ReadyCertificate{}, err
 	}
-	certificate := ReadyCertificate{Plan: plan.Request.Plan, Proof: proof.Clone(), Attestations: attestations}
+	certificate := ReadyCertificate{Plan: plan.Request.Plan, Proof: proof.Clone(), Acknowledgements: acknowledgements}
 	certificate.Digest = DigestReadyCertificate(certificate)
 	return certificate, nil
 }
 
-// VerifyReadyCertificate verifies an exact old quorum ready certificate.
-func VerifyReadyCertificate(plan VoterPlan, snapshot SnapshotCertificate, certificate ReadyCertificate) error {
-	if certificate.Plan != plan.Request.Plan || VerifyVoterReadyProof(plan, snapshot, certificate.Proof) != nil {
+// ValidateReadyCertificate structurally validates an old quorum ready certificate.
+func ValidateReadyCertificate(plan VoterPlan, snapshot SnapshotCertificate, certificate ReadyCertificate) error {
+	if certificate.Plan != plan.Request.Plan || ValidateVoterReadyProof(plan, snapshot, certificate.Proof) != nil {
 		return ErrBootstrapCertificate
 	}
-	canonical, err := BuildReadyCertificate(plan, certificate.Proof, certificate.Attestations)
+	canonical, err := BuildReadyCertificate(plan, certificate.Proof, certificate.Acknowledgements)
 	if err != nil || canonical.Digest != certificate.Digest {
 		return ErrBootstrapCertificate
 	}
 	return nil
 }
 
+// SnapshotDescriptor binds the finite fenced state installed by the target.
 func validateSnapshotDescriptor(plan VoterPlan, descriptor SnapshotDescriptor) error {
 	if descriptor.Cluster != plan.Request.Cluster || descriptor.Plan != plan.Request.Plan ||
 		!confStateEqual(descriptor.Base, plan.Request.Base) || !confStateEqual(descriptor.Successor, plan.Successor) ||
 		!voterIdentityEqual(descriptor.Target, plan.Request.Target) || descriptor.Source != plan.Request.Source ||
 		descriptor.Reservations != plan.Reservations || descriptor.TargetAllocatorFloor != plan.Request.TargetAllocatorFloor ||
 		descriptor.ReleaseDigest != plan.Request.ReleaseDigest || descriptor.TimingDigest != plan.Request.TimingDigest ||
-		descriptor.SealDigest == (StateDigest{}) || descriptor.ManifestDigest == (StateDigest{}) ||
+		descriptor.FenceDigest == (StateDigest{}) || descriptor.ManifestDigest == (StateDigest{}) ||
 		descriptor.DeltaRoot == (StateDigest{}) || descriptor.ApplicationDigest == (StateDigest{}) ||
 		descriptor.IdempotencyDigest == (StateDigest{}) || descriptor.ConfigHistoryDigest == (StateDigest{}) ||
 		descriptor.InstanceDigest == (StateDigest{}) || descriptor.HardStateDigest == (StateDigest{}) ||
@@ -1187,9 +1150,8 @@ func validateSnapshotDescriptor(plan VoterPlan, descriptor SnapshotDescriptor) e
 	}
 	return nil
 }
-
 func voterIdentityEqual(a, b VoterIdentity) bool {
-	return a.Replica == b.Replica && a.Incarnation == b.Incarnation && bytes.Equal(a.VerifyKey, b.VerifyKey)
+	return a.Replica == b.Replica && a.Incarnation == b.Incarnation
 }
 
 func confStateEqual(a, b ConfState) bool { return a.ID == b.ID && sameReplicaIDs(a.Voters, b.Voters) }
@@ -1212,8 +1174,8 @@ func frontierEqual(a, b BootstrapFrontier) bool {
 func DigestBootstrapRecord(record BootstrapRecord) StateDigest {
 	canonical := appendVoterPlan(nil, record.Plan)
 	canonical = append(canonical, byte(record.Phase), byte(record.Outcome))
-	canonical = appendFixed(canonical, [32]byte(record.LocalSeal.Digest))
-	canonical = appendFixed(canonical, [32]byte(record.SealCertificate.Digest))
+	canonical = appendFixed(canonical, [32]byte(record.LocalFence.Digest))
+	canonical = appendFixed(canonical, [32]byte(record.FenceQuorum.Digest))
 	canonical = appendFixed(canonical, [32]byte(record.SnapshotCertificate.Digest))
 	canonical = appendFixed(canonical, [32]byte(DigestVoterReadyProof(record.TargetReady.Proof)))
 	canonical = appendFixed(canonical, [32]byte(record.ReadyCertificate.Digest))
@@ -1222,7 +1184,7 @@ func DigestBootstrapRecord(record BootstrapRecord) StateDigest {
 	canonical = appendFrontier(canonical, record.Closed.Frontier)
 	canonical = appendReservations(canonical, record.Closed.Reservations)
 	canonical = appendFixed(canonical, [32]byte(record.Closed.CertificateDigest))
-	return domainDigest("epaxos/bootstrap/record/v1", canonical)
+	return domainDigest("epaxos/bootstrap/record/v2", canonical)
 }
 
 func validateVoterPlan(plan VoterPlan) error {
@@ -1264,6 +1226,79 @@ func validateVoterPlan(plan VoterPlan) error {
 	return nil
 }
 
+func voterReadyProofIsZero(proof VoterReadyProof) bool {
+	return proof.Cluster == (ClusterID{}) &&
+		proof.Plan == (BootstrapID{}) &&
+		proof.Target == (VoterIdentity{}) &&
+		proof.SnapshotDigest == (StateDigest{}) &&
+		proof.InstalledStateDigest == (StateDigest{}) &&
+		proof.AllocatorFloor == 0 &&
+		proof.TOQClosedThrough == 0
+}
+
+func localAdmissionFenceIsZero(fence LocalAdmissionFence) bool {
+	return fence.Plan == (BootstrapID{}) &&
+		confStateIsZero(fence.Base) &&
+		fence.Voter == (VoterIdentity{}) &&
+		fence.Reservations == (ControlReservations{}) &&
+		frontierEqual(fence.Frontier, BootstrapFrontier{}) &&
+		fence.Digest == (StateDigest{})
+}
+
+func fenceQuorumIsZero(quorum FenceQuorum) bool {
+	return quorum.Plan == (BootstrapID{}) &&
+		confStateIsZero(quorum.Base) &&
+		quorum.Reservations == (ControlReservations{}) &&
+		frontierEqual(quorum.Frontier, BootstrapFrontier{}) &&
+		len(quorum.Fences) == 0 &&
+		quorum.Digest == (StateDigest{})
+}
+
+func snapshotDescriptorIsZero(descriptor SnapshotDescriptor) bool {
+	return descriptor.Cluster == (ClusterID{}) &&
+		descriptor.Plan == (BootstrapID{}) &&
+		confStateIsZero(descriptor.Base) &&
+		confStateIsZero(descriptor.Successor) &&
+		descriptor.Target == (VoterIdentity{}) &&
+		descriptor.Source == 0 &&
+		descriptor.Reservations == (ControlReservations{}) &&
+		descriptor.FenceDigest == (StateDigest{}) &&
+		frontierEqual(descriptor.Frontier, BootstrapFrontier{}) &&
+		descriptor.ManifestDigest == (StateDigest{}) &&
+		descriptor.DeltaFirst == 0 &&
+		descriptor.DeltaLast == 0 &&
+		descriptor.DeltaRoot == (StateDigest{}) &&
+		descriptor.ApplicationDigest == (StateDigest{}) &&
+		descriptor.IdempotencyDigest == (StateDigest{}) &&
+		descriptor.ConfigHistoryDigest == (StateDigest{}) &&
+		descriptor.InstanceDigest == (StateDigest{}) &&
+		descriptor.HardStateDigest == (StateDigest{}) &&
+		descriptor.CompactionDigest == (StateDigest{}) &&
+		descriptor.InstalledStateDigest == (StateDigest{}) &&
+		descriptor.TargetAllocatorFloor == 0 &&
+		descriptor.TOQClosedThrough == 0 &&
+		descriptor.TOQRuntimeDigest == (StateDigest{}) &&
+		descriptor.TimingDigest == (StateDigest{}) &&
+		descriptor.ReleaseDigest == (StateDigest{})
+}
+
+func snapshotCertificateIsZero(certificate SnapshotCertificate) bool {
+	return snapshotDescriptorIsZero(certificate.Descriptor) &&
+		len(certificate.Acknowledgements) == 0 &&
+		certificate.Digest == (StateDigest{})
+}
+
+func readyCertificateIsZero(certificate ReadyCertificate) bool {
+	return certificate.Plan == (BootstrapID{}) &&
+		voterReadyProofIsZero(certificate.Proof) &&
+		len(certificate.Acknowledgements) == 0 &&
+		certificate.Digest == (StateDigest{})
+}
+
+func targetReadyRecordIsZero(record TargetReadyRecord) bool {
+	return record.Plan == (BootstrapID{}) && voterReadyProofIsZero(record.Proof)
+}
+
 func validateBootstrapRecord(record BootstrapRecord) error {
 	if err := validateVoterPlan(record.Plan); err != nil {
 		return err
@@ -1272,47 +1307,55 @@ func validateBootstrapRecord(record BootstrapRecord) error {
 		record.Outcome > BootstrapOutcomeRejectedInvalid || record.Digest != DigestBootstrapRecord(record) {
 		return fmt.Errorf("%w: malformed bootstrap record", ErrInvalidConfig)
 	}
-	if record.LocalSeal.Digest != (StateDigest{}) {
-		identity, ok := identityFor(record.Plan, record.LocalSeal.Signer.Replica)
-		if !ok || !voterIdentityEqual(identity, record.LocalSeal.Signer) ||
-			record.LocalSeal.Plan != record.Plan.Request.Plan ||
-			!confStateEqual(record.LocalSeal.Base, record.Plan.Request.Base) ||
-			record.LocalSeal.Reservations != record.Plan.Reservations ||
-			VerifyLocalSeal(record.LocalSeal) != nil ||
-			validateBootstrapFrontier(record.LocalSeal.Frontier, record.Plan.Request.Base) != nil {
+	if record.LocalFence.Digest != (StateDigest{}) {
+		identity, ok := identityFor(record.Plan, record.LocalFence.Voter.Replica)
+		if !ok || !voterIdentityEqual(identity, record.LocalFence.Voter) ||
+			record.LocalFence.Plan != record.Plan.Request.Plan ||
+			!confStateEqual(record.LocalFence.Base, record.Plan.Request.Base) ||
+			record.LocalFence.Reservations != record.Plan.Reservations ||
+			ValidateLocalAdmissionFence(record.LocalFence) != nil ||
+			validateBootstrapFrontier(record.LocalFence.Frontier, record.Plan.Request.Base) != nil {
 			return ErrBootstrapCertificate
 		}
+	} else if !localAdmissionFenceIsZero(record.LocalFence) {
+		return ErrBootstrapCertificate
 	}
-	if record.SealCertificate.Digest != (StateDigest{}) {
-		if err := VerifySealCertificate(record.Plan, record.SealCertificate); err != nil {
+	if record.FenceQuorum.Digest != (StateDigest{}) {
+		if err := ValidateFenceQuorum(record.Plan, record.FenceQuorum); err != nil {
 			return err
 		}
+	} else if !fenceQuorumIsZero(record.FenceQuorum) {
+		return ErrBootstrapCertificate
 	}
 	if record.SnapshotCertificate.Digest != (StateDigest{}) {
-		if err := VerifySnapshotCertificate(record.Plan, record.SnapshotCertificate); err != nil {
+		if err := ValidateSnapshotCertificate(record.Plan, record.SnapshotCertificate); err != nil {
 			return err
 		}
-		if record.SealCertificate.Digest != (StateDigest{}) &&
-			record.SnapshotCertificate.Descriptor.SealDigest != record.SealCertificate.Digest {
+		if record.FenceQuorum.Digest != (StateDigest{}) &&
+			record.SnapshotCertificate.Descriptor.FenceDigest != record.FenceQuorum.Digest {
 			return ErrBootstrapCertificate
 		}
+	} else if !snapshotCertificateIsZero(record.SnapshotCertificate) {
+		return ErrBootstrapCertificate
 	}
-	if len(record.TargetReady.Proof.Signature) != 0 {
+	if record.TargetReady.Plan != (BootstrapID{}) {
 		if record.TargetReady.Plan != record.Plan.Request.Plan ||
 			record.SnapshotCertificate.Digest == (StateDigest{}) ||
-			VerifyVoterReadyProof(record.Plan, record.SnapshotCertificate, record.TargetReady.Proof) != nil {
+			ValidateVoterReadyProof(record.Plan, record.SnapshotCertificate, record.TargetReady.Proof) != nil {
 			return ErrBootstrapCertificate
 		}
-	} else if record.TargetReady.Plan != (BootstrapID{}) {
+	} else if !targetReadyRecordIsZero(record.TargetReady) {
 		return ErrBootstrapCertificate
 	}
 	if record.ReadyCertificate.Digest != (StateDigest{}) {
 		if record.SnapshotCertificate.Digest == (StateDigest{}) ||
-			VerifyReadyCertificate(record.Plan, record.SnapshotCertificate, record.ReadyCertificate) != nil ||
-			(len(record.TargetReady.Proof.Signature) != 0 &&
-				DigestVoterReadyProof(record.TargetReady.Proof) != DigestVoterReadyProof(record.ReadyCertificate.Proof)) {
+			record.TargetReady.Plan != record.Plan.Request.Plan ||
+			ValidateReadyCertificate(record.Plan, record.SnapshotCertificate, record.ReadyCertificate) != nil ||
+			DigestVoterReadyProof(record.TargetReady.Proof) != DigestVoterReadyProof(record.ReadyCertificate.Proof) {
 			return ErrBootstrapCertificate
 		}
+	} else if !readyCertificateIsZero(record.ReadyCertificate) {
+		return ErrBootstrapCertificate
 	}
 	if !confStateIsZero(record.Closed.Conf) {
 		if !confStateEqual(record.Closed.Conf, record.Plan.Request.Base) ||
@@ -1321,12 +1364,12 @@ func validateBootstrapRecord(record BootstrapRecord) error {
 			return ErrBootstrapCertificate
 		}
 		if record.Closed.CertificateDigest != (StateDigest{}) {
-			if record.SealCertificate.Digest != (StateDigest{}) &&
-				record.Closed.CertificateDigest != record.SealCertificate.Digest {
+			if record.FenceQuorum.Digest != (StateDigest{}) &&
+				record.Closed.CertificateDigest != record.FenceQuorum.Digest {
 				return ErrBootstrapCertificate
 			}
 			if record.SnapshotCertificate.Digest != (StateDigest{}) &&
-				record.Closed.CertificateDigest != record.SnapshotCertificate.Descriptor.SealDigest {
+				record.Closed.CertificateDigest != record.SnapshotCertificate.Descriptor.FenceDigest {
 				return ErrBootstrapCertificate
 			}
 		}
@@ -1335,18 +1378,18 @@ func validateBootstrapRecord(record BootstrapRecord) error {
 		record.Closed.CertificateDigest != (StateDigest{}) {
 		return ErrBootstrapCertificate
 	}
-	if record.Phase == BootstrapPhaseLocalSealed && record.LocalSeal.Digest == (StateDigest{}) {
+	if record.Phase == BootstrapPhaseLocalFenced && record.LocalFence.Digest == (StateDigest{}) {
 		return ErrBootstrapCertificate
 	}
-	if record.Phase >= BootstrapPhaseSealed && record.Phase <= BootstrapPhaseTargetReady &&
-		record.SealCertificate.Digest == (StateDigest{}) {
+	if record.Phase >= BootstrapPhaseFenced && record.Phase <= BootstrapPhaseTargetReady &&
+		record.FenceQuorum.Digest == (StateDigest{}) {
 		return ErrBootstrapCertificate
 	}
 	if record.Phase >= BootstrapPhaseCertified && record.Phase <= BootstrapPhaseTargetReady &&
 		record.SnapshotCertificate.Digest == (StateDigest{}) {
 		return ErrBootstrapCertificate
 	}
-	if record.Phase == BootstrapPhaseTargetReady && len(record.TargetReady.Proof.Signature) == 0 {
+	if record.Phase == BootstrapPhaseTargetReady && record.TargetReady.Plan == (BootstrapID{}) {
 		return ErrBootstrapCertificate
 	}
 	switch record.Phase {
@@ -1355,7 +1398,7 @@ func validateBootstrapRecord(record BootstrapRecord) error {
 			record.ReadyCertificate.Digest == (StateDigest{}) ||
 			!confStateEqual(record.Closed.Conf, record.Plan.Request.Base) ||
 			!frontierEqual(record.Closed.Frontier, record.SnapshotCertificate.Descriptor.Frontier) ||
-			record.Closed.CertificateDigest != record.SnapshotCertificate.Descriptor.SealDigest {
+			record.Closed.CertificateDigest != record.SnapshotCertificate.Descriptor.FenceDigest {
 			return ErrBootstrapControl
 		}
 	case BootstrapPhaseAborted:
@@ -1418,8 +1461,8 @@ func validateMembershipResult(record InstanceRecord) error {
 	return nil
 }
 
-func bootstrapMessageSigningBytes(message BootstrapMessage) ([]byte, error) {
-	if message.Type < BootstrapMsgSealRequest || message.Type > BootstrapMsgActivationNotice ||
+func bootstrapMessageCanonicalBytes(message BootstrapMessage) ([]byte, error) {
+	if message.Type < BootstrapMsgFenceRequest || message.Type > BootstrapMsgActivationNotice ||
 		message.Cluster == (ClusterID{}) || message.Plan == (BootstrapID{}) ||
 		message.From == 0 || message.To == 0 || message.FromIncarnation == 0 ||
 		message.BaseID == 0 || message.BaseDigest == (StateDigest{}) || len(message.Payload) > maxBootstrapPayload {
@@ -1446,48 +1489,34 @@ func bootstrapMessageSigningBytes(message BootstrapMessage) ([]byte, error) {
 	return out, nil
 }
 
-// SignBootstrapMessage authenticates an out-of-band bootstrap envelope.
-func SignBootstrapMessage(message BootstrapMessage, signer VoterIdentity, private ed25519.PrivateKey) (BootstrapMessage, error) {
-	if message.From != signer.Replica || message.FromIncarnation != signer.Incarnation || !publicKeyMatches(signer, private) {
-		return BootstrapMessage{}, ErrBootstrapEligibility
-	}
-	canonical, err := bootstrapMessageSigningBytes(message)
-	if err != nil {
+// BuildBootstrapMessage validates and prepares a transport-neutral envelope.
+func BuildBootstrapMessage(message BootstrapMessage) (BootstrapMessage, error) {
+	if _, err := bootstrapMessageCanonicalBytes(message); err != nil {
 		return BootstrapMessage{}, err
 	}
 	message.PayloadDigest = domainDigest("epaxos/bootstrap/payload/v1", message.Payload)
-	message.Signature = ed25519.Sign(private, canonical)
 	return message, nil
 }
 
-// VerifyBootstrapMessage verifies an envelope against its exact sender identity.
-func VerifyBootstrapMessage(message BootstrapMessage, signer VoterIdentity) error {
-	if !signer.valid() || message.From != signer.Replica || message.FromIncarnation != signer.Incarnation ||
-		len(message.Signature) != ed25519.SignatureSize {
-		return ErrInvalidBootstrapMessage
-	}
-	canonical, err := bootstrapMessageSigningBytes(message)
-	if err != nil || !ed25519.Verify(ed25519.PublicKey(signer.VerifyKey), canonical, message.Signature) {
-		return ErrInvalidBootstrapMessage
-	}
-	return nil
+// ValidateBootstrapMessage validates an envelope without transport authentication.
+func ValidateBootstrapMessage(message BootstrapMessage) error {
+	_, err := bootstrapMessageCanonicalBytes(message)
+	return err
 }
 
 // EncodeBootstrapMessage appends the strict canonical envelope.
 func EncodeBootstrapMessage(dst []byte, message BootstrapMessage) ([]byte, error) {
-	canonical, err := bootstrapMessageSigningBytes(message)
-	if err != nil || len(message.Signature) != ed25519.SignatureSize {
-		return dst, ErrInvalidBootstrapMessage
+	canonical, err := bootstrapMessageCanonicalBytes(message)
+	if err != nil {
+		return dst, err
 	}
-	dst = append(dst, canonical...)
-	dst = append(dst, message.Signature...)
-	return dst, nil
+	return append(dst, canonical...), nil
 }
 
 // DecodeBootstrapMessage decodes one complete strict envelope.
 func DecodeBootstrapMessage(src []byte, message *BootstrapMessage) error {
 	*message = BootstrapMessage{}
-	if len(src) < len(bootstrapWireMagic)+ed25519.SignatureSize || !bytes.Equal(src[:len(bootstrapWireMagic)], bootstrapWireMagic[:]) {
+	if len(src) < len(bootstrapWireMagic) || !bytes.Equal(src[:len(bootstrapWireMagic)], bootstrapWireMagic[:]) {
 		return ErrInvalidBootstrapMessage
 	}
 	p := bootstrapParser{b: src[len(bootstrapWireMagic):]}
@@ -1504,19 +1533,18 @@ func DecodeBootstrapMessage(src []byte, message *BootstrapMessage) error {
 	p.fixed((*[32]byte)(&message.BaseDigest))
 	message.Payload = p.bytes(maxBootstrapPayload)
 	p.fixed((*[32]byte)(&message.PayloadDigest))
-	if p.err || len(p.b) != ed25519.SignatureSize {
+	if p.err || len(p.b) != 0 {
 		*message = BootstrapMessage{}
 		return ErrInvalidBootstrapMessage
 	}
-	message.Signature = append([]byte(nil), p.b...)
-	if _, err := bootstrapMessageSigningBytes(*message); err != nil {
+	if err := ValidateBootstrapMessage(*message); err != nil {
 		*message = BootstrapMessage{}
 		return err
 	}
 	return nil
 }
 
-func bootstrapChunkSigningBytes(chunk BootstrapChunk) ([]byte, error) {
+func bootstrapChunkCanonicalBytes(chunk BootstrapChunk) ([]byte, error) {
 	if chunk.Cluster == (ClusterID{}) || chunk.Plan == (BootstrapID{}) || chunk.Manifest == (StateDigest{}) ||
 		chunk.From == 0 || chunk.To == 0 || chunk.FromIncarnation == 0 || chunk.Index >= maxBootstrapChunks ||
 		len(chunk.Payload) == 0 || len(chunk.Payload) > maxBootstrapChunk || chunk.Total == 0 ||
@@ -1546,48 +1574,38 @@ func bootstrapChunkSigningBytes(chunk BootstrapChunk) ([]byte, error) {
 	return out, nil
 }
 
-// SignBootstrapChunk authenticates one chunk frame.
-func SignBootstrapChunk(chunk BootstrapChunk, signer VoterIdentity, private ed25519.PrivateKey) (BootstrapChunk, error) {
-	if chunk.From != signer.Replica || chunk.FromIncarnation != signer.Incarnation || !publicKeyMatches(signer, private) {
-		return BootstrapChunk{}, ErrBootstrapEligibility
-	}
-	canonical, err := bootstrapChunkSigningBytes(chunk)
-	if err != nil {
+// BuildBootstrapChunk validates and prepares a transport-neutral chunk.
+func BuildBootstrapChunk(chunk BootstrapChunk) (BootstrapChunk, error) {
+	if _, err := bootstrapChunkCanonicalBytes(chunk); err != nil {
 		return BootstrapChunk{}, err
 	}
 	chunk.PayloadDigest = domainDigest("epaxos/bootstrap/chunk-payload/v1", chunk.Payload)
-	chunk.Signature = ed25519.Sign(private, canonical)
 	return chunk, nil
 }
 
-// VerifyBootstrapChunk verifies one complete chunk frame.
-func VerifyBootstrapChunk(chunk BootstrapChunk, signer VoterIdentity) error {
-	if !signer.valid() || chunk.From != signer.Replica || chunk.FromIncarnation != signer.Incarnation ||
-		len(chunk.Signature) != ed25519.SignatureSize {
+// ValidateBootstrapChunk validates a chunk and authenticated transport sender metadata.
+func ValidateBootstrapChunk(chunk BootstrapChunk, authenticatedReplica ReplicaID, authenticatedIncarnation uint64) error {
+	if chunk.From != authenticatedReplica || chunk.FromIncarnation != authenticatedIncarnation ||
+		authenticatedReplica == 0 || authenticatedIncarnation == 0 {
 		return ErrInvalidBootstrapMessage
 	}
-	canonical, err := bootstrapChunkSigningBytes(chunk)
-	if err != nil || !ed25519.Verify(ed25519.PublicKey(signer.VerifyKey), canonical, chunk.Signature) {
-		return ErrInvalidBootstrapMessage
-	}
-	return nil
+	_, err := bootstrapChunkCanonicalBytes(chunk)
+	return err
 }
 
 // EncodeBootstrapChunk appends one strict chunk frame.
 func EncodeBootstrapChunk(dst []byte, chunk BootstrapChunk) ([]byte, error) {
-	canonical, err := bootstrapChunkSigningBytes(chunk)
-	if err != nil || len(chunk.Signature) != ed25519.SignatureSize {
-		return dst, ErrInvalidBootstrapMessage
+	canonical, err := bootstrapChunkCanonicalBytes(chunk)
+	if err != nil {
+		return dst, err
 	}
-	dst = append(dst, canonical...)
-	dst = append(dst, chunk.Signature...)
-	return dst, nil
+	return append(dst, canonical...), nil
 }
 
 // DecodeBootstrapChunk decodes one complete strict chunk frame.
 func DecodeBootstrapChunk(src []byte, chunk *BootstrapChunk) error {
 	*chunk = BootstrapChunk{}
-	if len(src) < len(bootstrapChunkMagic)+ed25519.SignatureSize || !bytes.Equal(src[:len(bootstrapChunkMagic)], bootstrapChunkMagic[:]) {
+	if len(src) < len(bootstrapChunkMagic) || !bytes.Equal(src[:len(bootstrapChunkMagic)], bootstrapChunkMagic[:]) {
 		return ErrInvalidBootstrapMessage
 	}
 	p := bootstrapParser{b: src[len(bootstrapChunkMagic):]}
@@ -1605,12 +1623,11 @@ func DecodeBootstrapChunk(src []byte, chunk *BootstrapChunk) error {
 	chunk.Total = p.uvarint()
 	chunk.Payload = p.bytes(maxBootstrapChunk)
 	p.fixed((*[32]byte)(&chunk.PayloadDigest))
-	if p.err || len(p.b) != ed25519.SignatureSize {
+	if p.err || len(p.b) != 0 {
 		*chunk = BootstrapChunk{}
 		return ErrInvalidBootstrapMessage
 	}
-	chunk.Signature = append([]byte(nil), p.b...)
-	if _, err := bootstrapChunkSigningBytes(*chunk); err != nil {
+	if _, err := bootstrapChunkCanonicalBytes(*chunk); err != nil {
 		*chunk = BootstrapChunk{}
 		return err
 	}
@@ -1662,20 +1679,20 @@ func (p *bootstrapParser) bytes(max int) []byte {
 
 type bootstrapState struct {
 	record         BootstrapRecord
-	sealAcks       map[ReplicaID]LocalSeal
+	fenceAcks      map[ReplicaID]LocalAdmissionFence
 	durablePhase   BootstrapPhase
 	durableDigest  StateDigest
 	snapshotDigest StateDigest
 	readyDigest    StateDigest
-	snapshotVotes  map[ReplicaID]VoterAttestation
-	readyVotes     map[ReplicaID]VoterAttestation
+	snapshotVotes  map[ReplicaID]VoterAcknowledgement
+	readyVotes     map[ReplicaID]VoterAcknowledgement
 }
 
 type bootstrapDurabilityAction struct {
 	plan         BootstrapID
 	recordDigest StateDigest
 	message      BootstrapMessage
-	unseal       bool
+	unfence      bool
 }
 
 type membershipOperation uint8
@@ -1687,17 +1704,17 @@ const (
 )
 
 type membershipCommandWire struct {
-	Version    uint8
-	Operation  membershipOperation
-	Plan       VoterPlan
-	Snapshot   SnapshotCertificate
-	Ready      ReadyCertificate
-	SealDigest StateDigest
+	Version     uint8
+	Operation   membershipOperation
+	Plan        VoterPlan
+	Snapshot    SnapshotCertificate
+	Ready       ReadyCertificate
+	FenceDigest StateDigest
 }
 
 type snapshotVotePayload struct {
-	Descriptor  SnapshotDescriptor
-	Attestation VoterAttestation
+	Descriptor      SnapshotDescriptor
+	Acknowledgement VoterAcknowledgement
 }
 
 type installProofPayload struct {
@@ -1757,11 +1774,11 @@ func decodeMembershipCommand(command Command) (membershipCommandWire, error) {
 	}
 	switch wire.Operation {
 	case membershipPrepare:
-		if wire.Snapshot.Digest != (StateDigest{}) || wire.Ready.Digest != (StateDigest{}) || wire.SealDigest != (StateDigest{}) {
+		if wire.Snapshot.Digest != (StateDigest{}) || wire.Ready.Digest != (StateDigest{}) || wire.FenceDigest != (StateDigest{}) {
 			return membershipCommandWire{}, ErrBootstrapControl
 		}
 	case membershipActivate:
-		if wire.Snapshot.Digest == (StateDigest{}) || wire.Ready.Digest == (StateDigest{}) || wire.SealDigest == (StateDigest{}) {
+		if wire.Snapshot.Digest == (StateDigest{}) || wire.Ready.Digest == (StateDigest{}) || wire.FenceDigest == (StateDigest{}) {
 			return membershipCommandWire{}, ErrBootstrapControl
 		}
 	case membershipAbort:
@@ -1807,11 +1824,11 @@ func (n *RawNode) restoreBootstrapRecord(record BootstrapRecord) error {
 	}
 	state := &bootstrapState{
 		record:        record.Clone(),
-		sealAcks:      make(map[ReplicaID]LocalSeal),
+		fenceAcks:     make(map[ReplicaID]LocalAdmissionFence),
 		durablePhase:  record.Phase,
 		durableDigest: record.Digest,
-		snapshotVotes: make(map[ReplicaID]VoterAttestation),
-		readyVotes:    make(map[ReplicaID]VoterAttestation),
+		snapshotVotes: make(map[ReplicaID]VoterAcknowledgement),
+		readyVotes:    make(map[ReplicaID]VoterAcknowledgement),
 	}
 	if record.SnapshotCertificate.Digest != (StateDigest{}) {
 		state.snapshotDigest = DigestSnapshotDescriptor(record.SnapshotCertificate.Descriptor)
@@ -1823,18 +1840,18 @@ func (n *RawNode) restoreBootstrapRecord(record BootstrapRecord) error {
 	if record.Phase != BootstrapPhaseAborted {
 		n.bootstrapByBase[record.Plan.Request.Base.ID] = id
 	}
-	if record.Phase >= BootstrapPhaseLocalSealed && record.Phase != BootstrapPhaseAborted {
+	if record.Phase >= BootstrapPhaseLocalFenced && record.Phase != BootstrapPhaseAborted {
 		closed := record.Closed.Clone()
 		if confStateIsZero(closed.Conf) {
 			closed = ClosedConfig{
 				Conf:         record.Plan.Request.Base.Clone(),
-				Frontier:     record.LocalSeal.Frontier.Clone(),
+				Frontier:     record.LocalFence.Frontier.Clone(),
 				Reservations: record.Plan.Reservations,
 			}
 		}
-		if record.SealCertificate.Digest != (StateDigest{}) {
-			closed.Frontier = record.SealCertificate.Frontier.Clone()
-			closed.CertificateDigest = record.SealCertificate.Digest
+		if record.FenceQuorum.Digest != (StateDigest{}) {
+			closed.Frontier = record.FenceQuorum.Frontier.Clone()
+			closed.CertificateDigest = record.FenceQuorum.Digest
 		}
 		n.closedConfigs[closed.Conf.ID] = closed
 	}
@@ -1865,17 +1882,17 @@ func (n *RawNode) enqueueFrontierUpdate(frontier BootstrapFrontier) {
 	target.MustSync = true
 }
 
-func (n *RawNode) enqueueBootstrapAfterAdvance(state *bootstrapState, message BootstrapMessage, unseal bool) {
+func (n *RawNode) enqueueBootstrapAfterAdvance(state *bootstrapState, message BootstrapMessage, unfence bool) {
 	n.bootstrapDurability = append(n.bootstrapDurability, bootstrapDurabilityAction{
 		plan:         state.record.Plan.Request.Plan,
 		recordDigest: state.record.Digest,
 		message:      message.Clone(),
-		unseal:       unseal,
+		unfence:      unfence,
 	})
 }
 
 func (n *RawNode) prepareBootstrapMessage(messageType BootstrapMessageType, state *bootstrapState, to ReplicaID, payload any) (BootstrapMessage, error) {
-	if !n.localIdentity.valid() || len(n.bootstrapPrivateKey) != ed25519.PrivateKeySize {
+	if !n.localIdentity.valid() {
 		return BootstrapMessage{}, ErrBootstrapEligibility
 	}
 	encoded, err := marshalBootstrapCanonical(payload)
@@ -1893,7 +1910,7 @@ func (n *RawNode) prepareBootstrapMessage(messageType BootstrapMessageType, stat
 		BaseDigest:      state.record.Plan.RequestDigest,
 		Payload:         encoded,
 	}
-	return SignBootstrapMessage(message, n.localIdentity, ed25519.PrivateKey(n.bootstrapPrivateKey))
+	return BuildBootstrapMessage(message)
 }
 
 func (n *RawNode) validatePrepareRequest(request PrepareVoterRequest) (VoterPlan, error) {
@@ -2016,8 +2033,8 @@ func (n *RawNode) PrepareVoter(request PrepareVoterRequest) (VoterPlan, error) {
 		return VoterPlan{}, ErrInstanceExhausted
 	}
 	state := &bootstrapState{
-		record:   BootstrapRecord{Plan: plan.Clone(), Phase: BootstrapPhasePreparing},
-		sealAcks: make(map[ReplicaID]LocalSeal), snapshotVotes: make(map[ReplicaID]VoterAttestation), readyVotes: make(map[ReplicaID]VoterAttestation),
+		record:    BootstrapRecord{Plan: plan.Clone(), Phase: BootstrapPhasePreparing},
+		fenceAcks: make(map[ReplicaID]LocalAdmissionFence), snapshotVotes: make(map[ReplicaID]VoterAcknowledgement), readyVotes: make(map[ReplicaID]VoterAcknowledgement),
 	}
 	n.nextInstance = floor
 	n.allocatorFloor = maxInstanceNum(n.allocatorFloor, floor)
@@ -2105,39 +2122,43 @@ func (n *RawNode) bootstrapLocalFrontier(base ConfState) (BootstrapFrontier, err
 	return frontier, nil
 }
 
-// BeginVoterSeal installs the local fence immediately and emits SealAck only
+// BeginVoterFence installs the local fence immediately and emits FenceAck only
 // after the resulting bootstrap Ready record is Advanced.
-func (n *RawNode) BeginVoterSeal(plan VoterPlan) error {
+func (n *RawNode) BeginVoterFence(plan VoterPlan) error {
 	state := n.bootstrapPlans[plan.Request.Plan]
 	if state == nil || !voterPlanEqual(state.record.Plan, plan) {
 		return ErrBootstrapStale
 	}
-	if state.record.Phase >= BootstrapPhaseLocalSealed {
+	if state.record.Phase >= BootstrapPhaseLocalFenced {
 		return nil
 	}
 	if state.durablePhase < BootstrapPhasePrepared {
 		return ErrBootstrapClosure
 	}
-	if !n.localIdentity.valid() || len(n.bootstrapPrivateKey) != ed25519.PrivateKeySize {
+	if !n.localIdentity.valid() {
+		return ErrBootstrapEligibility
+	}
+	expectedIdentity, ok := identityFor(plan, n.id)
+	if !ok || !voterIdentityEqual(expectedIdentity, n.localIdentity) {
 		return ErrBootstrapEligibility
 	}
 	frontier, err := n.bootstrapLocalFrontier(plan.Request.Base)
 	if err != nil {
 		return err
 	}
-	seal, err := SignLocalSeal(LocalSeal{
-		Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Signer: n.localIdentity.Clone(),
+	fence, err := BuildLocalAdmissionFence(LocalAdmissionFence{
+		Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Voter: n.localIdentity.Clone(),
 		Reservations: plan.Reservations, Frontier: frontier,
-	}, ed25519.PrivateKey(n.bootstrapPrivateKey))
+	})
 	if err != nil {
 		return err
 	}
-	message, err := n.prepareBootstrapMessage(BootstrapMsgSealAck, state, plan.Reservations.Prepare.Replica, seal)
+	message, err := n.prepareBootstrapMessage(BootstrapMsgFenceAck, state, plan.Reservations.Prepare.Replica, fence)
 	if err != nil {
 		return err
 	}
-	state.record.Phase = BootstrapPhaseLocalSealed
-	state.record.LocalSeal = seal.Clone()
+	state.record.Phase = BootstrapPhaseLocalFenced
+	state.record.LocalFence = fence.Clone()
 	state.record.Closed = ClosedConfig{Conf: plan.Request.Base.Clone(), Frontier: frontier.Clone(), Reservations: plan.Reservations}
 	n.closedConfigs[plan.Request.Base.ID] = state.record.Closed.Clone()
 	n.enqueueBootstrapRecord(state)
@@ -2231,23 +2252,23 @@ func makeBootstrapRecoveryTimer(deadline uint64, inst *instance) timer {
 	}
 }
 
-// ApplySealCertificate verifies an exact old quorum and installs its union fence.
-func (n *RawNode) ApplySealCertificate(certificate SealCertificate) error {
+// ApplyFenceQuorum validates an exact old quorum and installs its union fence.
+func (n *RawNode) ApplyFenceQuorum(certificate FenceQuorum) error {
 	state := n.bootstrapPlans[certificate.Plan]
 	if state == nil {
 		return ErrBootstrapStale
 	}
-	if err := VerifySealCertificate(state.record.Plan, certificate); err != nil {
+	if err := ValidateFenceQuorum(state.record.Plan, certificate); err != nil {
 		return err
 	}
-	if state.record.SealCertificate.Digest != (StateDigest{}) {
-		if state.record.SealCertificate.Digest == certificate.Digest {
+	if state.record.FenceQuorum.Digest != (StateDigest{}) {
+		if state.record.FenceQuorum.Digest == certificate.Digest {
 			return nil
 		}
 		return ErrBootstrapCertificate
 	}
 	if state.record.Phase < BootstrapPhasePrepared {
-		return ErrBootstrapNotSealed
+		return ErrBootstrapNotFenced
 	}
 	var canonicalMessages []BootstrapMessage
 	if n.id == state.record.Plan.Reservations.Prepare.Replica {
@@ -2255,7 +2276,7 @@ func (n *RawNode) ApplySealCertificate(certificate SealCertificate) error {
 			if voter == n.id {
 				continue
 			}
-			message, err := n.prepareBootstrapMessage(BootstrapMsgCanonicalSeal, state, voter, certificate)
+			message, err := n.prepareBootstrapMessage(BootstrapMsgFenceQuorum, state, voter, certificate)
 			if err != nil {
 				return err
 			}
@@ -2265,8 +2286,8 @@ func (n *RawNode) ApplySealCertificate(certificate SealCertificate) error {
 	if err := n.scheduleBootstrapClosure(state.record.Plan, certificate.Frontier); err != nil {
 		return err
 	}
-	state.record.Phase = BootstrapPhaseSealed
-	state.record.SealCertificate = certificate.Clone()
+	state.record.Phase = BootstrapPhaseFenced
+	state.record.FenceQuorum = certificate.Clone()
 	state.record.Closed = ClosedConfig{
 		Conf: state.record.Plan.Request.Base.Clone(), Frontier: certificate.Frontier.Clone(),
 		Reservations: state.record.Plan.Reservations, CertificateDigest: certificate.Digest,
@@ -2285,10 +2306,10 @@ func (n *RawNode) ApplySealCertificate(certificate SealCertificate) error {
 func (n *RawNode) BootstrapClosure(plan VoterPlan) BootstrapClosureStatus {
 	status := BootstrapClosureStatus{Plan: plan.Request.Plan}
 	state := n.bootstrapPlans[plan.Request.Plan]
-	if state == nil || !voterPlanEqual(state.record.Plan, plan) || state.record.SealCertificate.Digest == (StateDigest{}) {
+	if state == nil || !voterPlanEqual(state.record.Plan, plan) || state.record.FenceQuorum.Digest == (StateDigest{}) {
 		return status
 	}
-	refs, err := bootstrapClosureRefs(plan, state.record.SealCertificate.Frontier)
+	refs, err := bootstrapClosureRefs(plan, state.record.FenceQuorum.Frontier)
 	if err != nil {
 		return status
 	}
@@ -2312,20 +2333,21 @@ func (n *RawNode) RecordTargetReady(plan VoterPlan, proof VoterReadyProof) error
 	if state.record.SnapshotCertificate.Digest == (StateDigest{}) {
 		return ErrBootstrapSnapshot
 	}
-	if err := VerifyVoterReadyProof(plan, state.record.SnapshotCertificate, proof); err != nil {
+	if err := ValidateVoterReadyProof(plan, state.record.SnapshotCertificate, proof); err != nil {
 		return err
 	}
-	if state.record.TargetReady.Proof.Signature != nil {
-		if DigestVoterReadyProof(state.record.TargetReady.Proof) == DigestVoterReadyProof(proof) {
+	if state.record.TargetReady.Plan != (BootstrapID{}) {
+		if state.record.TargetReady.Plan == plan.Request.Plan &&
+			DigestVoterReadyProof(state.record.TargetReady.Proof) == DigestVoterReadyProof(proof) {
 			return nil
 		}
 		return ErrBootstrapSnapshot
 	}
-	attestation, err := SignVoterAttestation(DigestVoterReadyProof(proof), n.localIdentity, ed25519.PrivateKey(n.bootstrapPrivateKey))
+	acknowledgement, err := BuildVoterAcknowledgement(DigestVoterReadyProof(proof), n.localIdentity)
 	if err != nil {
 		return err
 	}
-	message, err := n.prepareBootstrapMessage(BootstrapMsgReadyAck, state, plan.Reservations.Prepare.Replica, attestation)
+	message, err := n.prepareBootstrapMessage(BootstrapMsgReadyAck, state, plan.Reservations.Prepare.Replica, acknowledgement)
 	if err != nil {
 		return err
 	}
@@ -2348,13 +2370,13 @@ func (n *RawNode) ActivateVoter(plan VoterPlan, snapshot SnapshotCertificate, re
 	if closure := n.BootstrapClosure(plan); !closure.Complete {
 		return InstanceRef{}, ErrBootstrapClosure
 	}
-	if err := VerifySnapshotCertificate(plan, snapshot); err != nil ||
-		snapshot.Descriptor.SealDigest != state.record.SealCertificate.Digest ||
+	if err := ValidateSnapshotCertificate(plan, snapshot); err != nil ||
+		snapshot.Descriptor.FenceDigest != state.record.FenceQuorum.Digest ||
 		(state.record.SnapshotCertificate.Digest != (StateDigest{}) &&
 			state.record.SnapshotCertificate.Digest != snapshot.Digest) {
 		return InstanceRef{}, ErrBootstrapSnapshot
 	}
-	if err := VerifyReadyCertificate(plan, snapshot, ready); err != nil ||
+	if err := ValidateReadyCertificate(plan, snapshot, ready); err != nil ||
 		(state.record.ReadyCertificate.Digest != (StateDigest{}) &&
 			state.record.ReadyCertificate.Digest != ready.Digest) {
 		return InstanceRef{}, ErrBootstrapCertificate
@@ -2364,7 +2386,7 @@ func (n *RawNode) ActivateVoter(plan VoterPlan, snapshot SnapshotCertificate, re
 	}
 	wire := membershipCommandWire{
 		Operation: membershipActivate, Plan: plan.Clone(), Snapshot: snapshot.Clone(),
-		Ready: ready.Clone(), SealDigest: state.record.SealCertificate.Digest,
+		Ready: ready.Clone(), FenceDigest: state.record.FenceQuorum.Digest,
 	}
 	command, err := encodeMembershipCommand(wire)
 	if err != nil {
@@ -2401,9 +2423,9 @@ func (n *RawNode) AbortVoter(plan VoterPlan) (InstanceRef, error) {
 	if state.durablePhase < BootstrapPhasePrepared {
 		return InstanceRef{}, ErrBootstrapClosure
 	}
-	sealDigest := state.record.SealCertificate.Digest
+	fenceDigest := state.record.FenceQuorum.Digest
 	command, err := encodeMembershipCommand(membershipCommandWire{
-		Operation: membershipAbort, Plan: plan.Clone(), SealDigest: sealDigest,
+		Operation: membershipAbort, Plan: plan.Clone(), FenceDigest: fenceDigest,
 	})
 	if err != nil {
 		return InstanceRef{}, err
@@ -2485,18 +2507,22 @@ func (n *RawNode) bootstrapMessageIdentity(state *bootstrapState, message Bootst
 	return identityFor(state.record.Plan, message.From)
 }
 
-func verifyBootstrapAttestation(plan VoterPlan, digest StateDigest, attestation VoterAttestation) error {
-	identity, ok := identityFor(plan, attestation.Signer.Replica)
-	if !ok || !voterIdentityEqual(identity, attestation.Signer) ||
-		attestation.AttestedDigest != digest || len(attestation.Signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(ed25519.PublicKey(attestation.Signer.VerifyKey), digest[:], attestation.Signature) {
+func validateBootstrapAcknowledgement(plan VoterPlan, digest StateDigest, acknowledgement VoterAcknowledgement) error {
+	identity, ok := identityFor(plan, acknowledgement.Voter.Replica)
+	if !ok || !voterIdentityEqual(identity, acknowledgement.Voter) ||
+		acknowledgement.AttestedDigest != digest {
 		return ErrBootstrapCertificate
 	}
 	return nil
 }
 
-// StepBootstrap applies one authenticated out-of-band bootstrap message.
-func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
+// StepBootstrapAuthenticated applies one bootstrap message after the lower
+// transport authenticates its sender metadata.
+func (n *RawNode) StepBootstrapAuthenticated(message BootstrapMessage, authenticatedReplica ReplicaID, authenticatedIncarnation uint64) error {
+	if authenticatedReplica == 0 || authenticatedIncarnation == 0 ||
+		message.From != authenticatedReplica || message.FromIncarnation != authenticatedIncarnation {
+		return ErrInvalidBootstrapMessage
+	}
 	if message.To != n.id || message.Cluster != n.cluster {
 		return ErrInvalidBootstrapMessage
 	}
@@ -2504,9 +2530,12 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 	if state == nil {
 		return ErrBootstrapStale
 	}
-	identity, ok := n.bootstrapMessageIdentity(state, message)
-	if !ok || VerifyBootstrapMessage(message, identity) != nil || message.BaseID != state.record.Plan.Request.Base.ID ||
+	if ValidateBootstrapMessage(message) != nil || message.BaseID != state.record.Plan.Request.Base.ID ||
 		message.BaseDigest != state.record.Plan.RequestDigest {
+		return ErrInvalidBootstrapMessage
+	}
+	identity, ok := n.bootstrapMessageIdentity(state, message)
+	if !ok || !voterIdentityEqual(identity, VoterIdentity{Replica: authenticatedReplica, Incarnation: authenticatedIncarnation}) {
 		return ErrInvalidBootstrapMessage
 	}
 	if state.record.Phase == BootstrapPhaseAborted {
@@ -2517,78 +2546,83 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		return ErrBootstrapControl
 	}
 	switch message.Type {
-	case BootstrapMsgSealRequest:
+	case BootstrapMsgFenceRequest:
 		var plan VoterPlan
 		if err := unmarshalBootstrapCanonical(message.Payload, &plan); err != nil || !voterPlanEqual(plan, state.record.Plan) {
 			return ErrInvalidBootstrapMessage
 		}
-		return n.BeginVoterSeal(plan)
-	case BootstrapMsgSealAck:
-		var seal LocalSeal
-		if err := unmarshalBootstrapCanonical(message.Payload, &seal); err != nil ||
-			seal.Signer.Replica != message.From || VerifyLocalSeal(seal) != nil ||
-			seal.Plan != state.record.Plan.Request.Plan ||
-			!confStateEqual(seal.Base, state.record.Plan.Request.Base) ||
-			seal.Reservations != state.record.Plan.Reservations ||
-			validateBootstrapFrontier(seal.Frontier, state.record.Plan.Request.Base) != nil {
+		return n.BeginVoterFence(plan)
+	case BootstrapMsgFenceAck:
+		var fence LocalAdmissionFence
+		if err := unmarshalBootstrapCanonical(message.Payload, &fence); err != nil {
 			return ErrInvalidBootstrapMessage
 		}
-		if state.record.SealCertificate.Digest != (StateDigest{}) {
-			for _, certified := range state.record.SealCertificate.Seals {
-				if certified.Signer.Replica == message.From && certified.Digest == seal.Digest {
+		identity, ok := identityFor(state.record.Plan, message.From)
+		if !ok || !voterIdentityEqual(identity, fence.Voter) ||
+			ValidateLocalAdmissionFence(fence) != nil ||
+			fence.Plan != state.record.Plan.Request.Plan ||
+			!confStateEqual(fence.Base, state.record.Plan.Request.Base) ||
+			fence.Reservations != state.record.Plan.Reservations ||
+			validateBootstrapFrontier(fence.Frontier, state.record.Plan.Request.Base) != nil {
+			return ErrInvalidBootstrapMessage
+		}
+		if state.record.FenceQuorum.Digest != (StateDigest{}) {
+			for _, certified := range state.record.FenceQuorum.Fences {
+				if certified.Voter.Replica == message.From && certified.Digest == fence.Digest {
 					return nil
 				}
 			}
 			return ErrBootstrapCertificate
 		}
-		if existing, duplicate := state.sealAcks[message.From]; duplicate {
-			if existing.Digest == seal.Digest {
+		if existing, duplicate := state.fenceAcks[message.From]; duplicate {
+			if existing.Digest == fence.Digest {
 				return nil
 			}
 			return ErrBootstrapCertificate
 		}
-		state.sealAcks[message.From] = seal.Clone()
-		if len(state.sealAcks) < slowQuorumSize(len(state.record.Plan.Request.Base.Voters)) {
+		state.fenceAcks[message.From] = fence.Clone()
+		if len(state.fenceAcks) < slowQuorumSize(len(state.record.Plan.Request.Base.Voters)) {
 			return nil
 		}
-		seals := make([]LocalSeal, 0, len(state.sealAcks))
-		for _, candidate := range state.sealAcks {
-			seals = append(seals, candidate.Clone())
+		fences := make([]LocalAdmissionFence, 0, len(state.fenceAcks))
+		for _, candidate := range state.fenceAcks {
+			fences = append(fences, candidate.Clone())
 		}
-		certificate, err := BuildSealCertificate(state.record.Plan, seals)
+		quorum, err := BuildFenceQuorum(state.record.Plan, fences)
 		if err != nil {
 			return err
 		}
-		return n.ApplySealCertificate(certificate)
-	case BootstrapMsgCanonicalSeal:
-		var certificate SealCertificate
-		if err := unmarshalBootstrapCanonical(message.Payload, &certificate); err != nil {
-			return err
+		return n.ApplyFenceQuorum(quorum)
+	case BootstrapMsgFenceQuorum:
+		var quorum FenceQuorum
+		if err := unmarshalBootstrapCanonical(message.Payload, &quorum); err != nil {
+			return ErrInvalidBootstrapMessage
 		}
-		return n.ApplySealCertificate(certificate)
+		return n.ApplyFenceQuorum(quorum)
 	case BootstrapMsgSnapshotVote:
 		if closure := n.BootstrapClosure(state.record.Plan); !closure.Complete {
 			return ErrBootstrapClosure
 		}
 		var vote snapshotVotePayload
-		var digest StateDigest
 		if err := unmarshalBootstrapCanonical(message.Payload, &vote); err != nil {
 			return ErrInvalidBootstrapMessage
 		}
-		digest = DigestSnapshotDescriptor(vote.Descriptor)
-		if vote.Attestation.Signer.Replica != message.From ||
-			verifyBootstrapAttestation(state.record.Plan, digest, vote.Attestation) != nil {
+		digest := DigestSnapshotDescriptor(vote.Descriptor)
+		if vote.Acknowledgement.Voter.Replica != message.From ||
+			validateBootstrapAcknowledgement(state.record.Plan, digest, vote.Acknowledgement) != nil {
 			return ErrInvalidBootstrapMessage
 		}
-		if err := validateSnapshotDescriptor(state.record.Plan, vote.Descriptor); err != nil ||
-			vote.Descriptor.SealDigest != state.record.SealCertificate.Digest {
+		if err := validateSnapshotDescriptor(state.record.Plan, vote.Descriptor); err != nil {
 			return err
+		}
+		if vote.Descriptor.FenceDigest != state.record.FenceQuorum.Digest {
+			return ErrBootstrapCertificate
 		}
 		if state.record.SnapshotCertificate.Digest != (StateDigest{}) {
 			if DigestSnapshotDescriptor(state.record.SnapshotCertificate.Descriptor) == digest {
-				for _, certified := range state.record.SnapshotCertificate.Attestations {
-					if certified.Signer.Replica == message.From &&
-						bytes.Equal(certified.Signature, vote.Attestation.Signature) {
+				for _, certified := range state.record.SnapshotCertificate.Acknowledgements {
+					if certified.Voter == vote.Acknowledgement.Voter &&
+						certified.AttestedDigest == vote.Acknowledgement.AttestedDigest {
 						return nil
 					}
 				}
@@ -2600,20 +2634,20 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		}
 		state.snapshotDigest = digest
 		if existing, duplicate := state.snapshotVotes[message.From]; duplicate {
-			if existing.AttestedDigest == vote.Attestation.AttestedDigest && bytes.Equal(existing.Signature, vote.Attestation.Signature) {
+			if existing == vote.Acknowledgement {
 				return nil
 			}
 			return ErrBootstrapCertificate
 		}
-		state.snapshotVotes[message.From] = vote.Attestation.Clone()
+		state.snapshotVotes[message.From] = vote.Acknowledgement.Clone()
 		if len(state.snapshotVotes) < slowQuorumSize(len(state.record.Plan.Request.Base.Voters)) {
 			return nil
 		}
-		attestations := make([]VoterAttestation, 0, len(state.snapshotVotes))
+		acknowledgements := make([]VoterAcknowledgement, 0, len(state.snapshotVotes))
 		for _, candidate := range state.snapshotVotes {
-			attestations = append(attestations, candidate.Clone())
+			acknowledgements = append(acknowledgements, candidate.Clone())
 		}
-		certificate, err := BuildSnapshotCertificate(state.record.Plan, vote.Descriptor, attestations)
+		certificate, err := BuildSnapshotCertificate(state.record.Plan, vote.Descriptor, acknowledgements)
 		if err != nil {
 			return err
 		}
@@ -2627,10 +2661,10 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		}
 		var install installProofPayload
 		if err := unmarshalBootstrapCanonical(message.Payload, &install); err != nil ||
-			VerifySnapshotCertificate(state.record.Plan, install.Snapshot) != nil ||
-			state.record.SealCertificate.Digest == (StateDigest{}) ||
-			install.Snapshot.Descriptor.SealDigest != state.record.SealCertificate.Digest ||
-			VerifyVoterReadyProof(state.record.Plan, install.Snapshot, install.Proof) != nil {
+			ValidateSnapshotCertificate(state.record.Plan, install.Snapshot) != nil ||
+			state.record.FenceQuorum.Digest == (StateDigest{}) ||
+			install.Snapshot.Descriptor.FenceDigest != state.record.FenceQuorum.Digest ||
+			ValidateVoterReadyProof(state.record.Plan, install.Snapshot, install.Proof) != nil {
 			return ErrInvalidBootstrapMessage
 		}
 		if state.record.SnapshotCertificate.Digest == (StateDigest{}) {
@@ -2643,19 +2677,21 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		}
 		return n.RecordTargetReady(state.record.Plan, install.Proof)
 	case BootstrapMsgReadyAck:
-		if state.record.TargetReady.Proof.Signature == nil {
+		if state.record.TargetReady.Plan != state.record.Plan.Request.Plan ||
+			targetReadyRecordIsZero(state.record.TargetReady) {
 			return ErrBootstrapSnapshot
 		}
-		var attestation VoterAttestation
+		var acknowledgement VoterAcknowledgement
 		digest := DigestVoterReadyProof(state.record.TargetReady.Proof)
-		if err := unmarshalBootstrapCanonical(message.Payload, &attestation); err != nil ||
-			attestation.Signer.Replica != message.From ||
-			verifyBootstrapAttestation(state.record.Plan, digest, attestation) != nil {
+		if err := unmarshalBootstrapCanonical(message.Payload, &acknowledgement); err != nil ||
+			acknowledgement.Voter.Replica != message.From ||
+			validateBootstrapAcknowledgement(state.record.Plan, digest, acknowledgement) != nil {
 			return ErrInvalidBootstrapMessage
 		}
 		if state.record.ReadyCertificate.Digest != (StateDigest{}) {
-			for _, certified := range state.record.ReadyCertificate.Attestations {
-				if certified.Signer.Replica == message.From && bytes.Equal(certified.Signature, attestation.Signature) {
+			for _, certified := range state.record.ReadyCertificate.Acknowledgements {
+				if certified.Voter == acknowledgement.Voter &&
+					certified.AttestedDigest == acknowledgement.AttestedDigest {
 					return nil
 				}
 			}
@@ -2666,20 +2702,20 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		}
 		state.readyDigest = digest
 		if existing, duplicate := state.readyVotes[message.From]; duplicate {
-			if existing.AttestedDigest == attestation.AttestedDigest && bytes.Equal(existing.Signature, attestation.Signature) {
+			if existing == acknowledgement {
 				return nil
 			}
 			return ErrBootstrapCertificate
 		}
-		state.readyVotes[message.From] = attestation.Clone()
+		state.readyVotes[message.From] = acknowledgement.Clone()
 		if len(state.readyVotes) < slowQuorumSize(len(state.record.Plan.Request.Base.Voters)) {
 			return nil
 		}
-		attestations := make([]VoterAttestation, 0, len(state.readyVotes))
+		acknowledgements := make([]VoterAcknowledgement, 0, len(state.readyVotes))
 		for _, candidate := range state.readyVotes {
-			attestations = append(attestations, candidate.Clone())
+			acknowledgements = append(acknowledgements, candidate.Clone())
 		}
-		certificate, err := BuildReadyCertificate(state.record.Plan, state.record.TargetReady.Proof, attestations)
+		certificate, err := BuildReadyCertificate(state.record.Plan, state.record.TargetReady.Proof, acknowledgements)
 		if err != nil {
 			return err
 		}
@@ -2701,13 +2737,30 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 	case BootstrapMsgReadyResponse:
 		var certificate ReadyCertificate
 		if err := unmarshalBootstrapCanonical(message.Payload, &certificate); err != nil ||
-			VerifyReadyCertificate(state.record.Plan, state.record.SnapshotCertificate, certificate) != nil {
+			ValidateReadyCertificate(state.record.Plan, state.record.SnapshotCertificate, certificate) != nil {
 			return ErrInvalidBootstrapMessage
 		}
-		if state.record.ReadyCertificate.Digest != (StateDigest{}) && state.record.ReadyCertificate.Digest != certificate.Digest {
+		if state.record.ReadyCertificate.Digest != (StateDigest{}) {
+			if state.record.ReadyCertificate.Digest != certificate.Digest {
+				return ErrBootstrapCertificate
+			}
+			if state.record.TargetReady.Plan != state.record.Plan.Request.Plan ||
+				DigestVoterReadyProof(state.record.TargetReady.Proof) != DigestVoterReadyProof(certificate.Proof) {
+				return ErrBootstrapCertificate
+			}
+			return nil
+		}
+		targetReady := TargetReadyRecord{Plan: state.record.Plan.Request.Plan, Proof: certificate.Proof.Clone()}
+		if state.record.TargetReady.Plan != (BootstrapID{}) {
+			if state.record.TargetReady.Plan != targetReady.Plan ||
+				DigestVoterReadyProof(state.record.TargetReady.Proof) != DigestVoterReadyProof(targetReady.Proof) {
+				return ErrBootstrapCertificate
+			}
+		} else if !targetReadyRecordIsZero(state.record.TargetReady) {
 			return ErrBootstrapCertificate
 		}
 		state.record.Phase = BootstrapPhaseFinalizing
+		state.record.TargetReady = targetReady
 		state.record.ReadyCertificate = certificate.Clone()
 		state.readyDigest = DigestVoterReadyProof(certificate.Proof)
 		n.enqueueBootstrapRecord(state)
@@ -2728,7 +2781,6 @@ func (n *RawNode) StepBootstrap(message BootstrapMessage) error {
 		return ErrInvalidBootstrapMessage
 	}
 }
-
 func (n *RawNode) findBootstrapControl(ref InstanceRef) (*bootstrapState, membershipOperation, bool) {
 	for _, state := range n.bootstrapPlans {
 		switch ref {
@@ -2752,12 +2804,12 @@ func bootstrapIdentityDigest(plan VoterPlan) StateDigest {
 	for _, identity := range identities {
 		canonical = appendIdentity(canonical, identity)
 	}
-	return domainDigest("epaxos/bootstrap/identity-set/v1", canonical)
+	return domainDigest("epaxos/bootstrap/identity-set/v2", canonical)
 }
 
-func (n *RawNode) admitWhileSealed(message Message) error {
-	closed, sealed := n.closedConfigs[message.Ref.Conf]
-	if !sealed {
+func (n *RawNode) admitWhileFenced(message Message) error {
+	closed, fenced := n.closedConfigs[message.Ref.Conf]
+	if !fenced {
 		return nil
 	}
 	if state, operation, control := n.findBootstrapControl(message.Ref); control {
@@ -2780,27 +2832,27 @@ func (n *RawNode) admitWhileSealed(message Message) error {
 	}
 	lane, ok := closed.Frontier.lane(message.Ref.Replica)
 	if !ok {
-		return ErrBootstrapSealed
+		return ErrBootstrapFenced
 	}
 	if message.Ref.Instance > lane.ObservedThrough {
 		if message.Type == MsgCommit {
 			return ErrBootstrapContradiction
 		}
-		return ErrBootstrapSealed
+		return ErrBootstrapFenced
 	}
 	inst := n.instances[message.Ref]
 	switch message.Type {
 	case MsgPreAccept:
 		if inst == nil || !phaseMessageValueEqual(inst.rec, message) {
-			return ErrBootstrapSealed
+			return ErrBootstrapFenced
 		}
 	case MsgAccept:
 		if !message.Ballot.IsRecovery() && (inst == nil || !phaseMessageValueEqual(inst.rec, message)) {
-			return ErrBootstrapSealed
+			return ErrBootstrapFenced
 		}
 	case MsgPrepare:
 		if !message.Ballot.IsRecovery() {
-			return ErrBootstrapSealed
+			return ErrBootstrapFenced
 		}
 	case MsgCommit:
 		if inst == nil {
@@ -2816,7 +2868,7 @@ func (n *RawNode) membershipAllNoneCommand(ref InstanceRef) (Command, bool) {
 		state.durableDigest != state.record.Digest {
 		return Command{}, false
 	}
-	wire := membershipCommandWire{Operation: operation, Plan: state.record.Plan.Clone(), SealDigest: state.record.SealCertificate.Digest}
+	wire := membershipCommandWire{Operation: operation, Plan: state.record.Plan.Clone(), FenceDigest: state.record.FenceQuorum.Digest}
 	if operation == membershipActivate {
 		if state.record.SnapshotCertificate.Digest == (StateDigest{}) || state.record.ReadyCertificate.Digest == (StateDigest{}) {
 			return Command{}, false
@@ -2856,12 +2908,12 @@ func (n *RawNode) applyMembershipControl(ref InstanceRef, command Command) (Memb
 		if state.record.Outcome != BootstrapOutcomeUnspecified {
 			return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedSuperseded, ExitRef: ref}, ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}
 		}
-		if VerifySnapshotCertificate(wire.Plan, wire.Snapshot) != nil ||
-			VerifyReadyCertificate(wire.Plan, wire.Snapshot, wire.Ready) != nil ||
-			wire.SealDigest == (StateDigest{}) ||
-			(state.record.SealCertificate.Digest != (StateDigest{}) &&
-				wire.SealDigest != state.record.SealCertificate.Digest) ||
-			wire.Snapshot.Descriptor.SealDigest != wire.SealDigest {
+		if ValidateSnapshotCertificate(wire.Plan, wire.Snapshot) != nil ||
+			ValidateReadyCertificate(wire.Plan, wire.Snapshot, wire.Ready) != nil ||
+			wire.FenceDigest == (StateDigest{}) ||
+			(state.record.FenceQuorum.Digest != (StateDigest{}) &&
+				wire.FenceDigest != state.record.FenceQuorum.Digest) ||
+			wire.Snapshot.Descriptor.FenceDigest != wire.FenceDigest {
 			return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedInvalid, ExitRef: ref}, ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
 		}
 		if _, exists := n.appliedConfByBase[ref.Conf]; exists {
@@ -2887,7 +2939,7 @@ func (n *RawNode) applyMembershipControl(ref InstanceRef, command Command) (Memb
 		state.record.ReadyCertificate = wire.Ready.Clone()
 		state.record.Closed = ClosedConfig{
 			Conf: wire.Plan.Request.Base.Clone(), Frontier: wire.Snapshot.Descriptor.Frontier.Clone(),
-			Reservations: wire.Plan.Reservations, CertificateDigest: wire.SealDigest,
+			Reservations: wire.Plan.Reservations, CertificateDigest: wire.FenceDigest,
 		}
 		n.closedConfigs[ref.Conf] = state.record.Closed.Clone()
 		target := n.readyTarget()
@@ -2924,7 +2976,7 @@ func (n *RawNode) applyMembershipControl(ref InstanceRef, command Command) (Memb
 		if state.record.Outcome != BootstrapOutcomeUnspecified {
 			return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedSuperseded, ExitRef: ref}, ConfChangeResult{Outcome: ConfChangeRejectedSuperseded}
 		}
-		if state.record.SealCertificate.Digest != (StateDigest{}) && wire.SealDigest != state.record.SealCertificate.Digest {
+		if state.record.FenceQuorum.Digest != (StateDigest{}) && wire.FenceDigest != state.record.FenceQuorum.Digest {
 			return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedInvalid, ExitRef: ref}, ConfChangeResult{Outcome: ConfChangeRejectedInvalid}
 		}
 		state.record.Phase = BootstrapPhaseAborted
@@ -2932,7 +2984,7 @@ func (n *RawNode) applyMembershipControl(ref InstanceRef, command Command) (Memb
 		state.record.TerminalRef = ref
 		n.enqueueBootstrapRecord(state)
 		n.enqueueBootstrapAfterAdvance(state, BootstrapMessage{}, true)
-		return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeAborted, ExitRef: ref, CertificateDigest: wire.SealDigest}, ConfChangeResult{}
+		return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeAborted, ExitRef: ref, CertificateDigest: wire.FenceDigest}, ConfChangeResult{}
 	default:
 		return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedInvalid, ExitRef: ref}, ConfChangeResult{}
 	}
@@ -2957,7 +3009,7 @@ func bootstrapMessageEqual(a, b BootstrapMessage) bool {
 	return a.Type == b.Type && a.Cluster == b.Cluster && a.Plan == b.Plan && a.From == b.From &&
 		a.FromIncarnation == b.FromIncarnation && a.To == b.To && a.BaseID == b.BaseID &&
 		a.BaseDigest == b.BaseDigest && a.PayloadDigest == b.PayloadDigest &&
-		bytes.Equal(a.Payload, b.Payload) && bytes.Equal(a.Signature, b.Signature)
+		bytes.Equal(a.Payload, b.Payload)
 }
 
 func (n *RawNode) applyBootstrapDurability(records []BootstrapRecord) {
@@ -2986,7 +3038,7 @@ func (n *RawNode) applyBootstrapDurability(records []BootstrapRecord) {
 			remaining = append(remaining, action)
 			continue
 		}
-		if action.unseal {
+		if action.unfence {
 			if state := n.bootstrapPlans[action.plan]; state != nil {
 				delete(n.closedConfigs, state.record.Plan.Request.Base.ID)
 				delete(n.bootstrapByBase, state.record.Plan.Request.Base.ID)
@@ -3010,8 +3062,8 @@ var (
 	ErrBootstrapBusy = errors.New("epaxos: bootstrap plan busy")
 	// ErrBootstrapStale reports a plan whose exact base is no longer current.
 	ErrBootstrapStale = errors.New("epaxos: bootstrap plan stale")
-	// ErrBootstrapNotSealed reports an operation attempted before canonical seal.
-	ErrBootstrapNotSealed = errors.New("epaxos: bootstrap plan not sealed")
+	// ErrBootstrapNotFenced reports an operation attempted before the durable fence.
+	ErrBootstrapNotFenced = errors.New("epaxos: bootstrap plan not fenced")
 	// ErrBootstrapClosure reports unresolved old-configuration closure obligations.
 	ErrBootstrapClosure = errors.New("epaxos: bootstrap closure incomplete")
 	// ErrBootstrapCertificate reports malformed, noncanonical, or insufficient evidence.
@@ -3022,8 +3074,8 @@ var (
 	ErrBootstrapAborted = errors.New("epaxos: bootstrap plan aborted")
 	// ErrBootstrapSnapshot reports a stale or mismatched installed snapshot.
 	ErrBootstrapSnapshot = errors.New("epaxos: invalid bootstrap snapshot")
-	// ErrBootstrapSealed reports ordinary old-config traffic refused by the fence.
-	ErrBootstrapSealed = errors.New("epaxos: configuration sealed")
+	// ErrBootstrapFenced reports ordinary old-config traffic refused by the fence.
+	ErrBootstrapFenced = errors.New("epaxos: configuration fenced")
 	// ErrBootstrapContradiction reports a commit above a certified frontier.
 	ErrBootstrapContradiction = errors.New("epaxos: bootstrap frontier contradiction")
 	// ErrBootstrapBounds reports an input exceeding a protocol bound.

@@ -22,15 +22,15 @@ func TestBootstrapChunkCodecRoundTripAndMalformedFrames(t *testing.T) {
 		Total:           uint64(len(payload)),
 		Payload:         payload,
 	}
-	signed, err := SignBootstrapChunk(chunk, fixture.identities[0], fixture.private[0])
+	built, err := BuildBootstrapChunk(chunk)
 	if err != nil {
-		t.Fatalf("SignBootstrapChunk: %v", err)
+		t.Fatalf("BuildBootstrapChunk: %v", err)
 	}
-	if err := VerifyBootstrapChunk(signed, fixture.identities[0]); err != nil {
-		t.Fatalf("VerifyBootstrapChunk: %v", err)
+	if err := ValidateBootstrapChunk(built, fixture.identities[0].Replica, fixture.identities[0].Incarnation); err != nil {
+		t.Fatalf("ValidateBootstrapChunk: %v", err)
 	}
 
-	encoded, err := EncodeBootstrapChunk([]byte{0xa5}, signed)
+	encoded, err := EncodeBootstrapChunk([]byte{0xa5}, built)
 	if err != nil {
 		t.Fatalf("EncodeBootstrapChunk: %v", err)
 	}
@@ -42,29 +42,29 @@ func TestBootstrapChunkCodecRoundTripAndMalformedFrames(t *testing.T) {
 	if err := DecodeBootstrapChunk(frame, &decoded); err != nil {
 		t.Fatalf("DecodeBootstrapChunk: %v", err)
 	}
-	if !reflect.DeepEqual(decoded, signed) {
-		t.Fatalf("decoded chunk differs from signed chunk:\n got %#v\nwant %#v", decoded, signed)
+	if !reflect.DeepEqual(decoded, built) {
+		t.Fatalf("decoded chunk differs from built chunk:\n got %#v\nwant %#v", decoded, built)
 	}
-	if err := VerifyBootstrapChunk(decoded, fixture.identities[0]); err != nil {
-		t.Fatalf("VerifyBootstrapChunk(decoded): %v", err)
+	if err := ValidateBootstrapChunk(decoded, fixture.identities[0].Replica, fixture.identities[0].Incarnation); err != nil {
+		t.Fatalf("ValidateBootstrapChunk(decoded): %v", err)
 	}
 
-	invalidDigest := signed
+	invalidDigest := built
 	invalidDigest.PayloadDigest[0]++
 	unchanged, err := EncodeBootstrapChunk([]byte{0x7f}, invalidDigest)
-	if !errors.Is(err, ErrInvalidBootstrapMessage) {
-		t.Fatalf("invalid payload digest error = %v, want ErrInvalidBootstrapMessage", err)
+	if !errors.Is(err, ErrBootstrapChunkConflict) {
+		t.Fatalf("invalid payload digest error = %v, want ErrBootstrapChunkConflict", err)
 	}
-	if _, conflictErr := bootstrapChunkSigningBytes(invalidDigest); !errors.Is(conflictErr, ErrBootstrapChunkConflict) {
+	if _, conflictErr := bootstrapChunkCanonicalBytes(invalidDigest); !errors.Is(conflictErr, ErrBootstrapChunkConflict) {
 		t.Fatalf("invalid payload digest canonical error = %v, want ErrBootstrapChunkConflict", conflictErr)
 	}
 	if !bytes.Equal(unchanged, []byte{0x7f}) {
 		t.Fatalf("invalid encode changed destination: %x", unchanged)
 	}
 
-	digestOffset := bytes.Index(frame, signed.PayloadDigest[:])
+	digestOffset := bytes.Index(frame, built.PayloadDigest[:])
 	if digestOffset < 0 {
-		t.Fatal("signed payload digest not found in canonical frame")
+		t.Fatal("built payload digest not found in canonical frame")
 	}
 	for length := 0; length < len(frame); length++ {
 		mutated := frame[:length]
@@ -93,7 +93,7 @@ func TestBootstrapChunkCodecRoundTripAndMalformedFrames(t *testing.T) {
 	}{
 		{name: "bad-magic", mutate: func(b []byte) []byte { b[0] ^= 0xff; return b }},
 		{name: "bad-version", mutate: func(b []byte) []byte {
-			b[len(bootstrapChunkMagic)] = 2
+			b[len(bootstrapChunkMagic)] = 3
 			return b
 		}},
 		{name: "trailing-byte", mutate: func(b []byte) []byte { return append(b, 0x01) }},
@@ -125,7 +125,7 @@ func TestStorageStateCloneDoesNotShareOwnedSlices(t *testing.T) {
 			AppliedRef: InstanceRef{Replica: 1, Instance: 4, Conf: conf.ID},
 		}},
 		LocalVoterState: LocalVoterState{
-			Identity: VoterIdentity{Replica: 1, Incarnation: 2, VerifyKey: []byte{1, 2, 3}},
+			Identity: VoterIdentity{Replica: 1, Incarnation: 2},
 			Conf:     conf.Clone(),
 		},
 		Frontiers: []FrontierUpdate{{
@@ -140,11 +140,11 @@ func TestStorageStateCloneDoesNotShareOwnedSlices(t *testing.T) {
 	clone.HardState.Conf.Voters[0] = 9
 	clone.ConfigHistory[0].Conf.Voters[1] = 8
 	clone.LocalVoterState.Conf.Voters[2] = 7
-	clone.LocalVoterState.Identity.VerifyKey[0] = 9
+	clone.LocalVoterState.Identity.Incarnation = 3
 	clone.Frontiers[0].Frontier.Lanes[0].Sparse[0] = 6
 
 	if state.HardState.Conf.Voters[0] != 1 || state.ConfigHistory[0].Conf.Voters[1] != 2 ||
-		state.LocalVoterState.Conf.Voters[2] != 3 || state.LocalVoterState.Identity.VerifyKey[0] != 1 ||
+		state.LocalVoterState.Conf.Voters[2] != 3 || state.LocalVoterState.Identity.Incarnation != 2 ||
 		state.Frontiers[0].Frontier.Lanes[0].Sparse[0] != 2 {
 		t.Fatalf("StorageState.Clone shared mutable storage: original=%#v", state)
 	}

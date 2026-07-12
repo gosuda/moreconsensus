@@ -81,8 +81,8 @@ func ChecksumRecordWithoutTimingDomain(r InstanceRecord) [32]byte {
 	return checksumRecord(r, true, true, true, true, true, true)
 }
 
-// checksumRecord retains the pre-TimingDomain private signature for the older
-// exact-layout migration verifiers.
+// checksumRecord retains the pre-TimingDomain durable checksum layout for
+// older exact-layout migration verifiers.
 func checksumRecord(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult bool) [32]byte {
 	return checksumRecordLayout(r, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, false, false)
 }

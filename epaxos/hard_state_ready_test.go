@@ -345,8 +345,8 @@ func TestReadyHardStateCloneReleaseAndAckValidationAllocations(t *testing.T) {
 func TestConfigurationExecutionCarriesCompleteHardState(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	seal := sealBootstrapPlan(t, f, plan)
-	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	fence := fenceBootstrapPlan(t, f, plan)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, fence)
 	ready := readyBootstrapTarget(t, f, plan, snapshot)
 	ref, err := f.node.ActivateVoter(plan, snapshot, ready)
 	if err != nil {
@@ -371,8 +371,7 @@ func TestConfigurationExecutionCarriesCompleteHardState(t *testing.T) {
 	identities := append(cloneVoterIdentities(f.identities), f.target.Clone())
 	restarted, err := NewRawNode(Config{
 		ID: 1, Voters: plan.Request.Base.Voters, Cluster: f.cluster,
-		LocalIdentity: f.identities[0], VoterIdentities: identities,
-		BootstrapPrivateKey: f.private[0], Storage: f.store,
+		LocalIdentity: f.identities[0], VoterIdentities: identities, Storage: f.store,
 	})
 	if err != nil {
 		t.Fatal(err)

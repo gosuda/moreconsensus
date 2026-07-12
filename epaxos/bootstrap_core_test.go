@@ -1,7 +1,6 @@
 package epaxos
 
 import (
-	"crypto/ed25519"
 	"errors"
 	"testing"
 )
@@ -11,9 +10,7 @@ type bootstrapTestFixture struct {
 	store      *MemoryStorage
 	cluster    ClusterID
 	identities []VoterIdentity
-	private    []ed25519.PrivateKey
 	target     VoterIdentity
-	targetKey  ed25519.PrivateKey
 	planID     BootstrapID
 }
 
@@ -21,17 +18,10 @@ func newBootstrapTestFixture(t *testing.T, voters int, local ReplicaID) bootstra
 	t.Helper()
 	conf := ConfState{ID: 1, Voters: makeIDs(voters)}
 	identities := make([]VoterIdentity, voters)
-	private := make([]ed25519.PrivateKey, voters)
 	for i := range identities {
-		seed := make([]byte, ed25519.SeedSize)
-		seed[0] = byte(i + 1)
-		private[i] = ed25519.NewKeyFromSeed(seed)
-		identities[i] = VoterIdentity{Replica: ReplicaID(i + 1), Incarnation: 1, VerifyKey: append([]byte(nil), private[i].Public().(ed25519.PublicKey)...)}
+		identities[i] = VoterIdentity{Replica: ReplicaID(i + 1), Incarnation: 1}
 	}
-	targetSeed := make([]byte, ed25519.SeedSize)
-	targetSeed[0] = byte(voters + 1)
-	targetKey := ed25519.NewKeyFromSeed(targetSeed)
-	target := VoterIdentity{Replica: ReplicaID(voters + 1), Incarnation: 1, VerifyKey: append([]byte(nil), targetKey.Public().(ed25519.PublicKey)...)}
+	target := VoterIdentity{Replica: ReplicaID(voters + 1), Incarnation: 1}
 	cluster := ClusterID{1, 2, 3}
 	planID := BootstrapID{9, byte(voters), byte(local)}
 	store := NewMemoryStorage()
@@ -44,12 +34,12 @@ func newBootstrapTestFixture(t *testing.T, voters int, local ReplicaID) bootstra
 	node, err := NewRawNode(Config{
 		ID: local, Voters: conf.Voters, Cluster: cluster,
 		LocalIdentity: identities[local-1], VoterIdentities: identities,
-		BootstrapPrivateKey: private[local-1], Storage: store,
+		Storage: store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bootstrapTestFixture{node: node, store: store, cluster: cluster, identities: identities, private: private, target: target, targetKey: targetKey, planID: planID}
+	return bootstrapTestFixture{node: node, store: store, cluster: cluster, identities: identities, target: target, planID: planID}
 }
 
 func (f bootstrapTestFixture) request() PrepareVoterRequest {
@@ -86,34 +76,34 @@ func prepareBootstrapPlan(t *testing.T, f bootstrapTestFixture) VoterPlan {
 	return plan
 }
 
-func sealBootstrapPlan(t *testing.T, f bootstrapTestFixture, plan VoterPlan) SealCertificate {
+func fenceBootstrapPlan(t *testing.T, f bootstrapTestFixture, plan VoterPlan) FenceQuorum {
 	t.Helper()
-	if err := f.node.BeginVoterSeal(plan); err != nil {
-		t.Fatalf("BeginVoterSeal: %v", err)
+	if err := f.node.BeginVoterFence(plan); err != nil {
+		t.Fatalf("BeginVoterFence: %v", err)
 	}
 	persistBootstrapReady(t, f)
 	out := persistBootstrapReady(t, f)
-	if len(out.BootstrapMessages) != 1 || out.BootstrapMessages[0].Type != BootstrapMsgSealAck {
-		t.Fatalf("post-durable SealAck=%#v", out.BootstrapMessages)
+	if len(out.BootstrapMessages) != 1 || out.BootstrapMessages[0].Type != BootstrapMsgFenceAck {
+		t.Fatalf("post-durable FenceAck=%#v", out.BootstrapMessages)
 	}
-	seal := f.node.BootstrapStatus().Plans[0].LocalSeal
-	certificate, err := BuildSealCertificate(plan, []LocalSeal{seal})
+	fence := f.node.BootstrapStatus().Plans[0].LocalFence
+	quorum, err := BuildFenceQuorum(plan, []LocalAdmissionFence{fence})
 	if err != nil {
-		t.Fatalf("BuildSealCertificate: %v", err)
+		t.Fatalf("BuildFenceQuorum: %v", err)
 	}
-	if err := f.node.ApplySealCertificate(certificate); err != nil {
-		t.Fatalf("ApplySealCertificate: %v", err)
+	if err := f.node.ApplyFenceQuorum(quorum); err != nil {
+		t.Fatalf("ApplyFenceQuorum: %v", err)
 	}
 	persistBootstrapReady(t, f)
-	return certificate
+	return quorum
 }
 
-func certifyBootstrapSnapshot(t *testing.T, f bootstrapTestFixture, plan VoterPlan, seal SealCertificate) SnapshotCertificate {
+func certifyBootstrapSnapshot(t *testing.T, f bootstrapTestFixture, plan VoterPlan, fence FenceQuorum) SnapshotCertificate {
 	t.Helper()
 	descriptor := SnapshotDescriptor{
 		Cluster: f.cluster, Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Successor: plan.Successor.Clone(),
 		Target: plan.Request.Target.Clone(), Source: plan.Request.Source, Reservations: plan.Reservations,
-		SealDigest: seal.Digest, Frontier: seal.Frontier.Clone(), ManifestDigest: StateDigest{4},
+		FenceDigest: fence.Digest, Frontier: fence.Frontier.Clone(), ManifestDigest: StateDigest{4},
 		DeltaFirst: 1, DeltaLast: 1, DeltaRoot: StateDigest{5}, ApplicationDigest: StateDigest{6},
 		IdempotencyDigest: StateDigest{7}, ConfigHistoryDigest: StateDigest{8}, InstanceDigest: StateDigest{9},
 		HardStateDigest: StateDigest{10}, CompactionDigest: StateDigest{11},
@@ -122,28 +112,28 @@ func certifyBootstrapSnapshot(t *testing.T, f bootstrapTestFixture, plan VoterPl
 		TimingDigest:     plan.Request.TimingDigest, ReleaseDigest: plan.Request.ReleaseDigest,
 	}
 	digest := DigestSnapshotDescriptor(descriptor)
-	attestation, err := SignVoterAttestation(digest, f.identities[0], f.private[0])
+	acknowledgement, err := BuildVoterAcknowledgement(digest, f.identities[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, err := BuildSnapshotCertificate(plan, descriptor, []VoterAttestation{attestation})
+	certificate, err := BuildSnapshotCertificate(plan, descriptor, []VoterAcknowledgement{acknowledgement})
 	if err != nil {
 		t.Fatalf("BuildSnapshotCertificate: %v", err)
 	}
-	payload, err := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Attestation: attestation})
+	payload, err := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Acknowledgement: acknowledgement})
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := SignBootstrapMessage(BootstrapMessage{
+	message, err := BuildBootstrapMessage(BootstrapMessage{
 		Type: BootstrapMsgSnapshotVote, Cluster: f.cluster, Plan: plan.Request.Plan,
 		From: 1, FromIncarnation: 1, To: f.node.id, BaseID: plan.Request.Base.ID,
 		BaseDigest: plan.RequestDigest, Payload: payload,
-	}, f.identities[0], f.private[0])
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.node.StepBootstrap(message); err != nil {
-		t.Fatalf("StepBootstrap SnapshotVote: %v", err)
+	if err := f.node.StepBootstrapAuthenticated(message, message.From, message.FromIncarnation); err != nil {
+		t.Fatalf("StepBootstrapAuthenticated SnapshotVote: %v", err)
 	}
 	persistBootstrapReady(t, f)
 	return certificate
@@ -151,12 +141,12 @@ func certifyBootstrapSnapshot(t *testing.T, f bootstrapTestFixture, plan VoterPl
 
 func readyBootstrapTarget(t *testing.T, f bootstrapTestFixture, plan VoterPlan, snapshot SnapshotCertificate) ReadyCertificate {
 	t.Helper()
-	proof, err := SignVoterReadyProof(VoterReadyProof{
+	proof, err := BuildVoterReadyProof(VoterReadyProof{
 		Cluster: f.cluster, Plan: plan.Request.Plan, Target: plan.Request.Target.Clone(),
 		SnapshotDigest: snapshot.Digest, InstalledStateDigest: snapshot.Descriptor.InstalledStateDigest,
 		AllocatorFloor:   snapshot.Descriptor.TargetAllocatorFloor,
 		TOQClosedThrough: snapshot.Descriptor.TOQClosedThrough,
-	}, f.targetKey)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,11 +155,11 @@ func readyBootstrapTarget(t *testing.T, f bootstrapTestFixture, plan VoterPlan, 
 	}
 	persistBootstrapReady(t, f)
 	persistBootstrapReady(t, f)
-	attestation, err := SignVoterAttestation(DigestVoterReadyProof(proof), f.identities[0], f.private[0])
+	acknowledgement, err := BuildVoterAcknowledgement(DigestVoterReadyProof(proof), f.identities[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate, err := BuildReadyCertificate(plan, proof, []VoterAttestation{attestation})
+	certificate, err := BuildReadyCertificate(plan, proof, []VoterAcknowledgement{acknowledgement})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,11 +218,11 @@ func TestLegacyAddVoterRequiresCertificateAndStutters(t *testing.T) {
 func TestTargetCannotVoteUntilActivationAndLocalEligibilityAreDurable(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	seal := sealBootstrapPlan(t, f, plan)
+	fence := fenceBootstrapPlan(t, f, plan)
 	if closure := f.node.BootstrapClosure(plan); !closure.Complete {
 		t.Fatalf("closure=%#v", closure)
 	}
-	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, fence)
 	ready := readyBootstrapTarget(t, f, plan, snapshot)
 	if f.node.Status().Conf.Contains(f.target.Replica) {
 		t.Fatal("target voted before Activate")

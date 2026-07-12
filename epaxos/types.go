@@ -2,7 +2,6 @@ package epaxos
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"sort"
@@ -397,11 +396,8 @@ type Config struct {
 	Cluster ClusterID
 	// LocalIdentity is the exact locally fenced voter incarnation.
 	LocalIdentity VoterIdentity
-	// VoterIdentities supplies canonical verification identities for Voters.
+	// VoterIdentities supplies canonical externally authenticated incarnations for Voters.
 	VoterIdentities []VoterIdentity
-	// BootstrapPrivateKey signs bootstrap evidence for LocalIdentity. It is
-	// copied by NewRawNode and is never exposed through Ready or Status.
-	BootstrapPrivateKey ed25519.PrivateKey
 	// Storage persists hard state and instance records. A nil Storage selects
 	// an in-memory implementation.
 	Storage Storage

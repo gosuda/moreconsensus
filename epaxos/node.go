@@ -3,7 +3,6 @@ package epaxos
 import (
 	"bytes"
 	"container/heap"
-	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -177,7 +176,6 @@ type RawNode struct {
 	cluster             ClusterID
 	localIdentity       VoterIdentity
 	voterIdentities     map[ReplicaID]VoterIdentity
-	bootstrapPrivateKey []byte
 	localVoter          LocalVoterState
 	durableLocalVoter   LocalVoterState
 	bootstrapPlans      map[BootstrapID]*bootstrapState
@@ -669,7 +667,6 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		cluster:                         cfg.Cluster,
 		localIdentity:                   cfg.LocalIdentity.Clone(),
 		voterIdentities:                 make(map[ReplicaID]VoterIdentity),
-		bootstrapPrivateKey:             append([]byte(nil), cfg.BootstrapPrivateKey...),
 		retryTicks:                      cfg.RetryTicks,
 		recoveryTicks:                   cfg.RecoveryTicks,
 		timeOptimization:                cfg.TimeOptimization,
@@ -748,9 +745,8 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	loadedRecords := make([]InstanceRecord, 0)
 	if cfg.Cluster != (ClusterID{}) {
 		if !cfg.LocalIdentity.valid() || cfg.LocalIdentity.Replica != cfg.ID ||
-			len(cfg.VoterIdentities) != len(n.q.conf.Voters) ||
-			!publicKeyMatches(cfg.LocalIdentity, ed25519.PrivateKey(cfg.BootstrapPrivateKey)) {
-			return nil, fmt.Errorf("%w: complete current voter identities and matching bootstrap key required", ErrInvalidConfig)
+			len(cfg.VoterIdentities) != len(n.q.conf.Voters) {
+			return nil, fmt.Errorf("%w: complete current voter identities required", ErrInvalidConfig)
 		}
 		for i, voter := range n.q.conf.Voters {
 			identity := cfg.VoterIdentities[i]
@@ -758,6 +754,11 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 				return nil, fmt.Errorf("%w: noncanonical voter identities", ErrInvalidConfig)
 			}
 			n.voterIdentities[voter] = identity.Clone()
+		}
+		if n.q.conf.Contains(cfg.ID) {
+			if identity, ok := n.voterIdentities[cfg.ID]; !ok || !voterIdentityEqual(identity, cfg.LocalIdentity) {
+				return nil, fmt.Errorf("%w: local identity is not canonical for current membership", ErrInvalidConfig)
+			}
 		}
 		n.localVoter = state.LocalVoterState.Clone()
 		if !n.localVoter.IsEligible(cfg.ID, n.q.conf) || n.localVoter.Cluster != cfg.Cluster ||
@@ -1985,7 +1986,7 @@ func (n *RawNode) Step(m Message) error {
 	}
 	if !commandValidForConfiguration(m.Command, m.Ref, conf) {
 		if _, _, control := n.findBootstrapControl(m.Ref); control {
-			if _, sealed := n.closedConfigs[m.Ref.Conf]; sealed {
+			if _, fenced := n.closedConfigs[m.Ref.Conf]; fenced {
 				return ErrBootstrapControl
 			}
 		}
@@ -1997,7 +1998,7 @@ func (n *RawNode) Step(m Message) error {
 	if err := n.requireLocalVoterForConf(conf); err != nil {
 		return err
 	}
-	if err := n.admitWhileSealed(m); err != nil {
+	if err := n.admitWhileFenced(m); err != nil {
 		return err
 	}
 	if messageCarriesValue(m) && !n.messageTimingDomainEnabled(m) {

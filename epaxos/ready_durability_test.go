@@ -716,8 +716,8 @@ func TestRestartWithOnlyCommittedRecordReemitsUserCommand(t *testing.T) {
 func TestConfChangeExecutesWithoutApplicationCommit(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	seal := sealBootstrapPlan(t, f, plan)
-	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	fence := fenceBootstrapPlan(t, f, plan)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, fence)
 	ready := readyBootstrapTarget(t, f, plan, snapshot)
 	ref, err := f.node.ActivateVoter(plan, snapshot, ready)
 	if err != nil {

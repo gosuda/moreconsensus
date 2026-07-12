@@ -7,7 +7,7 @@ EXTENDS Naturals, FiniteSets, TLC
 (* until an Activate control instance has been chosen under the old       *)
 (* configuration, executed, and made durable.                              *)
 (*                                                                         *)
-(* This model checks the staged Prepare/Seal/ReadyProof/Activate-or-Abort *)
+(* This model checks the staged Prepare/Fence/ReadyProof/Activate-or-Abort *)
 (* protocol.  It deliberately does not model or claim joint consensus.    *)
 (* Slot values and digests are symbolic and collision-free in this finite *)
 (* model.  The per-lane frontier covers two representative instance       *)
@@ -20,7 +20,7 @@ CONSTANTS N, Mode, Mutation, MaxCrashes, MaxRef
 Modes == {"size", "crash-prefix", "race", "fair"}
 DeterministicMode == Mode \in Modes
 Mutations ==
-    {"none", "RemoveSealFence", "EarlyTargetVote",
+    {"none", "RemoveFence", "EarlyTargetVote",
      "IncompleteFrontier", "ReuseControlRef", "AcceptStaleProof"}
 
 ASSUME /\ N \in 1..6
@@ -77,9 +77,9 @@ MaxOfSet(set) == CHOOSE item \in set : \A other \in set : other <= item
 VARIABLE state
 vars == <<state>>
 
-ReportUnion(signers) ==
+ReportUnion(voters) ==
     [lane \in OldVoters |->
-        MaxOfSet({state.durableFrontier[voter][lane] : voter \in signers})]
+        MaxOfSet({state.durableFrontier[voter][lane] : voter \in voters})]
 
 CertificateDigest(frontier, coverage) ==
     [configDigest |-> [version |-> 1, voters |-> OldVoters],
@@ -159,8 +159,8 @@ Init ==
 
          ordinaryStatus |-> InitialStatus,
          ordinaryProposalSeen |-> FALSE,
-         preSealVotes |-> {},
-         postSealVotes |-> {},
+         preFenceVotes |-> {},
+         postFenceVotes |-> {},
          lateOldChosen |-> FALSE,
 
          reservationSucceeded |-> FALSE,
@@ -177,9 +177,9 @@ Init ==
          volatileFrontier |-> [voter \in OldVoters |-> ZeroFrontier],
          durableControls |-> [voter \in OldVoters |-> {}],
          volatileControls |-> [voter \in OldVoters |-> {}],
-         pendingSeal |-> {},
-         sealAcks |-> {},
-         sealClosed |-> FALSE,
+         pendingFence |-> {},
+         fenceAcks |-> {},
+         fenceClosed |-> FALSE,
          unionFrontier |-> ZeroFrontier,
          admissionChecks |-> {},
 
@@ -188,8 +188,8 @@ Init ==
          certificateCoverage |-> {},
          certificateFrontier |-> ZeroFrontier,
          certificateDigest |-> NoDigest,
-         certificateSigners |-> {},
-         certificateSignerDigest |-> [voter \in OldVoters |-> NoDigest],
+         certificateVoters |-> {},
+         certificateVoterDigest |-> [voter \in OldVoters |-> NoDigest],
 
          durableTargetImage |-> NoImage,
          volatileTargetImage |-> NoImage,
@@ -232,9 +232,9 @@ Init ==
          duplicateActivationSeen |-> FALSE]
 
 (***************************************************************************)
-(* Pre-seal ordinary work.  AttackRef is representative old in-flight     *)
+(* Pre-fence ordinary work.  AttackRef is representative old in-flight     *)
 (* work.  It may collect a genuine old slow quorum before Prepare, and is *)
-(* still recovered through the certified frontier after Seal.             *)
+(* still recovered through the certified frontier after Fence.             *)
 (***************************************************************************)
 
 ObserveOrdinaryProposal ==
@@ -245,18 +245,18 @@ ObserveOrdinaryProposal ==
             !.ordinaryProposalSeen = TRUE,
             !.ordinaryStatus[AttackRef] = "accepted"]
 
-CastPreSealVote(voter) ==
+CastPreFenceVote(voter) ==
     /\ state.phase = "idle"
     /\ state.running[voter]
-    /\ voter \notin state.preSealVotes
-    /\ Cardinality(state.preSealVotes) < OldSlowQuorum
+    /\ voter \notin state.preFenceVotes
+    /\ Cardinality(state.preFenceVotes) < OldSlowQuorum
     /\ \/ ~DeterministicMode
        \/ /\ voter \in OldSlowWitness
-          /\ voter = MinOfSet(OldSlowWitness \ state.preSealVotes)
-    /\ LET votes == state.preSealVotes \cup {voter}
+          /\ voter = MinOfSet(OldSlowWitness \ state.preFenceVotes)
+    /\ LET votes == state.preFenceVotes \cup {voter}
        IN state' =
             [state EXCEPT
-                !.preSealVotes = votes,
+                !.preFenceVotes = votes,
                 !.ordinaryStatus[AttackRef] =
                     IF Cardinality(votes) >= OldSlowQuorum
                     THEN "terminal"
@@ -285,7 +285,7 @@ ChoosePrepareAndReserve ==
     /\ AllocatorFloor <= MaxRef
     /\ state' =
         [state EXCEPT
-            !.phase = "sealing",
+            !.phase = "fencing",
             !.reservationSucceeded = TRUE,
             !.allocatorNext = AllocatorFloor,
             !.pinned = PinnedAfterReservation,
@@ -297,14 +297,14 @@ ChoosePrepareAndReserve ==
                                 [kind |-> "prepare", config |-> OldConfig])}]
 
 (***************************************************************************)
-(* Each SealAck travels only after an atomic durable fence write.  The     *)
+(* Each FenceAck travels only after an atomic durable fence write.  The     *)
 (* write rejects new initial-C work, rejects work above the reported lane *)
 (* frontier, allows only retry/recovery at or below it until terminal, and *)
 (* exempts only the exact matching Activate and Abort control refs.        *)
 (***************************************************************************)
 
 DurablyFence(voter) ==
-    /\ state.phase = "sealing"
+    /\ state.phase = "fencing"
     /\ state.running[voter]
     /\ ~state.durableFence[voter]
     /\ \/ ~DeterministicMode
@@ -320,67 +320,67 @@ DurablyFence(voter) ==
             !.volatileFrontier[voter] = InitialFrontier,
             !.durableControls[voter] = FenceExemptRefs,
             !.volatileControls[voter] = FenceExemptRefs,
-            !.pendingSeal = @ \cup {voter}]
+            !.pendingFence = @ \cup {voter}]
 
-SendSealWithoutFence ==
-    /\ Mutation = "RemoveSealFence"
-    /\ state.phase = "sealing"
+SendFenceWithoutDurableAdmission ==
+    /\ Mutation = "RemoveFence"
+    /\ state.phase = "fencing"
     /\ state.running[1]
     /\ ~state.durableFence[1]
-    /\ 1 \notin state.pendingSeal
-    /\ 1 \notin state.sealAcks
-    /\ state' = [state EXCEPT !.pendingSeal = @ \cup {1}]
+    /\ 1 \notin state.pendingFence
+    /\ 1 \notin state.fenceAcks
+    /\ state' = [state EXCEPT !.pendingFence = @ \cup {1}]
 
-RetrySeal(voter) ==
-    /\ state.phase = "sealing"
+RetryFence(voter) ==
+    /\ state.phase = "fencing"
     /\ state.running[voter]
-    /\ voter \notin state.pendingSeal
-    /\ voter \notin state.sealAcks
+    /\ voter \notin state.pendingFence
+    /\ voter \notin state.fenceAcks
     /\ \/ state.durableFence[voter]
-       \/ /\ Mutation = "RemoveSealFence"
+       \/ /\ Mutation = "RemoveFence"
           /\ voter = 1
-    /\ state' = [state EXCEPT !.pendingSeal = @ \cup {voter}]
+    /\ state' = [state EXCEPT !.pendingFence = @ \cup {voter}]
 
-LoseSeal(voter) ==
+LoseFence(voter) ==
     /\ Mode = "race"
-    /\ voter \in state.pendingSeal
+    /\ voter \in state.pendingFence
     /\ state' =
         [state EXCEPT
-            !.pendingSeal = @ \ {voter},
+            !.pendingFence = @ \ {voter},
             !.networkLoss = TRUE]
 
-DeliverSeal(voter) ==
-    /\ voter \in state.pendingSeal
+DeliverFence(voter) ==
+    /\ voter \in state.pendingFence
     /\ \/ ~DeterministicMode
        \/ /\ voter \in OldSlowWitness
           /\ voter =
-                 MinOfSet(state.pendingSeal \cap OldSlowWitness)
+                 MinOfSet(state.pendingFence \cap OldSlowWitness)
     /\ state' =
         [state EXCEPT
-            !.pendingSeal = @ \ {voter},
-            !.sealAcks = @ \cup {voter},
+            !.pendingFence = @ \ {voter},
+            !.fenceAcks = @ \cup {voter},
             !.networkReorder =
-                @ \/ \E other \in state.pendingSeal : other < voter]
+                @ \/ \E other \in state.pendingFence : other < voter]
 
-ObserveDuplicateSeal(voter) ==
-    /\ voter \in state.sealAcks
+ObserveDuplicateFence(voter) ==
+    /\ voter \in state.fenceAcks
     /\ ~state.networkDuplicate
     /\ state' = [state EXCEPT !.networkDuplicate = TRUE]
 
-CloseSeal ==
-    /\ state.phase = "sealing"
-    /\ Cardinality(state.sealAcks) >= OldSlowQuorum
+CloseFence ==
+    /\ state.phase = "fencing"
+    /\ Cardinality(state.fenceAcks) >= OldSlowQuorum
     /\ state' =
         [state EXCEPT
             !.phase = "recovering",
-            !.sealClosed = TRUE,
-            !.unionFrontier = ReportUnion(state.sealAcks),
-            !.pendingSeal = {}]
+            !.fenceClosed = TRUE,
+            !.unionFrontier = ReportUnion(state.fenceAcks),
+            !.pendingFence = {}]
 
 ProbeDurableFenceAdmissions ==
-    /\ state.sealClosed
+    /\ state.fenceClosed
     /\ state.admissionChecks = {}
-    /\ \E voter \in state.sealAcks : state.durableFence[voter]
+    /\ \E voter \in state.fenceAcks : state.durableFence[voter]
     /\ state' =
         [state EXCEPT
             !.admissionChecks =
@@ -393,21 +393,21 @@ ProbeDurableFenceAdmissions ==
                  "below-frontier-retry-or-recovery-only",
                  "activate-abort-control-exempt"}]
 
-CastPostSealOldVote(voter) ==
-    /\ state.sealClosed
+CastPostFenceOldVote(voter) ==
+    /\ state.fenceClosed
     /\ state.planExit = "none"
     /\ state.running[voter]
     /\ ~state.durableFence[voter]
-    /\ voter \notin state.postSealVotes
+    /\ voter \notin state.postFenceVotes
     /\ \/ ~DeterministicMode
        \/ voter =
               MinOfSet({member \in OldVoters :
                            ~state.durableFence[member]} \
-                       state.postSealVotes)
-    /\ LET votes == state.postSealVotes \cup {voter}
+                       state.postFenceVotes)
+    /\ LET votes == state.postFenceVotes \cup {voter}
        IN state' =
             [state EXCEPT
-                !.postSealVotes = votes,
+                !.postFenceVotes = votes,
                 !.lateOldChosen =
                     @ \/ Cardinality(votes) >= OldSlowQuorum,
                 !.chosenRecords =
@@ -441,10 +441,10 @@ BuildCertificate ==
             !.certificateFrontier = state.unionFrontier,
             !.certificateDigest =
                 CertificateDigest(state.unionFrontier, state.recovered),
-            !.certificateSigners = state.sealAcks,
-            !.certificateSignerDigest =
+            !.certificateVoters = state.fenceAcks,
+            !.certificateVoterDigest =
                 [voter \in OldVoters |->
-                    IF voter \in state.sealAcks
+                    IF voter \in state.fenceAcks
                     THEN CertificateDigest(state.unionFrontier,
                                            state.recovered)
                     ELSE NoDigest]]
@@ -571,14 +571,14 @@ FinishReadyProofReplication ==
 (***************************************************************************)
 
 TerminalRecoveryPhase ==
-    state.sealClosed /\
+    state.fenceClosed /\
     state.phase \in
         {"recovering", "certified", "installed", "proof", "terminal-race"}
 
 ObserveNetworkReorder ==
     /\ Mode = "race"
     /\ ~state.networkReorder
-    /\ \/ Cardinality(state.pendingSeal) >= 2
+    /\ \/ Cardinality(state.pendingFence) >= 2
        \/ Cardinality(state.pendingProof) >= 2
     /\ state' = [state EXCEPT !.networkReorder = TRUE]
 
@@ -850,19 +850,19 @@ Restart(voter) ==
 
 Next ==
     \/ ObserveOrdinaryProposal
-    \/ \E voter \in OldVoters : CastPreSealVote(voter)
+    \/ \E voter \in OldVoters : CastPreFenceVote(voter)
     \/ RejectExhaustedReservation
     \/ ChoosePrepareAndReserve
     \/ \E voter \in OldVoters : DurablyFence(voter)
-    \/ SendSealWithoutFence
-    \/ \E voter \in OldVoters : RetrySeal(voter)
-    \/ \E voter \in OldVoters : LoseSeal(voter)
-    \/ \E voter \in OldVoters : DeliverSeal(voter)
-    \/ \E voter \in OldVoters : ObserveDuplicateSeal(voter)
+    \/ SendFenceWithoutDurableAdmission
+    \/ \E voter \in OldVoters : RetryFence(voter)
+    \/ \E voter \in OldVoters : LoseFence(voter)
+    \/ \E voter \in OldVoters : DeliverFence(voter)
+    \/ \E voter \in OldVoters : ObserveDuplicateFence(voter)
     \/ ObserveNetworkReorder
-    \/ CloseSeal
+    \/ CloseFence
     \/ ProbeDurableFenceAdmissions
-    \/ \E voter \in OldVoters : CastPostSealOldVote(voter)
+    \/ \E voter \in OldVoters : CastPostFenceOldVote(voter)
     \/ RecoverNextFrontierRef
     \/ BuildCertificate
     \/ InstallTargetAtomically
@@ -903,22 +903,22 @@ Spec == Init /\ [][Next]_vars
 (* checkpoint availability.  Fair configurations disable crashes/loss.   *)
 (***************************************************************************)
 
-MissingOldSealWitness == OldSlowWitness \ state.sealAcks
+MissingOldFenceWitness == OldSlowWitness \ state.fenceAcks
 MissingProofWitness == OldSlowWitness \ state.proofReplicas
 MissingActivateWitness == OldSlowWitness \ state.activateVotes
 MissingActivatePrepareWitness ==
     OldSlowWitness \ state.activatePrepareVotes
 MissingSuccessorWitness == SuccessorWitness \ state.successorVotes
 
-FairSealStep ==
-    /\ state.phase = "sealing"
+FairFenceStep ==
+    /\ state.phase = "fencing"
     /\ IF \E voter \in OldSlowWitness : ~state.durableFence[voter]
        THEN DurablyFence(
                 MinOfSet({voter \in OldSlowWitness :
                             ~state.durableFence[voter]}))
-       ELSE IF MissingOldSealWitness # {}
-            THEN DeliverSeal(MinOfSet(MissingOldSealWitness))
-            ELSE CloseSeal
+       ELSE IF MissingOldFenceWitness # {}
+            THEN DeliverFence(MinOfSet(MissingOldFenceWitness))
+            ELSE CloseFence
 
 FairProofStep ==
     /\ state.phase = "proof"
@@ -947,8 +947,8 @@ FairSuccessorStep ==
 
 FairProgress ==
     \/ ChoosePrepareAndReserve
-    \/ FairSealStep
-    \/ CloseSeal
+    \/ FairFenceStep
+    \/ CloseFence
     \/ RecoverNextFrontierRef
     \/ BuildCertificate
     \/ InstallTargetAtomically
@@ -980,17 +980,17 @@ ReservedRefsUnique ==
     /\ state.durableReservation = ControlRefs
     /\ (state.running[1] => state.volatileReservation = ControlRefs)
 
-SealAckAfterDurableFence ==
-    \A voter \in state.sealAcks :
+FenceAckAfterDurableFence ==
+    \A voter \in state.fenceAcks :
         /\ state.durableFence[voter]
         /\ state.durableFrontier[voter] = InitialFrontier
         /\ state.durableControls[voter] = FenceExemptRefs
 
-SealedQuorumBlocksOldChoice ==
-    ~state.sealClosed \/
-    /\ Cardinality(state.sealAcks) >= OldSlowQuorum
+FencedQuorumBlocksOldChoice ==
+    ~state.fenceClosed \/
+    /\ Cardinality(state.fenceAcks) >= OldSlowQuorum
     /\ ~state.lateOldChosen
-    /\ Cardinality(state.postSealVotes) < OldSlowQuorum
+    /\ Cardinality(state.postFenceVotes) < OldSlowQuorum
 
 FrontierCompleteBeforeCertificate ==
     ~state.certificateIssued \/
@@ -1006,9 +1006,9 @@ SnapshotDigestAgreement ==
         /\ state.certificateDigest =
                CertificateDigest(state.certificateFrontier,
                                  state.certificateCoverage)
-        /\ Cardinality(state.certificateSigners) >= OldSlowQuorum
-        /\ \A voter \in state.certificateSigners :
-               state.certificateSignerDigest[voter] =
+        /\ Cardinality(state.certificateVoters) >= OldSlowQuorum
+        /\ \A voter \in state.certificateVoters :
+               state.certificateVoterDigest[voter] =
                    state.certificateDigest)
     /\ (~state.durableTargetImage.installed \/
         /\ state.durableTargetImage = ExpectedImage
@@ -1110,10 +1110,10 @@ CrashReplayEquivalent ==
         /\ state.volatileTargetImage = state.durableTargetImage
         /\ state.volatileActivation = state.durableActivation)
 
-FiniteSealResolves ==
-    state.sealClosed ~> state.planExit # "none"
+FiniteFenceResolves ==
+    state.fenceClosed ~> state.planExit # "none"
 
 SuccessorWorkProgresses ==
-    state.sealClosed ~> state.successorChosen
+    state.fenceClosed ~> state.successorChosen
 
 =============================================================================

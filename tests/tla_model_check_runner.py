@@ -15,6 +15,18 @@ import tempfile
 import urllib.request
 from dataclasses import dataclass
 
+BOOTSTRAP_PROFILE = (
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize1.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize2.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize3.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize4.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize5.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapSize6.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapCrashPrefix.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapRace.cfg"),
+    ("tla/EPaxosVoterBootstrap.tla", "tla/EPaxosVoterBootstrapFair.cfg"),
+)
+
 FAST_PROFILE = (
     ("tla/ReadyAdvance.tla", "tla/ReadyAdvance.cfg"),
     ("tla/ReadyAdvance.tla", "tla/ReadyAdvanceCapped.cfg"),
@@ -30,6 +42,7 @@ FAST_PROFILE = (
     ("tla/EPaxosRawNodeRefinement.tla", "tla/EPaxosRawNodeRefinementTOQ.cfg"),
     ("tla/EPaxosRawNodeRefinement.tla", "tla/EPaxosRawNodeRefinementRecovery.cfg"),
     ("tla/EPaxosSparsePrefix.tla", "tla/EPaxosSparsePrefixSafety.cfg"),
+    *BOOTSTRAP_PROFILE,
 )
 
 FULL_PROFILE = (
@@ -53,6 +66,7 @@ FULL_PROFILE = (
         "EPaxosConfigRecoveryLostResponseRetry", "EPaxosConfigAddRecovery", "EPaxosRollbackAllocation",
         "EPaxosRevisited", "TOQClockDiscipline", "KVTimestampStaleness", "KVOmissionRecovery",
     )),
+    *BOOTSTRAP_PROFILE,
     ("tla/Quorum.tla", "tla/Quorum.cfg"),
 )
 

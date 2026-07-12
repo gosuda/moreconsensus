@@ -2,8 +2,8 @@ package epaxos
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -40,11 +40,11 @@ func standaloneFrontier(plan VoterPlan, observed InstanceNum) BootstrapFrontier 
 	return frontier
 }
 
-func standaloneSnapshotDescriptor(plan VoterPlan, seal SealCertificate) SnapshotDescriptor {
+func standaloneSnapshotDescriptor(plan VoterPlan, fence FenceQuorum) SnapshotDescriptor {
 	return SnapshotDescriptor{
 		Cluster: plan.Request.Cluster, Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(),
 		Successor: plan.Successor.Clone(), Target: plan.Request.Target.Clone(), Source: plan.Request.Source,
-		Reservations: plan.Reservations, SealDigest: seal.Digest, Frontier: seal.Frontier.Clone(),
+		Reservations: plan.Reservations, FenceDigest: fence.Digest, Frontier: fence.Frontier.Clone(),
 		ManifestDigest: StateDigest{1}, DeltaRoot: StateDigest{2}, ApplicationDigest: StateDigest{3},
 		IdempotencyDigest: StateDigest{4}, ConfigHistoryDigest: StateDigest{5}, InstanceDigest: StateDigest{6},
 		HardStateDigest: StateDigest{7}, CompactionDigest: StateDigest{8}, InstalledStateDigest: StateDigest{9},
@@ -53,16 +53,16 @@ func standaloneSnapshotDescriptor(plan VoterPlan, seal SealCertificate) Snapshot
 	}
 }
 
-func signedStandaloneSeal(t *testing.T, plan VoterPlan, identity VoterIdentity, key ed25519.PrivateKey, frontier BootstrapFrontier) LocalSeal {
+func standaloneAdmissionFence(t *testing.T, plan VoterPlan, identity VoterIdentity, frontier BootstrapFrontier) LocalAdmissionFence {
 	t.Helper()
-	seal, err := SignLocalSeal(LocalSeal{
-		Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Signer: identity.Clone(),
+	fence, err := BuildLocalAdmissionFence(LocalAdmissionFence{
+		Plan: plan.Request.Plan, Base: plan.Request.Base.Clone(), Voter: identity.Clone(),
 		Reservations: plan.Reservations, Frontier: frontier,
-	}, key)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return seal
+	return fence
 }
 
 func TestPrepareVoterIdempotencyAndConcurrentPlanExclusion(t *testing.T) {
@@ -87,35 +87,35 @@ func TestPrepareVoterIdempotencyAndConcurrentPlanExclusion(t *testing.T) {
 	}
 }
 
-func TestSealAckEmittedOnlyAfterBootstrapReadyPersistence(t *testing.T) {
+func TestFenceAckEmittedOnlyAfterBootstrapReadyPersistence(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	if err := f.node.BeginVoterSeal(plan); err != nil {
+	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	rd := f.node.Ready()
 	if len(rd.BootstrapMessages) != 0 || !rd.MustSync || len(rd.BootstrapRecords) == 0 {
-		t.Fatalf("pre-persistence seal Ready=%#v", rd)
+		t.Fatalf("pre-persistence fence Ready=%#v", rd)
 	}
 	if err := f.store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.node.Ready().BootstrapMessages) != 0 {
-		t.Fatal("SealAck visible before Advance")
+		t.Fatal("FenceAck visible before Advance")
 	}
 	if err := f.node.Advance(rd); err != nil {
 		t.Fatal(err)
 	}
 	out := f.node.Ready()
-	if out.MustSync || len(out.BootstrapMessages) != 1 || out.BootstrapMessages[0].Type != BootstrapMsgSealAck {
+	if out.MustSync || len(out.BootstrapMessages) != 1 || out.BootstrapMessages[0].Type != BootstrapMsgFenceAck {
 		t.Fatalf("post-persistence Ready=%#v", out)
 	}
 }
 
-func TestSealFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t *testing.T) {
+func TestFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	if err := f.node.BeginVoterSeal(plan); err != nil {
+	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	above := plan.Reservations.Abort.Instance + 1
@@ -127,34 +127,34 @@ func TestSealFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t 
 	beforeInstances := len(f.node.instances)
 	beforeReady := f.node.Ready()
 	for _, message := range messages {
-		if err := f.node.Step(message); !errors.Is(err, ErrBootstrapSealed) {
+		if err := f.node.Step(message); !errors.Is(err, ErrBootstrapFenced) {
 			t.Fatalf("%s above fence err=%v", message.Type, err)
 		}
 	}
 	afterReady := f.node.Ready()
 	if len(f.node.instances) != beforeInstances || len(afterReady.Records) != len(beforeReady.Records) || len(afterReady.Messages) != len(beforeReady.Messages) {
-		t.Fatal("sealed rejection mutated records or responses")
+		t.Fatal("fenced rejection mutated records or responses")
 	}
 }
 
-func TestSealFenceAllowsOnlyMatchingPreSealRetryOrRecoveryBelowFrontier(t *testing.T) {
+func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
-	userRef, err := f.node.Propose(Command{Payload: []byte("before-seal"), ConflictKeys: [][]byte{[]byte("k")}})
+	userRef, err := f.node.Propose(Command{Payload: []byte("before-fence"), ConflictKeys: [][]byte{[]byte("k")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	persistBootstrapReady(t, f)
 	plan := prepareBootstrapPlan(t, f)
-	if err := f.node.BeginVoterSeal(plan); err != nil {
+	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	stored := f.node.instances[userRef].rec.Clone()
 	retry := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: userRef, Ballot: stored.Ballot, Seq: stored.Seq, Deps: stored.Deps, Command: stored.Command}
 	if err := f.node.Step(retry); err != nil {
-		t.Fatalf("matching pre-seal retry: %v", err)
+		t.Fatalf("matching pre-fence retry: %v", err)
 	}
 	retry.Command.Payload = []byte("different")
-	if err := f.node.Step(retry); !errors.Is(err, ErrBootstrapSealed) {
+	if err := f.node.Step(retry); !errors.Is(err, ErrBootstrapFenced) {
 		t.Fatalf("different retry err=%v", err)
 	}
 	recovery := Message{Type: MsgPrepare, From: 1, To: 1, Ref: userRef, Ballot: Ballot{Epoch: 1, Replica: 1}}
@@ -166,7 +166,7 @@ func TestSealFenceAllowsOnlyMatchingPreSealRetryOrRecoveryBelowFrontier(t *testi
 func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	if err := f.node.BeginVoterSeal(plan); err != nil {
+	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	wrong := []Command{{Payload: []byte("user")}, {Kind: CommandNoop}}
@@ -183,47 +183,83 @@ func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *tes
 	}
 }
 
-func TestCanonicalSealFrontierIsComponentwiseUnionAndReservationsAreOnlyHoles(t *testing.T) {
+func TestCanonicalFenceFrontierIsComponentwiseUnionAndReservationsAreOnlyHoles(t *testing.T) {
 	f, plan := standaloneBootstrapPlan(t, 3)
 	left := standaloneFrontier(plan, 0)
 	left.Lanes[0] = BootstrapLaneFrontier{Replica: 1, ObservedThrough: 5, CommittedThrough: 3, ExecutedThrough: 2, Sparse: []InstanceNum{1, 5}}
 	right := standaloneFrontier(plan, 0)
 	right.Lanes[0] = BootstrapLaneFrontier{Replica: 1, ObservedThrough: 7, CommittedThrough: 4, ExecutedThrough: 4, Sparse: []InstanceNum{2, 7}}
 	right.Lanes[1] = BootstrapLaneFrontier{Replica: 2, ObservedThrough: 9, CommittedThrough: 8, ExecutedThrough: 8, Sparse: []InstanceNum{9}}
-	seals := []LocalSeal{
-		signedStandaloneSeal(t, plan, f.identities[0], f.private[0], left),
-		signedStandaloneSeal(t, plan, f.identities[1], f.private[1], right),
+	fences := []LocalAdmissionFence{
+		standaloneAdmissionFence(t, plan, f.identities[0], left),
+		standaloneAdmissionFence(t, plan, f.identities[1], right),
 	}
-	certificate, err := BuildSealCertificate(plan, seals)
+	quorum, err := BuildFenceQuorum(plan, fences)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lane1, _ := certificate.Frontier.lane(1)
-	lane2, _ := certificate.Frontier.lane(2)
+	lane1, _ := quorum.Frontier.lane(1)
+	lane2, _ := quorum.Frontier.lane(2)
 	if lane1.ObservedThrough != 7 || lane1.CommittedThrough != 4 || lane1.ExecutedThrough != 4 ||
 		!instanceNumsEqual(lane1.Sparse, []InstanceNum{1, 2, 5, 7}) || lane2.ObservedThrough != 9 {
-		t.Fatalf("union frontier=%#v", certificate.Frontier)
+		t.Fatalf("union frontier=%#v", quorum.Frontier)
 	}
-	if !certificate.Reservations.ValidFor(plan.Request.Base) {
-		t.Fatalf("lost reservations: %#v", certificate.Reservations)
+	if !quorum.Reservations.ValidFor(plan.Request.Base) {
+		t.Fatalf("lost reservations: %#v", quorum.Reservations)
+	}
+}
+func TestSnapshotVoteCannotCountBeforeFenceQuorumIsDurable(t *testing.T) {
+	f := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, f)
+	if err := f.node.BeginVoterFence(plan); err != nil {
+		t.Fatal(err)
+	}
+	fence := f.node.BootstrapStatus().Plans[0].LocalFence
+	quorum, err := BuildFenceQuorum(plan, []LocalAdmissionFence{fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := standaloneSnapshotDescriptor(plan, quorum)
+	acknowledgement, err := BuildVoterAcknowledgement(DigestSnapshotDescriptor(descriptor), f.identities[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := marshalBootstrapCanonical(snapshotVotePayload{Descriptor: descriptor, Acknowledgement: acknowledgement})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := BuildBootstrapMessage(BootstrapMessage{
+		Type: BootstrapMsgSnapshotVote, Cluster: f.cluster, Plan: plan.Request.Plan,
+		From: 1, FromIncarnation: 1, To: 1, BaseID: plan.Request.Base.ID,
+		BaseDigest: plan.RequestDigest, Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.node.StepBootstrapAuthenticated(message, message.From, message.FromIncarnation); !errors.Is(err, ErrBootstrapClosure) {
+		t.Fatalf("pre-quorum snapshot vote err=%v", err)
+	}
+	record := f.node.BootstrapStatus().Plans[0]
+	if record.FenceQuorum.Digest != (StateDigest{}) || record.SnapshotCertificate.Digest != (StateDigest{}) {
+		t.Fatalf("pre-quorum snapshot vote mutated durable state: %#v", record)
 	}
 }
 
 func TestSnapshotVoteRequiresEveryUncompactedSlotThroughUnionFrontierResolved(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	if err := f.node.BeginVoterSeal(plan); err != nil {
+	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	persistBootstrapReady(t, f)
 	persistBootstrapReady(t, f)
 	frontier := BootstrapFrontier{Conf: 1, Lanes: []BootstrapLaneFrontier{{Replica: 1, ObservedThrough: 100, Sparse: []InstanceNum{plan.Reservations.Prepare.Instance, 100}}}}
-	seal := signedStandaloneSeal(t, plan, f.identities[0], f.private[0], frontier)
-	certificate, err := BuildSealCertificate(plan, []LocalSeal{seal})
+	fence := standaloneAdmissionFence(t, plan, f.identities[0], frontier)
+	quorum, err := BuildFenceQuorum(plan, []LocalAdmissionFence{fence})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.node.ApplySealCertificate(certificate); err != nil {
+	if err := f.node.ApplyFenceQuorum(quorum); err != nil {
 		t.Fatal(err)
 	}
 	closure := f.node.BootstrapClosure(plan)
@@ -236,8 +272,8 @@ func TestSnapshotVoteRequiresEveryUncompactedSlotThroughUnionFrontierResolved(t 
 		Conf:  plan.Request.Base.ID,
 		Lanes: []BootstrapLaneFrontier{{Replica: 1, ObservedThrough: ^InstanceNum(0), Sparse: []InstanceNum{^InstanceNum(0)}}},
 	}
-	oversizedSeal := signedStandaloneSeal(t, plan, f.identities[0], f.private[0], oversized)
-	if _, err := BuildSealCertificate(plan, []LocalSeal{oversizedSeal}); !errors.Is(err, ErrBootstrapBounds) {
+	oversizedFence := standaloneAdmissionFence(t, plan, f.identities[0], oversized)
+	if _, err := BuildFenceQuorum(plan, []LocalAdmissionFence{oversizedFence}); !errors.Is(err, ErrBootstrapBounds) {
 		t.Fatalf("unbounded closure frontier err=%v", err)
 	}
 }
@@ -245,39 +281,40 @@ func TestSnapshotVoteRequiresEveryUncompactedSlotThroughUnionFrontierResolved(t 
 func TestSnapshotCertificateRequiresUniqueExactOldQuorum(t *testing.T) {
 	f, plan := standaloneBootstrapPlan(t, 3)
 	frontier := standaloneFrontier(plan, 0)
-	seal1 := signedStandaloneSeal(t, plan, f.identities[0], f.private[0], frontier)
-	seal2 := signedStandaloneSeal(t, plan, f.identities[1], f.private[1], frontier)
-	sealCert, err := BuildSealCertificate(plan, []LocalSeal{seal1, seal2})
+	fence1 := standaloneAdmissionFence(t, plan, f.identities[0], frontier)
+	fence2 := standaloneAdmissionFence(t, plan, f.identities[1], frontier)
+	fenceQuorum, err := BuildFenceQuorum(plan, []LocalAdmissionFence{fence1, fence2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	descriptor := standaloneSnapshotDescriptor(plan, sealCert)
+	descriptor := standaloneSnapshotDescriptor(plan, fenceQuorum)
 	digest := DigestSnapshotDescriptor(descriptor)
-	a1, _ := SignVoterAttestation(digest, f.identities[0], f.private[0])
-	a2, _ := SignVoterAttestation(digest, f.identities[1], f.private[1])
-	a3, _ := SignVoterAttestation(digest, f.identities[2], f.private[2])
-	if _, err := BuildSnapshotCertificate(plan, descriptor, []VoterAttestation{a1, a2}); err != nil {
+	a1, _ := BuildVoterAcknowledgement(digest, f.identities[0])
+	a2, _ := BuildVoterAcknowledgement(digest, f.identities[1])
+	a3, _ := BuildVoterAcknowledgement(digest, f.identities[2])
+	if _, err := BuildSnapshotCertificate(plan, descriptor, []VoterAcknowledgement{a1, a2}); err != nil {
 		t.Fatalf("valid exact quorum: %v", err)
 	}
-	for name, attestations := range map[string][]VoterAttestation{
+	for name, acknowledgements := range map[string][]VoterAcknowledgement{
 		"below quorum":   {a1},
 		"duplicate":      {a1, a1},
-		"target":         {a1, {Signer: f.target, AttestedDigest: digest, Signature: make([]byte, ed25519.SignatureSize)}},
+		"target":         {a1, {Voter: f.target, AttestedDigest: digest}},
 		"missing source": {a2, a3},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BuildSnapshotCertificate(plan, descriptor, attestations); !errors.Is(err, ErrBootstrapCertificate) {
+			if _, err := BuildSnapshotCertificate(plan, descriptor, acknowledgements); !errors.Is(err, ErrBootstrapCertificate) {
 				t.Fatalf("err=%v", err)
 			}
 		})
 	}
-	a2.Signature[0] ^= 1
-	if _, err := BuildSnapshotCertificate(plan, descriptor, []VoterAttestation{a1, a2}); !errors.Is(err, ErrBootstrapCertificate) {
-		t.Fatalf("bad signature err=%v", err)
+	badDigest := a2
+	badDigest.AttestedDigest[0] ^= 1
+	if _, err := BuildSnapshotCertificate(plan, descriptor, []VoterAcknowledgement{a1, badDigest}); !errors.Is(err, ErrBootstrapCertificate) {
+		t.Fatalf("bad acknowledgement err=%v", err)
 	}
 	wrongConfig := descriptor.Clone()
 	wrongConfig.Base.Voters = []ReplicaID{1, 3}
-	if _, err := BuildSnapshotCertificate(plan, wrongConfig, []VoterAttestation{a1, a3}); err == nil {
+	if _, err := BuildSnapshotCertificate(plan, wrongConfig, []VoterAcknowledgement{a1, a3}); err == nil {
 		t.Fatal("wrong-config snapshot certificate accepted")
 	}
 }
@@ -285,8 +322,8 @@ func TestSnapshotCertificateRequiresUniqueExactOldQuorum(t *testing.T) {
 func TestActivateRejectsMissingStaleOrMismatchedInstallProof(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)
-	seal := sealBootstrapPlan(t, f, plan)
-	snapshot := certifyBootstrapSnapshot(t, f, plan, seal)
+	fence := fenceBootstrapPlan(t, f, plan)
+	snapshot := certifyBootstrapSnapshot(t, f, plan, fence)
 	ready := readyBootstrapTarget(t, f, plan, snapshot)
 	ready.Proof.SnapshotDigest[0] ^= 1
 	if _, err := f.node.ActivateVoter(plan, snapshot, ready); !errors.Is(err, ErrBootstrapCertificate) {
@@ -300,29 +337,34 @@ func TestActivateRejectsMissingStaleOrMismatchedInstallProof(t *testing.T) {
 func TestReadyProofQuorumReplicationSurvivesOriginalCoordinatorCrash(t *testing.T) {
 	f, plan := standaloneBootstrapPlan(t, 3)
 	frontier := standaloneFrontier(plan, 0)
-	seals := []LocalSeal{signedStandaloneSeal(t, plan, f.identities[0], f.private[0], frontier), signedStandaloneSeal(t, plan, f.identities[1], f.private[1], frontier)}
-	sealCert, _ := BuildSealCertificate(plan, seals)
-	descriptor := standaloneSnapshotDescriptor(plan, sealCert)
+	fences := []LocalAdmissionFence{
+		standaloneAdmissionFence(t, plan, f.identities[0], frontier),
+		standaloneAdmissionFence(t, plan, f.identities[1], frontier),
+	}
+	fenceQuorum, _ := BuildFenceQuorum(plan, fences)
+	descriptor := standaloneSnapshotDescriptor(plan, fenceQuorum)
 	digest := DigestSnapshotDescriptor(descriptor)
-	a1, _ := SignVoterAttestation(digest, f.identities[0], f.private[0])
-	a2, _ := SignVoterAttestation(digest, f.identities[1], f.private[1])
-	snapshot, _ := BuildSnapshotCertificate(plan, descriptor, []VoterAttestation{a1, a2})
-	proof, _ := SignVoterReadyProof(VoterReadyProof{Cluster: f.cluster, Plan: plan.Request.Plan, Target: f.target, SnapshotDigest: snapshot.Digest, InstalledStateDigest: descriptor.InstalledStateDigest, AllocatorFloor: 1}, f.targetKey)
+	a1, _ := BuildVoterAcknowledgement(digest, f.identities[0])
+	a2, _ := BuildVoterAcknowledgement(digest, f.identities[1])
+	snapshot, _ := BuildSnapshotCertificate(plan, descriptor, []VoterAcknowledgement{a1, a2})
+	proof, _ := BuildVoterReadyProof(VoterReadyProof{Cluster: f.cluster, Plan: plan.Request.Plan, Target: f.target, SnapshotDigest: snapshot.Digest, InstalledStateDigest: descriptor.InstalledStateDigest, AllocatorFloor: 1})
 	proofDigest := DigestVoterReadyProof(proof)
-	v2, _ := SignVoterAttestation(proofDigest, f.identities[1], f.private[1])
-	v3, _ := SignVoterAttestation(proofDigest, f.identities[2], f.private[2])
-	ready, err := BuildReadyCertificate(plan, proof, []VoterAttestation{v2, v3})
-	if err != nil || VerifyReadyCertificate(plan, snapshot, ready) != nil {
+	v2, _ := BuildVoterAcknowledgement(proofDigest, f.identities[1])
+	v3, _ := BuildVoterAcknowledgement(proofDigest, f.identities[2])
+	ready, err := BuildReadyCertificate(plan, proof, []VoterAcknowledgement{v2, v3})
+	if err != nil || ValidateReadyCertificate(plan, snapshot, ready) != nil {
 		t.Fatalf("coordinator-independent Ready certificate err=%v cert=%#v", err, ready)
 	}
-	if ready.Attestations[0].Signer.Replica == plan.Reservations.Prepare.Replica {
+	if ready.Acknowledgements[0].Voter.Replica == plan.Reservations.Prepare.Replica {
 		t.Fatal("test accidentally retained original coordinator")
 	}
 }
 
 func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
-	message, err := SignBootstrapMessage(BootstrapMessage{Type: BootstrapMsgReadyQuery, Cluster: f.cluster, Plan: f.planID, From: 1, FromIncarnation: 1, To: 1, BaseID: 1, BaseDigest: StateDigest{1}, Payload: []byte("{}")}, f.identities[0], f.private[0])
+	plan := prepareBootstrapPlan(t, f)
+	beforeStatus := f.node.BootstrapStatus()
+	message, err := BuildBootstrapMessage(BootstrapMessage{Type: BootstrapMsgReadyQuery, Cluster: f.cluster, Plan: plan.Request.Plan, From: 1, FromIncarnation: 1, To: 1, BaseID: plan.Request.Base.ID, BaseDigest: plan.RequestDigest, Payload: []byte("{}")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,8 +373,18 @@ func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *t
 		t.Fatal(err)
 	}
 	var decoded BootstrapMessage
-	if err := DecodeBootstrapMessage(encoded, &decoded); err != nil || VerifyBootstrapMessage(decoded, f.identities[0]) != nil {
+	if err := DecodeBootstrapMessage(encoded, &decoded); err != nil || ValidateBootstrapMessage(decoded) != nil {
 		t.Fatalf("round trip err=%v decoded=%#v", err, decoded)
+	}
+	if err := f.node.StepBootstrapAuthenticated(message, 2, 1); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("spoofed authenticated replica err=%v", err)
+	}
+	if err := f.node.StepBootstrapAuthenticated(message, 1, 2); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("spoofed authenticated incarnation err=%v", err)
+	}
+	afterStatus := f.node.BootstrapStatus()
+	if !reflect.DeepEqual(beforeStatus, afterStatus) {
+		t.Fatalf("spoofed bootstrap message mutated state: before=%#v after=%#v", beforeStatus, afterStatus)
 	}
 	if !bytes.Equal(decoded.Payload, message.Payload) {
 		t.Fatal("decoded envelope payload mismatch")
@@ -340,25 +392,46 @@ func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *t
 	if err := DecodeBootstrapMessage(append(encoded, 0), &decoded); !errors.Is(err, ErrInvalidBootstrapMessage) {
 		t.Fatalf("trailing envelope err=%v", err)
 	}
-	chunk, err := SignBootstrapChunk(BootstrapChunk{Cluster: f.cluster, Plan: f.planID, From: 1, FromIncarnation: 1, To: 2, Manifest: StateDigest{2}, Index: 1, Offset: 0, Total: 3, Payload: []byte("abc")}, f.identities[0], f.private[0])
+	chunk, err := BuildBootstrapChunk(BootstrapChunk{Cluster: f.cluster, Plan: f.planID, From: 1, FromIncarnation: 1, To: 2, Manifest: StateDigest{2}, Index: 1, Offset: 0, Total: 3, Payload: []byte("abc")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	set := BootstrapChunkSet{Limit: 3}
-	if err := set.Add(chunk, f.identities[0]); err != nil {
+	set := BootstrapChunkSet{Limit: 4}
+	if err := set.AddAuthenticated(chunk, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := set.Add(chunk, f.identities[0]); err != nil {
+	if err := set.AddAuthenticated(chunk, 1, 1); err != nil {
 		t.Fatalf("exact duplicate: %v", err)
 	}
-	conflict := chunk.Clone()
-	conflict.Index = 2
-	conflict.PayloadDigest = StateDigest{}
-	conflict.Signature = nil
-	conflict.Payload = []byte("x")
-	conflict.Offset = 1
-	conflict, _ = SignBootstrapChunk(conflict, f.identities[0], f.private[0])
-	if err := set.Add(conflict, f.identities[0]); !errors.Is(err, ErrBootstrapChunkConflict) {
-		t.Fatalf("overlap err=%v", err)
+	beforeChunks := len(set.chunks)
+	if err := set.AddAuthenticated(chunk, 2, 1); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("spoofed chunk replica err=%v", err)
+	}
+	if err := set.AddAuthenticated(chunk, 1, 2); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("spoofed chunk incarnation err=%v", err)
+	}
+	if len(set.chunks) != beforeChunks {
+		t.Fatalf("spoofed chunk mutated set: before=%d after=%d", beforeChunks, len(set.chunks))
+	}
+	conflictOffset := chunk.Clone()
+	conflictOffset.Offset = 1
+	conflictOffset.Payload = []byte("ab")
+	conflictOffset.PayloadDigest = StateDigest{}
+	conflictOffset, err = BuildBootstrapChunk(conflictOffset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := set.AddAuthenticated(conflictOffset, 1, 1); !errors.Is(err, ErrBootstrapChunkConflict) {
+		t.Fatalf("same-index offset conflict err=%v", err)
+	}
+	conflictTotal := chunk.Clone()
+	conflictTotal.Total = 4
+	conflictTotal.PayloadDigest = StateDigest{}
+	conflictTotal, err = BuildBootstrapChunk(conflictTotal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := set.AddAuthenticated(conflictTotal, 1, 1); !errors.Is(err, ErrBootstrapChunkConflict) {
+		t.Fatalf("same-index total conflict err=%v", err)
 	}
 }
