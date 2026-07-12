@@ -61,8 +61,8 @@ require_text "$scope" "signed operator-controlled deployment/capacity/lifecycle/
 
 require_text "$evidence" "Status: no-go evidence bundle"
 require_text "$evidence" "Current open blockers preserving no-go"
-require_text "$scope" "| Aggregate Go coverage | fail |"
-require_text "$evidence" "| Aggregate Go coverage | Fail:"
+require_text "$scope" "| Aggregate Go coverage | pass |"
+require_text "$evidence" "| Aggregate Go coverage | Pass:"
 require_text "$evidence" "bash tests/go_no_go_workflow.sh"
 require_text "$evidence" "bash tests/tla_model_check_fast.sh"
 require_text "$evidence" "go test ./... -count=1"

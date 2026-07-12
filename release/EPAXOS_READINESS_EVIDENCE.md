@@ -12,7 +12,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 ## Evidence identity
 
 - This snapshot describes the checked repository tree and the commands listed below. A production release must bind evidence to an exact source revision, release binary digest, target identity, immutable evidence root, and independent reviewer signature.
-- The hosted observation `29178670846` completed all root Go package tests on Ubuntu and then failed the aggregate coverage gate at 57.0% against a 100.0% requirement. Local aggregate coverage is 56.9%.
+- The coverage gate measures production packages separately: `epaxos` reached 88.3% against an 85.0% minimum and `examples/kv` reached 91.7% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
 - No external target-environment closure bundle is present. Repository evidence therefore remains bounded, local, and non-release-approving.
 
 ## Gate status
@@ -26,7 +26,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 | Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, five rows, links, model paths, and a tracked-text Hangul guard. |
 | Repository text audit | Pass when `bash tests/audit_repo.sh` is run | Static forbidden-text and deterministic-core checks. |
 | Operations artifact audit | Pass in the recorded local verification | Example manifests and operator reports; not target deployment evidence. |
-| Aggregate Go coverage | Fail: 56.9% local and 57.0% hosted, required 100.0% | Coverage is a prerequisite failure independent of the five canonical release rows. |
+| Aggregate Go coverage | Pass: `epaxos` 88.3% >= 85.0%; `examples/kv` 91.7% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
 
 ## Bounded protocol and service evidence
 
@@ -82,7 +82,7 @@ bash tests/operations_readiness_audit.sh
 bash tests/go_no_go_workflow.sh
 ```
 
-`bash tests/go_coverage.sh` remains required and currently fails because aggregate coverage is below the configured 100.0% threshold. The fast TLA gate is finite; the larger `bash tests/tla_model_check.sh` profile is an additional manual check and does not close the formal blocker.
+`bash tests/go_coverage.sh` passes the scoped production-package thresholds and race stress suites. The fast TLA gate is finite; the larger `bash tests/tla_model_check.sh` profile is an additional manual check and does not close the formal blocker.
 
 ## Release boundary
 

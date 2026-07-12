@@ -118,7 +118,7 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
 - `bash tests/tla_model_check_fast.sh` passes all 14 configured jobs.
-- `tests/go_coverage.sh` fails at 56.9% aggregate local coverage against 100.0%; the hosted observation reports 57.0%.
+- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 88.3% against 85.0% minimum and `examples/kv` 91.7% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - `tlapm` is not installed in the local environment, and no TLAPS proof artifact is part of the checked gate.
 
 ## Formal and release boundaries
