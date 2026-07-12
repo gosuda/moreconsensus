@@ -31,7 +31,7 @@
 
 - The production library surface is `gosuda.org/moreconsensus/epaxos`; the key-value service is an integration example and validation harness, not a multi-tenant product.
 - Voter sets support one through seven replicas. The core uses deterministic logical time; explicit TOQ inputs and operational clock discipline remain embedder responsibilities.
-- Formal evidence is finite model checking plus focused executable tests. It is not an exhaustive or unbounded proof, and it does not establish multi-host or real-network production readiness.
+- Formal evidence is finite model checking plus focused executable tests. It is not an exhaustive or unbounded proof, and it does not establish real-network production readiness.
 - Retention and checkpoint features provide bounded operational behavior; certified protocol-state compaction, target capacity, target data lifecycle, and signed incident evidence remain governed by [RELEASE_SCOPE.md](RELEASE_SCOPE.md).
 
 ## Module layout

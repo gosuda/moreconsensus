@@ -61,6 +61,8 @@ require_text .github/workflows/ci.yml "JAVA_VERSION: '$JAVA_VERSION'"
 require_text .github/workflows/ci.yml "LEIN_VERSION: '$LEIN_VERSION'"
 require_text .github/workflows/ci.yml "$LEIN_STANDALONE_URL"
 require_text .github/workflows/ci.yml "$LEIN_STANDALONE_SHA256"
+require_text .github/workflows/ci.yml 'clojure.main -m leiningen.core.main'
+reject_text .github/workflows/ci.yml 'exec java -jar'
 require_text .github/workflows/ci.yml "actions/checkout@$ACTIONS_CHECKOUT_SHA"
 require_text .github/workflows/ci.yml "actions/setup-go@$ACTIONS_SETUP_GO_SHA"
 require_text .github/workflows/ci.yml "actions/setup-java@$ACTIONS_SETUP_JAVA_SHA"

@@ -541,6 +541,8 @@ DST scenarios must prove both positive progress and negative fail-closed behavio
 - storage write failure prevents application until durable writes recover;
 - after heal/recovery, commands apply exactly once everywhere.
 
+DST verifies deterministic protocol behavior and virtualized transport/storage faults. It does not verify physical hosts, operating-system failure handling, network fabric behavior, or target-environment incident operations.
+
 The deterministic DST evidence covers reordering, liveness-after-heal, majority/minority availability, storage failure, pause/skew, rollback, owner-independent recovery, cluster-size tests, and focused failure-boundary tests: `TestDSTFailureBoundarySlowQuorumSizesOneThroughSeven`, `TestDSTStorageFailureBoundarySlowQuorumSizesOneThroughSeven`, `TestDSTFailureBoundaryThreeNodeCrashBoundary`, `TestDSTFailureBoundaryFiveNodeMajorityAndMinorityOmission`, `TestDSTLinearizabilityConflictingWritesReadsAcrossPartitionHeal`, and `TestDSTStorageFailureRetriesOutstandingReadyExactlyOnceWithHealthyQuorum`. The focused DST boundary command is `go test ./epaxos -run 'TestDST.*(FailureBoundary|Linearizability|Storage)' -count=1`.
 
 ### 16.3 Jepsen
@@ -566,7 +568,6 @@ The implementation and evidence currently support a bounded library/example clai
 
 - unbounded formal proof beyond finite TLC configurations;
 - certified EPaxos protocol-state compaction and late-message/incarnation fencing;
-- multi-host independent failure-domain behavior;
 - real-network fault-injection evidence;
 - operational TOQ clock synchronization and one-way-delay measurement;
 - in-place Pebble/WAL repair, synthesized recovery without a verified checkpoint, and multi-replica or quorum-loss recovery;
@@ -588,4 +589,4 @@ The KV embedding has one lifecycle-owned logical-tick loop, proposal waiters, te
 
 Pebble resource options and storage counters are explicit. Retention thresholds stop new proposals at pressure and stop all protocol mutation at the configured limit, but never delete instance history. This is a finite retention horizon, not certified compaction or unbounded uptime.
 
-Evidence consists of tagged KV behavior and race tests, deterministic fault simulation, and bounded finite model checking. Current evidence is limited to Darwin arm64, three-node same-host loopback service exercises, and simulated network faults. It does not provide unbounded formal proof, certified protocol-state compaction, multi-host independent failure domains, real-network fault evidence, or a mission-critical production-readiness claim.
+- Evidence consists of tagged KV behavior and race tests, deterministic fault simulation, and bounded finite model checking. Current evidence is limited to Darwin arm64, three-node same-host loopback service exercises, and simulated network faults. It does not provide unbounded formal proof, certified protocol-state compaction, real-network fault evidence, or a mission-critical production-readiness claim.

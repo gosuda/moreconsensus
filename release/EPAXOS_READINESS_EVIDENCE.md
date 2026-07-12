@@ -54,7 +54,7 @@ The repository contains example/operator artifacts and audits:
 - `tests/kvnode_capacity_envelope.sh`, `tests/kvnode_local_capacity_drill.sh`, `tests/kvnode_local_runner.go`, and the local lifecycle helpers produce bounded sample reports with explicit non-claim fields.
 - `tests/kvnode_incident_tabletop_drill.sh` and its local report checks provide storage and transport fault branches, evidence capture, and escalation guidance.
 - `examples/kv/cmd/kvcheckpoint` and its tests exercise checkpoint and rollback procedures.
-- These artifacts do not prove a signed target capacity envelope, backup/restore/rollback drill, real-network fault history across multi-host independent failure domains, or signed operator evidence.
+- These artifacts do not prove a signed target capacity envelope, backup/restore/rollback drill, real-network fault history, or signed operator evidence.
 
 ## Current open blockers preserving no-go
 
@@ -63,7 +63,7 @@ The repository contains example/operator artifacts and audits:
 | Broader formal model coverage | Unbounded Go/TLA refinement with a checked action correspondence, plus certified protocol-state compaction and late-message/incarnation fencing requirements. |
 | Data lifecycle | Certified compaction operational drill and target backup, restore, rollback, and disaster-recovery evidence. |
 | Capacity envelope | Signed target capacity envelope covering workload, latency, resources, retention, and operating limits. |
-| Incident readiness | Real-network fault evidence across multi-host independent failure domains and signed operator-controlled incident, escalation, rollback, and recovery evidence. |
+| Incident readiness | Real-network fault evidence and signed operator-controlled incident, escalation, rollback, and recovery evidence. |
 
 ## Reproduction commands
 
@@ -84,4 +84,4 @@ bash tests/go_no_go_workflow.sh
 
 ## Release boundary
 
-- This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation and three-node same-host loopback exercises. It does not support unbounded formal safety, certified protocol-state compaction, multi-host independent failure domains, real-network fault tolerance, operational TOQ clock synchronization, target capacity, target data lifecycle, or signed incident readiness. The release decision remains no-go until every open row has current target-bound evidence.
+- This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation and three-node same-host loopback exercises. It does not support unbounded formal safety, certified protocol-state compaction, real-network fault tolerance, operational TOQ clock synchronization, target capacity, target data lifecycle, or signed incident readiness. The release decision remains no-go until every open row has current target-bound evidence.

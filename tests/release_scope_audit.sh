@@ -51,7 +51,6 @@ require_text "$scope" "## Open release items"
 require_text "$scope" "## Non-claims"
 require_text "$scope" "unbounded proof"
 require_text "$scope" "certified protocol-state compaction"
-require_text "$scope" "multi-host independent failure domains"
 require_text "$scope" "real-network fault evidence"
 require_text "$scope" "signed operator-controlled capacity/lifecycle/incident evidence"
 

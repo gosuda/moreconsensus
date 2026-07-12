@@ -48,7 +48,7 @@ jobs:
           jar="/tmp/leiningen-${LEIN_VERSION}-standalone.jar"
           curl -fsSL -o "$jar" "$LEIN_STANDALONE_URL"
           echo "${LEIN_STANDALONE_SHA256}  ${jar}" | sha256sum -c -
-          printf '#!/usr/bin/env bash\nexec java -jar "%s" "$@"\n' "$jar" > /tmp/lein
+          printf '#!/usr/bin/env bash\nexec java -cp "%s" clojure.main -m leiningen.core.main "$@"\n' "$jar" > /tmp/lein
           chmod +x /tmp/lein
           echo /tmp >> "$GITHUB_PATH"
 

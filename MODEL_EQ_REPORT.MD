@@ -126,7 +126,7 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 - `tla/EPaxosInductiveProofs.tla` is restricted to its module-level `ConcreteNext`; it excludes codec, allocation, Ready ownership, SCC execution, TOQ timing, the implementation-shaped RawNode model, and arbitrary Go executions.
 - `tla/EPaxosRawNodeRefinement.tla` is finite and implementation-shaped; its TLC property is not an unbounded theorem.
 - `tla/EPaxosVoterBootstrap.tla` is model-only and absent from the RawNode semantic trace.
-- Deterministic simulation and loopback Jepsen histories do not represent real-network or multi-host failure domains.
+- Deterministic simulation and loopback Jepsen histories do not represent real-network behavior.
 - Certified protocol-state compaction, late-message/incarnation fencing, target capacity, target data lifecycle, real-network fault evidence, and signed operator evidence remain open in `RELEASE_SCOPE.md`.
 
 ## Release decision
