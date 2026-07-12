@@ -30,8 +30,7 @@ func benchmarkService(b *testing.B, voters []epaxos.ReplicaID, id epaxos.Replica
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { _ = db.Close() })
-	node, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: voters, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5})
+	node, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: voters, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5, MaxReadyMessages: queue})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -39,24 +38,29 @@ func benchmarkService(b *testing.B, voters []epaxos.ReplicaID, id epaxos.Replica
 	for _, voter := range voters {
 		peers[voter] = fmt.Sprintf("http://127.0.0.1:%d", 9000+voter)
 	}
-	return &service{id: id, node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan *outboundFrame, queue), nextSeq: 1, maxPeerBodyBytes: 2 << 20}
+	return &service{id: id, node: node, ready: db, db: db, peers: peers, client: &http.Client{}, sendq: make(chan *outboundFrame, queue), retryCapacity: queue, retryq: make(outboundRetryHeap, 0, queue), transportSpace: make(chan struct{}, 1), waiters: make(map[epaxos.InstanceRef]*proposalWaiter), nextSeq: 1, maxPeerBodyBytes: 2 << 20}
 }
 
 func BenchmarkPrepareOutboundFrames(b *testing.B) {
 	for _, size := range []int{64, 1024, 64 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+			b.StopTimer()
 			s := &service{peers: map[epaxos.ReplicaID]string{2: "http://127.0.0.1:9002"}, maxPeerBodyBytes: 2 << 20}
 			message := benchmarkPeerMessage(size)
 			b.ReportAllocs()
+			b.ResetTimer()
+			b.StartTimer()
 			for range b.N {
 				frames, err := s.prepareOutboundFrames([]epaxos.Message{message})
 				if err != nil {
 					b.Fatal(err)
 				}
 				benchmarkFrames = frames
+				b.StopTimer()
 				for _, frame := range frames {
 					s.releaseOutboundFrame(frame)
 				}
+				b.StartTimer()
 			}
 		})
 	}
@@ -71,6 +75,7 @@ func BenchmarkInboundStep(b *testing.B) {
 			}
 			for _, size := range []int{64, 1024, 64 << 10, 1 << 20} {
 				b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+					b.StopTimer()
 					message := benchmarkPeerMessage(size)
 					message.Deps = make([]epaxos.InstanceNum, voters)
 					body, err := epaxos.EncodeMessage(nil, message)
@@ -78,14 +83,14 @@ func BenchmarkInboundStep(b *testing.B) {
 						b.Fatal(err)
 					}
 					b.ReportAllocs()
-					b.StopTimer()
+					b.ResetTimer()
+					var decoded epaxos.Message
+					var scratch epaxos.DecodeScratch
 					for range b.N {
 						node, err := epaxos.NewRawNode(epaxos.Config{ID: 2, Voters: ids})
 						if err != nil {
 							b.Fatal(err)
 						}
-						var decoded epaxos.Message
-						var scratch epaxos.DecodeScratch
 						b.StartTimer()
 						err = epaxos.DecodeMessageWithScratch(body, &decoded, &scratch)
 						if err == nil {
@@ -105,25 +110,30 @@ func BenchmarkInboundStep(b *testing.B) {
 
 func BenchmarkRetryAdmission(b *testing.B) {
 	s := &service{sendq: make(chan *outboundFrame, 1)}
+	s.queueOwned = 1
 	s.outstandingFrames = 1
+	frame := s.getOutboundFrame()
 	b.ReportAllocs()
+	b.ResetTimer()
 	for range b.N {
-		frame := s.getOutboundFrame()
 		err := s.admitOutboundFrames([]*outboundFrame{frame})
 		if err == nil {
 			b.Fatal("saturated admission unexpectedly succeeded")
 		}
 	}
+	b.StopTimer()
+	s.releaseOutboundFrame(frame)
 }
 
 func BenchmarkDrainLocked(b *testing.B) {
 	for _, size := range []int{64, 1024, 64 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
-			s := benchmarkService(b, []epaxos.ReplicaID{1}, 1, 8)
+			b.StopTimer()
 			cmd := kv.CommandForPut(1, 1, []byte("fixed-conflict-key"), make([]byte, size))
 			b.ReportAllocs()
-			b.StopTimer()
+			b.ResetTimer()
 			for range b.N {
+				s := benchmarkService(b, []epaxos.ReplicaID{1}, 1, 8)
 				if _, err := s.node.Propose(cmd); err != nil {
 					b.Fatal(err)
 				}
@@ -131,6 +141,9 @@ func BenchmarkDrainLocked(b *testing.B) {
 				err := s.drainLocked()
 				b.StopTimer()
 				if err != nil {
+					b.Fatal(err)
+				}
+				if err := s.db.Close(); err != nil {
 					b.Fatal(err)
 				}
 			}

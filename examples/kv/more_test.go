@@ -114,11 +114,15 @@ func TestClusterErrorBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = cluster.Close() }()
-	if err := cluster.Nodes[1].Step(epaxos.Message{Type: epaxos.MsgCommit, From: 2, To: 1, Ref: epaxos.InstanceRef{Replica: 2, Instance: 90, Conf: 1}, Ballot: epaxos.Ballot{Replica: 2}, RecordBallot: epaxos.Ballot{Replica: 2}, Seq: 1, Deps: []epaxos.InstanceNum{0, 0, 0}, Command: epaxos.Command{Payload: []byte{opPut, 9}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := cluster.Drain(); err == nil {
-		t.Fatal("expected malformed apply failure")
+	err = cluster.Nodes[1].Step(epaxos.Message{
+		Type: epaxos.MsgCommit, From: 2, To: 1,
+		Ref:    epaxos.InstanceRef{Replica: 2, Instance: 90, Conf: 1},
+		Ballot: epaxos.Ballot{Replica: 2}, RecordBallot: epaxos.Ballot{Replica: 2},
+		Seq: 1, Deps: []epaxos.InstanceNum{0, 0, 0},
+		Command: epaxos.Command{Payload: []byte{opPut, 9}},
+	})
+	if !errors.Is(err, epaxos.ErrMessageRejected) {
+		t.Fatalf("malformed network command err=%v, want message rejection", err)
 	}
 }
 
@@ -1059,6 +1063,83 @@ func TestCheckpointTimestampAssignmentHonorsDependenciesAndRefOrdering(t *testin
 	}
 }
 
+func TestCheckpointTimestampAssignmentHonorsSCCExecutionOrder(t *testing.T) {
+	left := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	right := epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	leftGroup := checkpointGroupKey([]string{checkpointAtomKey(valueRecord, []byte("left"), []byte("value"))})
+	rightGroup := checkpointGroupKey([]string{checkpointAtomKey(valueRecord, []byte("right"), []byte("value"))})
+	state := checkpointState{
+		records: map[epaxos.InstanceRef]epaxos.InstanceRecord{
+			left:  {Ref: left, Status: epaxos.StatusExecuted, Seq: 2, Deps: []epaxos.InstanceNum{0, 1}},
+			right: {Ref: right, Status: epaxos.StatusExecuted, Seq: 1, Deps: []epaxos.InstanceNum{1, 0}},
+		},
+		writeGroups: map[epaxos.InstanceRef]string{left: leftGroup, right: rightGroup},
+		configHistory: map[epaxos.ConfID]epaxos.ConfState{
+			1: {ID: 1, Voters: []epaxos.ReplicaID{1, 2}},
+		},
+	}
+	candidates := map[string][]epaxos.InstanceRef{leftGroup: {left}, rightGroup: {right}}
+	runtimeOrder := []checkpointDataGroup{{timestamp: 1, key: rightGroup}, {timestamp: 2, key: leftGroup}}
+	if err := assignCheckpointTimestamps(runtimeOrder, candidates, state); err != nil {
+		t.Fatalf("assignCheckpointTimestamps rejected canonical SCC execution order: %v", err)
+	}
+	reversed := []checkpointDataGroup{{timestamp: 1, key: leftGroup}, {timestamp: 2, key: rightGroup}}
+	if err := assignCheckpointTimestamps(reversed, candidates, state); err == nil || !strings.Contains(err.Error(), "no dependency-satisfied") {
+		t.Fatalf("assignCheckpointTimestamps accepted noncanonical SCC order: %v", err)
+	}
+}
+
+func TestCheckpointTimestampAssignmentTraversesNonWritingRecords(t *testing.T) {
+	a := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
+	barrier := epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1}
+	b := epaxos.InstanceRef{Replica: 3, Instance: 1, Conf: 1}
+	aGroup := checkpointGroupKey([]string{checkpointAtomKey(valueRecord, []byte("a"), []byte("value"))})
+	bGroup := checkpointGroupKey([]string{checkpointAtomKey(valueRecord, []byte("b"), []byte("value"))})
+	conf := map[epaxos.ConfID]epaxos.ConfState{1: {ID: 1, Voters: []epaxos.ReplicaID{1, 2, 3}}}
+	candidates := map[string][]epaxos.InstanceRef{aGroup: {a}, bGroup: {b}}
+
+	t.Run("same SCC", func(t *testing.T) {
+		state := checkpointState{
+			records: map[epaxos.InstanceRef]epaxos.InstanceRecord{
+				a:       {Ref: a, Status: epaxos.StatusExecuted, Seq: 3, Deps: []epaxos.InstanceNum{0, 1, 0}},
+				barrier: {Ref: barrier, Status: epaxos.StatusExecuted, Seq: 2, Deps: []epaxos.InstanceNum{0, 0, 1}},
+				b:       {Ref: b, Status: epaxos.StatusCommitted, Seq: 1, Deps: []epaxos.InstanceNum{1, 0, 0}},
+			},
+			applied:       map[epaxos.InstanceRef]struct{}{b: {}},
+			writeGroups:   map[epaxos.InstanceRef]string{a: aGroup, b: bGroup},
+			configHistory: conf,
+		}
+		runtimeOrder := []checkpointDataGroup{{timestamp: 1, key: bGroup}, {timestamp: 2, key: aGroup}}
+		if err := assignCheckpointTimestamps(runtimeOrder, candidates, state); err != nil {
+			t.Fatalf("canonical non-writing SCC order rejected: %v", err)
+		}
+		reversed := []checkpointDataGroup{{timestamp: 1, key: aGroup}, {timestamp: 2, key: bGroup}}
+		if err := assignCheckpointTimestamps(reversed, candidates, state); err == nil {
+			t.Fatal("reversed non-writing SCC order accepted")
+		}
+	})
+
+	t.Run("ancestor component", func(t *testing.T) {
+		state := checkpointState{
+			records: map[epaxos.InstanceRef]epaxos.InstanceRecord{
+				a:       {Ref: a, Status: epaxos.StatusExecuted, Seq: 3, Deps: []epaxos.InstanceNum{0, 1, 0}},
+				barrier: {Ref: barrier, Status: epaxos.StatusExecuted, Seq: 2, Deps: []epaxos.InstanceNum{0, 0, 1}},
+				b:       {Ref: b, Status: epaxos.StatusExecuted, Seq: 1, Deps: []epaxos.InstanceNum{0, 0, 0}},
+			},
+			writeGroups:   map[epaxos.InstanceRef]string{a: aGroup, b: bGroup},
+			configHistory: conf,
+		}
+		dependencyOrder := []checkpointDataGroup{{timestamp: 1, key: bGroup}, {timestamp: 2, key: aGroup}}
+		if err := assignCheckpointTimestamps(dependencyOrder, candidates, state); err != nil {
+			t.Fatalf("transitive dependency order rejected: %v", err)
+		}
+		reversed := []checkpointDataGroup{{timestamp: 1, key: aGroup}, {timestamp: 2, key: bGroup}}
+		if err := assignCheckpointTimestamps(reversed, candidates, state); err == nil {
+			t.Fatal("reversed transitive dependency order accepted")
+		}
+	})
+}
+
 func TestCheckpointDependencyChecksDoNotExpandNumericPrefixes(t *testing.T) {
 	maxInstance := ^epaxos.InstanceNum(0)
 	dependency := epaxos.InstanceRef{Replica: 1, Instance: maxInstance, Conf: 1}
@@ -1151,8 +1232,8 @@ func TestClusterLiveCheckpointRecoveryRejectsVerificationAndPeerScanFailures(t *
 		setRawOpenPebbleKV(t, cluster.DBs[1].pebble, []byte{recordPrefix, 0}, []byte{valueRecord, 'x'})
 
 		err = cluster.RecoverReplicaFromLiveCheckpoint(2, 1, paths[1], filepath.Join(t.TempDir(), "checkpoint"))
-		if err == nil || !strings.Contains(err.Error(), "live checkpoint verification failed") {
-			t.Fatalf("RecoverReplicaFromLiveCheckpoint err=%v, want checkpoint verification failure", err)
+		if err == nil || !strings.Contains(err.Error(), "checkpoint semantic verification failed") {
+			t.Fatalf("RecoverReplicaFromLiveCheckpoint err=%v, want semantic checkpoint verification failure", err)
 		}
 		if cluster.DBs[2] != nil || cluster.Nodes[2] != nil {
 			t.Fatalf("rejected recovery reopened target: db=%v node=%v", cluster.DBs[2], cluster.Nodes[2])
@@ -1550,7 +1631,7 @@ func TestClusterRecoveryAndProposalResidualBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid recovered voter set closes reopened database", func(t *testing.T) {
+	t.Run("invalid recovered voter set is rejected before reopening database", func(t *testing.T) {
 		paths := []string{t.TempDir(), t.TempDir(), t.TempDir()}
 		cluster, err := OpenCluster(paths)
 		if err != nil {
@@ -1563,8 +1644,8 @@ func TestClusterRecoveryAndProposalResidualBranches(t *testing.T) {
 		cluster.ids = []epaxos.ReplicaID{1, 2, 3, 3, 3}
 
 		err = cluster.RecoverReplicaFromLiveCheckpoint(2, 1, paths[1], filepath.Join(t.TempDir(), "checkpoint"))
-		if !errors.Is(err, epaxos.ErrInvalidConfig) {
-			t.Fatalf("RecoverReplicaFromLiveCheckpoint err=%v, want invalid config", err)
+		if err == nil || !strings.Contains(err.Error(), "checkpoint semantic verification failed") {
+			t.Fatalf("RecoverReplicaFromLiveCheckpoint err=%v, want semantic checkpoint verification failure", err)
 		}
 		if cluster.DBs[2] != nil || cluster.Nodes[2] != nil {
 			t.Fatalf("failed raw node creation registered target: db=%v node=%v", cluster.DBs[2], cluster.Nodes[2])
@@ -3860,9 +3941,14 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 }
 
 func TestStageEPaxosRecordsRejectsInvalidChecksumBeforeWriting(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
 	setErr := errors.New("record set failed")
 	bad := epaxos.InstanceRecord{Ref: epaxos.InstanceRef{Replica: 1, Instance: 12, Conf: 1}, Checksum: [32]byte{1}}
-	if err := stageEPaxosRecords(txnBatchWithSetErr{err: setErr}, []epaxos.InstanceRecord{bad}); !errors.Is(err, epaxos.ErrChecksumMismatch) {
+	if _, err := stageAndCountEPaxosRecords(txnBatchWithSetErr{err: setErr}, []epaxos.InstanceRecord{bad}, db.durableRefs); !errors.Is(err, epaxos.ErrChecksumMismatch) {
 		t.Fatalf("err=%v", err)
 	}
 	good := checkedKVRecord(epaxos.InstanceRecord{
@@ -3873,7 +3959,7 @@ func TestStageEPaxosRecordsRejectsInvalidChecksumBeforeWriting(t *testing.T) {
 		Deps:    []epaxos.InstanceNum{0},
 		Command: CommandForDelete(43, 1, []byte("stage")),
 	})
-	if err := stageEPaxosRecords(txnBatchWithSetErr{err: setErr}, []epaxos.InstanceRecord{good}); !errors.Is(err, setErr) {
+	if _, err := stageAndCountEPaxosRecords(txnBatchWithSetErr{err: setErr}, []epaxos.InstanceRecord{good}, db.durableRefs); !errors.Is(err, setErr) {
 		t.Fatalf("err=%v", err)
 	}
 }

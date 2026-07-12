@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -23,8 +24,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -128,7 +129,6 @@ func TestKVNodeTransportEmptyLegacyProcessAtDomainFailsClosed(t *testing.T) {
 		t.Fatalf("empty legacy migration assertion error=%v, want ambiguous ErrInvalidConfig", err)
 	}
 }
-
 
 func TestDurationFromMillisRejectsInvalidBudgetsAndScalesPositiveValues(t *testing.T) {
 	tests := []struct {
@@ -532,6 +532,7 @@ func writeFile(t *testing.T, path string, content []byte) {
 
 func TestAPIMuxSeparationRoutesOnlyPlaneEndpoints(t *testing.T) {
 	s := newTestService(t)
+	s.enableFaultInjection = true
 	tests := []struct {
 		name   string
 		mux    http.Handler
@@ -1081,9 +1082,11 @@ func TestLatestReadBarrierAfterFailedLocalProposalCurrentCluster(t *testing.T) {
 	cluster.setInboundDrop(2, 1, true)
 	cluster.setInboundDrop(3, 1, true)
 	failedPut := httptest.NewRecorder()
-	first.handleKV(failedPut, httptest.NewRequest(http.MethodPut, "/kv/"+failedKey, bytes.NewReader([]byte("value-from-node-1"))))
-	if failedPut.Code != http.StatusServiceUnavailable || !strings.Contains(failedPut.Body.String(), "proposal outcome unknown after logical tick deadline") {
-		t.Fatalf("first put status=%d body=%q, want 503 unknown outcome", failedPut.Code, failedPut.Body.String())
+	failedCtx, cancelFailedPut := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelFailedPut()
+	first.handleKV(failedPut, httptest.NewRequest(http.MethodPut, "/kv/"+failedKey, bytes.NewReader([]byte("value-from-node-1"))).WithContext(failedCtx))
+	if failedPut.Code != http.StatusServiceUnavailable || !strings.Contains(failedPut.Body.String(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("first put status=%d body=%q, want canceled waiter outcome", failedPut.Code, failedPut.Body.String())
 	}
 
 	successfulPut := httptest.NewRecorder()
@@ -1349,6 +1352,237 @@ func TestPeerBodyLimitAcceptsValidMessageAndRejectsOversizedWithoutSteppingNode(
 	}
 }
 
+func TestBlockedPeersAcceptIngressAndReleaseTransportOwnership(t *testing.T) {
+	voters := []epaxos.ReplicaID{1, 2}
+	newPeer := func(id epaxos.ReplicaID) *service {
+		db, err := kv.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		node, err := epaxos.NewRawNode(epaxos.Config{ID: id, Voters: voters, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &service{
+			id:      id,
+			node:    node,
+			ready:   db,
+			db:      db,
+			peers:   map[epaxos.ReplicaID]string{1: "http://peer-1", 2: "http://peer-2"},
+			client:  &http.Client{},
+			sendq:   make(chan *outboundFrame, 1),
+			nextSeq: 1,
+		}
+	}
+	peers := map[epaxos.ReplicaID]*service{1: newPeer(1), 2: newPeer(2)}
+	inflight := make(map[epaxos.ReplicaID]*outboundFrame, len(peers))
+
+	for id, peer := range peers {
+		peer.mu.Lock()
+		for sequence := uint64(1); sequence <= 2; sequence++ {
+			command := kv.CommandForPut(uint64(id), sequence, []byte(fmt.Sprintf("peer-%d-%d", id, sequence)), []byte("value"))
+			if _, err := peer.node.Propose(command); err != nil {
+				peer.mu.Unlock()
+				t.Fatal(err)
+			}
+			if err := peer.drainLocked(); err != nil {
+				peer.mu.Unlock()
+				t.Fatal(err)
+			}
+		}
+		if !peer.admissionBlocked {
+			peer.mu.Unlock()
+			t.Fatalf("peer %d did not enter admission backpressure", id)
+		}
+		peer.mu.Unlock()
+		inflight[id] = <-peer.sendq
+	}
+
+	for from, frame := range inflight {
+		to := frame.to
+		response := httptest.NewRecorder()
+		peers[to].handleMessage(response, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(frame.body)))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("peer %d to %d status=%d body=%q", from, to, response.Code, response.Body.String())
+		}
+		if len(peers[to].node.Status().Instances) == 0 {
+			t.Fatalf("peer %d did not step the authenticated message from %d", to, from)
+		}
+	}
+
+	for id, frame := range inflight {
+		peers[id].finishOutboundFrame(frame, false)
+	}
+	for id, peer := range peers {
+		for attempt := 0; attempt < 8; attempt++ {
+			peer.mu.Lock()
+			err := peer.drainLocked()
+			blocked := peer.admissionBlocked
+			peer.mu.Unlock()
+			if err != nil {
+				t.Fatalf("peer %d drain: %v", id, err)
+			}
+			if !blocked {
+				break
+			}
+			frame := <-peer.sendq
+			peer.finishOutboundFrame(frame, false)
+		}
+		peer.mu.Lock()
+		blocked := peer.admissionBlocked
+		peer.mu.Unlock()
+		if blocked {
+			t.Fatalf("peer %d remained transport-saturated after acknowledged ingress released ownership", id)
+		}
+	}
+}
+
+func TestBlockedPeerIngressAllowanceBoundsPendingReadyGrowth(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2, 3})
+	s.sendq = make(chan *outboundFrame, 2)
+	s.mu.Lock()
+	for sequence := uint64(1); sequence <= 2; sequence++ {
+		if _, err := s.node.Propose(kv.CommandForPut(1, sequence, []byte(fmt.Sprintf("local-%d", sequence)), []byte("value"))); err != nil {
+			s.mu.Unlock()
+			t.Fatal(err)
+		}
+		if err := s.drainLocked(); err != nil {
+			s.mu.Unlock()
+			t.Fatal(err)
+		}
+	}
+	if !s.admissionBlocked {
+		s.mu.Unlock()
+		t.Fatal("service did not enter admission backpressure")
+	}
+	s.mu.Unlock()
+
+	peerBody := func(from epaxos.ReplicaID, instance epaxos.InstanceNum) []byte {
+		message := epaxos.Message{
+			Type:         epaxos.MsgCommit,
+			From:         from,
+			To:           1,
+			Ref:          epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
+			Ballot:       epaxos.Ballot{Replica: from},
+			RecordBallot: epaxos.Ballot{Replica: from},
+			Seq:          uint64(instance),
+			Deps:         []epaxos.InstanceNum{0, 0, 0},
+			Command:      kv.CommandForPut(uint64(from), uint64(instance), []byte(fmt.Sprintf("remote-%d-%d", from, instance)), []byte("value")),
+		}
+		body, err := epaxos.EncodeMessage(nil, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	noncritical := httptest.NewRecorder()
+	s.handleMessage(noncritical, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(peerBody(3, 1))))
+	if noncritical.Code != http.StatusNoContent {
+		t.Fatalf("noncritical peer ingress status=%d body=%q", noncritical.Code, noncritical.Body.String())
+	}
+	ownershipReleasingBody := peerBody(2, 1)
+	accepted := httptest.NewRecorder()
+	s.handleMessage(accepted, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(ownershipReleasingBody)))
+	if accepted.Code != http.StatusNoContent {
+		t.Fatalf("ownership-releasing peer ingress status=%d body=%q", accepted.Code, accepted.Body.String())
+	}
+	afterFirstDelivery := s.node.RuntimeStats()
+	duplicate := httptest.NewRecorder()
+	s.handleMessage(duplicate, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(ownershipReleasingBody)))
+	if duplicate.Code != http.StatusNoContent {
+		t.Fatalf("lost-ack duplicate status=%d body=%q", duplicate.Code, duplicate.Body.String())
+	}
+	if afterDuplicate := s.node.RuntimeStats(); afterDuplicate != afterFirstDelivery {
+		t.Fatalf("lost-ack duplicate stepped twice: first=%+v duplicate=%+v", afterFirstDelivery, afterDuplicate)
+	}
+	for _, from := range []epaxos.ReplicaID{2, 3} {
+		second := httptest.NewRecorder()
+		s.handleMessage(second, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(peerBody(from, 2))))
+		if second.Code != http.StatusNoContent {
+			t.Fatalf("second bounded ingress from=%d status=%d body=%q", from, second.Code, second.Body.String())
+		}
+	}
+
+	before := s.node.RuntimeStats()
+	for instance := epaxos.InstanceNum(3); instance <= 65; instance++ {
+		for _, from := range []epaxos.ReplicaID{2, 3} {
+			rejected := httptest.NewRecorder()
+			s.handleMessage(rejected, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(peerBody(from, instance))))
+			if rejected.Code != http.StatusServiceUnavailable {
+				t.Fatalf("flood from=%d instance=%d status=%d body=%q", from, instance, rejected.Code, rejected.Body.String())
+			}
+		}
+	}
+	after := s.node.RuntimeStats()
+	if after != before {
+		t.Fatalf("blocked peer flood grew protocol state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestBlockedPeerIngressReleasesAtomicBatchCapacity(t *testing.T) {
+	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2, 3})
+	s.sendq = make(chan *outboundFrame, 2)
+	s.mu.Lock()
+	for sequence := uint64(1); sequence <= 2; sequence++ {
+		if _, err := s.node.Propose(kv.CommandForPut(1, sequence, []byte(fmt.Sprintf("atomic-local-%d", sequence)), []byte("value"))); err != nil {
+			s.mu.Unlock()
+			t.Fatal(err)
+		}
+		if err := s.drainLocked(); err != nil {
+			s.mu.Unlock()
+			t.Fatal(err)
+		}
+	}
+	if !s.admissionBlocked || len(s.frozenFrames) != 2 {
+		s.mu.Unlock()
+		t.Fatalf("blocked=%v frozen=%d, want blocked two-frame Ready prefix", s.admissionBlocked, len(s.frozenFrames))
+	}
+	s.mu.Unlock()
+
+	peerBody := func(instance epaxos.InstanceNum) []byte {
+		message := epaxos.Message{
+			Type:         epaxos.MsgCommit,
+			From:         2,
+			To:           1,
+			Ref:          epaxos.InstanceRef{Replica: 2, Instance: instance, Conf: 1},
+			Ballot:       epaxos.Ballot{Replica: 2},
+			RecordBallot: epaxos.Ballot{Replica: 2},
+			Seq:          uint64(instance),
+			Deps:         []epaxos.InstanceNum{0, 0, 0},
+			Command:      kv.CommandForPut(2, uint64(instance), []byte(fmt.Sprintf("atomic-remote-%d", instance)), []byte("value")),
+		}
+		body, err := epaxos.EncodeMessage(nil, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	for instance := epaxos.InstanceNum(1); instance <= 2; instance++ {
+		response := httptest.NewRecorder()
+		s.handleMessage(response, httptest.NewRequest(http.MethodPost, "/epaxos/message", bytes.NewReader(peerBody(instance))))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("peer frame %d status=%d body=%q", instance, response.Code, response.Body.String())
+		}
+		s.finishOutboundFrame(<-s.sendq, false)
+		s.mu.Lock()
+		if err := s.drainLocked(); err != nil {
+			s.mu.Unlock()
+			t.Fatal(err)
+		}
+		blocked := s.admissionBlocked
+		s.mu.Unlock()
+		if instance == 1 && !blocked {
+			t.Fatal("one acknowledgement admitted a two-frame atomic prefix")
+		}
+		if instance == 2 && blocked {
+			t.Fatal("two same-peer acknowledgements did not admit the atomic prefix")
+		}
+	}
+}
+
 func TestHandleStorageFaultSetsListsAndClearsFailure(t *testing.T) {
 	s := newTestService(t)
 
@@ -1448,7 +1682,7 @@ func TestAdminLivenessAndReadinessSplit(t *testing.T) {
 	}
 	notReady := httptest.NewRecorder()
 	s.handleReady(notReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if notReady.Code != http.StatusServiceUnavailable || notReady.Body.String() != "storage fault active\n" {
+	if notReady.Code != http.StatusServiceUnavailable || notReady.Body.String() != "storage-failed\n" {
 		t.Fatalf("not ready status=%d body=%q", notReady.Code, notReady.Body.String())
 	}
 }
@@ -1480,8 +1714,10 @@ func TestHandleMetricsReportsLowCardinalityAdminState(t *testing.T) {
 			t.Fatalf("metrics body missing %q in:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "{") || strings.Contains(body, "}") {
-		t.Fatalf("metrics include labels/high-cardinality dimensions: %q", body)
+	withoutHistogramBuckets := strings.ReplaceAll(body, "_bucket{le=", "_bucket_le=")
+	withoutHistogramBuckets = strings.ReplaceAll(withoutHistogramBuckets, "}", "")
+	if strings.Contains(withoutHistogramBuckets, "{") {
+		t.Fatalf("metrics include unexpected high-cardinality labels: %q", body)
 	}
 }
 
@@ -1899,8 +2135,6 @@ func waitForSchedulerTick(t *testing.T, s *service, tick uint64) {
 	t.Fatalf("scheduler tick=%d, want at least %d", s.schedulerTick.Load(), tick)
 }
 
-
-
 type testKVNodeCluster struct {
 	t        *testing.T
 	services map[epaxos.ReplicaID]*service
@@ -2011,7 +2245,6 @@ func (c *testKVNodeCluster) takeOutboundMessages(s *service) []epaxos.Message {
 		}
 	}
 }
-
 
 func (c *testKVNodeCluster) tickAll(n int) {
 	c.t.Helper()
@@ -2205,6 +2438,7 @@ func TestTransportFrameImmediateFailureWaitsForLogicalRetryTick(t *testing.T) {
 	}
 	s.closeTransport()
 }
+
 type recordingReadyApplier struct {
 	inner   readyApplier
 	applied []epaxos.Ready
@@ -2255,18 +2489,18 @@ func TestSendQueueAtomicFullBatchBackpressureLeavesReadyUnadvanced(t *testing.T)
 	sentinel := &outboundFrame{to: 99, body: []byte("occupied"), admitted: true}
 	s.transportMu.Lock()
 	s.outstandingFrames = 1
+	s.queueOwned = 1
 	s.sendq <- sentinel
 	s.transportMu.Unlock()
 	drainErr := s.drainLocked()
 	readyAfter := s.node.Ready()
 	s.mu.Unlock()
 
-	var admissionErr *transportAdmissionError
-	if !errors.As(drainErr, &admissionErr) || !errors.Is(drainErr, errSendQueueBackpressure) {
-		t.Fatalf("drain error=%v, want typed send queue backpressure", drainErr)
+	if drainErr != nil {
+		t.Fatalf("blocked drain returned terminal error: %v", drainErr)
 	}
-	if admissionErr.Attempted != len(readyBefore.Messages) || admissionErr.Available != len(readyBefore.Messages)-1 {
-		t.Fatalf("admission error=%+v", admissionErr)
+	if !s.admissionBlocked {
+		t.Fatal("service did not record nonterminal admission pressure")
 	}
 	if len(recorder.applied) == 0 || !reflect.DeepEqual(recorder.applied[len(recorder.applied)-1], readyBefore) {
 		t.Fatalf("backpressured Ready was not durably applied before admission: applied=%d", len(recorder.applied))
@@ -2303,8 +2537,11 @@ func TestSendQueueAtomicFullBatchBackpressureLeavesReadyUnadvanced(t *testing.T)
 		}
 		s.finishOutboundFrame(frame, false)
 	}
-	if got := s.outboundMetrics.attempted.Load(); got != uint64(2*len(readyBefore.Messages)) {
-		t.Fatalf("attempted=%d, want %d", got, 2*len(readyBefore.Messages))
+	if got := s.outboundMetrics.attempted.Load(); got != uint64(len(readyBefore.Messages)) {
+		t.Fatalf("attempted=%d, want one encoding pass for %d messages", got, len(readyBefore.Messages))
+	}
+	if len(recorder.applied) != 1 {
+		t.Fatalf("durable apply repeated during admission retry: applied=%d", len(recorder.applied))
 	}
 	if got := s.outboundMetrics.admitted.Load(); got != uint64(len(readyBefore.Messages)) {
 		t.Fatalf("admitted=%d, want %d", got, len(readyBefore.Messages))
@@ -2512,16 +2749,18 @@ func TestSendQueueRetryHeapSaturationPreservesOutstandingBound(t *testing.T) {
 	waitForTransportState(t, s, 2, 2)
 
 	late := mustOutboundFrame(t, s, transportTestMessage([]byte("late")))
-	err = s.admitOutboundFrames([]*outboundFrame{late})
-	var admissionErr *transportAdmissionError
-	if !errors.As(err, &admissionErr) || !errors.Is(err, errSendQueueBackpressure) || admissionErr.Available != 0 {
-		t.Fatalf("saturated retry admission error=%v details=%+v", err, admissionErr)
+	if err := s.admitOutboundFrames([]*outboundFrame{late}); err != nil {
+		t.Fatalf("separate queue capacity rejected while retry heap was full: %v", err)
 	}
-	waitForTransportState(t, s, 2, 2)
-	if got := s.outboundMetrics.backpressured.Load(); got != 1 {
-		t.Fatalf("backpressured=%d, want 1", got)
+	receiveKVNodeTest(t, attempted)
+	waitForTransportState(t, s, 2, 3)
+	s.transportMu.RLock()
+	if s.queueOwned != 1 || s.retryOwned != 2 {
+		t.Fatalf("ownership queue=%d retry=%d, want queue=1 retry=2", s.queueOwned, s.retryOwned)
 	}
+	s.transportMu.RUnlock()
 	s.closeTransport()
+	waitForTransportState(t, s, 0, 0)
 }
 
 func TestTransportFrameRetryTickOverflowFailsClosed(t *testing.T) {
@@ -2553,7 +2792,6 @@ func TestTransportFrameRetryTickOverflowFailsClosed(t *testing.T) {
 	}
 	s.closeTransport()
 }
-
 
 func TestKVNodeTransportTerminalRejectionMetrics(t *testing.T) {
 	s := newTestService(t)
@@ -2768,8 +3006,6 @@ func TestGracefulShutdownDisposesRetryHeapFrame(t *testing.T) {
 		t.Fatalf("terminal failed=%d, want 1", got)
 	}
 }
-
-
 
 func TestHandleKVMapsUnreadablePutBodyToBadRequest(t *testing.T) {
 	s := newTestService(t)

@@ -26,6 +26,7 @@ var epaxosHardStateKey = []byte{epaxosStorePrefix, epaxosHardStateEntry}
 
 // PebbleStorage persists EPaxOS instance records inside the example Pebble database.
 type PebbleStorage struct {
+	db     *DB
 	pebble *pebble.DB
 }
 
@@ -37,7 +38,7 @@ type appliedMarkerLookup func(epaxos.InstanceRef) (io.Closer, error)
 
 // EPaxosStorage returns durable EPaxOS storage backed by the same Pebble database.
 func (db *DB) EPaxosStorage() *PebbleStorage {
-	return &PebbleStorage{pebble: db.pebble}
+	return &PebbleStorage{db: db, pebble: db.pebble}
 }
 
 // InitialState returns the complete stored durable consensus projection.
@@ -76,18 +77,40 @@ func (s *PebbleStorage) LoadInstances(fn func(epaxos.InstanceRecord) error) erro
 	return iter.Error()
 }
 
+// NextCommandSequence returns one greater than the largest durable sequence for client.
+func (db *DB) NextCommandSequence(client uint64) (uint64, error) {
+	next := uint64(1)
+	err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+		id := record.Command.ID
+		if id.Client != client {
+			return nil
+		}
+		if id.Sequence == ^uint64(0) {
+			return fmt.Errorf("kv: command sequence exhausted for client %d", client)
+		}
+		if candidate := id.Sequence + 1; candidate > next {
+			next = candidate
+		}
+		return nil
+	})
+	return next, err
+}
+
 // ApplyReady persists the durable records in rd without applying commands.
 func (s *PebbleStorage) ApplyReady(rd epaxos.Ready) error {
 	if len(rd.Records) == 0 && rd.HardState.Empty() {
 		return nil
 	}
+	s.db.durableMu.Lock()
+	defer s.db.durableMu.Unlock()
 	hardState, err := prepareEPaxosHardState(s.pebble, rd.HardState)
 	if err != nil {
 		return err
 	}
 	batch := s.pebble.NewBatch()
 	defer func() { _ = batch.Close() }()
-	if err := stageEPaxosRecords(batch, rd.Records); err != nil {
+	newRecords, err := stageAndCountEPaxosRecords(batch, rd.Records, s.db.durableRefs)
+	if err != nil {
 		return err
 	}
 	if hardState != nil {
@@ -95,7 +118,12 @@ func (s *PebbleStorage) ApplyReady(rd epaxos.Ready) error {
 			return err
 		}
 	}
-	return batch.Commit(pebble.Sync)
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	addDurableRecords(s.db.durableRefs, rd.Records)
+	s.db.durableRecords.Add(newRecords)
+	return nil
 }
 
 // ApplyReady atomically persists EPAXOS records and applies committed KV commands.
@@ -103,13 +131,16 @@ func (db *DB) ApplyReady(rd epaxos.Ready) error {
 	if len(rd.Records) == 0 && len(rd.Committed) == 0 && rd.HardState.Empty() {
 		return nil
 	}
+	db.durableMu.Lock()
+	defer db.durableMu.Unlock()
 	hardState, err := prepareEPaxosHardState(db.pebble, rd.HardState)
 	if err != nil {
 		return err
 	}
 	batch := db.newWriteBatch()
 	defer func() { _ = batch.Close() }()
-	if err := stageEPaxosRecords(batch, rd.Records); err != nil {
+	newRecords, err := stageAndCountEPaxosRecords(batch, rd.Records, db.durableRefs)
+	if err != nil {
 		return err
 	}
 	next := db.nextRecordTime()
@@ -136,7 +167,9 @@ func (db *DB) ApplyReady(rd epaxos.Ready) error {
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return err
 	}
+	addDurableRecords(db.durableRefs, rd.Records)
 	db.nextTime = next
+	db.durableRecords.Add(newRecords)
 	return nil
 }
 
@@ -292,26 +325,53 @@ func loadEPaxosHardState(pebbleDB *pebble.DB) (epaxos.HardState, bool, error) {
 	return hardState, true, nil
 }
 
-func stageEPaxosRecords(batch txnBatch, records []epaxos.InstanceRecord) error {
-	for _, rec := range records {
+func stageAndCountEPaxosRecords(batch txnBatch, records []epaxos.InstanceRecord, durableRefs map[epaxos.InstanceRef]struct{}) (uint64, error) {
+	newRecords := uint64(0)
+	var key [26]byte
+	encoded := make([]byte, 0, 128)
+	for index, rec := range records {
 		if !epaxos.VerifyRecordChecksum(rec) {
-			return epaxos.ErrChecksumMismatch
+			return 0, epaxos.ErrChecksumMismatch
 		}
-		if err := batch.Set(epaxosRecordKey(rec.Ref), encodeEPaxosRecord(rec), nil); err != nil {
-			return err
+		encodeEPaxosStoreRefKey(key[:], epaxosRecordEntry, rec.Ref)
+		if _, exists := durableRefs[rec.Ref]; !exists {
+			duplicate := false
+			for previous := 0; previous < index; previous++ {
+				if records[previous].Ref == rec.Ref {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				newRecords++
+			}
+		}
+		encoded = appendEPaxosRecord(encoded[:0], rec)
+		if err := batch.Set(key[:], encoded, nil); err != nil {
+			return 0, err
 		}
 	}
-	return nil
+	return newRecords, nil
+}
+
+func addDurableRecords(durableRefs map[epaxos.InstanceRef]struct{}, records []epaxos.InstanceRecord) {
+	for _, record := range records {
+		durableRefs[record.Ref] = struct{}{}
+	}
 }
 
 func epaxosRecordKey(ref epaxos.InstanceRef) []byte {
-	out := make([]byte, 2, 26)
-	out[0] = epaxosStorePrefix
-	out[1] = epaxosRecordEntry
-	out = binary.BigEndian.AppendUint64(out, uint64(ref.Conf))
-	out = binary.BigEndian.AppendUint64(out, uint64(ref.Replica))
-	out = binary.BigEndian.AppendUint64(out, uint64(ref.Instance))
+	out := make([]byte, 26)
+	encodeEPaxosStoreRefKey(out, epaxosRecordEntry, ref)
 	return out
+}
+
+func encodeEPaxosStoreRefKey(out []byte, entry byte, ref epaxos.InstanceRef) {
+	out[0] = epaxosStorePrefix
+	out[1] = entry
+	binary.BigEndian.PutUint64(out[2:10], uint64(ref.Conf))
+	binary.BigEndian.PutUint64(out[10:18], uint64(ref.Replica))
+	binary.BigEndian.PutUint64(out[18:26], uint64(ref.Instance))
 }
 
 func decodeEPaxosRecordKey(key []byte) (epaxos.InstanceRef, bool) {
@@ -370,7 +430,11 @@ func (db *DB) getAppliedMarker(ref epaxos.InstanceRef) (io.Closer, error) {
 }
 
 func encodeEPaxosRecord(rec epaxos.InstanceRecord) []byte {
-	out := []byte{epaxosRecordCodec}
+	return appendEPaxosRecord(nil, rec)
+}
+
+func appendEPaxosRecord(out []byte, rec epaxos.InstanceRecord) []byte {
+	out = append(out, epaxosRecordCodec)
 	out = binary.AppendUvarint(out, uint64(rec.Ref.Replica))
 	out = binary.AppendUvarint(out, uint64(rec.Ref.Instance))
 	out = binary.AppendUvarint(out, uint64(rec.Ref.Conf))

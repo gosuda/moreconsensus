@@ -361,10 +361,12 @@ func toStatus(s epaxos.StatusSnapshot) statusView {
 }
 
 func snapshot(rn *epaxos.RawNode, store *epaxos.MemoryStorage) (snapshotView, error) {
-	hard, configs, err := store.InitialState()
+	state, err := store.InitialState()
 	if err != nil {
 		return snapshotView{}, err
 	}
+	hard := state.HardState
+	configs := state.ConfigHistory
 	records := make([]recordView, 0, len(store.Records))
 	if err := store.LoadInstances(func(record epaxos.InstanceRecord) error {
 		records = append(records, toRecord(record))
@@ -374,7 +376,7 @@ func snapshot(rn *epaxos.RawNode, store *epaxos.MemoryStorage) (snapshotView, er
 	}
 	configViews := make([]confView, len(configs))
 	for i := range configs {
-		configViews[i] = toConf(configs[i])
+		configViews[i] = toConf(configs[i].Conf)
 	}
 	return snapshotView{
 		HasReady: rn.HasReady(), Node: toStatus(rn.Status()),

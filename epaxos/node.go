@@ -4386,6 +4386,9 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 	conf := n.confFor(exclude.Conf)
 	deps := make([]InstanceNum, len(conf.Voters))
 	seq := uint64(1)
+	if len(n.instances) == 0 {
+		return Attributes{Seq: seq, Deps: deps}
+	}
 	addRef := func(ref InstanceRef, rec InstanceRecord) {
 		if ref == exclude || rec.TOQPending || rec.Status == StatusNone || rec.Command.Kind == CommandNoop || ref.Conf != exclude.Conf {
 			return

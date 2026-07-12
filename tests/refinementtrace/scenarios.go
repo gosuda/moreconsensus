@@ -1114,12 +1114,17 @@ func captureConfigScenario() (semanticTrace, error) {
 		if !ok || record.Ref.Conf != 1 || record.Status != epaxos.StatusExecuted || record.ConfChangeResult.Outcome != epaxos.ConfChangeApplied || !confEqual(record.ConfChangeResult.Conf, wantConfig) {
 			return semanticTrace{}, fmt.Errorf("node %d config outcome record=%#v ok=%v", id, record, ok)
 		}
-		_, history, err := node.store.InitialState()
+		state, err := node.store.InitialState()
 		if err != nil {
 			return semanticTrace{}, err
 		}
-		if len(history) != 1 || !confEqual(history[0], wantConfig) {
-			return semanticTrace{}, fmt.Errorf("node %d config history=%#v, want exact successor", id, history)
+		initialConfig := epaxos.ConfState{ID: 1, Voters: []epaxos.ReplicaID{1, 2, 3}}
+		if len(state.ConfigHistory) != 2 ||
+			!confEqual(state.ConfigHistory[0].Conf, initialConfig) ||
+			state.ConfigHistory[0].AppliedRef != (epaxos.InstanceRef{}) ||
+			!confEqual(state.ConfigHistory[1].Conf, wantConfig) ||
+			state.ConfigHistory[1].AppliedRef != configRef {
+			return semanticTrace{}, fmt.Errorf("node %d config history=%#v, want exact initial and applied successor", id, state.ConfigHistory)
 		}
 	}
 	checkpoint, err := snapshot(leader.node, leader.store)

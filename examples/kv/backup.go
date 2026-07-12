@@ -606,6 +606,7 @@ func checkpointCountsEqual(left, right map[string]int) bool {
 
 func assignCheckpointTimestamps(groups []checkpointDataGroup, candidates map[string][]epaxos.InstanceRef, state checkpointState) error {
 	assigned := make(map[epaxos.InstanceRef]uint64, len(groups))
+	order := checkpointDependencyOrderForState(state)
 	used := make(map[epaxos.InstanceRef]struct{}, len(groups))
 	for _, group := range groups {
 		refs := candidates[group.key]
@@ -614,13 +615,13 @@ func assignCheckpointTimestamps(groups []checkpointDataGroup, candidates map[str
 			if _, ok := used[ref]; ok {
 				continue
 			}
-			if checkpointDependenciesAssignedForState(state.records[ref], assigned, state) {
+			if checkpointDependenciesAssignedForStateWithOrder(state.records[ref], assigned, state, order) {
 				selected = i
 				break
 			}
 		}
 		if selected < 0 {
-			return fmt.Errorf("kv: checkpoint timestamp %d has no dependency-satisfied applied command", group.timestamp)
+			return fmt.Errorf("kv: checkpoint timestamp %d has no dependency-satisfied applied command among candidates %v", group.timestamp, refs)
 		}
 		ref := refs[selected]
 		used[ref] = struct{}{}
@@ -633,21 +634,41 @@ func assignCheckpointTimestamps(groups []checkpointDataGroup, candidates map[str
 }
 
 func checkpointDependenciesAssignedForState(rec epaxos.InstanceRecord, assigned map[epaxos.InstanceRef]uint64, state checkpointState) bool {
+	return checkpointDependenciesAssignedForStateWithOrder(rec, assigned, state, nil)
+}
+
+type checkpointDependencyOrder struct {
+	component    map[epaxos.InstanceRef]int
+	dependencies map[int]map[int]struct{}
+}
+
+func checkpointDependenciesAssignedForStateWithOrder(rec epaxos.InstanceRecord, assigned map[epaxos.InstanceRef]uint64, state checkpointState, order *checkpointDependencyOrder) bool {
 	conf, known := state.configHistory[rec.Ref.Conf]
-	if !known {
-		return checkpointDependenciesAssigned(rec, assigned, state.writeGroups)
-	}
-	for i := len(conf.Voters); i < len(rec.Deps); i++ {
-		if rec.Deps[i] != 0 {
-			return false
+	if known {
+		for i := len(conf.Voters); i < len(rec.Deps); i++ {
+			if rec.Deps[i] != 0 {
+				return false
+			}
 		}
 	}
 	for depRef := range state.writeGroups {
-		if depRef == rec.Ref || depRef.Conf != rec.Ref.Conf || depRef.Instance == 0 {
+		if depRef == rec.Ref {
 			continue
 		}
-		slot, ok := conf.Index(depRef.Replica)
-		if !ok || slot >= len(rec.Deps) || depRef.Instance > rec.Deps[slot] {
+		required := checkpointRecordDependsOn(rec, depRef, state)
+		if order != nil {
+			component, currentKnown := order.component[rec.Ref]
+			dependencyComponent, dependencyKnown := order.component[depRef]
+			if currentKnown && dependencyKnown {
+				switch {
+				case component == dependencyComponent:
+					required = checkpointExecutionLess(state.records[depRef], rec)
+				default:
+					_, required = order.dependencies[component][dependencyComponent]
+				}
+			}
+		}
+		if !required {
 			continue
 		}
 		if _, ok := assigned[depRef]; !ok {
@@ -655,6 +676,116 @@ func checkpointDependenciesAssignedForState(rec epaxos.InstanceRecord, assigned 
 		}
 	}
 	return true
+}
+
+func checkpointRecordDependsOn(rec epaxos.InstanceRecord, depRef epaxos.InstanceRef, state checkpointState) bool {
+	if depRef == rec.Ref || depRef.Conf != rec.Ref.Conf || depRef.Replica == 0 || depRef.Instance == 0 {
+		return false
+	}
+	if conf, known := state.configHistory[rec.Ref.Conf]; known {
+		slot, ok := conf.Index(depRef.Replica)
+		return ok && slot < len(rec.Deps) && depRef.Instance <= rec.Deps[slot]
+	}
+	slot := uint64(depRef.Replica - 1)
+	return slot < uint64(len(rec.Deps)) && depRef.Instance <= rec.Deps[slot]
+}
+
+func checkpointExecutionLess(left, right epaxos.InstanceRecord) bool {
+	if left.Seq != right.Seq {
+		return left.Seq < right.Seq
+	}
+	return checkpointRefLess(left.Ref, right.Ref)
+}
+
+func checkpointDependencyOrderForState(state checkpointState) *checkpointDependencyOrder {
+	refs := make([]epaxos.InstanceRef, 0, len(state.records))
+	for ref, rec := range state.records {
+		_, applied := state.applied[ref]
+		if rec.Status == epaxos.StatusExecuted || applied {
+			refs = append(refs, ref)
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool { return checkpointRefLess(refs[i], refs[j]) })
+	indices := make(map[epaxos.InstanceRef]int, len(refs))
+	lowlinks := make(map[epaxos.InstanceRef]int, len(refs))
+	onStack := make(map[epaxos.InstanceRef]bool, len(refs))
+	stack := make([]epaxos.InstanceRef, 0, len(refs))
+	components := make(map[epaxos.InstanceRef]int, len(refs))
+	nextIndex := 0
+	nextComponent := 0
+	var visit func(epaxos.InstanceRef)
+	visit = func(ref epaxos.InstanceRef) {
+		nextIndex++
+		indices[ref] = nextIndex
+		lowlinks[ref] = nextIndex
+		stack = append(stack, ref)
+		onStack[ref] = true
+		rec := state.records[ref]
+		for _, dependency := range refs {
+			if !checkpointRecordDependsOn(rec, dependency, state) {
+				continue
+			}
+			if indices[dependency] == 0 {
+				visit(dependency)
+				if lowlinks[dependency] < lowlinks[ref] {
+					lowlinks[ref] = lowlinks[dependency]
+				}
+			} else if onStack[dependency] && indices[dependency] < lowlinks[ref] {
+				lowlinks[ref] = indices[dependency]
+			}
+		}
+		if lowlinks[ref] != indices[ref] {
+			return
+		}
+		nextComponent++
+		for {
+			last := len(stack) - 1
+			member := stack[last]
+			stack = stack[:last]
+			onStack[member] = false
+			components[member] = nextComponent
+			if member == ref {
+				return
+			}
+		}
+	}
+	for _, ref := range refs {
+		if indices[ref] == 0 {
+			visit(ref)
+		}
+	}
+
+	direct := make(map[int]map[int]struct{}, nextComponent)
+	for _, ref := range refs {
+		component := components[ref]
+		for _, dependency := range refs {
+			dependencyComponent := components[dependency]
+			if component == dependencyComponent || !checkpointRecordDependsOn(state.records[ref], dependency, state) {
+				continue
+			}
+			if direct[component] == nil {
+				direct[component] = make(map[int]struct{})
+			}
+			direct[component][dependencyComponent] = struct{}{}
+		}
+	}
+	dependencies := make(map[int]map[int]struct{}, nextComponent)
+	for component := 1; component <= nextComponent; component++ {
+		reachable := make(map[int]struct{})
+		var walk func(int)
+		walk = func(current int) {
+			for dependency := range direct[current] {
+				if _, seen := reachable[dependency]; seen {
+					continue
+				}
+				reachable[dependency] = struct{}{}
+				walk(dependency)
+			}
+		}
+		walk(component)
+		dependencies[component] = reachable
+	}
+	return &checkpointDependencyOrder{component: components, dependencies: dependencies}
 }
 
 func checkpointDependenciesAssigned(rec epaxos.InstanceRecord, assigned map[epaxos.InstanceRef]uint64, writeGroups map[epaxos.InstanceRef]string) bool {

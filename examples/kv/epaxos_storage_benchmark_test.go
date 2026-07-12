@@ -10,6 +10,7 @@ import (
 func BenchmarkApplyReady(b *testing.B) {
 	for _, count := range []int{1, 32} {
 		b.Run(fmt.Sprintf("records=%d/sync", count), func(b *testing.B) {
+			b.StopTimer()
 			db, err := Open(b.TempDir())
 			if err != nil {
 				b.Fatal(err)
@@ -17,7 +18,7 @@ func BenchmarkApplyReady(b *testing.B) {
 			b.Cleanup(func() { _ = db.Close() })
 			records := make([]epaxos.InstanceRecord, count)
 			b.ReportAllocs()
-			b.StopTimer()
+			b.ResetTimer()
 			for iteration := range b.N {
 				for index := range records {
 					record := epaxos.InstanceRecord{

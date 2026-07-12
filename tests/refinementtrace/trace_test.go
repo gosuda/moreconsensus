@@ -175,9 +175,13 @@ func TestCapturedSemanticsCoverFiniteContract(t *testing.T) {
 		oldRecovery = oldRecovery || event.Action == "ConfigStartOldRecovery" || event.ResponseAdmission == "exact-old-config-response-admitted"
 		wrongConfigStutter = wrongConfigStutter || event.Action == "ConfigWrongConfDrop" && event.ResponseAdmission == "wrong-config-stutter"
 		if event.Post != nil {
-			if len(event.Post.Durable.ConfigHistory) == 1 {
-				history := event.Post.Durable.ConfigHistory[0]
-				exactHistory = exactHistory || history.ID == 2 && len(history.Voters) == 2 && history.Voters[0] == 1 && history.Voters[1] == 2
+			if len(event.Post.Durable.ConfigHistory) == 2 {
+				initial := event.Post.Durable.ConfigHistory[0]
+				successor := event.Post.Durable.ConfigHistory[1]
+				exactHistory = exactHistory ||
+					initial.ID == 1 && len(initial.Voters) == 3 &&
+						successor.ID == 2 && len(successor.Voters) == 2 &&
+						successor.Voters[0] == 1 && successor.Voters[1] == 2
 			}
 			for _, record := range event.Post.Durable.Records {
 				oldPin = oldPin || record.Ref.Conf == 1 && record.Command.Kind == "config-change"

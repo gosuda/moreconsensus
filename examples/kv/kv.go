@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 	"gosuda.org/moreconsensus/epaxos"
@@ -150,6 +152,9 @@ type DB struct {
 	newIter             func(*pebble.IterOptions) (kvIterator, error)
 	newBatch            func() txnBatch
 	lookupAppliedMarker appliedMarkerLookup
+	durableRecords      atomic.Uint64
+	durableMu           sync.Mutex
+	durableRefs         map[epaxos.InstanceRef]struct{}
 }
 
 type kvIterator interface {
@@ -166,6 +171,21 @@ type txnBatch interface {
 	Set(key, value []byte, opts *pebble.WriteOptions) error
 	Commit(opts *pebble.WriteOptions) error
 	Close() error
+}
+
+// StorageStats is a copy-only view of Pebble and durable consensus retention.
+type StorageStats struct {
+	CacheSizeBytes         int64
+	CacheHits              int64
+	CacheMisses            int64
+	MemTableSizeBytes      uint64
+	MemTableCount          int64
+	CompactionDebtBytes    uint64
+	CompactionsInProgress  int64
+	WALBytes               uint64
+	DiskUsageBytes         uint64
+	ReadAmplification      int
+	DurableInstanceRecords uint64
 }
 
 // KV is one key-value pair returned by scans.
@@ -194,11 +214,24 @@ type ScanOptions struct {
 
 // Open opens a Pebble-backed key-value store and resumes automatic version timestamps from existing records.
 func Open(path string) (*DB, error) {
-	return open(path, nil)
+	return OpenWithOptions(path, nil)
+}
+
+// OpenWithOptions opens a store with a shallow copy of caller-owned Pebble options.
+func OpenWithOptions(path string, options *pebble.Options) (*DB, error) {
+	return openWithOptions(path, options, nil)
 }
 
 func open(path string, newIterFor func(*pebble.DB) func(*pebble.IterOptions) (kvIterator, error)) (*DB, error) {
-	pebbleDB, err := pebble.Open(path, &pebble.Options{})
+	return openWithOptions(path, nil, newIterFor)
+}
+
+func openWithOptions(path string, options *pebble.Options, newIterFor func(*pebble.DB) func(*pebble.IterOptions) (kvIterator, error)) (*DB, error) {
+	var configured pebble.Options
+	if options != nil {
+		configured = *options
+	}
+	pebbleDB, err := pebble.Open(path, &configured)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +249,13 @@ func open(path string, newIterFor func(*pebble.DB) func(*pebble.IterOptions) (kv
 		newIter:  newIterFor(pebbleDB),
 		newBatch: func() txnBatch { return pebbleDB.NewBatch() },
 	}
+	refs, err := loadDurableRecords(pebbleDB)
+	if err != nil {
+		_ = pebbleDB.Close()
+		return nil, err
+	}
+	db.durableRefs = refs
+	db.durableRecords.Store(uint64(len(refs)))
 	next, err := db.loadNextTime()
 	if err != nil {
 		_ = pebbleDB.Close()
@@ -227,6 +267,46 @@ func open(path string, newIterFor func(*pebble.DB) func(*pebble.IterOptions) (kv
 
 // Close closes the underlying Pebble database.
 func (db *DB) Close() error { return db.pebble.Close() }
+
+// StorageStats returns current Pebble counters without scanning records.
+func (db *DB) StorageStats() StorageStats {
+	metrics := db.pebble.Metrics()
+	return StorageStats{
+		CacheSizeBytes:         metrics.BlockCache.Size,
+		CacheHits:              metrics.BlockCache.Hits,
+		CacheMisses:            metrics.BlockCache.Misses,
+		MemTableSizeBytes:      metrics.MemTable.Size,
+		MemTableCount:          metrics.MemTable.Count,
+		CompactionDebtBytes:    metrics.Compact.EstimatedDebt,
+		CompactionsInProgress:  metrics.Compact.NumInProgress,
+		WALBytes:               metrics.WAL.BytesWritten,
+		DiskUsageBytes:         metrics.DiskSpaceUsage(),
+		ReadAmplification:      metrics.ReadAmp(),
+		DurableInstanceRecords: db.durableRecords.Load(),
+	}
+}
+
+func loadDurableRecords(pebbleDB *pebble.DB) (map[epaxos.InstanceRef]struct{}, error) {
+	lower := []byte{epaxosStorePrefix, epaxosRecordEntry}
+	upper := prefixLimit(lower)
+	iter, err := pebbleDB.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+	refs := make(map[epaxos.InstanceRef]struct{})
+	for valid := iter.First(); valid; valid = iter.Next() {
+		ref, ok := decodeEPaxosRecordKey(iter.Key())
+		if !ok {
+			return nil, errors.New("kv: malformed epaxos record key")
+		}
+		refs[ref] = struct{}{}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
 
 func (db *DB) loadNextTime() (uint64, error) {
 	lower := EncodeUserPrefix(nil, db.cf, nil)
