@@ -7,6 +7,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"debug/macho"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -363,6 +365,39 @@ func TestFailedRejectionMutationAndWritableMountFailClosed(t *testing.T) {
 	}
 }
 
+func writeMachOFixture(t *testing.T, root, name string, cpu macho.Cpu) string {
+	t.Helper()
+	header := make([]byte, 32)
+	binary.LittleEndian.PutUint32(header[0:4], 0xfeedfacf)
+	binary.LittleEndian.PutUint32(header[4:8], uint32(cpu))
+	binary.LittleEndian.PutUint32(header[8:12], 0)
+	binary.LittleEndian.PutUint32(header[12:16], 2)
+	path := filepath.Join(root, name)
+	if err := os.WriteFile(path, header, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestMachOReleaseBinaryFixtureIsHostIndependent(t *testing.T) {
+	root := t.TempDir()
+	arm64 := writeMachOFixture(t, root, "kvnode-arm64", macho.CpuArm64)
+	if digest, err := verifyMachOArm64(arm64); err != nil || len(digest) != 64 {
+		t.Fatalf("arm64 fixture digest=%q err=%v", digest, err)
+	}
+	amd64 := writeMachOFixture(t, root, "kvnode-amd64", macho.CpuAmd64)
+	if _, err := verifyMachOArm64(amd64); err == nil || !strings.Contains(err.Error(), "want arm64") {
+		t.Fatalf("amd64 fixture err=%v", err)
+	}
+	notMachO := filepath.Join(root, "not-mach-o")
+	if err := os.WriteFile(notMachO, []byte("not a Mach-O executable"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyMachOArm64(notMachO); err == nil || !strings.Contains(err.Error(), "not a Mach-O release binary") {
+		t.Fatalf("invalid fixture err=%v", err)
+	}
+}
+
 func makeRehearsalFixture(t *testing.T) rehearsalFixture {
 	t.Helper()
 	root := t.TempDir()
@@ -370,10 +405,7 @@ func makeRehearsalFixture(t *testing.T) rehearsalFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	executable := writeMachOFixture(t, root, "kvnode-release-arm64", macho.CpuArm64)
 	binarySHA, err := verifyMachOArm64(executable)
 	if err != nil {
 		t.Fatal(err)
