@@ -420,17 +420,24 @@ require_text "$env_example" "KVNODE_MAX_PEER_BODY_BYTES="
 require_text "$env_example" "KVNODE_MAX_ADMIN_BODY_BYTES="
 require_text "$env_example" "KVNODE_MAX_SCAN_LIMIT="
 require_text "$env_example" "KVNODE_TLS_ARGS="
-require_text "$env_example" "-tls-cert=/etc/kvnode/tls/node1.crt"
-require_text "$env_example" "-tls-key=/etc/kvnode/tls/node1.key"
-require_text "$env_example" "-tls-ca=/etc/kvnode/tls/ca.crt"
-require_text "$env_example" "transport configuration only; it does not add application authz/authn"
+require_text "$env_example" "-peer-tls-cert=/etc/kvnode/tls/node1-peer.crt"
+require_text "$env_example" "-peer-tls-key=/etc/kvnode/tls/node1-peer.key"
+require_text "$env_example" "-peer-tls-ca=/etc/kvnode/tls/peer-ca.crt"
+require_text "$env_example" "-client-tls-cert=/etc/kvnode/tls/node1-client.crt"
+require_text "$env_example" "-client-tls-key=/etc/kvnode/tls/node1-client.key"
+require_text "$env_example" "-client-client-ca=/etc/kvnode/tls/client-ca.crt"
+require_text "$env_example" "-admin-tls-cert=/etc/kvnode/tls/node1-admin.crt"
+require_text "$env_example" "-admin-tls-key=/etc/kvnode/tls/node1-admin.key"
+require_text "$env_example" "-admin-client-ca=/etc/kvnode/tls/admin-ca.crt"
+require_text "$env_example" "single-tenant"
+require_text "$env_example" "does not provide per-user or multi-tenant RBAC"
 
 # Cross-platform manifest exercise: renders the example EnvironmentFile into the
 # ExecStart contract, writes an explicit non-claim report when requested, and
 # runs systemd-analyze verify when the host provides it.
 manifest_required_env_vars="KVNODE_ID,KVNODE_CLIENT_LISTEN,KVNODE_PEER_LISTEN,KVNODE_ADMIN_LISTEN,KVNODE_DATA_DIR,KVNODE_PEERS,KVNODE_REQUEST_DEADLINE_MS,KVNODE_PEER_DEADLINE_MS,KVNODE_MAX_CLIENT_BODY_BYTES,KVNODE_MAX_PEER_BODY_BYTES,KVNODE_MAX_ADMIN_BODY_BYTES,KVNODE_MAX_SCAN_LIMIT,KVNODE_TLS_ARGS"
 manifest_deadline_defaults="deadline_defaults=request_deadline_ms=5000,peer_deadline_ms=2000"
-manifest_body_scan_limits="body_scan_limits=max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000"
+manifest_body_scan_limits="body_scan_limits=max_client_body_bytes=1048576,max_peer_body_bytes=2097152,max_admin_body_bytes=65536,max_scan_limit=1000"
 manifest_hardening="hardening=User,Group,StateDirectory,ProtectSystem,NoNewPrivileges"
 manifest_evidence_files="evidence_files=deploy/systemd/kvnode@.service,deploy/systemd/kvnode.env.example"
 
@@ -768,8 +775,8 @@ require_text "$capacity" "KVNODE_CAPACITY_WORKLOAD_LABEL"
 require_text "$capacity" "Single-line workload label. Default: unspecified"
 require_text "$capacity" "KVNODE_CAPACITY_REPORT"
 require_text "$capacity" "Optional success report path"
-require_text "$capacity" "report.env                     Optional 0600 report with throughput and latency summary fields."
-require_text "$capacity" "writes a 0600 example/operator report with throughput and latency summary fields."
+require_text "$capacity" "report.env                     Optional local non-claim or validated target report."
+require_text "$capacity" "created with mode 0600"
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_OPS_PER_PHASE "$ops_per_phase" 1000'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_TIMEOUT_SECONDS "$timeout_seconds" 300'
 require_text "$capacity" 'bounded_int KVNODE_CAPACITY_MAX_VALUE_BYTES "$max_value_bytes" 1048576'
@@ -777,15 +784,15 @@ require_text "$capacity" 'bounded_int KVNODE_CAPACITY_MAX_SCAN_LIMIT "$max_scan_
 require_text "$capacity" "label_value()"
 require_text "$capacity" 'environment_label="$(label_value KVNODE_CAPACITY_ENVIRONMENT_LABEL "${KVNODE_CAPACITY_ENVIRONMENT_LABEL:-unspecified}")"'
 require_text "$capacity" 'workload_label="$(label_value KVNODE_CAPACITY_WORKLOAD_LABEL "${KVNODE_CAPACITY_WORKLOAD_LABEL:-unspecified}")"'
-require_text "$capacity" '$name must not be empty'
-require_text "$capacity" '$name must be a single line without ='
-require_text "$capacity" '$name must be <= 128 characters'
+require_text "$capacity" '$name-must-not-be-empty'
+require_text "$capacity" '$name-must-be-a-single-line-without-equals'
+require_text "$capacity" '$name-must-be-at-most-$max-characters'
 require_text "$capacity" "validate_report_path()"
 require_text "$capacity" 'capacity_report="${KVNODE_CAPACITY_REPORT:-}"'
 require_text "$capacity" 'validate_report_path KVNODE_CAPACITY_REPORT "$capacity_report"'
-require_text "$capacity" '[[ "$value" == "." || "$value" == "/" ]]'
+require_text "$capacity" '[[ "$value" == "." || "$value" == "/" || "$value" == */ ]]'
 require_text "$capacity" '$name must name a file'
-require_text_before "$capacity" 'validate_report_path KVNODE_CAPACITY_REPORT "$capacity_report"' "record_resources before"
+require_text_before "$capacity" 'validate_report_path KVNODE_CAPACITY_REPORT "$capacity_report"' "run_phase warmup"
 require_text "$capacity" "metadata.env                    Harness inputs and peer-count label."
 require_text "$capacity" "latency.csv                     operation,http_status,seconds rows."
 require_text "$capacity" "resources.csv                   before/after RSS, disk, queue-depth samples."

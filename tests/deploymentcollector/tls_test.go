@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +36,12 @@ func TestProductionHTTPClientUsesOnlyBoundCustomCAAndSAN(t *testing.T) {
 			_, _ = response.Write([]byte("healthy\n"))
 		}
 	}))
-	server.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AppendCertsFromPEM(caPEM)
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{pair}, ClientCAs: clientCAPool,
+		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13,
+	}
 	server.StartTLS()
 	defer server.Close()
 	root := t.TempDir()
@@ -43,14 +49,16 @@ func TestProductionHTTPClientUsesOnlyBoundCustomCAAndSAN(t *testing.T) {
 	if err := os.WriteFile(caPath, caPEM, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	config := Config{CAPath: caPath, RequestTimeoutSeconds: 5}
-	client, err := deploymentHTTPClient(config)
+	certPath := writeFixture(t, root, "client.crt", certPEM, 0o400)
+	keyPath := writeFixture(t, root, "client.key", keyPEM, 0o400)
+	config := Config{PeerCAPath: caPath, ClientCAPath: caPath, AdminCAPath: caPath, RequestTimeoutSeconds: 5}
+	client, err := deploymentHTTPClient(config, caPath, certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	transport, ok := client.Transport.(*http.Transport)
-	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.RootCAs == nil || transport.TLSClientConfig.InsecureSkipVerify || transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
-		t.Fatalf("production TLS policy is not explicit/custom-CA verified: %#v", client.Transport)
+	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.RootCAs == nil || transport.TLSClientConfig.InsecureSkipVerify || transport.TLSClientConfig.MinVersion != tls.VersionTLS13 || len(transport.TLSClientConfig.Certificates) != 1 {
+		t.Fatalf("production mTLS policy is not explicit/custom-CA verified: %#v", client.Transport)
 	}
 	observation, err := observeEndpoint(client, 1, "health", server.URL)
 	if err != nil {
@@ -70,7 +78,7 @@ func TestProductionHTTPClientUsesOnlyBoundCustomCAAndSAN(t *testing.T) {
 	if err := os.WriteFile(wrongCAPath, wrongCA, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	wrongClient, err := deploymentHTTPClient(Config{CAPath: wrongCAPath, RequestTimeoutSeconds: 5})
+	wrongClient, err := deploymentHTTPClient(Config{RequestTimeoutSeconds: 5}, wrongCAPath, certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +107,9 @@ func TestProductionHTTPClientUsesOnlyBoundCustomCAAndSAN(t *testing.T) {
 	if err := os.WriteFile(wrongSANCAPath, wrongSANCA, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	sanClient, err := deploymentHTTPClient(Config{CAPath: wrongSANCAPath, RequestTimeoutSeconds: 5})
+	wrongSANCertPath := writeFixture(t, root, "wrong-san-client.crt", wrongSANCert2, 0o400)
+	wrongSANKeyPath := writeFixture(t, root, "wrong-san-client.key", wrongSANKey2, 0o400)
+	sanClient, err := deploymentHTTPClient(Config{RequestTimeoutSeconds: 5}, wrongSANCAPath, wrongSANCertPath, wrongSANKeyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,18 +138,21 @@ func TestInspectNodeTLSBindsCAHashChainKeyAndSAN(t *testing.T) {
 	caPath := writeFixture(t, root, "ca.pem", caPEM, 0o400)
 	certPath := writeFixture(t, root, "node.crt", certPEM, 0o400)
 	keyPath := writeFixture(t, root, "node.key", keyPEM, 0o400)
-	config := Config{CAPath: caPath}
-	node := NodeConfig{ClientURL: "https://127.0.0.1:19090", PeerURL: "https://127.0.0.1:19091", AdminURL: "https://127.0.0.1:19092", ServerCertPath: certPath, ServerKeyPath: keyPath}
-	certFact, keyFact, err := inspectNodeTLS(config, node)
+	config := Config{PeerCAPath: caPath, ClientCAPath: caPath, AdminCAPath: caPath}
+	node := NodeConfig{
+		ID: 1, ClientURL: "https://127.0.0.1:19090", PeerURL: "https://127.0.0.1:19091", AdminURL: "https://127.0.0.1:19092",
+		PeerCertPath: certPath, PeerKeyPath: keyPath, ClientCertPath: certPath, ClientKeyPath: keyPath, AdminCertPath: certPath, AdminKeyPath: keyPath,
+	}
+	tlsFacts, err := inspectNodeTLS(config, node)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if certFact.SHA256 != digestBytes(certPEM) || keyFact.SHA256 != digestBytes(keyPEM) {
+	if tlsFacts["peer_certificate"].SHA256 != digestBytes(certPEM) || tlsFacts["peer_private_key"].SHA256 != digestBytes(keyPEM) {
 		t.Fatal("TLS exact bytes were not content bound")
 	}
 	facts := map[string]FileFact{
 		"binary": {SHA256: strings.Repeat("a", 64)}, "prior_binary": {SHA256: strings.Repeat("b", 64)},
-		"ca_certificate": {SHA256: digestBytes(caPEM)},
+		"peer_ca_certificate": {SHA256: digestBytes(caPEM)}, "client_ca_certificate": {SHA256: strings.Repeat("c", 64)}, "admin_ca_certificate": {SHA256: strings.Repeat("d", 64)},
 	}
 	bindingConfig := Config{TargetID: productionTarget, ReleaseID: "release-12345678", SourceRevision: strings.Repeat("c", 40), Nodes: make([]NodeConfig, 3)}
 	for i := range bindingConfig.Nodes {
@@ -147,23 +160,41 @@ func TestInspectNodeTLSBindsCAHashChainKeyAndSAN(t *testing.T) {
 		bindingConfig.Nodes[i].ID = i + 1
 		bindingConfig.Nodes[i].Label = label
 		facts["node_"+string(rune('1'+i))+"_plist"] = FileFact{SHA256: strings.Repeat(string(rune('1'+i)), 64)}
-		facts["node_"+string(rune('1'+i))+"_certificate"] = FileFact{SHA256: certFact.SHA256}
-		facts["node_"+string(rune('1'+i))+"_private_key"] = FileFact{SHA256: keyFact.SHA256}
+		for suffix, fact := range tlsFacts {
+			facts["node_"+string(rune('1'+i))+"_"+suffix] = fact
+		}
 	}
 	binding, err := bindingFromFacts(bindingConfig, strings.Repeat("d", 64), facts, strings.Repeat("e", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.CASHA256 != digestBytes(caPEM) {
-		t.Fatal("CA hash missing from release binding")
+	if binding.CASHA256["peer"] != digestBytes(caPEM) {
+		t.Fatal("peer CA hash missing from release binding")
 	}
-	facts["ca_certificate"] = FileFact{SHA256: strings.Repeat("f", 64)}
+	facts["peer_ca_certificate"] = FileFact{SHA256: strings.Repeat("f", 64)}
 	changed, err := bindingFromFacts(bindingConfig, strings.Repeat("d", 64), facts, strings.Repeat("e", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.CASHA256 == changed.CASHA256 {
+	if binding.CASHA256["peer"] == changed.CASHA256["peer"] {
 		t.Fatal("changed CA bytes did not change the release binding")
+	}
+}
+
+func TestSeparatedCAValidationRejectsAliasesAndSharedTrustAnchors(t *testing.T) {
+	if err := requireDistinctCAPaths("/tls/peer-ca.pem", "/tls/peer-ca.pem", "/tls/admin-ca.pem"); err == nil || !strings.Contains(err.Error(), "CA paths must be distinct") {
+		t.Fatalf("shared CA path accepted: %v", err)
+	}
+
+	caPEM, _, _ := testCertificateChain(t, true)
+	fingerprints, err := certificateFingerprints(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireDisjointCAFingerprints(map[string]map[string]struct{}{
+		"peer": fingerprints, "client": fingerprints, "admin": {},
+	}); err == nil || !strings.Contains(err.Error(), "share trust anchor") {
+		t.Fatalf("shared CA certificate accepted: %v", err)
 	}
 }
 
@@ -183,9 +214,10 @@ func testCertificateChain(t *testing.T, loopbackSAN bool) ([]byte, []byte, []byt
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverTemplate := &x509.Certificate{SerialNumber: big.NewInt(now.UnixNano() + 1), Subject: pkix.Name{CommonName: "deployment collector test server"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	serverTemplate := &x509.Certificate{SerialNumber: big.NewInt(now.UnixNano() + 1), Subject: pkix.Name{CommonName: "deployment collector test server"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}}
 	if loopbackSAN {
 		serverTemplate.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+		serverTemplate.URIs = []*url.URL{{Scheme: "spiffe", Host: "gosuda.org", Path: "/moreconsensus/replica/1"}}
 	} else {
 		serverTemplate.DNSNames = []string{"wrong.invalid"}
 	}

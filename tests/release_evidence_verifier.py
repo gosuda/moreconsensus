@@ -970,8 +970,8 @@ def verify_item_result(
             + re.escape(str(evidence_root))
             + r" evidence_volume_uuid=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} "
             r"limitations=same-host,loopback-only,no-independent-failure-domain,"
-            r"server-auth-tls-only,no-client-authorization,no-production-capacity,"
-            r"no-off-host-backup release_claim=target-deployment-accepted"
+            r"no-production-capacity,no-off-host-backup "
+            r"release_claim=target-deployment-accepted"
         )
         if re.fullmatch(deployment_pattern, output) is None:
             fail("deployment-manifest verifier output does not match the authoritative v2 target result")

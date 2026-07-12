@@ -24,7 +24,7 @@ const (
 	productionTarget   = "mc-kv-darwin24-arm64-launchd-3n-r1"
 	productionProfile  = "native-darwin24-arm64-launchd-system-domain-v1"
 	productionClaim    = "target-deployment-accepted"
-	productionNonclaim = "same-host,loopback-only,no-independent-failure-domain,server-auth-tls-only,no-client-authorization,no-production-capacity,no-off-host-backup"
+	productionNonclaim = "same-host,loopback-only,no-independent-failure-domain,no-production-capacity,no-off-host-backup"
 )
 
 var (
@@ -61,7 +61,9 @@ type Config struct {
 	PriorBinaryPath           string       `json:"prior_binary_path"`
 	ServiceUser               string       `json:"service_user"`
 	ServiceGroup              string       `json:"service_group"`
-	CAPath                    string       `json:"ca_path"`
+	PeerCAPath                string       `json:"peer_ca_path"`
+	ClientCAPath              string       `json:"client_ca_path"`
+	AdminCAPath               string       `json:"admin_ca_path"`
 	CheckpointRoot            string       `json:"checkpoint_root"`
 	QuarantineRoot            string       `json:"quarantine_root"`
 	Nodes                     []NodeConfig `json:"nodes"`
@@ -97,8 +99,12 @@ type NodeConfig struct {
 	AdminURL                 string   `json:"admin_url"`
 	DataPath                 string   `json:"data_path"`
 	LogPath                  string   `json:"log_path"`
-	ServerCertPath           string   `json:"server_cert_path"`
-	ServerKeyPath            string   `json:"server_key_path"`
+	PeerCertPath             string   `json:"peer_cert_path"`
+	PeerKeyPath              string   `json:"peer_key_path"`
+	ClientCertPath           string   `json:"client_cert_path"`
+	ClientKeyPath            string   `json:"client_key_path"`
+	AdminCertPath            string   `json:"admin_cert_path"`
+	AdminKeyPath             string   `json:"admin_key_path"`
 }
 
 type Binding struct {
@@ -111,7 +117,7 @@ type Binding struct {
 	BinarySHA256       string            `json:"binary_sha256"`
 	PriorBinarySHA256  string            `json:"prior_binary_sha256"`
 	PlistSHA256        map[string]string `json:"plist_sha256"`
-	CASHA256           string            `json:"ca_sha256"`
+	CASHA256           map[string]string `json:"ca_sha256"`
 	CertificateSHA256  map[string]string `json:"certificate_sha256"`
 	PrivateKeySHA256   map[string]string `json:"private_key_sha256"`
 	StatePublicKeyHash string            `json:"state_public_key_sha256"`
@@ -193,58 +199,58 @@ type PeerConnection struct {
 }
 
 type CanaryObservation struct {
-	Key          string            `json:"key"`
-	ValueSHA256  string            `json:"value_sha256"`
-	PutStatus    int               `json:"put_status"`
+	Key         string            `json:"key"`
+	ValueSHA256 string            `json:"value_sha256"`
+	PutStatus   int               `json:"put_status"`
 	GetStatuses map[string]int    `json:"get_statuses"`
-	Bodies       map[string]string `json:"body_sha256_by_node"`
-	ObservedAt   string            `json:"observed_at_utc"`
+	Bodies      map[string]string `json:"body_sha256_by_node"`
+	ObservedAt  string            `json:"observed_at_utc"`
 }
 
 type ActionReceipt struct {
-	Schema                 string     `json:"schema"`
-	Action                 string     `json:"action"`
-	Nonce                  string     `json:"nonce"`
-	TargetID               string     `json:"target_id"`
-	ReleaseID              string     `json:"release_id"`
-	NodeLabel              string     `json:"node_label"`
-	OldPID                 int        `json:"old_pid"`
-	ReplacementPID         int        `json:"replacement_pid"`
-	OldProcessStart        string     `json:"old_process_start"`
-	NewProcessStart        string     `json:"new_process_start"`
-	PriorBinarySHA256      string     `json:"prior_binary_sha256"`
-	ActiveBinarySHA256     string     `json:"active_binary_sha256"`
-	RollbackRestored       bool       `json:"rollback_restored"`
-	PersistentCanary       bool       `json:"persistent_canary"`
-	AcceptsStopped         bool       `json:"accepts_stopped"`
-	InflightDrained        bool       `json:"inflight_drained"`
-	GracefulExitSeconds    int        `json:"graceful_exit_seconds"`
-	Commands               [][]string `json:"commands"`
-	CommandResults         []Command  `json:"command_results"`
-	ObservedAtUTC          string     `json:"observed_at_utc"`
-	SignerIdentity         string     `json:"signer_identity"`
-	Signature              string     `json:"signature"`
+	Schema              string     `json:"schema"`
+	Action              string     `json:"action"`
+	Nonce               string     `json:"nonce"`
+	TargetID            string     `json:"target_id"`
+	ReleaseID           string     `json:"release_id"`
+	NodeLabel           string     `json:"node_label"`
+	OldPID              int        `json:"old_pid"`
+	ReplacementPID      int        `json:"replacement_pid"`
+	OldProcessStart     string     `json:"old_process_start"`
+	NewProcessStart     string     `json:"new_process_start"`
+	PriorBinarySHA256   string     `json:"prior_binary_sha256"`
+	ActiveBinarySHA256  string     `json:"active_binary_sha256"`
+	RollbackRestored    bool       `json:"rollback_restored"`
+	PersistentCanary    bool       `json:"persistent_canary"`
+	AcceptsStopped      bool       `json:"accepts_stopped"`
+	InflightDrained     bool       `json:"inflight_drained"`
+	GracefulExitSeconds int        `json:"graceful_exit_seconds"`
+	Commands            [][]string `json:"commands"`
+	CommandResults      []Command  `json:"command_results"`
+	ObservedAtUTC       string     `json:"observed_at_utc"`
+	SignerIdentity      string     `json:"signer_identity"`
+	Signature           string     `json:"signature"`
 }
 
 type PendingState struct {
-	Schema             string                 `json:"schema"`
-	Binding            Binding                `json:"binding"`
-	PrebootUUID        string                 `json:"preboot_uuid"`
-	CapturedAtUTC      string                 `json:"captured_at_utc"`
-	Nodes              []ProcessObservation   `json:"nodes"`
-	Health             []HTTPObservation      `json:"health"`
-	Readiness          []HTTPObservation      `json:"readiness"`
-	Metrics            []HTTPObservation      `json:"metrics"`
-	PeerConnections    []PeerConnection       `json:"peer_connections"`
-	Canary             CanaryObservation      `json:"canary"`
-	InstallationReceipt ActionReceipt          `json:"installation_receipt"`
-	CrashReceipt       ActionReceipt          `json:"crash_receipt"`
-	RollbackReceipt    ActionReceipt          `json:"rollback_receipt"`
-	GracefulReceipt    ActionReceipt          `json:"graceful_receipt"`
-	LogSHA256          map[string]string       `json:"log_sha256"`
-	PersistentData     map[string]string       `json:"persistent_data_sha256"`
-	ArtifactSHA256     map[string]string       `json:"artifact_sha256"`
-	CommandTranscripts map[string]Command      `json:"command_transcripts"`
+	Schema              string               `json:"schema"`
+	Binding             Binding              `json:"binding"`
+	PrebootUUID         string               `json:"preboot_uuid"`
+	CapturedAtUTC       string               `json:"captured_at_utc"`
+	Nodes               []ProcessObservation `json:"nodes"`
+	Health              []HTTPObservation    `json:"health"`
+	Readiness           []HTTPObservation    `json:"readiness"`
+	Metrics             []HTTPObservation    `json:"metrics"`
+	PeerConnections     []PeerConnection     `json:"peer_connections"`
+	Canary              CanaryObservation    `json:"canary"`
+	InstallationReceipt ActionReceipt        `json:"installation_receipt"`
+	CrashReceipt        ActionReceipt        `json:"crash_receipt"`
+	RollbackReceipt     ActionReceipt        `json:"rollback_receipt"`
+	GracefulReceipt     ActionReceipt        `json:"graceful_receipt"`
+	LogSHA256           map[string]string    `json:"log_sha256"`
+	PersistentData      map[string]string    `json:"persistent_data_sha256"`
+	ArtifactSHA256      map[string]string    `json:"artifact_sha256"`
+	CommandTranscripts  map[string]Command   `json:"command_transcripts"`
 }
 
 type SignedEnvelope struct {
@@ -254,42 +260,42 @@ type SignedEnvelope struct {
 }
 
 type PostbootState struct {
-	Schema          string                `json:"schema"`
-	PendingSHA256   string                `json:"pending_sha256"`
-	Binding         Binding               `json:"binding"`
-	PrebootUUID     string                `json:"preboot_uuid"`
-	PostbootUUID    string                `json:"postboot_uuid"`
-	CapturedAtUTC   string                `json:"captured_at_utc"`
-	Nodes           []ProcessObservation  `json:"nodes"`
-	Health          []HTTPObservation     `json:"health"`
-	Readiness       []HTTPObservation     `json:"readiness"`
-	Metrics         []HTTPObservation     `json:"metrics"`
-	Canary          CanaryObservation     `json:"canary"`
-	LogSHA256       map[string]string      `json:"log_sha256"`
-	PersistentData  map[string]string      `json:"persistent_data_sha256"`
-	ArtifactSHA256  map[string]string      `json:"artifact_sha256"`
-	ApprovalPayload ApprovalPayload       `json:"approval_payload"`
+	Schema          string               `json:"schema"`
+	PendingSHA256   string               `json:"pending_sha256"`
+	Binding         Binding              `json:"binding"`
+	PrebootUUID     string               `json:"preboot_uuid"`
+	PostbootUUID    string               `json:"postboot_uuid"`
+	CapturedAtUTC   string               `json:"captured_at_utc"`
+	Nodes           []ProcessObservation `json:"nodes"`
+	Health          []HTTPObservation    `json:"health"`
+	Readiness       []HTTPObservation    `json:"readiness"`
+	Metrics         []HTTPObservation    `json:"metrics"`
+	Canary          CanaryObservation    `json:"canary"`
+	LogSHA256       map[string]string    `json:"log_sha256"`
+	PersistentData  map[string]string    `json:"persistent_data_sha256"`
+	ArtifactSHA256  map[string]string    `json:"artifact_sha256"`
+	ApprovalPayload ApprovalPayload      `json:"approval_payload"`
 }
 
 type ApprovalPayload struct {
-	Schema             string            `json:"schema"`
-	TargetID           string            `json:"target_id"`
-	TargetEnvironment  string            `json:"target_environment"`
-	ReleaseID          string            `json:"release_id"`
-	Nonce              string            `json:"nonce"`
-	SourceRevision     string            `json:"source_revision"`
-	SourceTreeSHA256   string            `json:"source_tree_sha256"`
-	BinarySHA256       string            `json:"binary_sha256"`
-	PlistSHA256        map[string]string `json:"plist_sha256"`
-	CASHA256           string            `json:"ca_sha256"`
-	CertificateSHA256  map[string]string `json:"certificate_sha256"`
-	PrebootUUID        string            `json:"preboot_uuid"`
-	PostbootUUID       string            `json:"postboot_uuid"`
-	OperationalSHA256  map[string]string `json:"operational_artifact_sha256"`
+	Schema              string            `json:"schema"`
+	TargetID            string            `json:"target_id"`
+	TargetEnvironment   string            `json:"target_environment"`
+	ReleaseID           string            `json:"release_id"`
+	Nonce               string            `json:"nonce"`
+	SourceRevision      string            `json:"source_revision"`
+	SourceTreeSHA256    string            `json:"source_tree_sha256"`
+	BinarySHA256        string            `json:"binary_sha256"`
+	PlistSHA256         map[string]string `json:"plist_sha256"`
+	CASHA256            map[string]string `json:"ca_sha256"`
+	CertificateSHA256   map[string]string `json:"certificate_sha256"`
+	PrebootUUID         string            `json:"preboot_uuid"`
+	PostbootUUID        string            `json:"postboot_uuid"`
+	OperationalSHA256   map[string]string `json:"operational_artifact_sha256"`
 	WritableStagingPath string            `json:"writable_staging_path"`
 	FinalMountPath      string            `json:"final_mount_path"`
-	ExplicitNonclaims  string            `json:"explicit_nonclaims"`
-	GeneratedAtUTC     string            `json:"generated_at_utc"`
+	ExplicitNonclaims   string            `json:"explicit_nonclaims"`
+	GeneratedAtUTC      string            `json:"generated_at_utc"`
 }
 
 type Approval struct {
@@ -302,7 +308,6 @@ type Approval struct {
 	PayloadSHA256 string `json:"payload_sha256"`
 	Signature     string `json:"signature"`
 }
-
 
 type RehearsalRecord struct {
 	Schema               string               `json:"schema"`
@@ -352,11 +357,14 @@ func (c *Config) validate() error {
 	if len(c.Nodes) != 3 {
 		return errors.New("exactly three nodes are required")
 	}
-	paths := []string{c.SourceRoot, c.BinaryPath, c.PriorBinaryPath, c.CAPath, c.CheckpointRoot, c.QuarantineRoot, c.WorkRoot, c.PendingStatePath, c.WritableStagingRoot, c.FinalImagePath, c.FinalMountPath, c.VerifierPath}
+	paths := []string{c.SourceRoot, c.BinaryPath, c.PriorBinaryPath, c.PeerCAPath, c.ClientCAPath, c.AdminCAPath, c.CheckpointRoot, c.QuarantineRoot, c.WorkRoot, c.PendingStatePath, c.WritableStagingRoot, c.FinalImagePath, c.FinalMountPath, c.VerifierPath}
 	for _, p := range paths {
 		if p == "" || !filepath.IsAbs(p) || strings.ContainsAny(p, "\r\n\x00") {
 			return fmt.Errorf("all configured paths must be nonempty absolute paths: %q", p)
 		}
+	}
+	if err := requireDistinctCAPaths(c.PeerCAPath, c.ClientCAPath, c.AdminCAPath); err != nil {
+		return err
 	}
 	if c.Profile == "production" {
 		for _, p := range []string{
@@ -417,7 +425,7 @@ func (c *Config) validate() error {
 		if len(n.ExpectedProgramArguments) < 3 || n.ExpectedProgramArguments[0] != c.BinaryPath {
 			return fmt.Errorf("node %d expected argv must begin with the bound binary", n.ID)
 		}
-		for _, p := range []string{n.DataPath, n.LogPath, n.ServerCertPath, n.ServerKeyPath} {
+		for _, p := range []string{n.DataPath, n.LogPath, n.PeerCertPath, n.PeerKeyPath, n.ClientCertPath, n.ClientKeyPath, n.AdminCertPath, n.AdminKeyPath} {
 			if !filepath.IsAbs(p) || seenPaths[p] {
 				return fmt.Errorf("node %d path is relative or reused: %s", n.ID, p)
 			}
@@ -459,6 +467,18 @@ func validateLoopbackURL(raw string, requireTLS bool) error {
 
 func utc(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
+func requireDistinctCAPaths(paths ...string) error {
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		clean := filepath.Clean(path)
+		if _, exists := seen[clean]; exists {
+			return errors.New("peer, client, and admin CA paths must be distinct")
+		}
+		seen[clean] = struct{}{}
+	}
+	return nil
+}
+
 func utcSeconds(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 func canonicalProgramArguments(config Config, node NodeConfig) []string {
@@ -473,12 +493,29 @@ func canonicalProgramArguments(config Config, node NodeConfig) []string {
 		"-request-deadline-ms", "5000",
 		"-peer-deadline-ms", "2000",
 		"-max-client-body-bytes", "1048576",
-		"-max-peer-body-bytes", "1048576",
+		"-max-peer-body-bytes", "2097152",
 		"-max-admin-body-bytes", "65536",
 		"-max-scan-limit", "1000",
-		"-tls-cert", node.ServerCertPath,
-		"-tls-key", node.ServerKeyPath,
-		"-tls-ca", config.CAPath,
+		"-production=true",
+		"-peer-tls-cert", node.PeerCertPath,
+		"-peer-tls-key", node.PeerKeyPath,
+		"-peer-tls-ca", config.PeerCAPath,
+		"-client-tls-cert", node.ClientCertPath,
+		"-client-tls-key", node.ClientKeyPath,
+		"-client-client-ca", config.ClientCAPath,
+		"-admin-tls-cert", node.AdminCertPath,
+		"-admin-tls-key", node.AdminKeyPath,
+		"-admin-client-ca", config.AdminCAPath,
+		"-pebble-cache-bytes", "8388608",
+		"-pebble-memtable-bytes", "4194304",
+		"-pebble-memtable-stop-writes", "2",
+		"-pebble-max-open-files", "1000",
+		"-pebble-max-concurrent-compactions", "1",
+		"-pebble-bytes-per-sync", "524288",
+		"-pebble-wal-bytes-per-sync", "0",
+		"-retention-max-resident-instances", "100000",
+		"-retention-max-durable-records", "100000",
+		"-retention-max-data-bytes", "10737418240",
 	}
 }
 

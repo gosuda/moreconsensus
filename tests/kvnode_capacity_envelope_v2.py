@@ -343,6 +343,12 @@ def validate_schema_contract() -> None:
     for field in ("campaign", "binary", "intermediate", "approval"):
         if field not in production_root["required"] or field not in production_properties:
             fail(f"production capacity v2 schema omits emitted field {field}")
+    native_schema = production_root["$defs"]["nativeEnvironment"]["properties"]
+    workload_schema = production_root["$defs"]["supportEnvelope"]["properties"]["workload"]
+    if native_schema["tls_scope"].get("const") != "mutual-auth-separated-planes":
+        fail("production capacity schema must require separated-plane mutual TLS")
+    if "value_sizes_bytes" not in workload_schema["required"] or workload_schema["properties"]["value_sizes_bytes"].get("const") != [64, 1024, 65536, 1048576]:
+        fail("production capacity schema must require the exact four value-size cells")
     test_schema_path = (
         Path(__file__).resolve().parents[1]
         / "release/evidence/schema/kvnode-production-capacity-test-fixture-v2.schema.json"
@@ -1082,7 +1088,7 @@ def collect(config_path: Path, out_dir: Path) -> Path:
     return measurement_path
 
 
-def validate_native_environment(value: Any) -> dict[str, Any]:
+def validate_native_environment(value: Any, expected_tls_scope: str = "server-auth-only") -> dict[str, Any]:
     required = {
         "platform",
         "architecture",
@@ -1108,7 +1114,7 @@ def validate_native_environment(value: Any) -> dict[str, Any]:
         "launchd_domain": "system",
         "filesystem": "apfs",
         "network_scope": "same-host-loopback",
-        "tls_scope": "server-auth-only",
+        "tls_scope": expected_tls_scope,
     }
     for key, wanted in expected.items():
         if environment[key] != wanted:
@@ -2110,7 +2116,7 @@ def validate_support_envelope(value: Any) -> dict[str, Any]:
             "operation_sequence",
             "key_seed",
             "key_count",
-            "value_bytes",
+            "value_sizes_bytes",
             "warmup_operations",
             "measurement_operations",
             "concurrency",
@@ -2124,7 +2130,9 @@ def validate_support_envelope(value: Any) -> dict[str, Any]:
     if re.fullmatch(r"[A-Za-z0-9._-]+", workload["key_seed"]) is None:
         fail("support_envelope.workload.key_seed must be URL-safe deterministic text")
     require_int(workload["key_count"], "support_envelope.workload.key_count", minimum=1, maximum=10_000_000)
-    require_int(workload["value_bytes"], "support_envelope.workload.value_bytes", minimum=1, maximum=4 * 1024 * 1024)
+    value_sizes = workload["value_sizes_bytes"]
+    if value_sizes != [64, 1024, 65536, 1048576]:
+        fail("support_envelope.workload.value_sizes_bytes must equal [64,1024,65536,1048576]")
     warmup_operations = require_int(workload["warmup_operations"], "support_envelope.workload.warmup_operations", minimum=1)
     measurement_operations = require_int(workload["measurement_operations"], "support_envelope.workload.measurement_operations", minimum=1)
     concurrency = require_int(workload["concurrency"], "support_envelope.workload.concurrency", minimum=1, maximum=64)
@@ -2348,9 +2356,15 @@ def validate_production_isolation(
                 "client_url",
                 "peer_url",
                 "admin_url",
-                "server_cert_path",
-                "server_key_path",
-                "tls_ca_path",
+                "peer_cert_path",
+                "peer_key_path",
+                "peer_ca_path",
+                "client_cert_path",
+                "client_key_path",
+                "client_ca_path",
+                "admin_cert_path",
+                "admin_key_path",
+                "admin_ca_path",
                 "program_arguments",
                 "listener_owner_pid",
                 "listener_observation_provenance",
@@ -2370,8 +2384,12 @@ def validate_production_isolation(
         for url_name in ("client_url", "peer_url", "admin_url"):
             url = require_string(node[url_name], f"{repetition_id} isolation node {index}.{url_name}", maximum=256)
             if re.fullmatch(r"https://127\.0\.0\.1:[0-9]{1,5}", url) is None:
-                fail(f"{repetition_id} isolation node {index}.{url_name} is not loopback HTTPS")
-        for path_name in ("server_cert_path", "server_key_path", "tls_ca_path"):
+                fail(f"{repetition_id} isolation node {index}.{url_name} must be loopback HTTPS")
+        for path_name in (
+            "peer_cert_path", "peer_key_path", "peer_ca_path",
+            "client_cert_path", "client_key_path", "client_ca_path",
+            "admin_cert_path", "admin_key_path", "admin_ca_path",
+        ):
             path = require_string(node[path_name], f"{repetition_id} isolation node {index}.{path_name}", maximum=1024)
             if not path.startswith("/"):
                 fail(f"{repetition_id} isolation node {index}.{path_name} must be absolute")
@@ -2386,12 +2404,29 @@ def validate_production_isolation(
             "-request-deadline-ms", "5000",
             "-peer-deadline-ms", "2000",
             "-max-client-body-bytes", "1048576",
-            "-max-peer-body-bytes", "1048576",
+            "-max-peer-body-bytes", "2097152",
             "-max-admin-body-bytes", "65536",
             "-max-scan-limit", "1000",
-            "-tls-cert", node["server_cert_path"],
-            "-tls-key", node["server_key_path"],
-            "-tls-ca", node["tls_ca_path"],
+            "-production=true",
+            "-peer-tls-cert", node["peer_cert_path"],
+            "-peer-tls-key", node["peer_key_path"],
+            "-peer-tls-ca", node["peer_ca_path"],
+            "-client-tls-cert", node["client_cert_path"],
+            "-client-tls-key", node["client_key_path"],
+            "-client-client-ca", node["client_ca_path"],
+            "-admin-tls-cert", node["admin_cert_path"],
+            "-admin-tls-key", node["admin_key_path"],
+            "-admin-client-ca", node["admin_ca_path"],
+            "-pebble-cache-bytes", "8388608",
+            "-pebble-memtable-bytes", "4194304",
+            "-pebble-memtable-stop-writes", "2",
+            "-pebble-max-open-files", "1000",
+            "-pebble-max-concurrent-compactions", "1",
+            "-pebble-bytes-per-sync", "524288",
+            "-pebble-wal-bytes-per-sync", "0",
+            "-retention-max-resident-instances", "100000",
+            "-retention-max-durable-records", "100000",
+            "-retention-max-data-bytes", "10737418240",
         ]
         if (
             node["launchd_label"] != label
@@ -2424,6 +2459,10 @@ def validate_production_isolation(
             "observed_at_utc",
             "observation_provenance",
             "workload_sha256",
+            "client_cert_path",
+            "client_key_path",
+            "client_ca_path",
+            "client_cert_sha256",
         },
         f"{repetition_id} workload generator",
     )
@@ -2432,6 +2471,10 @@ def validate_production_isolation(
     workload_executable = require_string(workload["executable_path"], f"{repetition_id} workload generator.executable_path", maximum=1024)
     workload_observed_at = parse_utc(workload["observed_at_utc"], f"{repetition_id} workload generator.observed_at_utc")
     workload_arguments = workload["program_arguments"]
+    client_cert_path = require_string(workload["client_cert_path"], f"{repetition_id} workload generator.client_cert_path", maximum=1024)
+    client_key_path = require_string(workload["client_key_path"], f"{repetition_id} workload generator.client_key_path", maximum=1024)
+    client_ca_path = require_string(workload["client_ca_path"], f"{repetition_id} workload generator.client_ca_path", maximum=1024)
+    client_cert_sha256 = require_sha256(workload["client_cert_sha256"], f"{repetition_id} workload generator.client_cert_sha256")
     if (
         workload_pid in node_pids
         or not workload_executable.startswith("/")
@@ -2439,18 +2482,22 @@ def validate_production_isolation(
         or not workload_arguments
         or workload_arguments[0] != workload_executable
         or any(not isinstance(argument, str) or not argument or any(character.isspace() for character in argument) for argument in workload_arguments)
+        or not all(path.startswith("/") for path in (client_cert_path, client_key_path, client_ca_path))
+        or workload_arguments[-6:] != ["--client-cert", client_cert_path, "--client-key", client_key_path, "--ca", client_ca_path]
+        or client_cert_sha256 == "0" * 64
         or workload["observation_provenance"] != "darwin-libproc-proc_pidpath-rusage-v2"
         or workload["workload_sha256"] != canonical_json_sha256(repetition["support_envelope"]["workload"])
         or not repetition_started <= workload_observed_at <= repetition_completed
     ):
         fail(f"{repetition_id} workload generator is not bound to the declared same-host workload")
     commands = isolation["observed_commands"]
-    if not isinstance(commands, list) or len(commands) != 13:
-        fail(f"{repetition_id} isolation evidence must contain the exact thirteen raw Darwin observations")
+    if not isinstance(commands, list) or len(commands) != 14:
+        fail(f"{repetition_id} isolation evidence must contain the exact fourteen raw Darwin observations")
     observed_sysctl = False
     observed_pmset_custom = False
     observed_pmset_batt = False
     observed_ps = False
+    observed_client_cert_hash = False
     observed_launchd_labels: set[str] = set()
     observed_stat_dirs: set[str] = set()
     observed_diskutil_dirs: set[str] = set()
@@ -2486,6 +2533,11 @@ def validate_production_isolation(
                 fail(f"{repetition_id} process-list command is not the exact same-host observation")
             observed_ps = True
             ps_output = stdout
+        elif argv[0] == "/usr/bin/shasum":
+            expected_output = f"{client_cert_sha256}  {client_cert_path}"
+            if observed_client_cert_hash or argv != ["/usr/bin/shasum", "-a", "256", client_cert_path] or stdout.strip() != expected_output:
+                fail(f"{repetition_id} workload client certificate hash observation is invalid")
+            observed_client_cert_hash = True
         elif argv[0] == "/bin/launchctl":
             if len(argv) != 3 or argv[1] != "print" or not argv[2].startswith("system/"):
                 fail(f"{repetition_id} launchctl command is invalid")
@@ -2504,8 +2556,8 @@ def validate_production_isolation(
             observed_diskutil_dirs.add(argv[2])
         else:
             fail(f"{repetition_id} isolation evidence contains an unexpected command")
-    if not observed_sysctl or not observed_pmset_custom or not observed_pmset_batt or not observed_ps:
-        fail(f"{repetition_id} isolation evidence omits a required Darwin observation")
+    if not observed_sysctl or not observed_pmset_custom or not observed_pmset_batt or not observed_ps or not observed_client_cert_hash:
+        fail(f"{repetition_id} isolation evidence omits a required Darwin or client-certificate observation")
     if observed_launchd_labels != set(expected_launchd_pids):
         fail(f"{repetition_id} launchd observations do not bind all exact node PIDs")
     if observed_stat_dirs != expected_data_dirs or observed_diskutil_dirs != expected_data_dirs:
@@ -2540,6 +2592,7 @@ def validate_production_requests(
     binding: dict[str, Any],
     repetition: dict[str, Any],
     workload: dict[str, Any],
+    expected_client_cert_sha256: str,
     isolation_nodes: list[dict[str, Any]],
     native_environment: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, tuple[int, int]]]:
@@ -2554,9 +2607,10 @@ def validate_production_requests(
             repetition["measurement_completed_monotonic_ns"],
         ),
     }
+    value_sizes = workload["value_sizes_bytes"]
     expected_counts = {
-        "warmup": workload["warmup_operations"],
-        "measurement": workload["measurement_operations"],
+        "warmup": workload["warmup_operations"] * len(value_sizes),
+        "measurement": workload["measurement_operations"] * len(value_sizes),
     }
     expected_nodes = {node["node_id"]: node for node in isolation_nodes}
     phase_rows: dict[str, list[dict[str, Any]]] = {"warmup": [], "measurement": []}
@@ -2578,6 +2632,7 @@ def validate_production_requests(
                 "request_url",
                 "listener_owner_pid",
                 "tls_ca_sha256",
+                "client_cert_sha256",
                 "started_utc",
                 "started_monotonic_ns",
                 "ended_monotonic_ns",
@@ -2595,14 +2650,19 @@ def validate_production_requests(
         if phase not in phase_rows:
             fail(f"{repetition_id} request observation {index} phase is invalid")
         operation_index = require_int(row["operation_index"], f"{repetition_id} request observation {index}.operation_index", minimum=0)
-        expected_operation = workload["operation_sequence"][operation_index % len(workload["operation_sequence"])]
+        operations_per_size = workload[f"{phase}_operations"]
+        size_index = operation_index // operations_per_size
+        local_index = operation_index % operations_per_size
+        if size_index >= len(value_sizes):
+            fail(f"{repetition_id} request observation {index} exceeds declared size cells")
+        expected_operation = workload["operation_sequence"][local_index % len(workload["operation_sequence"])]
         if row["operation"] != expected_operation:
             fail(f"{repetition_id} request observation {index} violates the deterministic operation sequence")
-        if row["key_index"] != operation_index % workload["key_count"] or row["value_bytes"] != workload["value_bytes"]:
-            fail(f"{repetition_id} request observation {index} violates the deterministic key/value workload")
-        node_id = operation_index % 3 + 1
+        if row["key_index"] != local_index % workload["key_count"] or row["value_bytes"] != value_sizes[size_index]:
+            fail(f"{repetition_id} request observation {index} violates the deterministic key/value size cell")
+        node_id = local_index % 3 + 1
         expected_node = expected_nodes.get(node_id)
-        key = f"{workload['key_seed']}-{row['key_index']:08d}"
+        key = f"{workload['key_seed']}-{local_index % workload['key_count']:08d}"
         expected_url = (
             expected_node["client_url"] + f"/scan?prefix={key}&limit=16"
             if expected_operation == "scan"
@@ -2613,6 +2673,7 @@ def validate_production_requests(
             or expected_node is None
             or row["request_url"] != expected_url
             or row["listener_owner_pid"] != expected_node["pid"]
+            or row["client_cert_sha256"] != expected_client_cert_sha256
             or row["tls_ca_sha256"] != native_environment["tls_ca_sha256"]
         ):
             fail(f"{repetition_id} request observation {index} is not bound to the exact node listener and TLS CA")
@@ -2895,7 +2956,7 @@ def validate_production_repetition(
         fail(f"{repetition_id} sequence or campaign count is invalid")
     if binding_from(repetition["target"], f"{repetition_id}.target") != binding:
         fail(f"{repetition_id} target binding does not match the campaign")
-    if validate_native_environment(repetition["native_environment"]) != native_environment:
+    if validate_native_environment(repetition["native_environment"], "mutual-auth-separated-planes") != native_environment:
         fail(f"{repetition_id} native environment does not match the campaign")
     if validate_support_envelope(repetition["support_envelope"]) != support_envelope:
         fail(f"{repetition_id} support envelope does not match the campaign")
@@ -2935,6 +2996,7 @@ def validate_production_repetition(
         binding,
         repetition,
         support_envelope["workload"],
+        isolation["workload_generator"]["client_cert_sha256"],
         isolation["nodes"],
         native_environment,
     )
@@ -3001,7 +3063,7 @@ def validate_production_campaign(
         fail("production capacity campaign identity or non-certification state is invalid")
     operator = require_string(campaign["operator_identity"], "production capacity campaign.operator_identity", maximum=128)
     binding = binding_from(campaign["target"], "production capacity campaign.target")
-    native_environment = validate_native_environment(campaign["native_environment"])
+    native_environment = validate_native_environment(campaign["native_environment"], "mutual-auth-separated-planes")
     support_envelope = validate_support_envelope(campaign["support_envelope"])
     thresholds = validate_production_thresholds(campaign["thresholds"])
     binary_path = root / "kvnode"

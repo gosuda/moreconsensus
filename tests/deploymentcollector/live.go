@@ -263,8 +263,8 @@ func rejectEvidenceRedirect(request *http.Request, via []*http.Request) error {
 	return fmt.Errorf("evidence HTTP redirect refused from %s to %s", from, request.URL.String())
 }
 
-func deploymentHTTPClient(config Config) (*http.Client, error) {
-	ca, _, err := readSecureRegular(config.CAPath, 16<<20)
+func deploymentHTTPClient(config Config, caPath, certPath, keyPath string) (*http.Client, error) {
+	ca, _, err := readSecureRegular(caPath, 16<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +272,16 @@ func deploymentHTTPClient(config Config) (*http.Client, error) {
 	if !roots.AppendCertsFromPEM(ca) {
 		return nil, errors.New("CA bundle is malformed")
 	}
-	return &http.Client{Timeout: time.Duration(config.RequestTimeoutSeconds) * time.Second, CheckRedirect: rejectEvidenceRedirect, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}}, nil
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load evidence client identity: %w", err)
+	}
+	tlsConfig := &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13}
+	return &http.Client{
+		Timeout:       time.Duration(config.RequestTimeoutSeconds) * time.Second,
+		CheckRedirect: rejectEvidenceRedirect,
+		Transport:     &http.Transport{TLSClientConfig: tlsConfig},
+	}, nil
 }
 
 func observeEndpoint(client *http.Client, nodeID int, kind, rawURL string) (HTTPObservation, error) {
@@ -299,12 +308,12 @@ func observeEndpoint(client *http.Client, nodeID int, kind, rawURL string) (HTTP
 }
 
 func observeServiceEndpoints(config Config) ([]HTTPObservation, []HTTPObservation, []HTTPObservation, error) {
-	client, err := deploymentHTTPClient(config)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 	health, readiness, metrics := make([]HTTPObservation, 0, 3), make([]HTTPObservation, 0, 3), make([]HTTPObservation, 0, 3)
 	for _, node := range config.Nodes {
+		client, err := deploymentHTTPClient(config, config.AdminCAPath, node.AdminCertPath, node.AdminKeyPath)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 		for kind, suffix := range map[string]string{"health": "/healthz", "readiness": "/readyz", "metrics": "/metrics"} {
 			observation, err := observeEndpoint(client, node.ID, kind, strings.TrimRight(node.AdminURL, "/")+suffix)
 			if err != nil {
@@ -327,13 +336,13 @@ func observeServiceEndpoints(config Config) ([]HTTPObservation, []HTTPObservatio
 }
 
 func observeCanary(config Config, key string, value []byte, create bool) (CanaryObservation, error) {
-	client, err := deploymentHTTPClient(config)
-	if err != nil {
-		return CanaryObservation{}, err
-	}
 	result := CanaryObservation{Key: key, ValueSHA256: digestBytes(value), GetStatuses: map[string]int{}, Bodies: map[string]string{}, ObservedAt: utc(time.Now())}
 	if create {
 		request, err := http.NewRequest(http.MethodPut, strings.TrimRight(config.Nodes[0].ClientURL, "/")+"/kv/"+url.PathEscape(key), bytes.NewReader(value))
+		if err != nil {
+			return CanaryObservation{}, err
+		}
+		client, err := deploymentHTTPClient(config, config.ClientCAPath, config.Nodes[0].ClientCertPath, config.Nodes[0].ClientKeyPath)
 		if err != nil {
 			return CanaryObservation{}, err
 		}
@@ -350,6 +359,10 @@ func observeCanary(config Config, key string, value []byte, create bool) (Canary
 	}
 	deadline := time.Now().Add(time.Duration(config.ObservationTimeoutSeconds) * time.Second)
 	for _, node := range config.Nodes {
+		client, err := deploymentHTTPClient(config, config.ClientCAPath, node.ClientCertPath, node.ClientKeyPath)
+		if err != nil {
+			return CanaryObservation{}, err
+		}
 		for {
 			response, err := client.Get(strings.TrimRight(node.ClientURL, "/") + "/kv/" + url.PathEscape(key))
 			if err == nil {
@@ -371,11 +384,11 @@ func observeCanary(config Config, key string, value []byte, create bool) (Canary
 }
 
 func warmAndObserveDirectedPeers(config Config, runner commandRunner) ([]PeerConnection, error) {
-	client, err := deploymentHTTPClient(config)
-	if err != nil {
-		return nil, err
-	}
 	for _, source := range config.Nodes {
+		client, err := deploymentHTTPClient(config, config.ClientCAPath, source.ClientCertPath, source.ClientKeyPath)
+		if err != nil {
+			return nil, err
+		}
 		key := fmt.Sprintf("deployment-peer-probe-%s-%d", config.Nonce, source.ID)
 		request, _ := http.NewRequest(http.MethodPut, strings.TrimRight(source.ClientURL, "/")+"/kv/"+key, strings.NewReader(config.ReleaseID))
 		response, err := client.Do(request)
@@ -725,7 +738,7 @@ func preboot(config Config, runner commandRunner) (PendingState, error) {
 		"nodes": nodes, "health": health, "readiness": readiness, "metrics": metrics, "canary": canary,
 		"peer_connections": connections, "logs": logs, "persistent_data": persistent,
 		"installation_receipt": json.RawMessage(installationRaw),
-		"crash_receipt": json.RawMessage(crashRaw), "rollback_receipt": json.RawMessage(rollbackRaw), "graceful_receipt": json.RawMessage(gracefulRaw),
+		"crash_receipt":        json.RawMessage(crashRaw), "rollback_receipt": json.RawMessage(rollbackRaw), "graceful_receipt": json.RawMessage(gracefulRaw),
 		"commands": commands,
 	}
 	hashes, err := writeStageArtifacts(filepath.Join(config.WorkRoot, "preboot"), artifacts)

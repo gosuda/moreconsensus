@@ -240,7 +240,6 @@ func validateIndependentApprovals(operator Approval, operatorKey []byte, reviewe
 	return nil
 }
 
-
 func buildOperationalArtifacts(config Config, inspection Inspection, pending PendingState, postboot PostbootState) (map[string][]byte, error) {
 	artifacts := make(map[string][]byte, len(operationalCategories))
 	binary, _, err := readSecureRegular(config.BinaryPath, maxEvidenceFile)
@@ -319,8 +318,10 @@ func buildOperationalArtifacts(config Config, inspection Inspection, pending Pen
 		"final_evidence_root_external=true", "final_evidence_image_format=udro",
 	}, nil)
 	artifacts["tls"] = artifactLines([]string{
-		"tls_scope=server-authentication-only", "mutual_tls=false", "client_authorization=false", "tls_ca_path=" + config.CAPath,
-		"tls_ca_sha256=" + postboot.Binding.CASHA256, "tls_minimum_version=TLS1.2", "tls_verification=custom-ca-chain-and-ip-san",
+		"tls_scope=mutual-auth-separated-planes", "mutual_tls=true", "client_authorization=true",
+		"peer_tls_ca_path=" + config.PeerCAPath, "client_tls_ca_path=" + config.ClientCAPath, "admin_tls_ca_path=" + config.AdminCAPath,
+		"peer_tls_ca_sha256=" + postboot.Binding.CASHA256["peer"], "client_tls_ca_sha256=" + postboot.Binding.CASHA256["client"], "admin_tls_ca_sha256=" + postboot.Binding.CASHA256["admin"],
+		"tls_minimum_version=TLS1.3", "tls_verification=disjoint-custom-ca-chains-hostname-uri-san-and-client-certificate",
 	}, map[string]any{"ca_sha256": postboot.Binding.CASHA256, "certificate_sha256": postboot.Binding.CertificateSHA256, "private_key_sha256": postboot.Binding.PrivateKeySHA256})
 	artifacts["peer_connectivity"] = artifactLines([]string{"directed_peer_probe_count=6", "transport=tls", "connection_state=ESTABLISHED"}, pending.PeerConnections)
 	artifacts["resource_limits"] = artifactLines([]string{"source=reviewed-launchdaemon-plists-and-live-launchctl-system-records", "node_count=3"}, map[string]any{"inspection": inspection.Transcripts, "postboot": postboot.Nodes})
@@ -408,7 +409,7 @@ func buildV2Input(config Config, inspection Inspection, pending PendingState, po
 		{"binary_source_revision", config.SourceRevision}, {"binary_immutable", "true"}, {"source_revision", config.SourceRevision},
 		{"service_user", config.ServiceUser}, {"service_group", config.ServiceGroup}, {"service_uid", inspection.ServiceUID}, {"service_gid", inspection.ServiceGID},
 		{"service_permissions_profile", "dedicated-non-root-least-privilege"}, {"host_topology", "single-darwin-host"}, {"network_scope", "loopback-only"},
-		{"tls_scope", "server-authentication-only"}, {"tls_ca_path", config.CAPath}, {"mutual_tls", "false"}, {"client_authorization", "false"}, {"nonclaims", productionNonclaim},
+		{"tls_scope", "mutual-auth-separated-planes"}, {"peer_tls_ca_path", config.PeerCAPath}, {"client_tls_ca_path", config.ClientCAPath}, {"admin_tls_ca_path", config.AdminCAPath}, {"mutual_tls", "true"}, {"client_authorization", "true"}, {"nonclaims", productionNonclaim},
 		{"boot_observation", "real-host-reboot"}, {"boot_observation_synthetic", "false"}, {"boot_uuid_before", pending.PrebootUUID}, {"boot_uuid_after", postboot.PostbootUUID},
 		{"graceful_signal", "SIGTERM"}, {"graceful_accepts_stopped", "true"}, {"graceful_inflight_drained", "true"},
 		{"graceful_exit_seconds", strconv.Itoa(pending.GracefulReceipt.GracefulExitSeconds)}, {"graceful_durable_canary", "pass"},
@@ -423,8 +424,10 @@ func buildV2Input(config Config, inspection Inspection, pending PendingState, po
 			[2]string{fmt.Sprintf("node_%d_label", n), node.Label}, [2]string{fmt.Sprintf("node_%d_pid", n), strconv.Itoa(observed.PID)},
 			[2]string{fmt.Sprintf("node_%d_client_listener", n), observed.ClientListener}, [2]string{fmt.Sprintf("node_%d_peer_listener", n), observed.PeerListener},
 			[2]string{fmt.Sprintf("node_%d_admin_listener", n), observed.AdminListener}, [2]string{fmt.Sprintf("node_%d_data_directory", n), node.DataPath},
-			[2]string{fmt.Sprintf("node_%d_plist_path", n), node.PlistPath}, [2]string{fmt.Sprintf("node_%d_tls_cert_path", n), node.ServerCertPath},
-			[2]string{fmt.Sprintf("node_%d_tls_key_path", n), node.ServerKeyPath}, [2]string{fmt.Sprintf("node_%d_plist_sha256", n), postboot.Binding.PlistSHA256[node.Label]},
+			[2]string{fmt.Sprintf("node_%d_plist_path", n), node.PlistPath}, [2]string{fmt.Sprintf("node_%d_peer_tls_cert_path", n), node.PeerCertPath},
+			[2]string{fmt.Sprintf("node_%d_peer_tls_key_path", n), node.PeerKeyPath}, [2]string{fmt.Sprintf("node_%d_client_tls_cert_path", n), node.ClientCertPath},
+			[2]string{fmt.Sprintf("node_%d_client_tls_key_path", n), node.ClientKeyPath}, [2]string{fmt.Sprintf("node_%d_admin_tls_cert_path", n), node.AdminCertPath},
+			[2]string{fmt.Sprintf("node_%d_admin_tls_key_path", n), node.AdminKeyPath}, [2]string{fmt.Sprintf("node_%d_plist_sha256", n), postboot.Binding.PlistSHA256[node.Label]},
 			[2]string{fmt.Sprintf("node_%d_plutil_lint_result", n), "pass"}, [2]string{fmt.Sprintf("node_%d_launchd_bootstrap_result", n), "pass"},
 			[2]string{fmt.Sprintf("node_%d_launchd_print_result", n), "pass"}, [2]string{fmt.Sprintf("node_%d_program_arguments_sha256", n), argvHash},
 			[2]string{fmt.Sprintf("node_%d_launchctl_program_arguments_sha256", n), observed.ArgumentsSHA256}, [2]string{fmt.Sprintf("node_%d_process_arguments_sha256", n), observed.ArgumentsSHA256},

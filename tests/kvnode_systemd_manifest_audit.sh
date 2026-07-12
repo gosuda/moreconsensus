@@ -143,7 +143,12 @@ rendered=(
 if [[ -n "$KVNODE_TLS_ARGS" ]]; then
   read -r -a tls_args <<< "$KVNODE_TLS_ARGS"
   for arg in "${tls_args[@]}"; do
-    [[ "$arg" == -tls-cert=* || "$arg" == -tls-key=* || "$arg" == -tls-ca=* ]] || fail "unexpected TLS arg: $arg"
+    case "$arg" in
+      -peer-tls-cert=*|-peer-tls-key=*|-peer-tls-ca=*|\
+      -client-tls-cert=*|-client-tls-key=*|-client-client-ca=*|\
+      -admin-tls-cert=*|-admin-tls-key=*|-admin-client-ca=*) ;;
+      *) fail "unexpected TLS arg: $arg" ;;
+    esac
     rendered+=("$arg")
   done
 fi

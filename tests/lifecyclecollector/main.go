@@ -13,16 +13,16 @@ import (
 )
 
 const (
-	productionTargetID        = "mc-kv-darwin24-arm64-launchd-3n-r1"
-	productionClusterID       = "mc-kv-darwin24-3n-r1"
-	productionProfile         = "native-darwin24-arm64-launchd-system-domain-v1"
-	rehearsalTargetID         = "mc-kv-darwin24-arm64-direct-3n-rehearsal-r1"
-	rehearsalClusterID        = "mc-kv-darwin24-direct-3n-rehearsal-r1"
-	rehearsalProfile          = "native-darwin24-arm64-direct-process-rehearsal-v1"
-	collectionSchema          = "moreconsensus.lifecycle-collection.v1"
-	rehearsalEnvelopeSchema   = "moreconsensus.lifecycle-rehearsal-evidence.v1"
+	productionTargetID       = "mc-kv-darwin24-arm64-launchd-3n-r1"
+	productionClusterID      = "mc-kv-darwin24-3n-r1"
+	productionProfile        = "native-darwin24-arm64-launchd-system-domain-v1"
+	rehearsalTargetID        = "mc-kv-darwin24-arm64-direct-3n-rehearsal-r1"
+	rehearsalClusterID       = "mc-kv-darwin24-direct-3n-rehearsal-r1"
+	rehearsalProfile         = "native-darwin24-arm64-direct-process-rehearsal-v1"
+	collectionSchema         = "moreconsensus.lifecycle-collection.v1"
+	rehearsalEnvelopeSchema  = "moreconsensus.lifecycle-rehearsal-evidence.v1"
 	commandObservationSchema = "moreconsensus.lifecycle-command-observation.v1"
-	verifierVersion           = "2.0.0"
+	verifierVersion          = "2.0.0"
 )
 
 type collectConfig struct {
@@ -35,7 +35,15 @@ type collectConfig struct {
 	sourceTreeSHA256  string
 	kvnodeBinary      string
 	checkpointBinary  string
-	tlsCA             string
+	clientTLSCA       string
+	clientTLSCert     string
+	clientTLSKey      string
+	adminTLSCA        string
+	adminTLSCert      string
+	adminTLSKey       string
+	peerTLSCA         string
+	peerTLSCerts      [3]string
+	peerTLSKeys       [3]string
 	clientURLs        [3]string
 	peerURLs          [3]string
 	adminURLs         [3]string
@@ -58,12 +66,12 @@ type collectConfig struct {
 }
 
 type finalizeConfig struct {
-	stagingPath     string
-	outputImage     string
-	mountPath       string
-	operatorSignoff string
-	reviewerSignoff string
-	verifierPath    string
+	stagingPath      string
+	outputImage      string
+	mountPath        string
+	operatorSignoff  string
+	reviewerSignoff  string
+	verifierPath     string
 	operationTimeout time.Duration
 }
 
@@ -129,7 +137,15 @@ func parseCollectConfig(args []string) (collectConfig, error) {
 	flags.StringVar(&cfg.sourceTreeSHA256, "source-tree-sha256", "", "optional expected exact source-tree SHA-256")
 	flags.StringVar(&cfg.kvnodeBinary, "kvnode-binary", "", "exact release kvnode binary")
 	flags.StringVar(&cfg.checkpointBinary, "kvcheckpoint-binary", "", "exact release kvcheckpoint binary")
-	flags.StringVar(&cfg.tlsCA, "tls-ca", "", "explicit PEM CA for production HTTPS probes")
+	flags.StringVar(&cfg.clientTLSCA, "client-tls-ca", "", "exclusive PEM CA for production client-plane HTTPS probes")
+	flags.StringVar(&cfg.clientTLSCert, "client-tls-cert", "", "PEM client identity for production client-plane probes")
+	flags.StringVar(&cfg.clientTLSKey, "client-tls-key", "", "private key for production client-plane probes")
+	flags.StringVar(&cfg.adminTLSCA, "admin-tls-ca", "", "exclusive PEM CA for production admin-plane HTTPS probes")
+	flags.StringVar(&cfg.adminTLSCert, "admin-tls-cert", "", "PEM client identity for production admin-plane probes")
+	flags.StringVar(&cfg.adminTLSKey, "admin-tls-key", "", "private key for production admin-plane probes")
+	flags.StringVar(&cfg.peerTLSCA, "peer-tls-ca", "", "exclusive PEM CA for production peer identities")
+	peerTLSCerts := flags.String("peer-tls-certs", "", "three comma-separated peer certificate paths ordered by replica ID")
+	peerTLSKeys := flags.String("peer-tls-keys", "", "three comma-separated peer private key paths ordered by replica ID")
 	clientURLs := flags.String("client-urls", "", "three comma-separated client URLs")
 	peerURLs := flags.String("peer-urls", "", "three comma-separated peer URLs; required with --start-direct")
 	adminURLs := flags.String("admin-urls", "", "three comma-separated admin URLs")
@@ -215,24 +231,62 @@ func parseCollectConfig(args []string) (collectConfig, error) {
 			return collectConfig{}, err
 		}
 	}
+	if *peerTLSCerts != "" {
+		if cfg.peerTLSCerts, err = parseTriple(*peerTLSCerts, "peer TLS certificates"); err != nil {
+			return collectConfig{}, err
+		}
+	}
+	if *peerTLSKeys != "" {
+		if cfg.peerTLSKeys, err = parseTriple(*peerTLSKeys, "peer TLS keys"); err != nil {
+			return collectConfig{}, err
+		}
+	}
+	tlsPaths := []struct {
+		name string
+		path string
+	}{
+		{"client-tls-ca", cfg.clientTLSCA},
+		{"client-tls-cert", cfg.clientTLSCert},
+		{"client-tls-key", cfg.clientTLSKey},
+		{"admin-tls-ca", cfg.adminTLSCA},
+		{"admin-tls-cert", cfg.adminTLSCert},
+		{"admin-tls-key", cfg.adminTLSKey},
+		{"peer-tls-ca", cfg.peerTLSCA},
+	}
 	if cfg.mode == "production" {
 		if cfg.launchdServices, err = parseTriple(*launchdServices, "launchd services"); err != nil {
 			return collectConfig{}, err
 		}
-		if cfg.tlsCA == "" {
-			return collectConfig{}, errors.New("production profile requires --tls-ca for explicit HTTPS verification")
+		for _, item := range tlsPaths {
+			if item.path == "" {
+				return collectConfig{}, fmt.Errorf("production profile requires --%s", item.name)
+			}
 		}
-		for _, endpoint := range append(cfg.clientURLs[:], cfg.adminURLs[:]...) {
+		if cfg.peerTLSCerts[0] == "" {
+			return collectConfig{}, errors.New("production profile requires --peer-tls-certs")
+		}
+		if cfg.peerTLSKeys[0] == "" {
+			return collectConfig{}, errors.New("production profile requires --peer-tls-keys")
+		}
+		if cfg.peerURLs[0] == "" {
+			return collectConfig{}, errors.New("production profile requires --peer-urls")
+		}
+		for _, endpoint := range append(append(cfg.clientURLs[:], cfg.adminURLs[:]...), cfg.peerURLs[:]...) {
 			if !strings.HasPrefix(endpoint, "https://") {
-				return collectConfig{}, fmt.Errorf("production probe URL must use HTTPS: %s", endpoint)
+				return collectConfig{}, fmt.Errorf("production endpoint URL must use HTTPS: %s", endpoint)
 			}
 		}
 	} else {
 		if *launchdServices != "" {
 			return collectConfig{}, errors.New("rehearsal profile cannot accept launchd service labels")
 		}
-		if cfg.tlsCA != "" {
-			return collectConfig{}, errors.New("direct-process rehearsal cannot accept a production TLS CA")
+		for _, item := range tlsPaths {
+			if item.path != "" {
+				return collectConfig{}, fmt.Errorf("direct-process rehearsal cannot accept --%s", item.name)
+			}
+		}
+		if *peerTLSCerts != "" || *peerTLSKeys != "" {
+			return collectConfig{}, errors.New("direct-process rehearsal cannot accept peer TLS identity files")
 		}
 		for _, endpoint := range append(cfg.clientURLs[:], cfg.adminURLs[:]...) {
 			if !strings.HasPrefix(endpoint, "http://") {
@@ -263,8 +317,15 @@ func parseCollectConfig(args []string) (collectConfig, error) {
 		}
 	}
 	paths := append([]string{cfg.sourceRoot, cfg.kvnodeBinary, cfg.checkpointBinary, cfg.checkpointPath, cfg.backupPath, cfg.quarantinePath, cfg.stagingPath, cfg.outputPath}, cfg.dataPaths[:]...)
-	if cfg.tlsCA != "" {
-		paths = append(paths, cfg.tlsCA)
+	for _, item := range tlsPaths {
+		if item.path != "" {
+			paths = append(paths, item.path)
+		}
+	}
+	for _, path := range append(cfg.peerTLSCerts[:], cfg.peerTLSKeys[:]...) {
+		if path != "" {
+			paths = append(paths, path)
+		}
 	}
 	for _, path := range paths {
 		if !filepath.IsAbs(path) {

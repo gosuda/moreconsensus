@@ -14,9 +14,9 @@ import (
 )
 
 type rehearsalVerification struct {
-	Scenarios int
-	Receipts int
-	MissingPrerequisites []string
+	Scenarios                int
+	Receipts                 int
+	MissingPrerequisites     []string
 	ProductionRejectionProof string
 }
 
@@ -123,10 +123,10 @@ func validateEnvelope(envelope rawEnvelope, item artifact, identity releaseIdent
 		return fmt.Errorf("structured observation invalid: %w", err)
 	}
 	if observed.BinarySHA256 != identity.BinarySHA256 ||
-		observed.TrustBundleSHA256 != identity.TrustBundleSHA256 ||
+		observed.TLSIdentitySHA256 != identity.TLSIdentitySHA256 ||
 		observed.StartedAtUTC == "" || observed.CompletedAtUTC == "" ||
 		observed.CompletedMonotonicNS < observed.StartedMonotonicNS {
-		return errors.New("structured observation is incomplete or trust identity is unbound")
+		return errors.New("structured observation is incomplete or TLS identity is unbound")
 	}
 	return nil
 }
@@ -216,69 +216,248 @@ func validateApprovalSeparation(executor string, operator, reviewer externalArti
 	return nil
 }
 
-func assemble(cfg assembleConfig)(rehearsalReport,error){
-	collection,_,err:=loadCollection(cfg.CollectionPath);if err!=nil{return rehearsalReport{},err}
-	collectionRoot:=filepath.Dir(cfg.CollectionPath)
-	var operator,reviewer,alert,runbook externalArtifact
-	opBytes,err:=readStrictExternal(cfg.OperatorApproval,&operator);if err!=nil{return rehearsalReport{},err};reviewBytes,err:=readStrictExternal(cfg.ReviewerApproval,&reviewer);if err!=nil{return rehearsalReport{},err};alertBytes,err:=readStrictExternal(cfg.AlertExport,&alert);if err!=nil{return rehearsalReport{},err};runbookBytes,err:=readStrictExternal(cfg.RunbookExport,&runbook);if err!=nil{return rehearsalReport{},err}
-	if err:=validateExternalIdentity(operator,"operator-approval","operator",collection.Identity,collection.CollectionSHA256);err!=nil{return rehearsalReport{},err};if err:=validateExternalIdentity(reviewer,"reviewer-approval","independent-reviewer",collection.Identity,collection.CollectionSHA256);err!=nil{return rehearsalReport{},err}
-	if err:=validateExternalIdentity(alert,"alert-export","alert-source",collection.Identity,collection.CollectionSHA256);err!=nil{return rehearsalReport{},err};if err:=validateExternalIdentity(runbook,"runbook-export","runbook-owner",collection.Identity,collection.CollectionSHA256);err!=nil{return rehearsalReport{},err}
+func assemble(cfg assembleConfig) (rehearsalReport, error) {
+	collection, _, err := loadCollection(cfg.CollectionPath)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	collectionRoot := filepath.Dir(cfg.CollectionPath)
+	var operator, reviewer, alert, runbook externalArtifact
+	opBytes, err := readStrictExternal(cfg.OperatorApproval, &operator)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	reviewBytes, err := readStrictExternal(cfg.ReviewerApproval, &reviewer)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	alertBytes, err := readStrictExternal(cfg.AlertExport, &alert)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	runbookBytes, err := readStrictExternal(cfg.RunbookExport, &runbook)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	if err := validateExternalIdentity(operator, "operator-approval", "operator", collection.Identity, collection.CollectionSHA256); err != nil {
+		return rehearsalReport{}, err
+	}
+	if err := validateExternalIdentity(reviewer, "reviewer-approval", "independent-reviewer", collection.Identity, collection.CollectionSHA256); err != nil {
+		return rehearsalReport{}, err
+	}
+	if err := validateExternalIdentity(alert, "alert-export", "alert-source", collection.Identity, collection.CollectionSHA256); err != nil {
+		return rehearsalReport{}, err
+	}
+	if err := validateExternalIdentity(runbook, "runbook-export", "runbook-owner", collection.Identity, collection.CollectionSHA256); err != nil {
+		return rehearsalReport{}, err
+	}
 	if err := validateApprovalSeparation(collection.ExecutorID, operator, reviewer); err != nil {
 		return rehearsalReport{}, err
 	}
 
-	parent:=filepath.Dir(cfg.OutputRoot);if err:=ensureSecureDirectory(parent,false);err!=nil{return rehearsalReport{},err};temporary,err:=os.MkdirTemp(parent,"."+filepath.Base(cfg.OutputRoot)+".assembling-");if err!=nil{return rehearsalReport{},err};committed:=false;defer func(){if !committed{_ = os.RemoveAll(temporary)}}()
-	for _,dir:=range []string{"raw","binary","manifest","trust","closure-records","external"}{if err:=os.MkdirAll(filepath.Join(temporary,dir),0o700);err!=nil{return rehearsalReport{},err}}
-	for _,item:=range collection.Artifacts{relative:=filepath.FromSlash(strings.TrimPrefix(item.URI,"file:"));destination:=filepath.Join(temporary,relative);hash,err:=copySecure(filepath.Join(collectionRoot,relative),destination,0o400);if err!=nil{return rehearsalReport{},err};if hash!=item.SHA256{return rehearsalReport{},fmt.Errorf("artifact %s changed during assembly",item.ArtifactID)}}
-	binaryHash,err:=copySecure(collection.BinaryPath,filepath.Join(temporary,"binary","kvnode"),0o500);if err!=nil{return rehearsalReport{},err};if binaryHash!=collection.Identity.BinarySHA256{return rehearsalReport{},errors.New("binary changed before assembly")}
-	manifestHash,err:=copySecure(collection.ManifestPath,filepath.Join(temporary,"manifest","release-manifest.json"),0o400);if err!=nil{return rehearsalReport{},err};if manifestHash!=collection.Identity.ManifestSHA256{return rehearsalReport{},errors.New("manifest changed before assembly")}
-	if collection.CAPath != "" {
-		caHash, err := copySecure(collection.CAPath, filepath.Join(temporary, "trust", "ca.pem"), 0o400)
+	parent := filepath.Dir(cfg.OutputRoot)
+	if err := ensureSecureDirectory(parent, false); err != nil {
+		return rehearsalReport{}, err
+	}
+	temporary, err := os.MkdirTemp(parent, "."+filepath.Base(cfg.OutputRoot)+".assembling-")
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
+	for _, dir := range []string{"raw", "binary", "manifest", "trust", "closure-records", "external"} {
+		if err := os.MkdirAll(filepath.Join(temporary, dir), 0o700); err != nil {
+			return rehearsalReport{}, err
+		}
+	}
+	for _, item := range collection.Artifacts {
+		relative := filepath.FromSlash(strings.TrimPrefix(item.URI, "file:"))
+		destination := filepath.Join(temporary, relative)
+		hash, err := copySecure(filepath.Join(collectionRoot, relative), destination, 0o400)
 		if err != nil {
 			return rehearsalReport{}, err
 		}
-		if caHash != collection.Identity.TrustBundleSHA256 {
-			return rehearsalReport{}, errors.New("CA trust bundle changed before assembly")
+		if hash != item.SHA256 {
+			return rehearsalReport{}, fmt.Errorf("artifact %s changed during assembly", item.ArtifactID)
 		}
 	}
-	store,err:=newArtifactStore(temporary,collection.Identity,map[bool]string{true:"target",false:"rehearsal"}[collection.ProductionEligible]);if err!=nil{return rehearsalReport{},err};for _,item:=range collection.Artifacts{store.ids[item.ArtifactID]=struct{}{};store.artifacts=append(store.artifacts,item)}
-	addExternal:=func(id,kind string,item externalArtifact,payload []byte)(artifact,error){signed,_:=time.Parse("2006-01-02T15:04:05Z",item.SignedAt);obs:=observation{Type:"external-artifact",StartedAtUTC:signed.UTC().Format(time.RFC3339Nano),CompletedAtUTC:signed.UTC().Format(time.RFC3339Nano),StartedMonotonicNS:signed.UnixNano(),CompletedMonotonicNS:signed.UnixNano(),BinarySHA256:collection.Identity.BinarySHA256,ResponseBody:string(payload),ResponseBodySHA256:digestBytes(payload),Decision:item.Decision,Details:"externally supplied identity-bound artifact preserved byte for byte"};return store.addAt(id,"campaign",kind,"capture externally supplied "+item.Kind,"observed-approval",0,obs,signed)}
-	alertArtifact,err:=addExternal("CAMPAIGN-ALERT","raw-alert",alert,alertBytes);if err!=nil{return rehearsalReport{},err};runbookArtifact,err:=addExternal("CAMPAIGN-RUNBOOK","raw-runbook",runbook,runbookBytes);if err!=nil{return rehearsalReport{},err};operatorArtifact,err:=addExternal("CAMPAIGN-OPERATOR-SIGNOFF","raw-signoff",operator,opBytes);if err!=nil{return rehearsalReport{},err};reviewerArtifact,err:=addExternal("CAMPAIGN-REVIEWER-SIGNOFF","raw-signoff",reviewer,reviewBytes);if err!=nil{return rehearsalReport{},err}
-	for name,payload:=range map[string][]byte{"operator-approval.json":opBytes,"reviewer-approval.json":reviewBytes,"alert-export.json":alertBytes,"runbook-export.json":runbookBytes}{if err:=writeAtomic(filepath.Join(temporary,"external",name),payload,0o400);err!=nil{return rehearsalReport{},err}}
-	missing:=append([]string(nil),requiredMissingPrerequisites...)
-	report:=rehearsalReport{Schema:rehearsalSchema,RecordMode:"rehearsal",Claim:"none",TargetID:collection.Identity.TargetID,Environment:collection.Identity.Environment,ProductionEligible:false,MissingPrerequisites:missing,Identity:collection.Identity,CollectionSHA256:collection.CollectionSHA256,OpenedAt:collection.OpenedAt,ClosedAt:utc(time.Now()),Nodes:collection.Nodes,Scenarios:collection.Scenarios,RawArtifacts:store.artifacts,OperationalArtifacts:map[string][]string{"topology_artifact_ids":{"CAMPAIGN-TOPOLOGY-NODE1","CAMPAIGN-TOPOLOGY-NODE2","CAMPAIGN-TOPOLOGY-NODE3"},"alert_artifact_ids":{alertArtifact.ArtifactID},"runbook_artifact_ids":{runbookArtifact.ArtifactID},"signoff_artifact_ids":{operatorArtifact.ArtifactID,reviewerArtifact.ArtifactID}},ExternalArtifacts:map[string]string{"operator":digestBytes(opBytes),"reviewer":digestBytes(reviewBytes),"alert":digestBytes(alertBytes),"runbook":digestBytes(runbookBytes)}}
+	binaryHash, err := copySecure(collection.BinaryPath, filepath.Join(temporary, "binary", "kvnode"), 0o500)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	if binaryHash != collection.Identity.BinarySHA256 {
+		return rehearsalReport{}, errors.New("binary changed before assembly")
+	}
+	manifestHash, err := copySecure(collection.ManifestPath, filepath.Join(temporary, "manifest", "release-manifest.json"), 0o400)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	if manifestHash != collection.Identity.ManifestSHA256 {
+		return rehearsalReport{}, errors.New("manifest changed before assembly")
+	}
+	tlsFiles := []struct{ source, name, want string }{
+		{collection.ClientTLSCAPath, "client-ca.pem", collection.ClientTLSCASHA256},
+		{collection.ClientTLSCertPath, "client-cert.pem", collection.ClientTLSCertSHA256},
+		{collection.AdminTLSCAPath, "admin-ca.pem", collection.AdminTLSCASHA256},
+		{collection.AdminTLSCertPath, "admin-cert.pem", collection.AdminTLSCertSHA256},
+	}
+	if collection.PeerTLSCAPath != "" {
+		tlsFiles = append(tlsFiles, struct{ source, name, want string }{collection.PeerTLSCAPath, "peer-ca.pem", collection.PeerTLSCASHA256})
+	}
+	for _, peer := range collection.PeerTLSIdentities {
+		tlsFiles = append(tlsFiles, struct{ source, name, want string }{
+			peer.CertPath, fmt.Sprintf("peer-%d-cert.pem", peer.ReplicaID), peer.CertSHA256,
+		})
+	}
+	for _, item := range tlsFiles {
+		if item.source == "" {
+			continue
+		}
+		hash, err := copySecure(item.source, filepath.Join(temporary, "trust", item.name), 0o400)
+		if err != nil {
+			return rehearsalReport{}, err
+		}
+		if hash != item.want {
+			return rehearsalReport{}, fmt.Errorf("TLS file %s changed before assembly", item.name)
+		}
+	}
+	if collection.ProductionEligible {
+		scenarioFiles := []struct{ source, name, want string }{
+			{collection.ScenarioBundlePath, "scenario-bundle.json", collection.ScenarioBundleSHA256},
+			{collection.ScenarioSignaturePath, "scenario-bundle.sig", collection.ScenarioSignatureSHA256},
+			{collection.ScenarioTrustRootPath, "scenario-bundle-trust-root.pem", collection.ScenarioTrustRootSHA256},
+		}
+		for _, item := range scenarioFiles {
+			hash, err := copySecure(item.source, filepath.Join(temporary, "external", item.name), 0o400)
+			if err != nil {
+				return rehearsalReport{}, err
+			}
+			if hash != item.want {
+				return rehearsalReport{}, fmt.Errorf("%s changed before assembly", item.name)
+			}
+		}
+	}
+	store, err := newArtifactStore(temporary, collection.Identity, map[bool]string{true: "target", false: "rehearsal"}[collection.ProductionEligible])
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	for _, item := range collection.Artifacts {
+		store.ids[item.ArtifactID] = struct{}{}
+		store.artifacts = append(store.artifacts, item)
+	}
+	addExternal := func(id, kind string, item externalArtifact, payload []byte) (artifact, error) {
+		signed, _ := time.Parse("2006-01-02T15:04:05Z", item.SignedAt)
+		obs := observation{Type: "external-artifact", StartedAtUTC: signed.UTC().Format(time.RFC3339Nano), CompletedAtUTC: signed.UTC().Format(time.RFC3339Nano), StartedMonotonicNS: signed.UnixNano(), CompletedMonotonicNS: signed.UnixNano(), BinarySHA256: collection.Identity.BinarySHA256, ResponseBody: string(payload), ResponseBodySHA256: digestBytes(payload), Decision: item.Decision, Details: "externally supplied identity-bound artifact preserved byte for byte"}
+		return store.addAt(id, "campaign", kind, "capture externally supplied "+item.Kind, "observed-approval", 0, obs, signed)
+	}
+	alertArtifact, err := addExternal("CAMPAIGN-ALERT", "raw-alert", alert, alertBytes)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	runbookArtifact, err := addExternal("CAMPAIGN-RUNBOOK", "raw-runbook", runbook, runbookBytes)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	operatorArtifact, err := addExternal("CAMPAIGN-OPERATOR-SIGNOFF", "raw-signoff", operator, opBytes)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	reviewerArtifact, err := addExternal("CAMPAIGN-REVIEWER-SIGNOFF", "raw-signoff", reviewer, reviewBytes)
+	if err != nil {
+		return rehearsalReport{}, err
+	}
+	for name, payload := range map[string][]byte{"operator-approval.json": opBytes, "reviewer-approval.json": reviewBytes, "alert-export.json": alertBytes, "runbook-export.json": runbookBytes} {
+		if err := writeAtomic(filepath.Join(temporary, "external", name), payload, 0o400); err != nil {
+			return rehearsalReport{}, err
+		}
+	}
+	missing := append([]string(nil), requiredMissingPrerequisites...)
+	report := rehearsalReport{Schema: rehearsalSchema, RecordMode: "rehearsal", Claim: "none", TargetID: collection.Identity.TargetID, Environment: collection.Identity.Environment, ProductionEligible: false, MissingPrerequisites: missing, Identity: collection.Identity, CollectionSHA256: collection.CollectionSHA256, OpenedAt: collection.OpenedAt, ClosedAt: utc(time.Now()), Nodes: collection.Nodes, Scenarios: collection.Scenarios, RawArtifacts: store.artifacts, OperationalArtifacts: map[string][]string{"topology_artifact_ids": {"CAMPAIGN-TOPOLOGY-NODE1", "CAMPAIGN-TOPOLOGY-NODE2", "CAMPAIGN-TOPOLOGY-NODE3"}, "alert_artifact_ids": {alertArtifact.ArtifactID}, "runbook_artifact_ids": {runbookArtifact.ArtifactID}, "signoff_artifact_ids": {operatorArtifact.ArtifactID, reviewerArtifact.ArtifactID}}, ExternalArtifacts: map[string]string{"operator": digestBytes(opBytes), "reviewer": digestBytes(reviewBytes), "alert": digestBytes(alertBytes), "runbook": digestBytes(runbookBytes)}}
 	var reportPath string
-	if collection.ProductionEligible{production,err:=buildProductionReport(collection,store.artifacts,operator,reviewer,alertArtifact,runbookArtifact,operatorArtifact,reviewerArtifact);if err!=nil{return rehearsalReport{},err};payload,err:=canonicalJSON(production);if err!=nil{return rehearsalReport{},err};reportPath=filepath.Join(temporary,"closure-records","incident-readiness.json");if err:=writeAtomic(reportPath,payload,0o400);err!=nil{return rehearsalReport{},err}}else{payload,err:=canonicalJSON(report);if err!=nil{return rehearsalReport{},err};reportPath=filepath.Join(temporary,"rehearsal-incident-evidence.json");if err:=writeAtomic(reportPath,payload,0o400);err!=nil{return rehearsalReport{},err}}
-	if err:=syncTree(temporary);err!=nil{return rehearsalReport{},err};if _,err:=os.Lstat(cfg.OutputRoot);err==nil{return rehearsalReport{},errors.New("assembly destination appeared before rename")}else if !os.IsNotExist(err){return rehearsalReport{},err};if err:=os.Rename(temporary,cfg.OutputRoot);err!=nil{return rehearsalReport{},err};if err:=syncDirectory(parent);err!=nil{return rehearsalReport{},err};committed=true
-	return report,nil
+	if collection.ProductionEligible {
+		production, err := buildProductionReport(collection, store.artifacts, operator, reviewer, alertArtifact, runbookArtifact, operatorArtifact, reviewerArtifact)
+		if err != nil {
+			return rehearsalReport{}, err
+		}
+		payload, err := canonicalJSON(production)
+		if err != nil {
+			return rehearsalReport{}, err
+		}
+		reportPath = filepath.Join(temporary, "closure-records", "incident-readiness.json")
+		if err := writeAtomic(reportPath, payload, 0o400); err != nil {
+			return rehearsalReport{}, err
+		}
+	} else {
+		payload, err := canonicalJSON(report)
+		if err != nil {
+			return rehearsalReport{}, err
+		}
+		reportPath = filepath.Join(temporary, "rehearsal-incident-evidence.json")
+		if err := writeAtomic(reportPath, payload, 0o400); err != nil {
+			return rehearsalReport{}, err
+		}
+	}
+	if err := syncTree(temporary); err != nil {
+		return rehearsalReport{}, err
+	}
+	if _, err := os.Lstat(cfg.OutputRoot); err == nil {
+		return rehearsalReport{}, errors.New("assembly destination appeared before rename")
+	} else if !os.IsNotExist(err) {
+		return rehearsalReport{}, err
+	}
+	if err := os.Rename(temporary, cfg.OutputRoot); err != nil {
+		return rehearsalReport{}, err
+	}
+	if err := syncDirectory(parent); err != nil {
+		return rehearsalReport{}, err
+	}
+	committed = true
+	return report, nil
 }
 
-func readStrictExternal(path string,item *externalArtifact)([]byte,error){payload,err:=readStrictFile(path,item);if err!=nil{return nil,err};if item.Schema!=externalSchema{return nil,errors.New("external artifact schema mismatch")};return payload,nil}
-func signedOrder(first,second string)bool{a,errA:=time.Parse("2006-01-02T15:04:05Z",first);b,errB:=time.Parse("2006-01-02T15:04:05Z",second);return errA==nil&&errB==nil&&b.After(a)}
+func readStrictExternal(path string, item *externalArtifact) ([]byte, error) {
+	payload, err := readStrictFile(path, item)
+	if err != nil {
+		return nil, err
+	}
+	if item.Schema != externalSchema {
+		return nil, errors.New("external artifact schema mismatch")
+	}
+	return payload, nil
+}
+func signedOrder(first, second string) bool {
+	a, errA := time.Parse("2006-01-02T15:04:05Z", first)
+	b, errB := time.Parse("2006-01-02T15:04:05Z", second)
+	return errA == nil && errB == nil && b.After(a)
+}
 
 type productionRejectionProof struct {
-	Schema                 string   `json:"schema"`
-	Result                 string   `json:"result"`
-	VerifierPath           string   `json:"verifier_path"`
-	VerifierSHA256         string   `json:"verifier_sha256"`
-	ReportPath             string   `json:"report_path"`
-	ReportSHA256           string   `json:"report_sha256"`
-	SourceRevision         string   `json:"source_revision"`
-	SourceDigest           string   `json:"source_digest"`
-	ExpectedTarget         string   `json:"expected_target"`
-	ExpectedEnvironment    string   `json:"expected_environment"`
-	Argv                   []string `json:"argv"`
-	StartedAtUTC           string   `json:"started_at_utc"`
-	CompletedAtUTC         string   `json:"completed_at_utc"`
-	StartedMonotonicNS     int64    `json:"started_monotonic_ns"`
-	CompletedMonotonicNS   int64    `json:"completed_monotonic_ns"`
-	ExitCode               int      `json:"exit_code"`
-	Stdout                 string   `json:"stdout"`
-	StdoutSHA256           string   `json:"stdout_sha256"`
-	Stderr                 string   `json:"stderr"`
-	StderrSHA256           string   `json:"stderr_sha256"`
-	RequiredDiagnostics    []string `json:"required_diagnostics"`
-	ResultSHA256           string   `json:"result_sha256,omitempty"`
+	Schema               string   `json:"schema"`
+	Result               string   `json:"result"`
+	VerifierPath         string   `json:"verifier_path"`
+	VerifierSHA256       string   `json:"verifier_sha256"`
+	ReportPath           string   `json:"report_path"`
+	ReportSHA256         string   `json:"report_sha256"`
+	SourceRevision       string   `json:"source_revision"`
+	SourceDigest         string   `json:"source_digest"`
+	ExpectedTarget       string   `json:"expected_target"`
+	ExpectedEnvironment  string   `json:"expected_environment"`
+	Argv                 []string `json:"argv"`
+	StartedAtUTC         string   `json:"started_at_utc"`
+	CompletedAtUTC       string   `json:"completed_at_utc"`
+	StartedMonotonicNS   int64    `json:"started_monotonic_ns"`
+	CompletedMonotonicNS int64    `json:"completed_monotonic_ns"`
+	ExitCode             int      `json:"exit_code"`
+	Stdout               string   `json:"stdout"`
+	StdoutSHA256         string   `json:"stdout_sha256"`
+	Stderr               string   `json:"stderr"`
+	StderrSHA256         string   `json:"stderr_sha256"`
+	RequiredDiagnostics  []string `json:"required_diagnostics"`
+	ResultSHA256         string   `json:"result_sha256,omitempty"`
 }
 
 func verifyRehearsal(cfg rehearsalVerifyConfig) (rehearsalVerification, error) {
@@ -379,27 +558,27 @@ func runProductionRejectionProof(cfg rehearsalVerifyConfig, report rehearsalRepo
 		return "", errors.New("rehearsal report changed during production rejection proof")
 	}
 	proof := productionRejectionProof{
-		Schema: "moreconsensus.incident-production-rejection-proof.v1",
-		Result: "expected-production-rejection-observed",
-		VerifierPath: cfg.VerifierPath,
-		VerifierSHA256: verifierSHA,
-		ReportPath: relative,
-		ReportSHA256: reportSHA,
-		SourceRevision: report.Identity.SourceRevision,
-		SourceDigest: report.Identity.SourceDigest,
-		ExpectedTarget: productionTargetID,
-		ExpectedEnvironment: productionProfile,
-		Argv: argv,
-		StartedAtUTC: started.UTC().Format(time.RFC3339Nano),
-		CompletedAtUTC: completed.UTC().Format(time.RFC3339Nano),
-		StartedMonotonicNS: started.UnixNano(),
+		Schema:               "moreconsensus.incident-production-rejection-proof.v1",
+		Result:               "expected-production-rejection-observed",
+		VerifierPath:         cfg.VerifierPath,
+		VerifierSHA256:       verifierSHA,
+		ReportPath:           relative,
+		ReportSHA256:         reportSHA,
+		SourceRevision:       report.Identity.SourceRevision,
+		SourceDigest:         report.Identity.SourceDigest,
+		ExpectedTarget:       productionTargetID,
+		ExpectedEnvironment:  productionProfile,
+		Argv:                 argv,
+		StartedAtUTC:         started.UTC().Format(time.RFC3339Nano),
+		CompletedAtUTC:       completed.UTC().Format(time.RFC3339Nano),
+		StartedMonotonicNS:   started.UnixNano(),
 		CompletedMonotonicNS: completed.UnixNano(),
-		ExitCode: exitError.ExitCode(),
-		Stdout: stdout.String(),
-		StdoutSHA256: digestBytes(stdout.Bytes()),
-		Stderr: stderrText,
-		StderrSHA256: digestBytes(stderr.Bytes()),
-		RequiredDiagnostics: required,
+		ExitCode:             exitError.ExitCode(),
+		Stdout:               stdout.String(),
+		StdoutSHA256:         digestBytes(stdout.Bytes()),
+		Stderr:               stderrText,
+		StderrSHA256:         digestBytes(stderr.Bytes()),
+		RequiredDiagnostics:  required,
 	}
 	unsigned, err := canonicalJSON(proof)
 	if err != nil {
@@ -453,13 +632,24 @@ func verifyRehearsalDocument(path string) (rehearsalVerification, error) {
 		return rehearsalVerification{}, errors.New("rehearsal contains fewer than 31 raw receipts")
 	}
 	root := filepath.Dir(path)
-	if report.Identity.TrustBundleSHA256 != "" {
-		trustBytes, err := readSecureRegular(filepath.Join(root, "trust", "ca.pem"))
-		if err != nil {
-			return rehearsalVerification{}, err
+	if report.Identity.TLSIdentitySHA256 != "" {
+		hashes := make([]string, 0, 8)
+		for _, name := range []string{"client-ca.pem", "client-cert.pem", "admin-ca.pem", "admin-cert.pem", "peer-ca.pem", "peer-1-cert.pem", "peer-2-cert.pem", "peer-3-cert.pem"} {
+			payload, err := readSecureRegular(filepath.Join(root, "trust", name))
+			if err != nil {
+				return rehearsalVerification{}, err
+			}
+			hashes = append(hashes, digestBytes(payload))
 		}
-		if digestBytes(trustBytes) != report.Identity.TrustBundleSHA256 {
-			return rehearsalVerification{}, errors.New("assembled CA trust bundle digest mismatch")
+		peers := make([]peerTLSIdentity, 0, 3)
+		for index := range 3 {
+			peers = append(peers, peerTLSIdentity{
+				ReplicaID: index + 1, CertSHA256: hashes[index+5],
+				URISAN: fmt.Sprintf("spiffe://gosuda.org/moreconsensus/replica/%d", index+1),
+			})
+		}
+		if tlsIdentityDigest(hashes[0], hashes[1], hashes[2], hashes[3], hashes[4], peers) != report.Identity.TLSIdentitySHA256 {
+			return rehearsalVerification{}, errors.New("assembled TLS identity digest mismatch")
 		}
 	}
 	seen := map[string]bool{}
@@ -516,16 +706,110 @@ func verifyRehearsalDocument(path string) (rehearsalVerification, error) {
 	}
 	return rehearsalVerification{Scenarios: len(report.Scenarios), Receipts: len(report.RawArtifacts), MissingPrerequisites: report.MissingPrerequisites}, nil
 }
-func contains(values []string,want string)bool{for _,value:=range values{if value==want{return true}};return false}
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
 
-func buildProductionReport(collection collectionRecord,artifacts []artifact,operator,reviewer externalArtifact,alert,runbook,operatorArtifact,reviewerArtifact artifact)(map[string]any,error){
-	for _,scenario:=range collection.Scenarios{if scenario.Execution!="live"||!scenario.FaultExercised{return nil,fmt.Errorf("production assembly rejects non-live scenario %s",scenario.DrillID)}}
-	var manifest releaseManifest;if _,err:=readStrictFile(collection.ManifestPath,&manifest);err!=nil{return nil,err}
-	commanderID:=collection.CommanderID;if commanderID==""{return nil,errors.New("production collection lacks commander identity")}
-	participants:=[]map[string]any{{"participant_id":collection.ExecutorID,"name":operator.Name,"role":"operator","organization":operator.Organization},{"participant_id":reviewer.ParticipantID,"name":reviewer.Name,"role":"independent-reviewer","organization":reviewer.Organization},{"participant_id":commanderID,"name":collection.CommanderName,"role":"incident-commander","organization":collection.CommanderOrganization}}
-	nodes:=make([]map[string]any,0,3);for i,node:=range collection.Nodes{nodes=append(nodes,map[string]any{"name":fmt.Sprintf("node%d",i+1),"node_id":i+1,"launchd_label":node.Label,"client_endpoint":node.ClientURL,"peer_endpoint":node.PeerURL,"admin_endpoint":node.AdminURL,"data_path":node.DataPath,"pid":node.PID,"binary_sha256":collection.Identity.BinarySHA256,"observed_at":collection.OpenedAt,"evidence_artifact_id":fmt.Sprintf("CAMPAIGN-TOPOLOGY-NODE%d",i+1)})}
-	drills:=make([]map[string]any,0,6);nonclaims:=map[string][]string{"process_crash_restart":{"not-host-reboot","not-independent-failure-domain"},"one_node_unavailability":{"not-multi-host","not-independent-failure-domain"},"bad_config_rollback":{"not-client-or-peer-authorization-evidence"},"certificate_secret_rotation":{"not-mtls","not-client-authorization","not-peer-authorization"},"storage_pressure_failure":{"not-physical-apfs-failure","not-enospc","not-media-failure"},"corrupted_checkpoint":{"not-live-corruption","not-forged-manifest-resistance"}}
-	for _,scenario:=range collection.Scenarios{drills=append(drills,map[string]any{"drill_id":scenario.DrillID,"incident_class":scenario.IncidentClass,"affected_nodes":scenario.AffectedNodes,"condition_source":"Observed an approved bounded native Darwin condition against a healthy three-node baseline.","injection_method":"Executed the identity-bound bounded action with exact command or HTTP receipts and no shell interpolation.","impact_boundary":"Impact remained bounded to the declared same-host processes, loopback links, and APFS campaign paths.","expected_outcome":"The unaffected quorum must preserve service and the affected scope must recover before the approved deadline.","observed_outcome":"Raw command, HTTP, metric, log, communication, recovery, and post-clear canary receipts observed the required outcome.","rollback_plan":"Clear every injected gate, abort on quorum degradation, preserve suspect bytes, and restore only verified state.","nonclaims":nonclaims[scenario.IncidentClass],"started_at":scenario.StartedAt,"completed_at":scenario.CompletedAt,"executor_participant_id":collection.ExecutorID,"approver_participant_id":commanderID,"approved_at":scenario.ApprovedAt,"result":"observed-pass","evidence_artifact_ids":scenario.ArtifactIDs,"observations":scenario.Observations})}
-	recorded:=time.Now().UTC();closed:=recorded.Add(-time.Second);built,_:=time.Parse("2006-01-02T15:04:05Z",collection.Identity.BuiltAt);if built.IsZero(){created,_:=time.Parse("2006-01-02T15:04:05Z",manifest.CreatedAt);built=created.Add(-time.Second)}
-	return map[string]any{"schema_version":productionSchema,"verifier_version":productionVerifier,"record_kind":productionRecordKind,"record_mode":"target","claim":"target-darwin-incident-readiness-observed","target":map[string]any{"name":productionTargetID,"environment":productionProfile,"service":"kvnode","cluster_id":productionClusterID},"profile":map[string]any{"platform":"darwin","os_version":collection.OSVersion,"os_build":collection.OSBuild,"architecture":"arm64","binary_format":"mach-o-64","execution_mode":"native","supervisor":"launchd","launchd_domain":"system","storage_filesystem":"apfs","network_scope":"same-host-loopback","tls_mode":"server-auth-only"},"topology":map[string]any{"node_count":3,"nodes":nodes},"participants":participants,"release_provenance":map[string]any{"release_id":collection.Identity.ReleaseID,"source_repository":collection.SourceRepository,"source_revision":collection.Identity.SourceRevision,"source_tree":"clean","binary_uri":"file:binary/kvnode","binary_sha256":collection.Identity.BinarySHA256,"release_manifest_uri":"file:manifest/release-manifest.json","release_manifest_sha256":collection.Identity.ManifestSHA256,"built_at":utc(built)},"opened_at":collection.OpenedAt,"closed_at":utc(closed),"recorded_at":utc(recorded),"valid_until":utc(recorded.Add(30*24*time.Hour)),"drills":drills,"raw_artifacts":artifacts,"operational_artifacts":map[string]any{"topology_artifact_ids":[]string{"CAMPAIGN-TOPOLOGY-NODE1","CAMPAIGN-TOPOLOGY-NODE2","CAMPAIGN-TOPOLOGY-NODE3"},"alert_artifact_ids":[]string{alert.ArtifactID},"runbook_artifact_ids":[]string{runbook.ArtifactID},"signoff_artifact_ids":[]string{operatorArtifact.ArtifactID,reviewerArtifact.ArtifactID}},"sign_off":map[string]any{"operator":map[string]any{"participant_id":operator.ParticipantID,"role":"operator","signed_at":operatorArtifact.CapturedAt,"decision":"approved","statement":operator.Statement,"artifact_id":operatorArtifact.ArtifactID},"independent_reviewer":map[string]any{"participant_id":reviewer.ParticipantID,"role":"independent-reviewer","signed_at":reviewerArtifact.CapturedAt,"decision":"approved","statement":reviewer.Statement,"artifact_id":reviewerArtifact.ArtifactID}},"nonclaims":map[string]any{"multi_host":false,"independent_failure_domains":false,"mtls":false,"client_authorization":false,"peer_authorization":false,"production_capacity":false,"physical_storage_failure":false}},nil
+func peerTLSClaims(peers []peerTLSIdentity) []map[string]any {
+	claims := make([]map[string]any, 0, len(peers))
+	for _, peer := range peers {
+		claims = append(claims, map[string]any{
+			"replica_id": peer.ReplicaID, "cert_sha256": peer.CertSHA256, "uri_san": peer.URISAN,
+		})
+	}
+	return claims
+}
+
+func buildProductionReport(collection collectionRecord, artifacts []artifact, operator, reviewer externalArtifact, alert, runbook, operatorArtifact, reviewerArtifact artifact) (map[string]any, error) {
+	for _, scenario := range collection.Scenarios {
+		if scenario.Execution != "live" || !scenario.FaultExercised {
+			return nil, fmt.Errorf("production assembly rejects non-live scenario %s", scenario.DrillID)
+		}
+	}
+	var manifest releaseManifest
+	if _, err := readStrictFile(collection.ManifestPath, &manifest); err != nil {
+		return nil, err
+	}
+	commanderID := collection.CommanderID
+	if commanderID == "" {
+		return nil, errors.New("production collection lacks commander identity")
+	}
+	participants := []map[string]any{{"participant_id": collection.ExecutorID, "name": operator.Name, "role": "operator", "organization": operator.Organization}, {"participant_id": reviewer.ParticipantID, "name": reviewer.Name, "role": "independent-reviewer", "organization": reviewer.Organization}, {"participant_id": commanderID, "name": collection.CommanderName, "role": "incident-commander", "organization": collection.CommanderOrganization}}
+	nodes := make([]map[string]any, 0, 3)
+	capturedByID := make(map[string]string, len(artifacts))
+	for _, item := range artifacts {
+		capturedByID[item.ArtifactID] = item.CapturedAt
+	}
+	for i, node := range collection.Nodes {
+		artifactID := fmt.Sprintf("CAMPAIGN-TOPOLOGY-NODE%d", i+1)
+		observedAt := capturedByID[artifactID]
+		if observedAt == "" {
+			return nil, fmt.Errorf("production topology artifact %s is missing", artifactID)
+		}
+		nodes = append(nodes, map[string]any{"name": fmt.Sprintf("node%d", i+1), "node_id": i + 1, "launchd_label": node.Label, "client_endpoint": node.ClientURL, "peer_endpoint": node.PeerURL, "admin_endpoint": node.AdminURL, "data_path": node.DataPath, "pid": node.PID, "binary_sha256": collection.Identity.BinarySHA256, "observed_at": observedAt, "evidence_artifact_id": artifactID})
+	}
+	drills := make([]map[string]any, 0, 6)
+	nonclaims := map[string][]string{"process_crash_restart": {"not-host-reboot", "not-independent-failure-domain"}, "one_node_unavailability": {"not-multi-host", "not-independent-failure-domain"}, "bad_config_rollback": {"not-multi-tenant-rbac"}, "certificate_secret_rotation": {"not-multi-tenant-rbac"}, "storage_pressure_failure": {"not-physical-apfs-failure", "not-enospc", "not-media-failure"}, "corrupted_checkpoint": {"not-live-corruption", "not-forged-manifest-resistance"}}
+	for _, scenario := range collection.Scenarios {
+		drills = append(drills, map[string]any{"drill_id": scenario.DrillID, "incident_class": scenario.IncidentClass, "affected_nodes": scenario.AffectedNodes, "condition_source": "Observed an approved bounded native Darwin condition against a healthy three-node baseline.", "injection_method": "Executed the identity-bound bounded action with exact command or HTTP receipts and no shell interpolation.", "impact_boundary": "Impact remained bounded to the declared same-host processes, loopback links, and APFS campaign paths.", "expected_outcome": "The unaffected quorum must preserve service and the affected scope must recover before the approved deadline.", "observed_outcome": "Raw command, HTTP, metric, log, communication, recovery, and post-clear canary receipts observed the required outcome.", "rollback_plan": "Clear every injected gate, abort on quorum degradation, preserve suspect bytes, and restore only verified state.", "nonclaims": nonclaims[scenario.IncidentClass], "started_at": scenario.StartedAt, "completed_at": scenario.CompletedAt, "executor_participant_id": collection.ExecutorID, "approver_participant_id": commanderID, "approved_at": scenario.ApprovedAt, "result": "observed-pass", "evidence_artifact_ids": scenario.ArtifactIDs, "observations": scenario.Observations})
+	}
+	recorded := time.Now().UTC()
+	closed := recorded.Add(-time.Second)
+	built, _ := time.Parse("2006-01-02T15:04:05Z", collection.Identity.BuiltAt)
+	if built.IsZero() {
+		created, _ := time.Parse("2006-01-02T15:04:05Z", manifest.CreatedAt)
+		built = created.Add(-time.Second)
+	}
+	releaseProvenance := map[string]any{
+		"release_id": collection.Identity.ReleaseID, "source_repository": collection.SourceRepository,
+		"source_revision": collection.Identity.SourceRevision, "source_tree": "clean",
+		"binary_uri": "file:binary/kvnode", "binary_sha256": collection.Identity.BinarySHA256,
+		"release_manifest_uri":    "file:manifest/release-manifest.json",
+		"release_manifest_sha256": collection.Identity.ManifestSHA256, "built_at": utc(built),
+		"scenario_bundle_uri":               "file:external/scenario-bundle.json",
+		"scenario_bundle_sha256":            collection.ScenarioBundleSHA256,
+		"scenario_bundle_signature_uri":     "file:external/scenario-bundle.sig",
+		"scenario_bundle_signature_sha256":  collection.ScenarioSignatureSHA256,
+		"scenario_bundle_trust_root_uri":    "file:external/scenario-bundle-trust-root.pem",
+		"scenario_bundle_trust_root_sha256": collection.ScenarioTrustRootSHA256,
+		"scenario_bundle_signer_identity":   collection.ScenarioSignerIdentity,
+	}
+	return map[string]any{
+		"schema_version": productionSchema, "verifier_version": productionVerifier,
+		"record_kind": productionRecordKind, "record_mode": "target",
+		"claim":  "target-darwin-incident-readiness-observed",
+		"target": map[string]any{"name": productionTargetID, "environment": productionProfile, "service": "kvnode", "cluster_id": productionClusterID},
+		"profile": map[string]any{
+			"platform": "darwin", "os_version": collection.OSVersion, "os_build": collection.OSBuild,
+			"architecture": "arm64", "binary_format": "mach-o-64", "execution_mode": "native",
+			"supervisor": "launchd", "launchd_domain": "system", "storage_filesystem": "apfs",
+			"network_scope": "same-host-loopback", "tls_mode": "mutual-auth-separated-planes",
+			"client_tls_ca_sha256": collection.ClientTLSCASHA256, "client_tls_cert_sha256": collection.ClientTLSCertSHA256,
+			"admin_tls_ca_sha256": collection.AdminTLSCASHA256, "admin_tls_cert_sha256": collection.AdminTLSCertSHA256,
+			"peer_tls_ca_sha256": collection.PeerTLSCASHA256, "peer_tls_identities": peerTLSClaims(collection.PeerTLSIdentities),
+			"tls_identity_sha256": collection.Identity.TLSIdentitySHA256,
+		},
+		"topology": map[string]any{"node_count": 3, "nodes": nodes}, "participants": participants,
+		"release_provenance": releaseProvenance, "opened_at": collection.OpenedAt,
+		"closed_at": utc(closed), "recorded_at": utc(recorded),
+		"valid_until": utc(recorded.Add(30 * 24 * time.Hour)), "drills": drills,
+		"raw_artifacts": artifacts,
+		"operational_artifacts": map[string]any{
+			"topology_artifact_ids":           []string{"CAMPAIGN-TOPOLOGY-NODE1", "CAMPAIGN-TOPOLOGY-NODE2", "CAMPAIGN-TOPOLOGY-NODE3"},
+			"mtls_rejection_artifact_ids":     []string{"CLIENT-MTLS-REQUIRED", "ADMIN-MTLS-REQUIRED"},
+			"peer_authorization_artifact_ids": []string{"PEER-1-AUTH-REQUIRED", "PEER-2-AUTH-REQUIRED", "PEER-3-AUTH-REQUIRED"},
+			"alert_artifact_ids":              []string{alert.ArtifactID}, "runbook_artifact_ids": []string{runbook.ArtifactID},
+			"signoff_artifact_ids": []string{operatorArtifact.ArtifactID, reviewerArtifact.ArtifactID},
+		},
+		"sign_off": map[string]any{
+			"operator":             map[string]any{"participant_id": operator.ParticipantID, "role": "operator", "signed_at": operatorArtifact.CapturedAt, "decision": "approved", "statement": operator.Statement, "artifact_id": operatorArtifact.ArtifactID},
+			"independent_reviewer": map[string]any{"participant_id": reviewer.ParticipantID, "role": "independent-reviewer", "signed_at": reviewerArtifact.CapturedAt, "decision": "approved", "statement": reviewer.Statement, "artifact_id": reviewerArtifact.ArtifactID},
+		},
+		"nonclaims": map[string]any{"multi_host": false, "independent_failure_domains": false, "multi_tenant_rbac": false, "production_capacity": false, "physical_storage_failure": false},
+	}, nil
 }

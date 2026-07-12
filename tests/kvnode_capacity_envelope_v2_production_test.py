@@ -67,7 +67,7 @@ class ProductionCapacityFixture:
             "launchd_domain": "system",
             "filesystem": "apfs",
             "network_scope": "same-host-loopback",
-            "tls_scope": "server-auth-only",
+            "tls_scope": "mutual-auth-separated-planes",
             "host_id": "synthetic-darwin-host.invalid",
             "os_version": "15.6-synthetic",
             "kernel_release": "24.6.0",
@@ -86,7 +86,7 @@ class ProductionCapacityFixture:
                 "operation_sequence": ["put", "get", "scan"],
                 "key_seed": "synthetic-seed-not-production",
                 "key_count": 32,
-                "value_bytes": 128,
+                "value_sizes_bytes": [64, 1024, 65536, 1048576],
                 "warmup_operations": 3,
                 "measurement_operations": 6,
                 "concurrency": 2,
@@ -197,9 +197,15 @@ class ProductionCapacityFixture:
             client_url = f"https://127.0.0.1:{18990 + node_id * 100}"
             peer_url = f"https://127.0.0.1:{18991 + node_id * 100}"
             admin_url = f"https://127.0.0.1:{18992 + node_id * 100}"
-            cert_path = f"/var/db/moreconsensus/tls/node{node_id}.pem"
-            key_path = f"/var/db/moreconsensus/tls/node{node_id}-key.pem"
-            ca_path = "/var/db/moreconsensus/tls/ca.pem"
+            peer_cert_path = f"/var/db/moreconsensus/tls/node{node_id}-peer.pem"
+            peer_key_path = f"/var/db/moreconsensus/tls/node{node_id}-peer-key.pem"
+            peer_ca_path = "/var/db/moreconsensus/tls/peer-ca.pem"
+            client_cert_path = f"/var/db/moreconsensus/tls/node{node_id}-client.pem"
+            client_key_path = f"/var/db/moreconsensus/tls/node{node_id}-client-key.pem"
+            client_ca_path = "/var/db/moreconsensus/tls/client-ca.pem"
+            admin_cert_path = f"/var/db/moreconsensus/tls/node{node_id}-admin.pem"
+            admin_key_path = f"/var/db/moreconsensus/tls/node{node_id}-admin-key.pem"
+            admin_ca_path = "/var/db/moreconsensus/tls/admin-ca.pem"
             arguments = [
                 executable_path,
                 "-id", str(node_id),
@@ -211,12 +217,29 @@ class ProductionCapacityFixture:
                 "-request-deadline-ms", "5000",
                 "-peer-deadline-ms", "2000",
                 "-max-client-body-bytes", "1048576",
-                "-max-peer-body-bytes", "1048576",
+                "-max-peer-body-bytes", "2097152",
                 "-max-admin-body-bytes", "65536",
                 "-max-scan-limit", "1000",
-                "-tls-cert", cert_path,
-                "-tls-key", key_path,
-                "-tls-ca", ca_path,
+                "-production=true",
+                "-peer-tls-cert", peer_cert_path,
+                "-peer-tls-key", peer_key_path,
+                "-peer-tls-ca", peer_ca_path,
+                "-client-tls-cert", client_cert_path,
+                "-client-tls-key", client_key_path,
+                "-client-client-ca", client_ca_path,
+                "-admin-tls-cert", admin_cert_path,
+                "-admin-tls-key", admin_key_path,
+                "-admin-client-ca", admin_ca_path,
+                "-pebble-cache-bytes", "8388608",
+                "-pebble-memtable-bytes", "4194304",
+                "-pebble-memtable-stop-writes", "2",
+                "-pebble-max-open-files", "1000",
+                "-pebble-max-concurrent-compactions", "1",
+                "-pebble-bytes-per-sync", "524288",
+                "-pebble-wal-bytes-per-sync", "0",
+                "-retention-max-resident-instances", "100000",
+                "-retention-max-durable-records", "100000",
+                "-retention-max-data-bytes", "10737418240",
             ]
             pid = 2000 + sequence * 10 + node_id
             nodes.append(
@@ -230,9 +253,15 @@ class ProductionCapacityFixture:
                     "client_url": client_url,
                     "peer_url": peer_url,
                     "admin_url": admin_url,
-                    "server_cert_path": cert_path,
-                    "server_key_path": key_path,
-                    "tls_ca_path": ca_path,
+                    "peer_cert_path": peer_cert_path,
+                    "peer_key_path": peer_key_path,
+                    "peer_ca_path": peer_ca_path,
+                    "client_cert_path": client_cert_path,
+                    "client_key_path": client_key_path,
+                    "client_ca_path": client_ca_path,
+                    "admin_cert_path": admin_cert_path,
+                    "admin_key_path": admin_key_path,
+                    "admin_ca_path": admin_ca_path,
                     "program_arguments": arguments,
                     "listener_owner_pid": pid,
                     "listener_observation_provenance": "darwin-lsof-nP-listener-owner-v2",
@@ -241,6 +270,10 @@ class ProductionCapacityFixture:
                     "observed_at_utc": utc(started + timedelta(seconds=1)),
                 }
             )
+        workload_client_cert = "/var/db/moreconsensus/tls/capacity-client.pem"
+        workload_client_key = "/var/db/moreconsensus/tls/capacity-client-key.pem"
+        workload_client_ca = "/var/db/moreconsensus/tls/client-ca.pem"
+        workload_client_cert_sha256 = "d" * 64
         workload_generator = {
             "pid": 3000 + sequence,
             "process_start_token": 6000 + sequence,
@@ -249,10 +282,20 @@ class ProductionCapacityFixture:
                 "/usr/local/bin/kvnode-capacity-loadgen",
                 "--campaign",
                 repetition_id,
+                "--client-cert",
+                workload_client_cert,
+                "--client-key",
+                workload_client_key,
+                "--ca",
+                workload_client_ca,
             ],
             "observed_at_utc": utc(started + timedelta(seconds=1)),
             "observation_provenance": "darwin-libproc-proc_pidpath-rusage-v2",
             "workload_sha256": CAPACITY.canonical_json_sha256(self.support_envelope["workload"]),
+            "client_cert_path": workload_client_cert,
+            "client_key_path": workload_client_key,
+            "client_ca_path": workload_client_ca,
+            "client_cert_sha256": workload_client_cert_sha256,
         }
         process_lines = "".join(
             f"{node['pid']} 1 10.0 1000 {' '.join(node['program_arguments'])}\n"
@@ -263,6 +306,7 @@ class ProductionCapacityFixture:
             {"argv": ["/usr/bin/pmset", "-g", "custom"], "returncode": 0, "stdout": "Battery Power:\n sleep 5\nAC Power:\n sleep 0", "stderr": ""},
             {"argv": ["/usr/bin/pmset", "-g", "batt"], "returncode": 0, "stdout": "Now drawing from 'AC Power'", "stderr": ""},
             {"argv": ["/bin/ps", "-axo", "pid=,ppid=,%cpu=,rss=,command="], "returncode": 0, "stdout": process_lines, "stderr": ""},
+            {"argv": ["/usr/bin/shasum", "-a", "256", workload_client_cert], "returncode": 0, "stdout": f"{workload_client_cert_sha256}  {workload_client_cert}", "stderr": ""},
             *[
                 {
                     "argv": ["/bin/launchctl", "print", f"system/{node['launchd_label']}"],
@@ -314,9 +358,16 @@ class ProductionCapacityFixture:
             ("warmup", 3, warmup_start),
             ("measurement", 6, measurement_start),
         ):
-            for operation_index in range(count):
-                request_start = window_start + 100_000_000 + (operation_index // 2) * 200_000_000
-                latency = 150_000_000
+            value_sizes = self.support_envelope["workload"]["value_sizes_bytes"]
+            total_operations = count * len(value_sizes)
+            for operation_index in range(total_operations):
+                size_index = operation_index // count
+                local_index = operation_index % count
+                request_start = window_start + 100_000_000 + (operation_index // 2) * 100_000_000
+                latency = 50_000_000
+                operation = self.support_envelope["workload"]["operation_sequence"][local_index % 3]
+                key_index = local_index % self.support_envelope["workload"]["key_count"]
+                node_index = local_index % 3
                 requests.append(
                     {
                         "target": copy.deepcopy(self.binding),
@@ -324,20 +375,21 @@ class ProductionCapacityFixture:
                         "sequence": sequence,
                         "phase": phase,
                         "operation_index": operation_index,
-                        "operation": self.support_envelope["workload"]["operation_sequence"][operation_index % 3],
-                        "key_index": operation_index % self.support_envelope["workload"]["key_count"],
-                        "value_bytes": self.support_envelope["workload"]["value_bytes"],
-                        "node_id": operation_index % 3 + 1,
+                        "operation": operation,
+                        "key_index": key_index,
+                        "value_bytes": value_sizes[size_index],
+                        "node_id": node_index + 1,
                         "request_url": (
-                            nodes[operation_index % 3]["client_url"]
+                            nodes[node_index]["client_url"]
                             + (
-                                f"/scan?prefix={self.support_envelope['workload']['key_seed']}-{operation_index % self.support_envelope['workload']['key_count']:08d}&limit=16"
-                                if self.support_envelope["workload"]["operation_sequence"][operation_index % 3] == "scan"
-                                else f"/kv/{self.support_envelope['workload']['key_seed']}-{operation_index % self.support_envelope['workload']['key_count']:08d}"
+                                f"/scan?prefix={self.support_envelope['workload']['key_seed']}-{key_index:08d}&limit=16"
+                                if operation == "scan"
+                                else f"/kv/{self.support_envelope['workload']['key_seed']}-{key_index:08d}"
                             )
                         ),
-                        "listener_owner_pid": nodes[operation_index % 3]["pid"],
+                        "listener_owner_pid": nodes[node_index]["pid"],
                         "tls_ca_sha256": self.native_environment["tls_ca_sha256"],
+                        "client_cert_sha256": workload_client_cert_sha256,
                         "started_utc": utc(started + timedelta(seconds=operation_index + 2)),
                         "started_monotonic_ns": request_start,
                         "ended_monotonic_ns": request_start + latency,
@@ -411,6 +463,7 @@ class ProductionCapacityFixture:
             self.binding,
             repetition,
             self.support_envelope["workload"],
+            workload_client_cert_sha256,
             nodes,
             self.native_environment,
         )

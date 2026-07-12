@@ -115,9 +115,7 @@ DARWIN_INCIDENT_CLASSES = {
 DARWIN_NONCLAIMS = {
     "multi_host",
     "independent_failure_domains",
-    "mtls",
-    "client_authorization",
-    "peer_authorization",
+    "multi_tenant_rbac",
     "production_capacity",
     "physical_storage_failure",
 }
@@ -1775,12 +1773,11 @@ def _validate_darwin_observations(
             "reload_method",
             "old_certificate_sha256",
             "new_certificate_sha256",
-            "old_private_key_sha256",
-            "new_private_key_sha256",
             "private_key_material_collected",
             "tls_server_auth_verified",
             "mtls_observed",
             "client_authorization_observed",
+            "peer_authorization_observed",
         }
         observations = checker.obj(raw_observations, path, keys)
         nodes = checker.array(observations.get("nodes_rotated"), f"{path}.nodes_rotated", 3)
@@ -1806,20 +1803,8 @@ def _validate_darwin_observations(
             observations.get("new_certificate_sha256"),
             f"{path}.new_certificate_sha256",
         )
-        old_key = _darwin_sha(
-            checker,
-            observations.get("old_private_key_sha256"),
-            f"{path}.old_private_key_sha256",
-        )
-        new_key = _darwin_sha(
-            checker,
-            observations.get("new_private_key_sha256"),
-            f"{path}.new_private_key_sha256",
-        )
         if old_certificate is not None and old_certificate == new_certificate:
             checker.fail(f"{path}.new_certificate_sha256", "must differ from old certificate")
-        if old_key is not None and old_key == new_key:
-            checker.fail(f"{path}.new_private_key_sha256", "must differ from old private key")
         _darwin_boolean(
             checker,
             observations.get("private_key_material_collected"),
@@ -1833,13 +1818,19 @@ def _validate_darwin_observations(
             True,
         )
         _darwin_boolean(
-            checker, observations.get("mtls_observed"), f"{path}.mtls_observed", False
+            checker, observations.get("mtls_observed"), f"{path}.mtls_observed", True
         )
         _darwin_boolean(
             checker,
             observations.get("client_authorization_observed"),
             f"{path}.client_authorization_observed",
-            False,
+            True,
+        )
+        _darwin_boolean(
+            checker,
+            observations.get("peer_authorization_observed"),
+            f"{path}.peer_authorization_observed",
+            True,
         )
         return
     if incident_class == "storage_pressure_failure":
@@ -2027,6 +2018,57 @@ def _validate_darwin_raw_envelope(
             checker.fail(f"{path}.envelope.exit_code", "must be nonzero for expected-rejection")
     elif result is not None and exit_code is not None and exit_code != 0:
         checker.fail(f"{path}.envelope.exit_code", "must be zero for successful observations")
+    mtls_plane = {
+        "CLIENT-MTLS-REQUIRED": "client",
+        "ADMIN-MTLS-REQUIRED": "admin",
+    }.get(artifact.get("artifact_id"))
+    if mtls_plane is not None:
+        if result != "expected-rejection" or exit_code in (None, 0):
+            checker.fail(f"{path}.envelope", "mTLS negative probe must retain a nonzero expected rejection")
+        if command is not None and "TLS 1.3 negative client-certificate probe" not in command:
+            checker.fail(f"{path}.envelope.command", "must identify the TLS 1.3 no-client-certificate probe")
+        if identity.get("record_mode") == "target" and output is not None:
+            try:
+                observation = json.loads(output, object_pairs_hook=_object_pairs_without_duplicates)
+            except (json.JSONDecodeError, ValueError) as exc:
+                checker.fail(f"{path}.envelope.output", f"must contain the structured mTLS rejection observation: {exc}")
+            else:
+                if not isinstance(observation, dict):
+                    checker.fail(f"{path}.envelope.output", "mTLS rejection observation must be an object")
+                else:
+                    if observation.get("type") != "tls-negative-probe":
+                        checker.fail(f"{path}.envelope.output.type", "must equal tls-negative-probe")
+                    if observation.get("decision") != "rejected":
+                        checker.fail(f"{path}.envelope.output.decision", "must equal rejected")
+                    details = observation.get("details")
+                    if not isinstance(details, str) or "authenticated controls succeeded before and after" not in details:
+                        checker.fail(f"{path}.envelope.output.details", "must bind authenticated controls around the rejection")
+    peer_destination = {
+        "PEER-1-AUTH-REQUIRED": 1,
+        "PEER-2-AUTH-REQUIRED": 2,
+        "PEER-3-AUTH-REQUIRED": 3,
+    }.get(artifact.get("artifact_id"))
+    if peer_destination is not None:
+        if result != "observed-success" or exit_code != 0:
+            checker.fail(f"{path}.envelope", "peer authorization probe must retain a successful three-control observation")
+        if command is not None and "verify peer TLS and replica sender authorization" not in command:
+            checker.fail(f"{path}.envelope.command", "must identify the peer TLS and sender-identity controls")
+        if identity.get("record_mode") == "target" and output is not None:
+            try:
+                observation = json.loads(output, object_pairs_hook=_object_pairs_without_duplicates)
+            except (json.JSONDecodeError, ValueError) as exc:
+                checker.fail(f"{path}.envelope.output", f"must contain the structured peer authorization observation: {exc}")
+            else:
+                if not isinstance(observation, dict):
+                    checker.fail(f"{path}.envelope.output", "peer authorization observation must be an object")
+                else:
+                    if observation.get("type") != "peer-authorization-probe":
+                        checker.fail(f"{path}.envelope.output.type", "must equal peer-authorization-probe")
+                    if observation.get("decision") != "verified":
+                        checker.fail(f"{path}.envelope.output.decision", "must equal verified")
+                    details = observation.get("details")
+                    if not isinstance(details, str) or "rejected no certificate" not in details or "sender mismatch" not in details:
+                        checker.fail(f"{path}.envelope.output.details", "must bind no-certificate and sender-mismatch rejections")
     if command is not None and len(command) < 8:
         checker.fail(f"{path}.envelope.command", "must record the observed command")
     if output is not None:
@@ -2156,6 +2198,13 @@ def _validate_darwin_v2_document(
         "storage_filesystem",
         "network_scope",
         "tls_mode",
+        "client_tls_ca_sha256",
+        "client_tls_cert_sha256",
+        "admin_tls_ca_sha256",
+        "admin_tls_cert_sha256",
+        "peer_tls_ca_sha256",
+        "peer_tls_identities",
+        "tls_identity_sha256",
     }
     profile = checker.obj(root.get("profile"), "$.profile", profile_keys)
     for key, required in (
@@ -2167,13 +2216,51 @@ def _validate_darwin_v2_document(
         ("launchd_domain", "system"),
         ("storage_filesystem", "apfs"),
         ("network_scope", "same-host-loopback"),
-        ("tls_mode", "server-auth-only"),
+        ("tls_mode", "mutual-auth-separated-planes"),
     ):
         checker.text(profile.get(key), f"$.profile.{key}", allowed={required})
     os_version = checker.text(profile.get("os_version"), "$.profile.os_version")
     if os_version is not None and re.fullmatch(r"24\.[0-9]+\.[0-9]+", os_version) is None:
         checker.fail("$.profile.os_version", "must identify Darwin 24")
     checker.text(profile.get("os_build"), "$.profile.os_build")
+    for key in (
+        "client_tls_ca_sha256",
+        "client_tls_cert_sha256",
+        "admin_tls_ca_sha256",
+        "admin_tls_cert_sha256",
+        "peer_tls_ca_sha256",
+        "tls_identity_sha256",
+    ):
+        _darwin_sha(checker, profile.get(key), f"$.profile.{key}")
+    raw_peer_identities = checker.array(profile.get("peer_tls_identities"), "$.profile.peer_tls_identities", 3)
+    if len(raw_peer_identities) != 3:
+        checker.fail("$.profile.peer_tls_identities", "must contain exactly three replica identities")
+    peer_identities: list[dict[str, Any]] = []
+    for index, raw_peer in enumerate(raw_peer_identities, start=1):
+        path = f"$.profile.peer_tls_identities[{index - 1}]"
+        peer = checker.obj(raw_peer, path, {"replica_id", "cert_sha256", "uri_san"})
+        replica_id = _darwin_integer(checker, peer.get("replica_id"), f"{path}.replica_id", minimum=1)
+        if replica_id is not None and replica_id != index:
+            checker.fail(f"{path}.replica_id", f"must equal {index}")
+        _darwin_sha(checker, peer.get("cert_sha256"), f"{path}.cert_sha256")
+        checker.text(peer.get("uri_san"), f"{path}.uri_san", allowed={f"spiffe://gosuda.org/moreconsensus/replica/{index}"})
+        peer_identities.append(peer)
+    canonical_tls_identity = (
+        f"client-ca={profile.get('client_tls_ca_sha256')}\n"
+        f"client-cert={profile.get('client_tls_cert_sha256')}\n"
+        f"admin-ca={profile.get('admin_tls_ca_sha256')}\n"
+        f"admin-cert={profile.get('admin_tls_cert_sha256')}\n"
+        f"peer-ca={profile.get('peer_tls_ca_sha256')}\n"
+    )
+    for peer in peer_identities:
+        replica_id = peer.get("replica_id")
+        canonical_tls_identity += (
+            f"peer-{replica_id}-cert={peer.get('cert_sha256')}\n"
+            f"peer-{replica_id}-uri={peer.get('uri_san')}\n"
+        )
+    expected_tls_identity = hashlib.sha256(canonical_tls_identity.encode("ascii")).hexdigest()
+    if profile.get("tls_identity_sha256") != expected_tls_identity:
+        checker.fail("$.profile.tls_identity_sha256", "does not bind the client/admin/peer TLS identity mapping")
 
     nonclaims = checker.obj(root.get("nonclaims"), "$.nonclaims", DARWIN_NONCLAIMS)
     for key in DARWIN_NONCLAIMS:
@@ -2201,6 +2288,13 @@ def _validate_darwin_v2_document(
         "release_manifest_uri",
         "release_manifest_sha256",
         "built_at",
+        "scenario_bundle_uri",
+        "scenario_bundle_sha256",
+        "scenario_bundle_signature_uri",
+        "scenario_bundle_signature_sha256",
+        "scenario_bundle_trust_root_uri",
+        "scenario_bundle_trust_root_sha256",
+        "scenario_bundle_signer_identity",
     }
     provenance = checker.obj(root.get("release_provenance"), "$.release_provenance", provenance_keys)
     release_id = checker.identifier(provenance.get("release_id"), "$.release_provenance.release_id")
@@ -2259,6 +2353,76 @@ def _validate_darwin_v2_document(
         test_mode=test_mode,
         verify_files=verify_files,
     )
+    scenario_bundle_document: dict[str, Any] | None = None
+    scenario_paths: dict[str, Path | None] = {}
+    for name, expected_uri in (
+        ("scenario_bundle", "file:external/scenario-bundle.json"),
+        ("scenario_bundle_signature", "file:external/scenario-bundle.sig"),
+        ("scenario_bundle_trust_root", "file:external/scenario-bundle-trust-root.pem"),
+    ):
+        uri_key = f"{name}_uri"
+        hash_key = f"{name}_sha256"
+        uri = provenance.get(uri_key)
+        if uri != expected_uri:
+            checker.fail(f"$.release_provenance.{uri_key}", f"must equal {expected_uri}")
+        expected_hash = _darwin_sha(
+            checker, provenance.get(hash_key), f"$.release_provenance.{hash_key}"
+        )
+        resolved = _darwin_resolve_uri(
+            checker,
+            uri,
+            f"$.release_provenance.{uri_key}",
+            evidence_root,
+            required_prefix="file:external/",
+            verify_files=verify_files,
+        )
+        scenario_paths[name] = resolved
+        if resolved is not None and verify_files:
+            if not resolved.is_file():
+                checker.fail(f"$.release_provenance.{uri_key}", "must name an existing regular file")
+            else:
+                try:
+                    if _sha256_file(resolved) != expected_hash:
+                        checker.fail(f"$.release_provenance.{hash_key}", "does not match retained bytes")
+                except OSError as exc:
+                    checker.fail(f"$.release_provenance.{uri_key}", f"cannot be read: {exc}")
+        if name == "scenario_bundle" and resolved is not None and verify_files and resolved.is_file():
+            try:
+                scenario_bundle_document = load_document(resolved)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                checker.fail(
+                    "$.release_provenance.scenario_bundle_uri",
+                    f"must contain strict JSON: {exc}",
+                )
+    scenario_signer = checker.identifier(
+        provenance.get("scenario_bundle_signer_identity"),
+        "$.release_provenance.scenario_bundle_signer_identity",
+    )
+    if verify_files and not test_mode and all(scenario_paths.values()):
+        try:
+            completed = subprocess.run(
+                [
+                    "/usr/bin/openssl", "dgst", "-sha256",
+                    "-verify", str(scenario_paths["scenario_bundle_trust_root"]),
+                    "-signature", str(scenario_paths["scenario_bundle_signature"]),
+                    str(scenario_paths["scenario_bundle"]),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            checker.fail(
+                "$.release_provenance.scenario_bundle_signature_uri",
+                f"detached RSA-SHA256 signature verification could not run: {exc}",
+            )
+        else:
+            if completed.returncode != 0 or "Verified OK" not in completed.stdout:
+                checker.fail(
+                    "$.release_provenance.scenario_bundle_signature_uri",
+                    "detached RSA-SHA256 signature verification failed",
+                )
     if not test_mode:
         if expected_release_id is not None and release_id != expected_release_id:
             checker.fail("$.release_provenance.release_id", "does not match --expected-release-id")
@@ -2370,6 +2534,11 @@ def _validate_darwin_v2_document(
     for role in {"operator", "independent-reviewer", "incident-commander"}:
         if role not in participant_roles.values():
             checker.fail("$.participants", f"must include role {role}")
+    if scenario_signer in participants:
+        checker.fail(
+            "$.release_provenance.scenario_bundle_signer_identity",
+            "must be independent from operator, reviewer, and commander participants",
+        )
 
     opened_at = checker.timestamp(root.get("opened_at"), "$.opened_at")
     closed_at = checker.timestamp(root.get("closed_at"), "$.closed_at")
@@ -2480,12 +2649,8 @@ def _validate_darwin_v2_document(
     class_nonclaims = {
         "process_crash_restart": {"not-host-reboot", "not-independent-failure-domain"},
         "one_node_unavailability": {"not-multi-host", "not-independent-failure-domain"},
-        "bad_config_rollback": {"not-client-or-peer-authorization-evidence"},
-        "certificate_secret_rotation": {
-            "not-mtls",
-            "not-client-authorization",
-            "not-peer-authorization",
-        },
+        "bad_config_rollback": {"not-multi-tenant-rbac"},
+        "certificate_secret_rotation": {"not-multi-tenant-rbac"},
         "storage_pressure_failure": {
             "not-physical-apfs-failure",
             "not-enospc",
@@ -2616,6 +2781,172 @@ def _validate_darwin_v2_document(
             f"{path}.observations",
         )
     checker.unique(drill_ids, "$.drills[*].drill_id")
+    if scenario_bundle_document is None:
+        checker.fail(
+            "$.release_provenance.scenario_bundle_uri",
+            "signed scenario bundle was not decoded",
+        )
+    else:
+        bundle = checker.obj(
+            scenario_bundle_document,
+            "$.release_provenance.scenario_bundle",
+            {
+                "schema", "identity", "commander_approval_sha256", "signer_identity",
+                "opened_at", "closed_at", "scenarios", "artifacts",
+            },
+        )
+        checker.text(
+            bundle.get("schema"),
+            "$.release_provenance.scenario_bundle.schema",
+            allowed={"incident-production-scenario-bundle-v1"},
+        )
+        if bundle.get("signer_identity") != scenario_signer:
+            checker.fail(
+                "$.release_provenance.scenario_bundle.signer_identity",
+                "does not match release_provenance signer identity",
+            )
+        _darwin_sha(
+            checker,
+            bundle.get("commander_approval_sha256"),
+            "$.release_provenance.scenario_bundle.commander_approval_sha256",
+        )
+        bundle_identity = checker.obj(
+            bundle.get("identity"),
+            "$.release_provenance.scenario_bundle.identity",
+            {
+                "target_id", "cluster_id", "environment", "release_id", "source_revision",
+                "source_digest", "binary_sha256", "manifest_sha256",
+                "tls_identity_sha256", "built_at",
+            },
+        )
+        identity_bindings = {
+            "target_id": target.get("name"),
+            "cluster_id": target.get("cluster_id"),
+            "environment": target.get("environment"),
+            "release_id": provenance.get("release_id"),
+            "source_revision": provenance.get("source_revision"),
+            "binary_sha256": provenance.get("binary_sha256"),
+            "manifest_sha256": provenance.get("release_manifest_sha256"),
+            "tls_identity_sha256": profile.get("tls_identity_sha256"),
+            "built_at": provenance.get("built_at"),
+        }
+        for key, expected in identity_bindings.items():
+            if bundle_identity.get(key) != expected:
+                checker.fail(
+                    f"$.release_provenance.scenario_bundle.identity.{key}",
+                    "does not match the assembled report identity",
+                )
+        _darwin_sha(
+            checker,
+            bundle_identity.get("source_digest"),
+            "$.release_provenance.scenario_bundle.identity.source_digest",
+        )
+        if bundle.get("opened_at") != root.get("opened_at"):
+            checker.fail(
+                "$.release_provenance.scenario_bundle.opened_at",
+                "does not match report opened_at",
+            )
+        expected_bundle_close = max(
+            (drill.get("completed_at") for drill in drills_raw if isinstance(drill, dict)),
+            default=None,
+        )
+        if bundle.get("closed_at") != expected_bundle_close:
+            checker.fail(
+                "$.release_provenance.scenario_bundle.closed_at",
+                "does not match the latest signed drill completion",
+            )
+        bundle_artifacts_raw = checker.array(
+            bundle.get("artifacts"),
+            "$.release_provenance.scenario_bundle.artifacts",
+            4,
+        )
+        bundle_artifacts: dict[str, dict[str, Any]] = {}
+        for index, raw_bundle_artifact in enumerate(bundle_artifacts_raw):
+            path = f"$.release_provenance.scenario_bundle.artifacts[{index}]"
+            bundle_artifact = checker.obj(
+                raw_bundle_artifact,
+                path,
+                {"artifact_id", "drill_id", "kind", "uri", "sha256"},
+            )
+            artifact_id = checker.identifier(bundle_artifact.get("artifact_id"), f"{path}.artifact_id")
+            uri = checker.text(bundle_artifact.get("uri"), f"{path}.uri")
+            if uri is not None and (
+                not uri.startswith("file:artifacts/")
+                or "\\" in uri
+                or ".." in PurePosixPath(uri[len("file:") :]).parts
+            ):
+                checker.fail(f"{path}.uri", "must be a normalized URI below file:artifacts/")
+            _darwin_sha(checker, bundle_artifact.get("sha256"), f"{path}.sha256")
+            if artifact_id is not None:
+                if artifact_id in bundle_artifacts:
+                    checker.fail(f"{path}.artifact_id", "duplicates an earlier signed artifact")
+                bundle_artifacts[artifact_id] = bundle_artifact
+        if set(bundle_artifacts) != referenced_artifacts:
+            checker.fail(
+                "$.release_provenance.scenario_bundle.artifacts",
+                "must exactly bind every and only scenario raw artifact",
+            )
+        for artifact_id, bundle_artifact in bundle_artifacts.items():
+            report_artifact = artifacts.get(artifact_id, {})
+            for key in ("drill_id", "kind", "sha256"):
+                if bundle_artifact.get(key) != report_artifact.get(key):
+                    checker.fail(
+                        f"$.release_provenance.scenario_bundle.artifacts[{artifact_id}].{key}",
+                        "does not match the assembled raw artifact",
+                    )
+        bundle_scenarios_raw = checker.array(
+            bundle.get("scenarios"),
+            "$.release_provenance.scenario_bundle.scenarios",
+            6,
+        )
+        report_drills = {
+            drill.get("drill_id"): drill
+            for drill in drills_raw
+            if isinstance(drill, dict) and isinstance(drill.get("drill_id"), str)
+        }
+        bundle_scenario_ids: set[str] = set()
+        bundle_scenario_keys = {
+            "drill_id", "incident_class", "requested_scenario", "execution", "approved_at",
+            "started_at", "completed_at", "affected_nodes", "fault_exercised",
+            "quorum_safety_decision", "rollback_completed", "recovery_observed",
+            "canaries_observed", "artifact_ids", "observations",
+        }
+        for index, raw_bundle_scenario in enumerate(bundle_scenarios_raw):
+            path = f"$.release_provenance.scenario_bundle.scenarios[{index}]"
+            scenario = checker.obj(raw_bundle_scenario, path, bundle_scenario_keys)
+            drill_id = checker.identifier(scenario.get("drill_id"), f"{path}.drill_id")
+            if drill_id is None:
+                continue
+            if drill_id in bundle_scenario_ids:
+                checker.fail(f"{path}.drill_id", "duplicates an earlier signed scenario")
+            bundle_scenario_ids.add(drill_id)
+            report_drill = report_drills.get(drill_id)
+            if report_drill is None:
+                checker.fail(f"{path}.drill_id", "does not identify an assembled drill")
+                continue
+            scenario_bindings = {
+                "incident_class": "incident_class", "approved_at": "approved_at",
+                "started_at": "started_at", "completed_at": "completed_at",
+                "affected_nodes": "affected_nodes", "artifact_ids": "evidence_artifact_ids",
+                "observations": "observations",
+            }
+            for bundle_key, report_key in scenario_bindings.items():
+                if scenario.get(bundle_key) != report_drill.get(report_key):
+                    checker.fail(
+                        f"{path}.{bundle_key}",
+                        f"does not match assembled drill {report_key}",
+                    )
+            if scenario.get("execution") != "live" or scenario.get("fault_exercised") is not True:
+                checker.fail(path, "must bind a live exercised production scenario")
+            for key in ("rollback_completed", "recovery_observed", "canaries_observed"):
+                if scenario.get(key) is not True:
+                    checker.fail(f"{path}.{key}", "must equal true")
+        if bundle_scenario_ids != set(report_drills):
+            checker.fail(
+                "$.release_provenance.scenario_bundle.scenarios",
+                "must exactly bind all six assembled drills",
+            )
+
     checker.unique(drill_classes, "$.drills[*].incident_class")
     if set(drill_classes) != DARWIN_INCIDENT_CLASSES:
         checker.fail(
@@ -2633,11 +2964,15 @@ def _validate_darwin_v2_document(
             "alert_artifact_ids",
             "runbook_artifact_ids",
             "signoff_artifact_ids",
+            "mtls_rejection_artifact_ids",
+            "peer_authorization_artifact_ids",
         },
     )
     operational_contract = (
         ("topology_artifact_ids", {"raw-command-output"}, 3),
         ("alert_artifact_ids", {"raw-alert"}, 1),
+        ("mtls_rejection_artifact_ids", {"raw-command-output"}, 2),
+        ("peer_authorization_artifact_ids", {"raw-command-output"}, 3),
         ("runbook_artifact_ids", {"raw-runbook"}, 1),
         ("signoff_artifact_ids", {"raw-signoff"}, 2),
     )
@@ -2669,6 +3004,20 @@ def _validate_darwin_v2_document(
         checker.fail(
             "$.operational_artifacts.topology_artifact_ids",
             "must exactly match the ordered per-node topology evidence references",
+        )
+    if operational_refs.get("mtls_rejection_artifact_ids") != ["CLIENT-MTLS-REQUIRED", "ADMIN-MTLS-REQUIRED"]:
+        checker.fail(
+            "$.operational_artifacts.mtls_rejection_artifact_ids",
+            "must exactly reference the ordered client/admin unauthenticated TLS rejection receipts",
+        )
+    if operational_refs.get("peer_authorization_artifact_ids") != [
+        "PEER-1-AUTH-REQUIRED",
+        "PEER-2-AUTH-REQUIRED",
+        "PEER-3-AUTH-REQUIRED",
+    ]:
+        checker.fail(
+            "$.operational_artifacts.peer_authorization_artifact_ids",
+            "must exactly reference the ordered per-replica peer authorization receipts",
         )
 
     sign_off = checker.obj(

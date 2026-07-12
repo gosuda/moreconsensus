@@ -134,7 +134,14 @@
         "launchd_domain",
         "storage_filesystem",
         "network_scope",
-        "tls_mode"
+        "tls_mode",
+        "client_tls_ca_sha256",
+        "client_tls_cert_sha256",
+        "admin_tls_ca_sha256",
+        "admin_tls_cert_sha256",
+        "peer_tls_ca_sha256",
+        "peer_tls_identities",
+        "tls_identity_sha256"
       ],
       "properties": {
         "platform": { "const": "darwin" },
@@ -147,7 +154,48 @@
         "launchd_domain": { "const": "system" },
         "storage_filesystem": { "const": "apfs" },
         "network_scope": { "const": "same-host-loopback" },
-        "tls_mode": { "const": "server-auth-only" }
+        "tls_mode": { "const": "mutual-auth-separated-planes" },
+        "client_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "client_tls_cert_sha256": { "$ref": "#/$defs/sha256" },
+        "admin_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "admin_tls_cert_sha256": { "$ref": "#/$defs/sha256" },
+        "peer_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "peer_tls_identities": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 1 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/1" }
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 2 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/2" }
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 3 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/3" }
+              }
+            }
+          ],
+          "items": false
+        },
+        "tls_identity_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "nodeBase": {
@@ -278,7 +326,14 @@
         "binary_sha256",
         "release_manifest_uri",
         "release_manifest_sha256",
-        "built_at"
+        "built_at",
+        "scenario_bundle_uri",
+        "scenario_bundle_sha256",
+        "scenario_bundle_signature_uri",
+        "scenario_bundle_signature_sha256",
+        "scenario_bundle_trust_root_uri",
+        "scenario_bundle_trust_root_sha256",
+        "scenario_bundle_signer_identity"
       ],
       "properties": {
         "release_id": { "$ref": "#/$defs/identifier" },
@@ -292,7 +347,14 @@
           "pattern": "^file:manifest/[A-Za-z0-9._/-]+$"
         },
         "release_manifest_sha256": { "$ref": "#/$defs/sha256" },
-        "built_at": { "$ref": "#/$defs/utcTimestamp" }
+        "built_at": { "$ref": "#/$defs/utcTimestamp" },
+        "scenario_bundle_uri": { "const": "file:external/scenario-bundle.json" },
+        "scenario_bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "scenario_bundle_signature_uri": { "const": "file:external/scenario-bundle.sig" },
+        "scenario_bundle_signature_sha256": { "$ref": "#/$defs/sha256" },
+        "scenario_bundle_trust_root_uri": { "const": "file:external/scenario-bundle-trust-root.pem" },
+        "scenario_bundle_trust_root_sha256": { "$ref": "#/$defs/sha256" },
+        "scenario_bundle_signer_identity": { "$ref": "#/$defs/identifier" }
       }
     },
     "rawArtifact": {
@@ -324,18 +386,14 @@
       "required": [
         "multi_host",
         "independent_failure_domains",
-        "mtls",
-        "client_authorization",
-        "peer_authorization",
+        "multi_tenant_rbac",
         "production_capacity",
         "physical_storage_failure"
       ],
       "properties": {
         "multi_host": { "const": false },
         "independent_failure_domains": { "const": false },
-        "mtls": { "const": false },
-        "client_authorization": { "const": false },
-        "peer_authorization": { "const": false },
+        "multi_tenant_rbac": { "const": false },
         "production_capacity": { "const": false },
         "physical_storage_failure": { "const": false }
       }
@@ -481,12 +539,11 @@
         "reload_method",
         "old_certificate_sha256",
         "new_certificate_sha256",
-        "old_private_key_sha256",
-        "new_private_key_sha256",
         "private_key_material_collected",
         "tls_server_auth_verified",
         "mtls_observed",
-        "client_authorization_observed"
+        "client_authorization_observed",
+        "peer_authorization_observed"
       ],
       "properties": {
         "nodes_rotated": { "const": ["node1", "node2", "node3"] },
@@ -494,12 +551,11 @@
         "reload_method": { "const": "rolling-launchd-restart" },
         "old_certificate_sha256": { "$ref": "#/$defs/sha256" },
         "new_certificate_sha256": { "$ref": "#/$defs/sha256" },
-        "old_private_key_sha256": { "$ref": "#/$defs/sha256" },
-        "new_private_key_sha256": { "$ref": "#/$defs/sha256" },
         "private_key_material_collected": { "const": false },
         "tls_server_auth_verified": { "const": true },
-        "mtls_observed": { "const": false },
-        "client_authorization_observed": { "const": false }
+        "mtls_observed": { "const": true },
+        "client_authorization_observed": { "const": true },
+        "peer_authorization_observed": { "const": true }
       }
     },
     "storagePressureFailureObservation": {
@@ -650,7 +706,9 @@
         "topology_artifact_ids",
         "alert_artifact_ids",
         "runbook_artifact_ids",
-        "signoff_artifact_ids"
+        "signoff_artifact_ids",
+        "mtls_rejection_artifact_ids",
+        "peer_authorization_artifact_ids"
       ],
       "properties": {
         "topology_artifact_ids": {
@@ -661,6 +719,12 @@
           "items": { "$ref": "#/$defs/identifier" }
         },
         "alert_artifact_ids": { "$ref": "#/$defs/artifactReferences" },
+        "mtls_rejection_artifact_ids": {
+          "const": ["CLIENT-MTLS-REQUIRED", "ADMIN-MTLS-REQUIRED"]
+        },
+        "peer_authorization_artifact_ids": {
+          "const": ["PEER-1-AUTH-REQUIRED", "PEER-2-AUTH-REQUIRED", "PEER-3-AUTH-REQUIRED"]
+        },
         "runbook_artifact_ids": { "$ref": "#/$defs/artifactReferences" },
         "signoff_artifact_ids": {
           "type": "array",

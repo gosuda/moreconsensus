@@ -22,6 +22,13 @@ import (
 	"time"
 )
 
+func admissionProfileCapacity(size int) int {
+	if size-1 > 4 {
+		return size - 1
+	}
+	return 4
+}
+
 type buildArtifacts struct {
 	KVNodePath       string `json:"kvnode_path"`
 	KVNodeSHA256     string `json:"kvnode_sha256"`
@@ -198,7 +205,7 @@ func (p *reservedPorts) close() {
 	p.listeners = nil
 }
 
-func startNativeCluster(caseDir string, size int, binary string, timeout time.Duration) (*nativeCluster, error) {
+func startNativeCluster(caseDir string, size int, binary string, timeout time.Duration, profile string) (*nativeCluster, error) {
 	if size < 1 || size > 7 {
 		return nil, fmt.Errorf("cluster size %d outside 1..7", size)
 	}
@@ -263,7 +270,18 @@ func startNativeCluster(caseDir string, size int, binary string, timeout time.Du
 			"-id", strconv.Itoa(id), "-listen", strings.TrimPrefix(node.clientURL, "http://"),
 			"-peer-listen", strings.TrimPrefix(node.peerURL, "http://"), "-admin-listen", strings.TrimPrefix(node.adminURL, "http://"),
 			"-data", node.dataDir, "-peers", peerArgument, "-request-deadline-ms", strconv.Itoa(int(timeout.Milliseconds())),
-			"-peer-deadline-ms", strconv.Itoa(int(timeout.Milliseconds())), "-max-peer-body-bytes", "65536",
+			"-peer-deadline-ms", strconv.Itoa(int(timeout.Milliseconds())), "-max-peer-body-bytes", "2097152",
+			"-enable-fault-injection=true",
+		}
+		switch profile {
+		case "admission":
+			node.args = append(node.args,
+				fmt.Sprintf("-transport-queue-capacity=%d", admissionProfileCapacity(size)),
+				fmt.Sprintf("-transport-retry-capacity=%d", admissionProfileCapacity(size)),
+				"-transport-workers=1",
+			)
+		case "retention":
+			node.args = append(node.args, "-retention-max-resident-instances=20", "-retention-max-durable-records=20", "-retention-max-data-bytes=1073741824")
 		}
 		cluster.nodes = append(cluster.nodes, node)
 	}
@@ -317,7 +335,8 @@ func startNodeProcess(node *nodeProcess) error {
 }
 
 func (c *nativeCluster) waitReady() error {
-	client := &http.Client{Timeout: c.timeout}
+	client := newOwnedHTTPClient(c.timeout)
+	defer client.CloseIdleConnections()
 	for _, node := range c.nodes {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := waitCondition(ctx, 50*time.Millisecond, func() error {
@@ -437,7 +456,8 @@ func (c *nativeCluster) restart(node *nodeProcess) error {
 	if err := startNodeProcess(node); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: c.timeout}
+	client := newOwnedHTTPClient(c.timeout)
+	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return waitCondition(ctx, 50*time.Millisecond, func() error {
@@ -475,6 +495,13 @@ func (c *nativeCluster) close() {
 	}
 }
 
+func newOwnedHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 64
+	transport.MaxIdleConnsPerHost = 16
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
 func rawHTTPRequest(client *http.Client, method, target string, body []byte, contentType string) (int, []byte, error) {
 	request, err := http.NewRequest(method, target, bytes.NewReader(body))
 	if err != nil {
@@ -502,4 +529,3 @@ func ioReadAllBounded(reader io.Reader, limit int64) ([]byte, error) {
 	}
 	return payload, nil
 }
-

@@ -168,7 +168,7 @@ func verifyRehearsal(config Config, runner commandRunner) (RehearsalRecord, erro
 		ProductionEligible: false, TargetID: config.TargetID, TargetEnvironment: config.TargetEnvironment, ReleaseID: config.ReleaseID,
 		BinarySHA256: binaryFact.SHA256, SourceTreeSHA256: sourceBefore, StartedAtUTC: utc(started), CompletedAtUTC: utc(time.Now()),
 		Nodes: observations, Health: health, Readiness: readiness, Metrics: metrics, Canary: canary,
-		MissingProduction: []string{"root-owned-/Library/LaunchDaemons-plists", "launchctl-system-domain-services", "administrator-approved-SIGKILL-and-rollback-receipts", "real-host-reboot-boot-UUID-transition", "read-only-UDRO-final-evidence-root", "external-operator-approval", "distinct-external-reviewer-approval"},
+		MissingProduction:   []string{"root-owned-/Library/LaunchDaemons-plists", "launchctl-system-domain-services", "administrator-approved-SIGKILL-and-rollback-receipts", "real-host-reboot-boot-UUID-transition", "read-only-UDRO-final-evidence-root", "external-operator-approval", "distinct-external-reviewer-approval"},
 		ProductionRejection: rejectionText, ProductionVerifierOK: false,
 	}
 	if err := validateRehearsalRecord(record); err != nil {
@@ -192,7 +192,7 @@ func rehearsalHTTPClient(config Config) (*http.Client, error) {
 		usesTLS = usesTLS || u.Scheme == "https"
 	}
 	if usesTLS {
-		ca, _, err := readSecureRegular(config.CAPath, 16<<20)
+		ca, _, err := readSecureRegular(config.AdminCAPath, 16<<20)
 		if err != nil {
 			return nil, err
 		}

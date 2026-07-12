@@ -561,14 +561,28 @@ The repository scripts wire focused verification:
 
 The implementation and evidence currently support a bounded library/example claim, not a mission-critical production-ready claim. The release remains no-go while these classes remain open in `RELEASE_SCOPE.md`:
 
-- full optimized-recovery parity beyond focused evidence slices;
-- unbounded formal proof beyond finite TLC configs;
-- operational TOQ clock synchronization and OWD measurement;
-- in-place disk-corruption repair, checksum recomputation/deletion, synthesized reconstruction without a verified checkpoint, or multi-replica/quorum-loss recovery;
-- exercised production deployment manifest;
-- target-environment backup/restore and disaster-recovery drill;
-- target-environment mixed-version compatibility beyond the local loopback old/new-binary drill;
-- target-environment capacity envelope;
-- incident readiness tabletop or live drill.
+- unbounded formal proof beyond finite TLC configurations;
+- certified EPaxos protocol-state compaction and late-message/incarnation fencing;
+- multi-host independent failure-domain behavior;
+- real-network fault-injection evidence;
+- operational TOQ clock synchronization and one-way-delay measurement;
+- in-place Pebble/WAL repair, synthesized recovery without a verified checkpoint, and multi-replica or quorum-loss recovery;
+- substantive mixed-version compatibility beyond the narrow local drill;
+- target-environment backup, restore, and disaster-recovery evidence;
+- signed target deployment, capacity, lifecycle, and incident evidence from operator-controlled inputs.
 
 The correct completion rule is therefore: do not mark the active goal complete unless current evidence proves mission-critical production readiness under the stated fault counts and every release blocker is closed with direct evidence.
+
+## 18. Allocation-conscious ownership does not weaken protocol evidence
+
+`ReadyInto` changes where copying occurs, not what is acknowledged. The frozen batch is immutable until an exact-prefix `Advance`; new output uses disjoint storage. Fixed-width voter masks and pooled lazy vote sets are indexed through the instance's pinned historical configuration. Invalid and duplicate senders therefore retain the same rejection/first-vote behavior, while terminal phases release transient state. Pool reset limits retained capacity and clears every active reference before reuse.
+
+Observable evidence: focused Ready ownership/durability/capped-tail tests, 1..7 quorum and historical-configuration tests, malformed-message and pool-alias tests, warmed zero-allocation Ready retry benchmarks, and same-workstation regression comparison. These checks establish implementation equivalence for the exercised finite cases; they do not constitute unbounded proof.
+
+## 19. Bounded service and retention claim
+
+The KV embedding has one lifecycle-owned logical-tick loop, proposal waiters, terminal error publication, atomic durable Ready application, capped-prefix frame admission, separate queue/retry capacities, and joined shutdown. Production mode requires mutual TLS 1.3 on peer, client, and admin planes. Peer certificates carry one replica URI SAN and inbound `Message.From` must match the authenticated replica. Client/admin CA membership is single-tenant authorization; per-user and multi-tenant RBAC are not implemented.
+
+Pebble resource options and storage counters are explicit. Retention thresholds stop new proposals at pressure and stop all protocol mutation at the configured limit, but never delete instance history. This is a finite retention horizon, not certified compaction or unbounded uptime.
+
+Evidence consists of tagged KV behavior and race tests, deterministic fault simulation, and bounded finite model checking. Current evidence is limited to Darwin arm64, three-node same-host loopback service exercises, and simulated network faults. It does not provide unbounded formal proof, certified protocol-state compaction, multi-host independent failure domains, real-network fault evidence, or a mission-critical production-readiness claim.

@@ -151,17 +151,84 @@
         "independent_failure_domains",
         "mtls",
         "client_authorization",
-        "production_capacity"
+        "peer_authorization",
+        "multi_tenant_rbac",
+        "production_capacity",
+        "client_tls_ca_sha256",
+        "client_tls_cert_sha256",
+        "admin_tls_ca_sha256",
+        "admin_tls_cert_sha256",
+        "peer_tls_ca_sha256",
+        "peer_tls_identities",
+        "tls_identity_sha256",
+        "client_mtls_rejection_artifact_id",
+        "admin_mtls_rejection_artifact_id",
+        "peer_authorization_artifact_ids"
       ],
       "properties": {
         "same_host": { "const": true },
         "loopback_only": { "const": true },
-        "tls_mode": { "const": "server-auth-only" },
+        "tls_mode": { "const": "mutual-auth-separated-planes" },
         "multi_host": { "const": false },
         "independent_failure_domains": { "const": false },
-        "mtls": { "const": false },
-        "client_authorization": { "const": false },
-        "production_capacity": { "const": false }
+        "mtls": { "const": true },
+        "client_authorization": { "const": true },
+        "peer_authorization": { "const": true },
+        "multi_tenant_rbac": { "const": false },
+        "production_capacity": { "const": false },
+        "client_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "client_tls_cert_sha256": { "$ref": "#/$defs/sha256" },
+        "admin_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "admin_tls_cert_sha256": { "$ref": "#/$defs/sha256" },
+        "peer_tls_ca_sha256": { "$ref": "#/$defs/sha256" },
+        "peer_tls_identities": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 1 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/1" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 2 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/2" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["replica_id", "cert_sha256", "uri_san"],
+              "properties": {
+                "replica_id": { "const": 3 },
+                "cert_sha256": { "$ref": "#/$defs/sha256" },
+                "uri_san": { "const": "spiffe://gosuda.org/moreconsensus/replica/3" }
+              }
+            }
+          ],
+          "items": false
+        },
+        "tls_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "client_mtls_rejection_artifact_id": { "$ref": "#/$defs/artifact_id" },
+        "admin_mtls_rejection_artifact_id": { "$ref": "#/$defs/artifact_id" },
+        "peer_authorization_artifact_ids": {
+          "const": [
+            "peer-1-authorization-required",
+            "peer-2-authorization-required",
+            "peer-3-authorization-required"
+          ]
+        }
       }
     },
     "target": {

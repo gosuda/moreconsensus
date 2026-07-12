@@ -64,16 +64,48 @@ func TestDurableInvariantCheckerRejectsUnorderedConflictsAndDuplicateApplication
 	})
 }
 
+func TestDependsTransitivelyUsesHistoricalVoterOrderingAndImplicitPrefix(t *testing.T) {
+	from := epaxos.InstanceRef{Replica: 4, Instance: 7, Conf: 1}
+	records := map[epaxos.InstanceRef]epaxos.InstanceRecord{
+		from: {Ref: from, Deps: []epaxos.InstanceNum{5, 3}},
+	}
+	configs := map[epaxos.ConfID]epaxos.ConfState{
+		1: {ID: 1, Voters: []epaxos.ReplicaID{4, 2}},
+	}
+	for _, target := range []epaxos.InstanceRef{
+		{Replica: 4, Instance: 1, Conf: 1},
+		{Replica: 2, Instance: 2, Conf: 1},
+	} {
+		if !dependsTransitively(from, target, records, configs, make(map[epaxos.InstanceRef]struct{})) {
+			t.Fatalf("%s did not include historical-slot dependency prefix through %s", from, target)
+		}
+	}
+	if dependsTransitively(from, epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, records, configs, make(map[epaxos.InstanceRef]struct{})) {
+		t.Fatal("dependency traversal used numeric replica indexing instead of historical voter ordering")
+	}
+	if dependsTransitively(from, epaxos.InstanceRef{Replica: 4, Instance: 1, Conf: 1}, records, nil, make(map[epaxos.InstanceRef]struct{})) {
+		t.Fatal("dependency traversal accepted a missing historical configuration")
+	}
+}
+
+func TestSameDurableConfigurationsRejectsReorderedVoters(t *testing.T) {
+	left := map[epaxos.ConfID]epaxos.ConfState{1: {ID: 1, Voters: []epaxos.ReplicaID{4, 2}}}
+	right := map[epaxos.ConfID]epaxos.ConfState{1: {ID: 1, Voters: []epaxos.ReplicaID{2, 4}}}
+	if sameDurableConfigurations(left, right) {
+		t.Fatal("durable configuration comparison accepted reordered voters")
+	}
+}
+
 func orderedInvariantRecords(first, second string) []epaxos.InstanceRecord {
 	firstRecord := epaxos.InstanceRecord{
-		Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Ref:    epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: 1}, RecordBallot: epaxos.Ballot{Replica: 1},
 		Status: epaxos.StatusExecuted, Seq: 1, Deps: []epaxos.InstanceNum{0, 0},
 		Command: epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Payload: []byte(first), ConflictKeys: [][]byte{[]byte("shared")}},
 	}
 	firstRecord.Checksum = epaxos.ChecksumRecord(firstRecord)
 	secondRecord := epaxos.InstanceRecord{
-		Ref: epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ref:    epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: 2}, RecordBallot: epaxos.Ballot{Replica: 2},
 		Status: epaxos.StatusExecuted, Seq: 2, Deps: []epaxos.InstanceNum{1, 0},
 		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, Payload: []byte(second), ConflictKeys: [][]byte{[]byte("shared")}},

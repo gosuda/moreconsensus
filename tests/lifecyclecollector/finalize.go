@@ -117,8 +117,13 @@ func verifyRehearsalReport(report map[string]any, root string, collection collec
 	if collection.ReleaseID != "mc-kv-"+collection.SourceRevision[:12]+"-r1" {
 		return errors.New("rehearsal release identity is replayed or not source-derived")
 	}
-	if collection.TLSCAPath != "" || collection.TLSCASHA256 != "" {
-		return errors.New("direct-process rehearsal must not bind or use a production TLS CA")
+	if collection.ClientTLSCAPath != "" || collection.ClientTLSCASHA256 != "" ||
+		collection.ClientTLSCertPath != "" || collection.ClientTLSCertSHA256 != "" ||
+		collection.AdminTLSCAPath != "" || collection.AdminTLSCASHA256 != "" ||
+		collection.AdminTLSCertPath != "" || collection.AdminTLSCertSHA256 != "" ||
+		collection.PeerTLSCAPath != "" || collection.PeerTLSCASHA256 != "" ||
+		len(collection.PeerTLSIdentities) != 0 {
+		return errors.New("direct-process rehearsal must not bind or use production TLS identities")
 	}
 	if err := verifyRetainedSourceTree(collection, "rehearsal"); err != nil {
 		return err
@@ -304,7 +309,7 @@ func finalize(cfg finalizeConfig) (finalizeResult, error) {
 	if err := verifyRetainedSourceTree(collection, "production non-claim"); err != nil {
 		return finalizeResult{}, err
 	}
-	if err := verifyRetainedTLSCA(collection); err != nil {
+	if err := verifyRetainedTLSIdentity(collection); err != nil {
 		return finalizeResult{}, err
 	}
 	if binaryDigest, err := verifyMachOArm64(collection.KVNodeBinary); err != nil || binaryDigest != collection.KVNodeSHA256 {
@@ -384,7 +389,7 @@ func finalize(cfg finalizeConfig) (finalizeResult, error) {
 	report := deepCopyMap(collection.Report)
 	report["evidence_root"] = map[string]any{"filesystem": "apfs", "external": true, "mount_read_only": true, "mount_artifact_id": "evidence-mount"}
 	report["sign_off"] = map[string]any{
-		"operator": map[string]any{"identity": operator.Identity, "role": operator.Role, "authenticated_by": operator.AuthenticatedBy, "signed_at": operator.SignedAt, "result": "approved", "artifact_id": "operator-signoff"},
+		"operator":             map[string]any{"identity": operator.Identity, "role": operator.Role, "authenticated_by": operator.AuthenticatedBy, "signed_at": operator.SignedAt, "result": "approved", "artifact_id": "operator-signoff"},
 		"independent_reviewer": map[string]any{"identity": reviewer.Identity, "role": reviewer.Role, "authenticated_by": reviewer.AuthenticatedBy, "signed_at": reviewer.SignedAt, "result": "approved", "artifact_id": "reviewer-signoff"},
 	}
 	report["raw_artifacts"] = store.artifacts
@@ -485,9 +490,13 @@ func validateSignoffs(operator, reviewer externalSignoff, collection collectionR
 		}
 		if signoff.TargetID != productionTargetID || signoff.ReleaseID != collection.ReleaseID ||
 			signoff.SourceRevision != collection.SourceRevision || signoff.SourceTreeSHA256 != collection.SourceTreeSHA256 ||
-			signoff.TLSCASHA256 != collection.TLSCASHA256 || signoff.BinarySHA256 != collection.KVNodeSHA256 ||
+			signoff.TLSIdentitySHA256 != tlsIdentityDigest(
+				collection.ClientTLSCASHA256, collection.ClientTLSCertSHA256,
+				collection.AdminTLSCASHA256, collection.AdminTLSCertSHA256,
+				collection.PeerTLSCASHA256, collection.PeerTLSIdentities,
+			) || signoff.BinarySHA256 != collection.KVNodeSHA256 ||
 			signoff.CollectionSHA256 != collection.CollectionSHA256 {
-			return fmt.Errorf("%s signoff replays or mismatches release/source-tree/TLS-CA/collection identities", expectedRole)
+			return fmt.Errorf("%s signoff replays or mismatches release/source-tree/TLS-identity/collection identities", expectedRole)
 		}
 		if _, err := time.Parse("2006-01-02T15:04:05Z", signoff.SignedAt); err != nil {
 			return fmt.Errorf("%s signed_at is not strict UTC", expectedRole)
@@ -512,7 +521,6 @@ func validateSignoffs(operator, reviewer externalSignoff, collection collectionR
 	return nil
 }
 
-
 func verifyRetainedSourceTree(collection collectionRecord, contextLabel string) error {
 	revision, sourceTreeSHA, err := sourceTreeIdentity(collection.SourceRoot)
 	if err != nil {
@@ -524,20 +532,48 @@ func verifyRetainedSourceTree(collection collectionRecord, contextLabel string) 
 	return nil
 }
 
-func verifyRetainedTLSCA(collection collectionRecord) error {
-	if collection.TLSCAPath == "" || !isSHA256(collection.TLSCASHA256) {
-		return errors.New("production non-claim: explicit TLS CA identity is missing")
+func verifyRetainedTLSIdentity(collection collectionRecord) error {
+	files := []struct {
+		label string
+		path  string
+		sha   string
+	}{
+		{"client CA", collection.ClientTLSCAPath, collection.ClientTLSCASHA256},
+		{"client certificate", collection.ClientTLSCertPath, collection.ClientTLSCertSHA256},
+		{"admin CA", collection.AdminTLSCAPath, collection.AdminTLSCASHA256},
+		{"admin certificate", collection.AdminTLSCertPath, collection.AdminTLSCertSHA256},
 	}
-	payload, err := readSecureRegular(collection.TLSCAPath)
-	if err != nil {
-		return fmt.Errorf("production non-claim: TLS CA unavailable: %w", err)
+	if collection.PeerTLSCAPath == "" || !isSHA256(collection.PeerTLSCASHA256) {
+		return errors.New("production non-claim: peer CA identity is missing")
 	}
-	if digestBytes(payload) != collection.TLSCASHA256 {
-		return errors.New("production non-claim: TLS CA changed after collection")
+	peerCA, err := readSecureRegular(collection.PeerTLSCAPath)
+	if err != nil || digestBytes(peerCA) != collection.PeerTLSCASHA256 {
+		return errors.New("production non-claim: peer CA changed after collection")
 	}
-	_, _, err = newEvidenceHTTPClient(collectConfig{mode: "production", tlsCA: collection.TLSCAPath, requestTimeout: time.Second})
-	if err != nil {
-		return fmt.Errorf("production non-claim: TLS CA cannot construct the strict probe client: %w", err)
+	if len(collection.PeerTLSIdentities) != 3 {
+		return errors.New("production non-claim: exact peer TLS identity mapping is missing")
+	}
+	for index, peer := range collection.PeerTLSIdentities {
+		wantURI := fmt.Sprintf("spiffe://gosuda.org/moreconsensus/replica/%d", index+1)
+		if peer.ReplicaID != index+1 || peer.URISAN != wantURI || peer.CertPath == "" || !isSHA256(peer.CertSHA256) {
+			return fmt.Errorf("production non-claim: peer %d TLS identity mapping is invalid", index+1)
+		}
+		payload, err := readSecureRegular(peer.CertPath)
+		if err != nil || digestBytes(payload) != peer.CertSHA256 {
+			return fmt.Errorf("production non-claim: peer %d certificate changed after collection", index+1)
+		}
+	}
+	for _, file := range files {
+		if file.path == "" || !isSHA256(file.sha) {
+			return fmt.Errorf("production non-claim: %s identity is missing", file.label)
+		}
+		payload, err := readSecureRegular(file.path)
+		if err != nil {
+			return fmt.Errorf("production non-claim: %s unavailable: %w", file.label, err)
+		}
+		if digestBytes(payload) != file.sha {
+			return fmt.Errorf("production non-claim: %s changed after collection", file.label)
+		}
 	}
 	return nil
 }

@@ -51,10 +51,10 @@ curl -fsS "http://${ADMIN_ADDR}/faults/storage"    # test storage fault state
 curl -fsS "http://${ADMIN_ADDR}/faults/transport"  # test transport drops
 ```
 
-If TLS is enabled with `-tls-cert`, `-tls-key`, and `-tls-ca`, use `https://` and supply the appropriate client trust settings, for example:
+Production mode uses plane-specific mutual TLS 1.3 flags. Administrative probes must present a certificate trusted by `-admin-client-ca` and verify the server certificate, for example:
 
 ```sh
-curl --cacert /etc/kvnode/ca.pem -fsS "https://${ADMIN_ADDR}/readyz"
+curl --cacert /etc/kvnode/tls/admin-ca.crt --cert /etc/kvnode/tls/operator-admin.crt --key /etc/kvnode/tls/operator-admin.key -fsS "https://${ADMIN_ADDR}/readyz"
 ```
 
 ## Evidence capture baseline
@@ -473,7 +473,7 @@ Containment:
 
 1. Remove the suspect node from client and admin access paths immediately.
 2. Block peer traffic from the suspect host at the network layer, or stop the service if you control the host.
-3. Rotate TLS material for remaining trusted nodes when `-tls-cert`, `-tls-key`, and `-tls-ca` are used. Do not reuse the suspect node's key or checkpoint.
+3. Rotate the peer, client, and admin certificate/key/CA material independently. Do not reuse the suspect node's keys or checkpoint.
 4. Continue serving only if the remaining trusted voters still form quorum. If quorum depends on the suspect peer, stop writes and escalate.
 5. Restore the compromised node only from a checkpoint taken before compromise and only after host rebuild and credential rotation.
 

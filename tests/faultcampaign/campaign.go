@@ -23,23 +23,23 @@ import (
 )
 
 type campaignManifest struct {
-	Version       string                 `json:"version"`
-	Status        string                 `json:"status"`
-	Scope         string                 `json:"scope"`
-	NonClaims     []string               `json:"non_claims"`
-	Source        buildArtifacts         `json:"source_and_binaries"`
-	Size          int                    `json:"size"`
-	Profile       string                 `json:"profile"`
-	Seed          uint64                 `json:"seed"`
-	Topology      []topologyNode         `json:"topology"`
-	Schedule      []TraceAction          `json:"schedule"`
-	Receipts      []TraceReceipt         `json:"receipts"`
-	HistoryCount  int                    `json:"history_count"`
-	MinimumReads  int                    `json:"minimum_successful_reads"`
-	MinimumWrites int                    `json:"minimum_successful_mutations"`
-	Artifacts     map[string]string      `json:"artifacts"`
-	Labels        map[string]string      `json:"labels"`
-	Error         string                 `json:"error,omitempty"`
+	Version       string            `json:"version"`
+	Status        string            `json:"status"`
+	Scope         string            `json:"scope"`
+	NonClaims     []string          `json:"non_claims"`
+	Source        buildArtifacts    `json:"source_and_binaries"`
+	Size          int               `json:"size"`
+	Profile       string            `json:"profile"`
+	Seed          uint64            `json:"seed"`
+	Topology      []topologyNode    `json:"topology"`
+	Schedule      []TraceAction     `json:"schedule"`
+	Receipts      []TraceReceipt    `json:"receipts"`
+	HistoryCount  int               `json:"history_count"`
+	MinimumReads  int               `json:"minimum_successful_reads"`
+	MinimumWrites int               `json:"minimum_successful_mutations"`
+	Artifacts     map[string]string `json:"artifacts"`
+	Labels        map[string]string `json:"labels"`
+	Error         string            `json:"error,omitempty"`
 }
 
 type resourceSample struct {
@@ -187,13 +187,14 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 	state := &campaignState{
 		cfg: cfg, build: build, size: size, profile: profile, caseDir: caseDir,
 		recorder: newHistoryRecorder(cfg.requestTimeout),
-		prefix: fmt.Sprintf("fc-%d-%s-%x", size, strings.ReplaceAll(profile, "-", "_"), cfg.seed),
-		rng: rand.New(rand.NewPCG(cfg.seed, uint64(size)<<32|uint64(len(profile)))),
+		prefix:   fmt.Sprintf("fc-%d-%s-%x", size, strings.ReplaceAll(profile, "-", "_"), cfg.seed),
+		rng:      rand.New(rand.NewPCG(cfg.seed, uint64(size)<<32|uint64(len(profile)))),
 	}
 	manifest := state.manifest("starting", "")
 	if err := writeJSONDurable(filepath.Join(caseDir, "manifest.json"), manifest); err != nil {
 		return FaultTrace{}, err
 	}
+	defer state.recorder.client.CloseIdleConnections()
 	defer func() {
 		if state.cluster != nil {
 			state.cluster.close()
@@ -210,7 +211,7 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 		}
 	}()
 
-	cluster, err := startNativeCluster(caseDir, size, build.KVNodePath, cfg.requestTimeout)
+	cluster, err := startNativeCluster(caseDir, size, build.KVNodePath, cfg.requestTimeout, profile)
 	if err != nil {
 		return FaultTrace{}, err
 	}
@@ -230,8 +231,10 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 	if err := state.runProfile(); err != nil {
 		return FaultTrace{}, err
 	}
-	if err := state.postHealCanary(); err != nil {
-		return FaultTrace{}, err
+	if state.profile != "retention" {
+		if err := state.postHealCanary(); err != nil {
+			return FaultTrace{}, err
+		}
 	}
 	if err := state.observeUnknownMutations(); err != nil {
 		return FaultTrace{}, err
@@ -240,8 +243,10 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 	if !checker.Valid {
 		return FaultTrace{}, fmt.Errorf("history checker: %s", checker.Error)
 	}
-	if err := state.verifyTerminalOnAll(checker.Terminal); err != nil {
-		return FaultTrace{}, err
+	if state.profile != "retention" {
+		if err := state.verifyTerminalOnAll(checker.Terminal); err != nil {
+			return FaultTrace{}, err
+		}
 	}
 	if err := state.sampleResources("healed"); err != nil {
 		return FaultTrace{}, err
@@ -304,7 +309,7 @@ func (s *campaignState) manifest(status, errorText string) campaignManifest {
 			"proxy_logs": "logs/proxy-*.jsonl", "checkpoint_logs": "checkpoint-logs/*.log",
 		},
 		Labels: map[string]string{"host": "native-darwin", "network": "single-host-loopback", "storage_fault": "service-level-unavailability"},
-		Error: errorText,
+		Error:  errorText,
 	}
 	if s.cluster != nil {
 		manifest.Topology = s.cluster.topology()
@@ -313,7 +318,7 @@ func (s *campaignState) manifest(status, errorText string) campaignManifest {
 }
 
 func newHistoryRecorder(timeout time.Duration) *historyRecorder {
-	return &historyRecorder{client: &http.Client{Timeout: timeout}}
+	return &historyRecorder{client: newOwnedHTTPClient(timeout)}
 }
 
 func (r *historyRecorder) Events() []HistoryEvent {
@@ -483,6 +488,10 @@ func (s *campaignState) runProfile() error {
 		return s.runMalformedFrames()
 	case "overload":
 		return s.runOverload()
+	case "admission":
+		return s.runAdmissionPressure()
+	case "retention":
+		return s.runRetentionPressure()
 	default:
 		return fmt.Errorf("unsupported profile %q", s.profile)
 	}
@@ -618,13 +627,13 @@ func (s *campaignState) runAsymmetricPartition() error {
 			return err
 		}
 	}
-	for offset := range f + 1 {
+	for offset := range s.size - 1 {
 		from := uint64(s.size - offset)
 		if err := s.setDirectedDrop(1, from, 1, true, "asymmetric-partition-fail-closed"); err != nil {
 			return err
 		}
 	}
-	if err := requireFailClosed(s.put(1, s.prefix+"-asym-blocked", "blocked"), "F+1-link asymmetric partition"); err != nil {
+	if err := requireFailClosed(s.put(1, s.prefix+"-asym-blocked", "blocked"), "all-inbound-link asymmetric partition"); err != nil {
 		return err
 	}
 	return s.clearTransport(1, "asymmetric-fail-closed-heal")
@@ -633,24 +642,32 @@ func (s *campaignState) runAsymmetricPartition() error {
 func (s *campaignState) setDirectedDrop(adminNode int, from, to uint64, drop bool, kind string) error {
 	action := s.planAction(kind, adminNode, from, to, true, "directed kvnode transport control")
 	body, _ := json.Marshal(map[string]any{"from": from, "to": to, "drop": drop})
-	status, response, err := rawHTTPRequest(s.recorder.client, http.MethodPost, s.cluster.nodes[adminNode-1].adminURL+"/faults/transport", body, "application/json")
+	err := s.controlRequest(http.MethodPost, s.cluster.nodes[adminNode-1].adminURL+"/faults/transport", body, "application/json")
 	reason := errorText(err)
-	if err == nil && status != http.StatusNoContent {
-		err = fmt.Errorf("transport control status=%d body=%s", status, strings.TrimSpace(string(response)))
-		reason = err.Error()
-	}
 	s.receipt(action, kind, 1, true, reason)
 	return err
 }
 
 func (s *campaignState) clearTransport(adminNode int, kind string) error {
 	action := s.planAction(kind, adminNode, 0, 0, true, "explicit directed transport heal")
-	status, response, err := rawHTTPRequest(s.recorder.client, http.MethodDelete, s.cluster.nodes[adminNode-1].adminURL+"/faults/transport", nil, "")
-	if err == nil && status != http.StatusNoContent {
-		err = fmt.Errorf("transport heal status=%d body=%s", status, strings.TrimSpace(string(response)))
-	}
+	err := s.controlRequest(http.MethodDelete, s.cluster.nodes[adminNode-1].adminURL+"/faults/transport", nil, "")
 	s.receipt(action, kind, 1, true, errorText(err))
 	return err
+}
+
+func (s *campaignState) controlRequest(method, target string, body []byte, contentType string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*s.cfg.requestTimeout)
+	defer cancel()
+	return waitCondition(ctx, 10*time.Millisecond, func() error {
+		status, response, err := rawHTTPRequest(s.recorder.client, method, target, body, contentType)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusNoContent {
+			return fmt.Errorf("fault control %s %s status=%d body=%s", method, target, status, strings.TrimSpace(string(response)))
+		}
+		return nil
+	})
 }
 
 func (s *campaignState) runCrashRestart() error {
@@ -741,10 +758,7 @@ func (s *campaignState) setStorageFault(nodeID int, fail bool, kind string) erro
 	reasonLabel := "service-level storage unavailability; not fsync, disk-full, or media failure"
 	action := s.planAction(kind, nodeID, 0, 0, true, reasonLabel)
 	body, _ := json.Marshal(map[string]bool{"fail": fail})
-	status, response, err := rawHTTPRequest(s.recorder.client, http.MethodPost, s.cluster.nodes[nodeID-1].adminURL+"/faults/storage", body, "application/json")
-	if err == nil && status != http.StatusNoContent {
-		err = fmt.Errorf("storage control status=%d body=%s", status, strings.TrimSpace(string(response)))
-	}
+	err := s.controlRequest(http.MethodPost, s.cluster.nodes[nodeID-1].adminURL+"/faults/storage", body, "application/json")
 	s.receipt(action, kind, 1, true, errorText(err))
 	return err
 }
@@ -849,7 +863,7 @@ func (s *campaignState) runMalformedFrames() error {
 	}{
 		{kind: "malformed-frame", body: []byte("not-an-epaxos-frame"), want: http.StatusBadRequest},
 		{kind: "truncated-frame", body: []byte{1}, want: http.StatusBadRequest},
-		{kind: "oversized-frame", body: bytes.Repeat([]byte{0xff}, 65537), want: http.StatusRequestEntityTooLarge},
+		{kind: "oversized-frame", body: bytes.Repeat([]byte{0xff}, (2<<20)+1), want: http.StatusRequestEntityTooLarge},
 	}
 	for _, testCase := range cases {
 		action := s.planAction(testCase.kind, target.id, 0, uint64(target.id), true, "direct peer listener hardening probe")
@@ -955,6 +969,201 @@ func (s *campaignState) runOverload() error {
 	return nil
 }
 
+func (s *campaignState) runAdmissionPressure() error {
+	if s.size == 1 {
+		reason := "not applicable: single-node cluster has no outbound peer transport"
+		action := s.planAction("bounded-admission-pressure", 0, 0, 0, false, reason)
+		s.receipt(action, "bounded-admission-pressure", 1, false, reason)
+		return nil
+	}
+	capacity := admissionProfileCapacity(s.size)
+	action := s.planAction("bounded-admission-pressure", 0, 0, 0, true, fmt.Sprintf("queue and retry ownership remain within configured %d-frame bounds", capacity))
+
+	leftAction := s.proxyActionID()
+	if err := s.cluster.proxies[0].Schedule(ProxyAction{ID: leftAction, Kind: "block", From: 2, To: 1}); err != nil {
+		return err
+	}
+	rightAction := s.proxyActionID()
+	if err := s.cluster.proxies[1].Schedule(ProxyAction{ID: rightAction, Kind: "block", From: 1, To: 2}); err != nil {
+		return err
+	}
+
+	const operations = 16
+	results := make(chan HistoryEvent, operations)
+	for operation := range operations {
+		go func(index int) {
+			node := index%2 + 1
+			results <- s.put(node, fmt.Sprintf("%s-admission-%02d", s.prefix, index), fmt.Sprintf("value-%02d", index))
+		}(operation)
+	}
+
+	type admissionSnapshot struct {
+		blocked  uint64
+		queued   uint64
+		inflight uint64
+		retrying uint64
+	}
+	admissionMetrics := func() ([]admissionSnapshot, error) {
+		snapshots := make([]admissionSnapshot, 0, len(s.cluster.nodes))
+		for _, node := range s.cluster.nodes {
+			status, body, err := rawHTTPRequest(s.recorder.client, http.MethodGet, node.adminURL+"/metrics", nil, "")
+			if err != nil || status != http.StatusOK {
+				return nil, fmt.Errorf("node %d admission metrics status=%d error=%v", node.id, status, err)
+			}
+			metrics := string(body)
+			queued, err := prometheusUint(metrics, "kvnode_transport_queued_frames")
+			if err != nil {
+				return nil, err
+			}
+			inflight, err := prometheusUint(metrics, "kvnode_transport_inflight_frames")
+			if err != nil {
+				return nil, err
+			}
+			retrying, err := prometheusUint(metrics, "kvnode_transport_retry_frames")
+			if err != nil {
+				return nil, err
+			}
+			blocked, err := prometheusUint(metrics, "kvnode_ready_admission_blocked")
+			if err != nil {
+				return nil, err
+			}
+			snapshots = append(snapshots, admissionSnapshot{blocked: blocked, queued: queued, inflight: inflight, retrying: retrying})
+			if queued+inflight > uint64(capacity) || retrying > uint64(capacity) {
+				return nil, fmt.Errorf("node %d exceeded transport ownership bounds queued=%d inflight=%d retry=%d", node.id, queued, inflight, retrying)
+			}
+		}
+		return snapshots, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*s.cfg.requestTimeout)
+	err := waitCondition(ctx, 10*time.Millisecond, func() error {
+		if len(s.cluster.proxies[0].HeldIDs()) != 1 || len(s.cluster.proxies[1].HeldIDs()) != 1 {
+			return fmt.Errorf("waiting for bilateral peer transport saturation")
+		}
+		snapshots, err := admissionMetrics()
+		if err != nil {
+			return err
+		}
+		if snapshots[0].blocked != 1 || snapshots[1].blocked != 1 {
+			return fmt.Errorf("waiting for bilateral Ready admission backpressure: node1=%d node2=%d", snapshots[0].blocked, snapshots[1].blocked)
+		}
+		return nil
+	})
+	cancel()
+	if err != nil {
+		return err
+	}
+	if _, err := admissionMetrics(); err != nil {
+		return err
+	}
+	for _, proxy := range s.cluster.proxies[:2] {
+		held := proxy.HeldIDs()
+		if _, err := proxy.Release(held); err != nil {
+			return err
+		}
+	}
+
+	pressured := 0
+	for range operations {
+		event := <-results
+		if event.Result == ResultOK {
+			continue
+		}
+		if event.Result == ResultUnknown {
+			pressured++
+			continue
+		}
+		if event.HTTPStatus != http.StatusServiceUnavailable {
+			return fmt.Errorf("admission pressure returned unexpected result=%s status=%d", event.Result, event.HTTPStatus)
+		}
+		pressured++
+	}
+	if pressured == 0 {
+		return fmt.Errorf("admission profile observed no backpressure or ambiguous timeout")
+	}
+	stableSamples := 0
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 30*s.cfg.requestTimeout)
+	err = waitCondition(recoveryCtx, 50*time.Millisecond, func() error {
+		snapshots, err := admissionMetrics()
+		if err != nil {
+			return err
+		}
+		for index, snapshot := range snapshots {
+			if snapshot.blocked != 0 || snapshot.queued+snapshot.inflight != 0 || snapshot.retrying != 0 {
+				stableSamples = 0
+				return fmt.Errorf("node %d transport not quiescent: blocked=%d queued=%d inflight=%d retry=%d", index+1, snapshot.blocked, snapshot.queued, snapshot.inflight, snapshot.retrying)
+			}
+		}
+		stableSamples++
+		if stableSamples < 2 {
+			return fmt.Errorf("waiting for consecutive quiescent transport samples")
+		}
+		return nil
+	})
+	recoveryCancel()
+	if err != nil {
+		return err
+	}
+	s.receipt(action, "bounded-admission-pressure", operations+2, true, "")
+	return nil
+}
+
+func (s *campaignState) runRetentionPressure() error {
+	action := s.planAction("bounded-retention-pressure", 0, 0, 0, true, "finite retention admission threshold without protocol history deletion")
+	for operation := range 16 {
+		event := s.put(operation%s.size+1, fmt.Sprintf("%s-retention-%02d", s.prefix, operation), fmt.Sprintf("value-%02d", operation))
+		writeRejected := event.Result != ResultOK
+		if writeRejected && event.HTTPStatus != http.StatusServiceUnavailable {
+			return fmt.Errorf("retention pressure write failed unexpectedly: %#v", event)
+		}
+		status, body, err := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/metrics", nil, "")
+		if err != nil || status != http.StatusOK {
+			return fmt.Errorf("retention metrics status=%d error=%v", status, err)
+		}
+		level, err := prometheusUint(string(body), "kvnode_retention_level")
+		if err != nil {
+			return err
+		}
+		if writeRejected && level < 2 {
+			return fmt.Errorf("proposal rejected below retention admission threshold: level=%d event=%#v", level, event)
+		}
+		if level > 2 {
+			return fmt.Errorf("retention profile skipped admission pressure and reached terminal level %d", level)
+		}
+		if level == 2 {
+			before, err := prometheusUint(string(body), "kvnode_storage_durable_instance_records")
+			if err != nil {
+				return err
+			}
+			rejected := event
+			if !writeRejected {
+				rejected = s.put(1, s.prefix+"-retention-rejected", "must-not-commit")
+			}
+			if rejected.Result == ResultOK || rejected.HTTPStatus != http.StatusServiceUnavailable {
+				return fmt.Errorf("retention pressure accepted new proposal: %#v", rejected)
+			}
+			status, afterBody, err := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/metrics", nil, "")
+			if err != nil || status != http.StatusOK {
+				return fmt.Errorf("retention post-rejection metrics status=%d error=%v", status, err)
+			}
+			after, err := prometheusUint(string(afterBody), "kvnode_storage_durable_instance_records")
+			if err != nil {
+				return err
+			}
+			if after < before {
+				return fmt.Errorf("durable instance count decreased under retention pressure: before=%d after=%d", before, after)
+			}
+			status, _, err = rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/livez", nil, "")
+			if err != nil || status != http.StatusOK {
+				return fmt.Errorf("retention pressure liveness status=%d error=%v", status, err)
+			}
+			s.receipt(action, "bounded-retention-pressure", uint64(operation+1), true, "")
+			return nil
+		}
+	}
+	return fmt.Errorf("retention admission threshold was not reached")
+}
+
 func (s *campaignState) sampleResources(phase string) error {
 	context, cancel := context.WithTimeout(context.Background(), s.cfg.requestTimeout)
 	defer cancel()
@@ -1006,20 +1215,22 @@ func (s *campaignState) postHealCanary() error {
 	})
 	cancel()
 	if err != nil {
-		return err
+		status, body, readyErr := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/readyz", nil, "")
+		return fmt.Errorf("%w; readiness status=%d body=%q error=%v", err, status, strings.TrimSpace(string(body)), readyErr)
 	}
 	for _, node := range s.cluster.nodes {
+		var event HistoryEvent
 		ctx, cancel := context.WithTimeout(context.Background(), 10*s.cfg.requestTimeout)
 		err := waitCondition(ctx, 50*time.Millisecond, func() error {
-			return s.requireRawValue(node.id, key, "healed")
+			event = s.get(node.id, key)
+			if event.Result != ResultOK || !event.Found || event.Value != "healed" {
+				return fmt.Errorf("node %d canary observation pending: %#v", node.id, event)
+			}
+			return nil
 		})
 		cancel()
 		if err != nil {
 			return err
-		}
-		event := s.get(node.id, key)
-		if event.Result != ResultOK || !event.Found || event.Value != "healed" {
-			return fmt.Errorf("node %d canary observation was not recorded: %#v", node.id, event)
 		}
 	}
 	return nil
@@ -1279,4 +1490,3 @@ func errorText(err error) string {
 	}
 	return err.Error()
 }
-

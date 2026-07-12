@@ -38,14 +38,21 @@ type ProxyReceipt struct {
 	Reason             string   `json:"reason,omitempty"`
 }
 
-type heldRequest struct {
-	id     uint64
-	method string
-	path   string
+type heldResponse struct {
+	status int
 	header http.Header
 	body   []byte
-	from   uint64
-	to     uint64
+}
+
+type heldRequest struct {
+	id       uint64
+	method   string
+	path     string
+	header   http.Header
+	body     []byte
+	from     uint64
+	to       uint64
+	complete chan heldResponse
 }
 
 type FaultProxy struct {
@@ -70,7 +77,7 @@ func newFaultProxy(listener net.Listener, upstream *url.URL, logWriter io.Writer
 	proxy := &FaultProxy{
 		listener:  listener,
 		upstream:  cloneURL(upstream),
-		client:    &http.Client{},
+		client:    newOwnedHTTPClient(0),
 		log:       logWriter,
 		actionIDs: make(map[uint64]struct{}),
 		held:      make(map[uint64]heldRequest),
@@ -122,13 +129,16 @@ func (p *FaultProxy) Close() error {
 	p.closed = true
 	started := p.started
 	p.mu.Unlock()
+	var err error
 	if !started {
 		if p.listener != nil {
-			return p.listener.Close()
+			err = p.listener.Close()
 		}
-		return nil
+	} else {
+		err = p.server.Close()
 	}
-	return p.server.Close()
+	p.client.CloseIdleConnections()
+	return err
 }
 
 func (p *FaultProxy) Schedule(actions ...ProxyAction) error {
@@ -146,7 +156,7 @@ func (p *FaultProxy) Schedule(actions ...ProxyAction) error {
 			return fmt.Errorf("duplicate proxy action ID %d", action.ID)
 		}
 		switch action.Kind {
-		case "pass", "drop", "duplicate", "delay":
+		case "pass", "drop", "duplicate", "delay", "block":
 		default:
 			return fmt.Errorf("unsupported proxy action %q", action.Kind)
 		}
@@ -209,16 +219,20 @@ func (p *FaultProxy) Release(ids []uint64) ([]ProxyReceipt, error) {
 	copies := 0
 	var releaseErr error
 	for _, request := range requests {
-		gotStatus, _, err := p.forward(request.method, request.path, request.header, request.body)
+		gotStatus, gotHeader, responseBody, err := p.forwardWithHeader(request.method, request.path, request.header, request.body)
 		if err != nil {
-			status = http.StatusBadGateway
+			gotStatus = http.StatusBadGateway
+			responseBody = []byte(err.Error())
 			releaseErr = errors.Join(releaseErr, err)
-			continue
+		} else {
+			copies++
+			if gotStatus < 200 || gotStatus >= 300 {
+				releaseErr = errors.Join(releaseErr, fmt.Errorf("release message %d upstream status %d", request.id, gotStatus))
+			}
 		}
-		copies++
-		if gotStatus < 200 || gotStatus >= 300 {
-			status = gotStatus
-			releaseErr = errors.Join(releaseErr, fmt.Errorf("release message %d upstream status %d", request.id, gotStatus))
+		status = gotStatus
+		if request.complete != nil {
+			request.complete <- heldResponse{status: gotStatus, header: gotHeader, body: responseBody}
 		}
 	}
 	p.mu.Lock()
@@ -252,6 +266,28 @@ func (p *FaultProxy) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	p.nextMessageID++
 	messageID := p.nextMessageID
 	action, hasAction := p.takeMatchingActionLocked(decoded, from, to)
+	if hasAction && action.Kind == "block" {
+		complete := make(chan heldResponse, 1)
+		p.held[messageID] = heldRequest{id: messageID, method: request.Method, path: request.URL.RequestURI(), header: request.Header.Clone(), body: append([]byte(nil), body...), from: from, to: to, complete: complete}
+		p.mu.Unlock()
+		select {
+		case response := <-complete:
+			p.mu.Lock()
+			p.appendReceiptLocked(ProxyReceipt{ActionID: action.ID, MessageID: messageID, Kind: action.Kind, From: from, To: to, HTTPStatus: response.status, Copies: 1, Applicable: true})
+			p.mu.Unlock()
+			copyHTTPHeader(w.Header(), response.header)
+			w.WriteHeader(response.status)
+			_, _ = w.Write(response.body)
+		case <-request.Context().Done():
+			p.mu.Lock()
+			if held, ok := p.held[messageID]; ok && held.complete == complete {
+				delete(p.held, messageID)
+			}
+			p.appendReceiptLocked(ProxyReceipt{ActionID: action.ID, MessageID: messageID, Kind: action.Kind, From: from, To: to, Applicable: true, Reason: request.Context().Err().Error()})
+			p.mu.Unlock()
+		}
+		return
+	}
 	if hasAction && action.Kind == "delay" {
 		p.held[messageID] = heldRequest{id: messageID, method: request.Method, path: request.URL.RequestURI(), header: request.Header.Clone(), body: append([]byte(nil), body...), from: from, to: to}
 		p.appendReceiptLocked(ProxyReceipt{ActionID: action.ID, MessageID: messageID, Kind: action.Kind, From: from, To: to, HTTPStatus: http.StatusNoContent, Applicable: true})

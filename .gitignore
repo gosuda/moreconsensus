@@ -29,6 +29,8 @@ states/
 jepsen/target/
 jepsen/.lein-failures
 jepsen/store/
+__pycache__/
+*.py[cod]
 kvnode-data/
 
 # env file

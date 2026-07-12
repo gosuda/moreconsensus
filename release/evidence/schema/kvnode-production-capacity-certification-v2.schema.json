@@ -176,7 +176,7 @@
         "launchd_domain": { "const": "system" },
         "filesystem": { "const": "apfs" },
         "network_scope": { "const": "same-host-loopback" },
-        "tls_scope": { "const": "server-auth-only" },
+        "tls_scope": { "const": "mutual-auth-separated-planes" },
         "host_id": { "$ref": "#/$defs/identity" },
         "os_version": { "$ref": "#/$defs/identity" },
         "kernel_release": {
@@ -211,7 +211,7 @@
             "operation_sequence",
             "key_seed",
             "key_count",
-            "value_bytes",
+            "value_sizes_bytes",
             "warmup_operations",
             "measurement_operations",
             "concurrency"
@@ -223,7 +223,9 @@
             },
             "key_seed": { "type": "string", "minLength": 1, "maxLength": 128 },
             "key_count": { "type": "integer", "minimum": 1 },
-            "value_bytes": { "type": "integer", "minimum": 1 },
+            "value_sizes_bytes": {
+              "const": [64, 1024, 65536, 1048576]
+            },
             "warmup_operations": { "type": "integer", "minimum": 1 },
             "measurement_operations": { "type": "integer", "minimum": 1 },
             "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 }

@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -153,21 +155,68 @@ func TestProductionConfigRequiresSystemLaunchdProbesAndRejectsDirectProcesses(t 
 	if _, err := parseCollectConfig(append(base, "--profile", "production")); err == nil || !strings.Contains(err.Error(), "launchd services") {
 		t.Fatalf("missing launchd services err=%v", err)
 	}
-	if _, err := parseCollectConfig(append(base, "--profile", "production", "--launchd-services", "svc1,svc2,svc3")); err == nil || !strings.Contains(err.Error(), "requires --tls-ca") {
-		t.Fatalf("missing explicit TLS CA err=%v", err)
+	if _, err := parseCollectConfig(append(base, "--profile", "production", "--launchd-services", "svc1,svc2,svc3")); err == nil || !strings.Contains(err.Error(), "requires --client-tls-ca") {
+		t.Fatalf("missing explicit client TLS CA err=%v", err)
 	}
 }
 
-func TestProductionHTTPSProbeUsesOnlyExplicitCAAndVerifiesIPSAN(t *testing.T) {
-	caPath, caPEM, serverCertificate := makeTLSMaterials(t, true)
+func TestPeerTLSIdentityBindsHostnameDualEKUAndReplicaURI(t *testing.T) {
+	materials := makeTLSMaterials(t, true)
+	dir := t.TempDir()
+	cfg := collectConfig{mode: "production", peerTLSCA: materials.caPath}
+	for index := range 3 {
+		cert, key := makePeerCertificatePEM(t, materials.caCert, materials.caKey, index+1, index+1, true, true)
+		cfg.peerTLSCerts[index] = filepath.Join(dir, fmt.Sprintf("peer-%d.pem", index+1))
+		cfg.peerTLSKeys[index] = filepath.Join(dir, fmt.Sprintf("peer-%d-key.pem", index+1))
+		cfg.peerURLs[index] = fmt.Sprintf("https://127.0.0.1:%d", 19000+index)
+		if err := os.WriteFile(cfg.peerTLSCerts[index], cert, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfg.peerTLSKeys[index], key, 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	caSHA, identities, err := loadPeerTLSIdentities(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caSHA != digestBytes(materials.caPEM) || len(identities) != 3 || identities[0].URISAN != "spiffe://gosuda.org/moreconsensus/replica/1" {
+		t.Fatalf("peer TLS mapping mismatch: sha=%s identities=%v", caSHA, identities)
+	}
+	wrongCert, wrongKey := makePeerCertificatePEM(t, materials.caCert, materials.caKey, 3, 2, true, true)
+	if err := os.WriteFile(cfg.peerTLSCerts[2], wrongCert, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg.peerTLSKeys[2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.peerTLSKeys[2], wrongKey, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadPeerTLSIdentities(cfg); err == nil || !strings.Contains(err.Error(), "URI SAN") {
+		t.Fatalf("wrong replica URI accepted: %v", err)
+	}
+}
+
+func TestProductionHTTPSProbeUsesSeparateMutualTLSIdentityAndVerifiesIPSAN(t *testing.T) {
+	materials := makeTLSMaterials(t, true)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		_, _ = response.Write([]byte("ok"))
 	}))
-	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{serverCertificate}}
+	clientRoots := x509.NewCertPool()
+	clientRoots.AppendCertsFromPEM(materials.caPEM)
+	server.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{materials.serverCertificate},
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: clientRoots,
+	}
 	server.StartTLS()
 	defer server.Close()
 
-	client, caSHA, err := newEvidenceHTTPClient(collectConfig{mode: "production", tlsCA: caPath, requestTimeout: 5 * time.Second})
+	cfg := collectConfig{
+		mode: "production", clientTLSCA: materials.caPath, clientTLSCert: materials.clientCertPath,
+		clientTLSKey: materials.clientKeyPath, requestTimeout: 5 * time.Second,
+	}
+	client, binding, err := newEvidenceHTTPClient(cfg, "client")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,36 +225,63 @@ func TestProductionHTTPSProbeUsesOnlyExplicitCAAndVerifiesIPSAN(t *testing.T) {
 		t.Fatal("production client omitted explicit TLS configuration")
 	}
 	tlsConfig := transport.TLSClientConfig
-	if tlsConfig.InsecureSkipVerify || tlsConfig.RootCAs == nil || tlsConfig.MinVersion != tls.VersionTLS12 || tlsConfig.ServerName != "" {
-		t.Fatalf("production TLS config=%#v, want explicit roots, automatic URL-host SAN verification, TLS 1.2+, and no insecure mode", tlsConfig)
+	if tlsConfig.InsecureSkipVerify || tlsConfig.RootCAs == nil || tlsConfig.MinVersion != tls.VersionTLS13 ||
+		tlsConfig.ServerName != "" || len(tlsConfig.Certificates) != 1 {
+		t.Fatalf("production TLS config=%#v, want explicit roots and identity, automatic URL-host SAN verification, TLS 1.3, and no insecure mode", tlsConfig)
 	}
-	if caSHA != digestBytes(caPEM) {
-		t.Fatalf("CA SHA-256=%s, want %s", caSHA, digestBytes(caPEM))
+	if binding.caSHA != digestBytes(materials.caPEM) || binding.certSHA == "" {
+		t.Fatalf("TLS binding=%#v", binding)
 	}
 	response, err := client.Get(server.URL)
 	if err != nil {
-		t.Fatalf("explicit CA and IP SAN probe failed: %v", err)
+		t.Fatalf("explicit mutual TLS probe failed: %v", err)
 	}
 	_ = response.Body.Close()
+	cfg.adminTLSCA, cfg.adminTLSCert, cfg.adminTLSKey = materials.caPath, materials.clientCertPath, materials.clientKeyPath
+	for index := range 3 {
+		cfg.clientURLs[index], cfg.adminURLs[index] = server.URL, server.URL
+	}
+	store, err := newArtifactStore(filepath.Join(t.TempDir(), "negative-probes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := lifecycleState{cfg: cfg, store: store, clientHTTP: client, adminHTTP: client}
+	if err := state.verifyClientAdminMTLSRequired(); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.artifacts) != 2 {
+		t.Fatalf("negative mTLS probe receipts=%d want=2", len(store.artifacts))
+	}
 
-	wrongCAPath, _, _ := makeTLSMaterials(t, true)
-	wrongClient, _, err := newEvidenceHTTPClient(collectConfig{mode: "production", tlsCA: wrongCAPath, requestTimeout: 5 * time.Second})
+	wrong := makeTLSMaterials(t, true)
+	wrongClient, _, err := newEvidenceHTTPClient(collectConfig{
+		mode: "production", clientTLSCA: wrong.caPath, clientTLSCert: wrong.clientCertPath,
+		clientTLSKey: wrong.clientKeyPath, requestTimeout: 5 * time.Second,
+	}, "client")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if response, err := wrongClient.Get(server.URL); err == nil {
 		_ = response.Body.Close()
-		t.Fatal("server certificate was accepted through a system-root or non-explicit fallback")
+		t.Fatal("cross-CA client identity or server trust was accepted")
 	}
 
-	dnsOnlyCA, _, dnsOnlyCertificate := makeTLSMaterials(t, false)
+	dnsOnly := makeTLSMaterials(t, false)
 	dnsOnlyServer := httptest.NewUnstartedServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		_, _ = response.Write([]byte("ok"))
 	}))
-	dnsOnlyServer.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{dnsOnlyCertificate}}
+	dnsRoots := x509.NewCertPool()
+	dnsRoots.AppendCertsFromPEM(dnsOnly.caPEM)
+	dnsOnlyServer.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{dnsOnly.serverCertificate},
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: dnsRoots,
+	}
 	dnsOnlyServer.StartTLS()
 	defer dnsOnlyServer.Close()
-	dnsOnlyClient, _, err := newEvidenceHTTPClient(collectConfig{mode: "production", tlsCA: dnsOnlyCA, requestTimeout: 5 * time.Second})
+	dnsOnlyClient, _, err := newEvidenceHTTPClient(collectConfig{
+		mode: "production", clientTLSCA: dnsOnly.caPath, clientTLSCert: dnsOnly.clientCertPath,
+		clientTLSKey: dnsOnly.clientKeyPath, requestTimeout: 5 * time.Second,
+	}, "client")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,14 +289,37 @@ func TestProductionHTTPSProbeUsesOnlyExplicitCAAndVerifiesIPSAN(t *testing.T) {
 		_ = response.Body.Close()
 		t.Fatal("IP endpoint accepted a certificate without an IP SAN")
 	}
-	productionState := lifecycleState{cfg: collectConfig{
-		mode: "production", tlsCA: caPath, sourceNode: 2,
-		adminURLs: [3]string{"https://127.0.0.1:1", "https://127.0.0.1:2", "https://127.0.0.1:3"},
-	}}
-	curlCommand := commandString(productionState.curlProbeArgv())
-	if !strings.Contains(curlCommand, "--cacert "+caPath) || !strings.Contains(curlCommand, "--proto =https") ||
-		!strings.Contains(curlCommand, "--tlsv1.2") || strings.Contains(curlCommand, "--insecure") || strings.Contains(curlCommand, " -k") {
-		t.Fatalf("production curl probe does not enforce explicit CA/HTTPS/TLS policy: %s", curlCommand)
+}
+
+func TestProductionTLSRejectsReadablePrivateKeysAndAmbiguousTargets(t *testing.T) {
+	materials := makeTLSMaterials(t, true)
+	if err := os.Chmod(materials.clientKeyPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := newEvidenceHTTPClient(collectConfig{
+		mode: "production", clientTLSCA: materials.caPath, clientTLSCert: materials.clientCertPath,
+		clientTLSKey: materials.clientKeyPath, requestTimeout: time.Second,
+	}, "client")
+	if err == nil || !strings.Contains(err.Error(), "0400 or 0600") {
+		t.Fatalf("readable private key err=%v", err)
+	}
+
+	state := lifecycleState{
+		cfg: collectConfig{
+			clientURLs: [3]string{"https://client.example", "https://client2.example", "https://client3.example"},
+			adminURLs:  [3]string{"https://admin.example", "https://admin2.example", "https://admin3.example"},
+		},
+		clientHTTP: &http.Client{},
+		adminHTTP:  &http.Client{},
+	}
+	request, _ := http.NewRequest(http.MethodGet, "https://admin.example.evil/readyz", nil)
+	if _, err := state.doEvidenceRequest(request); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("prefix-collision target err=%v", err)
+	}
+	state.cfg.adminURLs[0] = state.cfg.clientURLs[0]
+	request, _ = http.NewRequest(http.MethodGet, "https://client.example/readyz", nil)
+	if _, err := state.doEvidenceRequest(request); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous target err=%v", err)
 	}
 }
 
@@ -428,7 +527,14 @@ func productionSignoffCollection() collectionRecord {
 	return collectionRecord{
 		Mode: "production", Profile: productionProfile, ProductionEligible: true, ExecutorIdentity: "Alex Executor",
 		KVNodeSHA256: strings.Repeat("4", 64), SourceRevision: revision, SourceTreeSHA256: strings.Repeat("6", 64),
-		TLSCASHA256: strings.Repeat("7", 64),
+		ClientTLSCASHA256: strings.Repeat("7", 64), ClientTLSCertSHA256: strings.Repeat("8", 64),
+		AdminTLSCASHA256: strings.Repeat("9", 64), AdminTLSCertSHA256: strings.Repeat("a", 64),
+		PeerTLSCASHA256: strings.Repeat("b", 64),
+		PeerTLSIdentities: []peerTLSIdentity{
+			{ReplicaID: 1, CertSHA256: strings.Repeat("c", 64), URISAN: "spiffe://gosuda.org/moreconsensus/replica/1"},
+			{ReplicaID: 2, CertSHA256: strings.Repeat("d", 64), URISAN: "spiffe://gosuda.org/moreconsensus/replica/2"},
+			{ReplicaID: 3, CertSHA256: strings.Repeat("e", 64), URISAN: "spiffe://gosuda.org/moreconsensus/replica/3"},
+		},
 		ReleaseID: "mc-kv-" + revision[:12] + "-r1", CollectionSHA256: strings.Repeat("5", 64),
 		Report: map[string]any{"drill": map[string]any{"completed_at": utc(completed)}},
 	}
@@ -438,13 +544,16 @@ func signoffFor(collection collectionRecord, evidenceRole, identity, role string
 	return externalSignoff{
 		Schema: "moreconsensus.lifecycle-signoff.v1", EvidenceRole: evidenceRole, Identity: identity, Role: role,
 		AuthenticatedBy: "https://id.example.invalid/people/" + strings.ReplaceAll(strings.ToLower(identity), " ", "-"),
-		SignedAt: utc(signedAt), Result: "approved", TargetID: productionTargetID, ReleaseID: collection.ReleaseID,
+		SignedAt:        utc(signedAt), Result: "approved", TargetID: productionTargetID, ReleaseID: collection.ReleaseID,
 		SourceRevision: collection.SourceRevision, SourceTreeSHA256: collection.SourceTreeSHA256,
-		TLSCASHA256: collection.TLSCASHA256, BinarySHA256: collection.KVNodeSHA256,
+		TLSIdentitySHA256: tlsIdentityDigest(
+			collection.ClientTLSCASHA256, collection.ClientTLSCertSHA256,
+			collection.AdminTLSCASHA256, collection.AdminTLSCertSHA256,
+			collection.PeerTLSCASHA256, collection.PeerTLSIdentities,
+		), BinarySHA256: collection.KVNodeSHA256,
 		CollectionSHA256: collection.CollectionSHA256,
 	}
 }
-
 
 func makeSourceRepo(t *testing.T) (string, string, string) {
 	t.Helper()
@@ -469,7 +578,48 @@ func makeSourceRepo(t *testing.T) (string, string, string) {
 	return root, revision, sourceTreeSHA
 }
 
-func makeTLSMaterials(t *testing.T, includeIPSAN bool) (string, []byte, tls.Certificate) {
+func makePeerCertificatePEM(t *testing.T, ca *x509.Certificate, caKey *rsa.PrivateKey, replicaID, uriReplica int, includeIP, dualEKU bool) ([]byte, []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityURI, err := url.Parse(fmt.Sprintf("spiffe://gosuda.org/moreconsensus/replica/%d", uriReplica))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usages := []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	if dualEKU {
+		usages = append(usages, x509.ExtKeyUsageClientAuth)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano() + int64(replicaID)), Subject: pkix.Name{CommonName: fmt.Sprintf("peer-%d", replicaID)},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), ExtKeyUsage: usages,
+		KeyUsage: x509.KeyUsageDigitalSignature, URIs: []*url.URL{identityURI},
+	}
+	if includeIP {
+		template.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
+
+type testTLSMaterials struct {
+	caPath            string
+	caPEM             []byte
+	caCert            *x509.Certificate
+	caKey             *rsa.PrivateKey
+	clientCertPath    string
+	clientKeyPath     string
+	serverCertificate tls.Certificate
+}
+
+func makeTLSMaterials(t *testing.T, includeIPSAN bool) testTLSMaterials {
 	t.Helper()
 	now := time.Now().UTC()
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -492,13 +642,26 @@ func makeTLSMaterials(t *testing.T, includeIPSAN bool) (string, []byte, tls.Cert
 	serverTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "lifecycle-server"},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, DNSNames: []string{"localhost"},
 	}
 	if includeIPSAN {
 		serverTemplate.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
 	}
 	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caTemplate, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "lifecycle-client"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caTemplate, &clientKey.PublicKey, caKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,11 +672,21 @@ func makeTLSMaterials(t *testing.T, includeIPSAN bool) (string, []byte, tls.Cert
 	if err != nil {
 		t.Fatal(err)
 	}
-	caPath := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(caPath, caPEM, 0o400); err != nil {
-		t.Fatal(err)
+	clientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER})
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
+	root := t.TempDir()
+	caPath := filepath.Join(root, "ca.pem")
+	clientCertPath := filepath.Join(root, "client.pem")
+	clientKeyPath := filepath.Join(root, "client-key.pem")
+	for path, payload := range map[string][]byte{caPath: caPEM, clientCertPath: clientPEM, clientKeyPath: clientKeyPEM} {
+		if err := os.WriteFile(path, payload, 0o400); err != nil {
+			t.Fatal(err)
+		}
 	}
-	return caPath, caPEM, certificate
+	return testTLSMaterials{
+		caPath: caPath, caPEM: caPEM, caCert: caTemplate, caKey: caKey,
+		clientCertPath: clientCertPath, clientKeyPath: clientKeyPath, serverCertificate: certificate,
+	}
 }
 
 func TestSourceTreeIdentityFailsClosedOnTrackedAndUntrackedChanges(t *testing.T) {
@@ -561,5 +734,12 @@ func TestParseStrictJSONRejectsTrailingValue(t *testing.T) {
 func TestReadSecureRegularRejectsMissingFile(t *testing.T) {
 	if _, err := readSecureRegular(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing file err=%v", err)
+	}
+}
+
+func TestRehearsalSkipsProductionPeerAuthorizationProbe(t *testing.T) {
+	state := lifecycleState{cfg: collectConfig{mode: "rehearsal"}}
+	if err := state.verifyMTLSRequired(); err != nil {
+		t.Fatalf("rehearsal attempted production peer authorization probe: %v", err)
 	}
 }

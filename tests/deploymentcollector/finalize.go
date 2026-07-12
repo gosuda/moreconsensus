@@ -27,6 +27,7 @@ type FinalizeResult struct {
 	VerifyTranscript  Command `json:"verify_transcript"`
 	CompletedAtUTC    string  `json:"completed_at_utc"`
 }
+
 func validateFinalDiskInfo(output string) error {
 	compact := strings.ToLower(strings.Join(strings.Fields(output), ""))
 	if !strings.Contains(compact, "filesystempersonality:apfs") ||
@@ -36,7 +37,6 @@ func validateFinalDiskInfo(output string) error {
 	}
 	return nil
 }
-
 
 func finalize(config Config, runner commandRunner) (FinalizeResult, error) {
 	if config.Profile != "production" {
@@ -174,4 +174,3 @@ func finalize(config Config, runner commandRunner) (FinalizeResult, error) {
 	mounted = false // A successful finalization intentionally retains the read-only release mount.
 	return result, nil
 }
-

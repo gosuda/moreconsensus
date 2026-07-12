@@ -26,6 +26,33 @@ CLUSTER_ID = "mc-kv-darwin24-3n-r1"
 RELEASE_ID = "mc-kv-0123456789ab-r1"
 SOURCE_NODE = "node2"
 SOURCE_IDENTITY = f"{TARGET_ID}/{CLUSTER_ID}/{SOURCE_NODE}"
+CLIENT_TLS_CA_SHA = "21" * 32
+CLIENT_TLS_CERT_SHA = "32" * 32
+ADMIN_TLS_CA_SHA = "43" * 32
+ADMIN_TLS_CERT_SHA = "54" * 32
+PEER_TLS_CA_SHA = "65" * 32
+PEER_TLS_CERT_SHAS = ["76" * 32, "87" * 32, "98" * 32]
+PEER_TLS_IDENTITIES = [
+    {
+        "replica_id": index,
+        "cert_sha256": PEER_TLS_CERT_SHAS[index - 1],
+        "uri_san": f"spiffe://gosuda.org/moreconsensus/replica/{index}",
+    }
+    for index in range(1, 4)
+]
+TLS_IDENTITY_CANONICAL = (
+    f"client-ca={CLIENT_TLS_CA_SHA}\n"
+    f"client-cert={CLIENT_TLS_CERT_SHA}\n"
+    f"admin-ca={ADMIN_TLS_CA_SHA}\n"
+    f"admin-cert={ADMIN_TLS_CERT_SHA}\n"
+    f"peer-ca={PEER_TLS_CA_SHA}\n"
+)
+for peer in PEER_TLS_IDENTITIES:
+    TLS_IDENTITY_CANONICAL += (
+        f"peer-{peer['replica_id']}-cert={peer['cert_sha256']}\n"
+        f"peer-{peer['replica_id']}-uri={peer['uri_san']}\n"
+    )
+TLS_IDENTITY_SHA = hashlib.sha256(TLS_IDENTITY_CANONICAL.encode("ascii")).hexdigest()
 
 
 class SelfTestFailure(Exception):
@@ -43,6 +70,11 @@ def make_fixture(directory: Path) -> Path:
     artifact_ids = [
         "evidence-mount",
         "release-provenance",
+        "client-mtls-required",
+        "admin-mtls-required",
+        "peer-1-authorization-required",
+        "peer-2-authorization-required",
+        "peer-3-authorization-required",
         "pre-drill",
         "checkpoint-manifest",
         "configuration-history",
@@ -85,12 +117,52 @@ def make_fixture(directory: Path) -> Path:
     artifact_digests: dict[str, str] = {}
     for artifact_id in artifact_ids:
         relative = f"raw/{artifact_id}.txt"
-        payload = (
-            "Synthetic lifecycle v2 self-test evidence only.\n"
-            f"artifact_id={artifact_id}\n"
-            "observation=native-darwin-apfs-checkpoint-contract\n"
-            "release_claim=none\n"
-        ).encode()
+        if artifact_id in {"client-mtls-required", "admin-mtls-required"}:
+            plane = artifact_id.split("-", 1)[0]
+            ca_sha = CLIENT_TLS_CA_SHA if plane == "client" else ADMIN_TLS_CA_SHA
+            payload = (
+                json.dumps(
+                    {
+                        "schema": "moreconsensus.lifecycle-mtls-negative-probe.v1",
+                        "plane": plane,
+                        "target_origin": f"https://127.0.0.1:{19090 if plane == 'client' else 19092}",
+                        "tls_version": "1.3",
+                        "trusted_ca_sha256": ca_sha,
+                        "client_certificate_present": False,
+                        "handshake_rejected": True,
+                        "authenticated_control_before_and_after": True,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            ).encode()
+        elif artifact_id.startswith("peer-") and artifact_id.endswith("-authorization-required"):
+            destination_id = int(artifact_id.split("-")[1])
+            sender_id = destination_id % 3 + 1
+            payload = (
+                json.dumps(
+                    {
+                        "schema": "moreconsensus.lifecycle-peer-authorization-probe.v1",
+                        "destination_replica_id": destination_id,
+                        "authenticated_sender_replica_id": sender_id,
+                        "authenticated_sender_uri_san": f"spiffe://gosuda.org/moreconsensus/replica/{sender_id}",
+                        "trusted_ca_sha256": PEER_TLS_CA_SHA,
+                        "tls_version": "1.3",
+                        "authenticated_handshake_accepted": True,
+                        "no_certificate_handshake_rejected": True,
+                        "certificate_message_sender_mismatch_rejected": True,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            ).encode()
+        else:
+            payload = (
+                "Synthetic lifecycle v2 self-test evidence only.\n"
+                f"artifact_id={artifact_id}\n"
+                "observation=native-darwin-apfs-checkpoint-contract\n"
+                "release_claim=none\n"
+            ).encode()
         (directory / relative).write_bytes(payload)
         payload_digest = hashlib.sha256(payload).hexdigest()
         artifact_digests[artifact_id] = payload_digest
@@ -186,12 +258,28 @@ def make_fixture(directory: Path) -> Path:
         "scope": {
             "same_host": True,
             "loopback_only": True,
-            "tls_mode": "server-auth-only",
+            "tls_mode": "mutual-auth-separated-planes",
             "multi_host": False,
             "independent_failure_domains": False,
-            "mtls": False,
-            "client_authorization": False,
+            "mtls": True,
+            "client_authorization": True,
             "production_capacity": False,
+            "peer_authorization": True,
+            "multi_tenant_rbac": False,
+            "client_tls_ca_sha256": CLIENT_TLS_CA_SHA,
+            "client_tls_cert_sha256": CLIENT_TLS_CERT_SHA,
+            "admin_tls_ca_sha256": ADMIN_TLS_CA_SHA,
+            "admin_tls_cert_sha256": ADMIN_TLS_CERT_SHA,
+            "peer_tls_ca_sha256": PEER_TLS_CA_SHA,
+            "peer_tls_identities": PEER_TLS_IDENTITIES,
+            "tls_identity_sha256": TLS_IDENTITY_SHA,
+            "client_mtls_rejection_artifact_id": "client-mtls-required",
+            "admin_mtls_rejection_artifact_id": "admin-mtls-required",
+            "peer_authorization_artifact_ids": [
+                "peer-1-authorization-required",
+                "peer-2-authorization-required",
+                "peer-3-authorization-required",
+            ],
         },
         "target": {
             "target_id": TARGET_ID,
@@ -799,7 +887,8 @@ def main() -> int:
                 ("release-not-source-derived", set_value("target.release_id", "mc-kv-fedcba987654-r1"), ()),
                 ("multi-host-overclaim", set_value("scope.multi_host", True), ()),
                 ("failure-domain-overclaim", set_value("scope.independent_failure_domains", True), ()),
-                ("mtls-overclaim", set_value("scope.mtls", True), ()),
+                ("mtls-underclaim", set_value("scope.mtls", False), ()),
+                ("tls-identity-mismatch", set_value("scope.client_tls_ca_sha256", "65" * 32), ()),
                 ("capacity-overclaim", set_value("scope.production_capacity", True), ()),
                 ("mutable-root-declaration", set_value("evidence_root.mount_read_only", False), ()),
                 ("manifest-format", set_value("checkpoint.checkpoint_format", "legacy"), ()),

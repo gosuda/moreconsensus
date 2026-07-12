@@ -116,7 +116,8 @@ func inputFixture(t *testing.T) (Config, Inspection, PendingState, PostbootState
 		TargetID: productionTarget, TargetEnvironment: productionProfile, ReleaseID: release, ReleaseClaim: productionClaim,
 		SourceRevision: revision, Nonce: strings.Repeat("d", 32), BinaryPath: "/var/db/moreconsensus/releases/" + release + "-" + binaryHash + "/bin/kvnode",
 		PriorBinaryPath: "/var/db/moreconsensus/releases/prior-" + priorHash + "/bundles/kvnode-darwin-arm64",
-		ServiceUser: "kvnode", ServiceGroup: "kvnode", CAPath: "/var/db/moreconsensus/campaign/tls/ca.pem",
+		ServiceUser:     "kvnode", ServiceGroup: "kvnode",
+		PeerCAPath: "/var/db/moreconsensus/campaign/tls/peer-ca.pem", ClientCAPath: "/var/db/moreconsensus/campaign/tls/client-ca.pem", AdminCAPath: "/var/db/moreconsensus/campaign/tls/admin-ca.pem",
 		CheckpointRoot: "/var/db/moreconsensus/campaign/checkpoint", QuarantineRoot: "/var/db/moreconsensus/campaign/quarantine",
 		WritableStagingRoot: "/Volumes/mc-kv-staging-" + release, FinalMountPath: "/Volumes/mc-kv-evidence-" + release,
 	}
@@ -126,7 +127,7 @@ func inputFixture(t *testing.T) (Config, Inspection, PendingState, PostbootState
 	binding := Binding{
 		TargetID: productionTarget, TargetEnvironment: productionProfile, ReleaseID: release, Nonce: config.Nonce,
 		SourceRevision: revision, SourceTreeSHA256: strings.Repeat("e", 64), BinarySHA256: binaryHash, PriorBinarySHA256: priorHash,
-		PlistSHA256: map[string]string{}, CASHA256: strings.Repeat("0", 64), CertificateSHA256: map[string]string{}, PrivateKeySHA256: map[string]string{}, StatePublicKeyHash: strings.Repeat("f", 64),
+		PlistSHA256: map[string]string{}, CASHA256: map[string]string{"peer": strings.Repeat("0", 64), "client": strings.Repeat("1", 64), "admin": strings.Repeat("2", 64)}, CertificateSHA256: map[string]string{}, PrivateKeySHA256: map[string]string{}, StatePublicKeyHash: strings.Repeat("f", 64),
 	}
 	nodes := make([]ProcessObservation, 3)
 	for i := range 3 {
@@ -134,7 +135,9 @@ func inputFixture(t *testing.T) (Config, Inspection, PendingState, PostbootState
 		node := NodeConfig{
 			ID: i + 1, Label: label, PlistPath: "/Library/LaunchDaemons/" + label + ".plist", ClientURL: client[i], PeerURL: peer[i], AdminURL: admin[i],
 			DataPath: "/var/db/moreconsensus/campaign/data/node" + string(rune('1'+i)), LogPath: "/var/db/moreconsensus/campaign/log/node" + string(rune('1'+i)) + ".log",
-			ServerCertPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + ".crt", ServerKeyPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + ".key",
+			PeerCertPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-peer.crt", PeerKeyPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-peer.key",
+			ClientCertPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-client.crt", ClientKeyPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-client.key",
+			AdminCertPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-admin.crt", AdminKeyPath: "/var/db/moreconsensus/campaign/tls/node" + string(rune('1'+i)) + "-admin.key",
 		}
 		node.ExpectedProgramArguments = canonicalProgramArguments(config, node)
 		config.Nodes = append(config.Nodes, node)

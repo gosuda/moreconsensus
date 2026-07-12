@@ -10,7 +10,7 @@ This plan covers one-node-at-a-time replacement of the `kvnode` example service 
 go build -tags kvnode ./cmd/kvnode
 ```
 
-The runtime contract to preserve across the upgrade is the full flag set used by the existing node, including `-id`, `-listen`, `-peer-listen`, `-admin-listen`, `-data`, `-peers`, `-request-deadline-ms`, `-peer-deadline-ms`, `-tls-cert`, `-tls-key`, `-tls-ca`, `-max-client-body-bytes`, `-max-peer-body-bytes`, `-max-admin-body-bytes`, and `-max-scan-limit`. Do not change voters, peer URLs, data directories, TLS trust roots, body limits, or scan limits during the binary replacement unless a separately reviewed migration plan explicitly covers that change.
+The runtime contract to preserve across the upgrade is the full flag set used by the existing node: identity/listeners/data/peers, deadlines and body/scan limits, protocol and transport capacities, all peer/client/admin mutual-TLS flags, Pebble resource settings, and retention limits. Do not change voters, peer URLs, data directories, trust roots, queue limits, storage settings, or retention horizons during binary replacement unless a separately reviewed migration plan explicitly requires it.
 
 ## Preconditions
 

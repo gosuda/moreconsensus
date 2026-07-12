@@ -41,52 +41,55 @@ fixture_program_arguments_sha256() {
   local peer_listener="$4"
   local admin_listener="$5"
   local data_directory="$6"
-  local tls_cert_path="$7"
-  local tls_key_path="$8"
-  local tls_ca_path="$9"
+  local peer_cert_path="$7"
+  local peer_key_path="$8"
+  local client_cert_path="$9"
+  local client_key_path="${10}"
+  local admin_cert_path="${11}"
+  local admin_key_path="${12}"
+  local peer_ca_path="${13}"
+  local client_ca_path="${14}"
+  local admin_ca_path="${15}"
   local output=""
+  local -a argv=(
+    "$binary_path"
+    -id "$node"
+    -listen "$client_listener"
+    -peer-listen "$peer_listener"
+    -admin-listen "$admin_listener"
+    -data "$data_directory"
+    -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291"
+    -request-deadline-ms 5000
+    -peer-deadline-ms 2000
+    -max-client-body-bytes 1048576
+    -max-peer-body-bytes 2097152
+    -max-admin-body-bytes 65536
+    -max-scan-limit 1000
+    -production=true
+    -peer-tls-cert "$peer_cert_path"
+    -peer-tls-key "$peer_key_path"
+    -peer-tls-ca "$peer_ca_path"
+    -client-tls-cert "$client_cert_path"
+    -client-tls-key "$client_key_path"
+    -client-client-ca "$client_ca_path"
+    -admin-tls-cert "$admin_cert_path"
+    -admin-tls-key "$admin_key_path"
+    -admin-client-ca "$admin_ca_path"
+    -pebble-cache-bytes 8388608
+    -pebble-memtable-bytes 4194304
+    -pebble-memtable-stop-writes 2
+    -pebble-max-open-files 1000
+    -pebble-max-concurrent-compactions 1
+    -pebble-bytes-per-sync 524288
+    -pebble-wal-bytes-per-sync 0
+    -retention-max-resident-instances 100000
+    -retention-max-durable-records 100000
+    -retention-max-data-bytes 10737418240
+  )
   if command -v sha256sum >/dev/null 2>&1; then
-    output="$(
-      printf '%s\0' \
-        "$binary_path" \
-        -id "$node" \
-        -listen "$client_listener" \
-        -peer-listen "$peer_listener" \
-        -admin-listen "$admin_listener" \
-        -data "$data_directory" \
-        -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291" \
-        -request-deadline-ms 5000 \
-        -peer-deadline-ms 2000 \
-        -max-client-body-bytes 1048576 \
-        -max-peer-body-bytes 1048576 \
-        -max-admin-body-bytes 65536 \
-        -max-scan-limit 1000 \
-        -tls-cert "$tls_cert_path" \
-        -tls-key "$tls_key_path" \
-        -tls-ca "$tls_ca_path" |
-        sha256sum
-    )"
+    output="$(printf '%s\0' "${argv[@]}" | sha256sum)"
   else
-    output="$(
-      printf '%s\0' \
-        "$binary_path" \
-        -id "$node" \
-        -listen "$client_listener" \
-        -peer-listen "$peer_listener" \
-        -admin-listen "$admin_listener" \
-        -data "$data_directory" \
-        -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291" \
-        -request-deadline-ms 5000 \
-        -peer-deadline-ms 2000 \
-        -max-client-body-bytes 1048576 \
-        -max-peer-body-bytes 1048576 \
-        -max-admin-body-bytes 65536 \
-        -max-scan-limit 1000 \
-        -tls-cert "$tls_cert_path" \
-        -tls-key "$tls_key_path" \
-        -tls-ca "$tls_ca_path" |
-        shasum -a 256
-    )"
+    output="$(printf '%s\0' "${argv[@]}" | shasum -a 256)"
   fi
   printf '%s' "${output%%[[:space:]]*}"
 }
@@ -496,11 +499,13 @@ service_gid=41001
 service_permissions_profile=dedicated-non-root-least-privilege
 host_topology=single-darwin-host
 network_scope=loopback-only
-tls_scope=server-authentication-only
-tls_ca_path=/var/db/moreconsensus/synthetic-campaign/tls/ca.pem
-mutual_tls=false
-client_authorization=false
-nonclaims=same-host,loopback-only,no-independent-failure-domain,server-auth-tls-only,no-client-authorization,no-production-capacity,no-off-host-backup
+tls_scope=mutual-auth-separated-planes
+peer_tls_ca_path=/var/db/moreconsensus/synthetic-campaign/tls/peer-ca.pem
+client_tls_ca_path=/var/db/moreconsensus/synthetic-campaign/tls/client-ca.pem
+admin_tls_ca_path=/var/db/moreconsensus/synthetic-campaign/tls/admin-ca.pem
+mutual_tls=true
+client_authorization=true
+nonclaims=same-host,loopback-only,no-independent-failure-domain,no-production-capacity,no-off-host-backup
 boot_observation=real-host-reboot
 boot_observation_synthetic=false
 boot_uuid_before=11111111-1111-4111-8111-111111111111
@@ -552,8 +557,12 @@ for node in 1 2 3; do
       plist_hash=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
       ;;
   esac
-  tls_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}.crt"
-  tls_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}.key"
+  peer_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-peer.crt"
+  peer_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-peer.key"
+  client_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-client.crt"
+  client_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-client.key"
+  admin_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-admin.crt"
+  admin_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-admin.key"
   argv_hash="$(
     fixture_program_arguments_sha256 \
       "$node" \
@@ -562,9 +571,15 @@ for node in 1 2 3; do
       "$peer" \
       "$admin" \
       "/var/db/moreconsensus/synthetic-campaign/data/node${node}" \
-      "$tls_cert_path" \
-      "$tls_key_path" \
-      /var/db/moreconsensus/synthetic-campaign/tls/ca.pem
+      "$peer_cert_path" \
+      "$peer_key_path" \
+      "$client_cert_path" \
+      "$client_key_path" \
+      "$admin_cert_path" \
+      "$admin_key_path" \
+      /var/db/moreconsensus/synthetic-campaign/tls/peer-ca.pem \
+      /var/db/moreconsensus/synthetic-campaign/tls/client-ca.pem \
+      /var/db/moreconsensus/synthetic-campaign/tls/admin-ca.pem
   )"
   cat >> "$DARWIN_INPUT" <<EOF
 node_${node}_label=$label
@@ -574,8 +589,12 @@ node_${node}_peer_listener=$peer
 node_${node}_admin_listener=$admin
 node_${node}_data_directory=/var/db/moreconsensus/synthetic-campaign/data/node${node}
 node_${node}_plist_path=/Library/LaunchDaemons/$label.plist
-node_${node}_tls_cert_path=$tls_cert_path
-node_${node}_tls_key_path=$tls_key_path
+node_${node}_peer_tls_cert_path=$peer_cert_path
+node_${node}_peer_tls_key_path=$peer_key_path
+node_${node}_client_tls_cert_path=$client_cert_path
+node_${node}_client_tls_key_path=$client_key_path
+node_${node}_admin_tls_cert_path=$admin_cert_path
+node_${node}_admin_tls_key_path=$admin_key_path
 node_${node}_plist_sha256=$plist_hash
 node_${node}_plutil_lint_result=pass
 node_${node}_launchd_bootstrap_result=pass
@@ -629,7 +648,7 @@ done < <(/usr/sbin/diskutil info "$DARWIN_FINAL_ROOT")
 [[ "$DARWIN_VOLUME_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
   fail "darwin-v2-final-volume-UUID-missing"
 
-darwin_expected_stdout="kvnode-target-deployment-evidence status=verified verifier_version=darwin-v2 evidence_mode=test-only-synthetic release_id=$DARWIN_RELEASE_ID target_id=mc-kv-darwin24-arm64-launchd-3n-r1 source_revision=$DARWIN_SOURCE_REVISION binary_sha256=$DARWIN_BINARY_SHA256 final_evidence_root_read_only=observed-true final_evidence_root_path=$DARWIN_FINAL_ROOT evidence_volume_uuid=$DARWIN_VOLUME_UUID limitations=same-host,loopback-only,no-independent-failure-domain,server-auth-tls-only,no-client-authorization,no-production-capacity,no-off-host-backup release_claim=test-only-synthetic-deployment-accepted"
+darwin_expected_stdout="kvnode-target-deployment-evidence status=verified verifier_version=darwin-v2 evidence_mode=test-only-synthetic release_id=$DARWIN_RELEASE_ID target_id=mc-kv-darwin24-arm64-launchd-3n-r1 source_revision=$DARWIN_SOURCE_REVISION binary_sha256=$DARWIN_BINARY_SHA256 final_evidence_root_read_only=observed-true final_evidence_root_path=$DARWIN_FINAL_ROOT evidence_volume_uuid=$DARWIN_VOLUME_UUID limitations=same-host,loopback-only,no-independent-failure-domain,no-production-capacity,no-off-host-backup release_claim=test-only-synthetic-deployment-accepted"
 darwin_positive_output="$(KVNODE_DEPLOYMENT_ALLOW_TEST_FIXTURE=yes "$SCRIPT" verify "$DARWIN_BUNDLE/evidence.env" 2>&1)" ||
   fail "darwin-v2-positive-fixture-failed-output=$darwin_positive_output"
 [[ "$darwin_positive_output" == "$darwin_expected_stdout" ]] ||
@@ -651,8 +670,12 @@ for node in 1 2 3; do
     2) client=127.0.0.1:19190; peer=127.0.0.1:19191; admin=127.0.0.1:19192 ;;
     3) client=127.0.0.1:19290; peer=127.0.0.1:19291; admin=127.0.0.1:19292 ;;
   esac
-  tls_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}.crt"
-  tls_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}.key"
+  peer_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-peer.crt"
+  peer_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-peer.key"
+  client_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-client.crt"
+  client_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-client.key"
+  admin_cert_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-admin.crt"
+  admin_key_path="/var/db/moreconsensus/synthetic-campaign/tls/node${node}-admin.key"
   argv_hash="$(
     fixture_program_arguments_sha256 \
       "$node" \
@@ -661,9 +684,15 @@ for node in 1 2 3; do
       "$peer" \
       "$admin" \
       "/var/db/moreconsensus/synthetic-campaign/data/node${node}" \
-      "$tls_cert_path" \
-      "$tls_key_path" \
-      /var/db/moreconsensus/synthetic-campaign/tls/ca.pem
+      "$peer_cert_path" \
+      "$peer_key_path" \
+      "$client_cert_path" \
+      "$client_key_path" \
+      "$admin_cert_path" \
+      "$admin_key_path" \
+      /var/db/moreconsensus/synthetic-campaign/tls/peer-ca.pem \
+      /var/db/moreconsensus/synthetic-campaign/tls/client-ca.pem \
+      /var/db/moreconsensus/synthetic-campaign/tls/admin-ca.pem
   )"
   replace_field "$HEADER_ONLY_INPUT" "node_${node}_program_arguments_sha256" "$argv_hash"
   replace_field "$HEADER_ONLY_INPUT" "node_${node}_launchctl_program_arguments_sha256" "$argv_hash"
@@ -740,13 +769,13 @@ fresh_darwin_case localhost-as-multi-host
 replace_field "$DARWIN_CASE_REPORT" network_scope localhost-multi-host
 expect_verify_reject darwin-localhost-as-multi-host network_scope-must-equal-loopback-only "$DARWIN_CASE_REPORT"
 
-fresh_darwin_case mtls-claim
-replace_field "$DARWIN_CASE_REPORT" mutual_tls true
-expect_verify_reject darwin-mtls-claim mutual_tls-must-equal-false "$DARWIN_CASE_REPORT"
+fresh_darwin_case mtls-disabled
+replace_field "$DARWIN_CASE_REPORT" mutual_tls false
+expect_verify_reject darwin-mtls-disabled mutual_tls-must-equal-true "$DARWIN_CASE_REPORT"
 
-fresh_darwin_case client-authorization-claim
-replace_field "$DARWIN_CASE_REPORT" client_authorization true
-expect_verify_reject darwin-client-authorization-claim client_authorization-must-equal-false "$DARWIN_CASE_REPORT"
+fresh_darwin_case client-authorization-disabled
+replace_field "$DARWIN_CASE_REPORT" client_authorization false
+expect_verify_reject darwin-client-authorization-disabled client_authorization-must-equal-true "$DARWIN_CASE_REPORT"
 
 fresh_darwin_case missing-nonclaims
 remove_field "$DARWIN_CASE_REPORT" nonclaims

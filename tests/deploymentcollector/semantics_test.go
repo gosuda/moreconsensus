@@ -108,8 +108,8 @@ func validRehearsalRecord() RehearsalRecord {
 	return RehearsalRecord{
 		Schema: rehearsalSchema, Profile: "native-darwin-direct-process-nonclaim-v1", Claim: "none-production-deployment-not-performed",
 		ProductionEligible: false, Nodes: nodes, Health: httpObservations, Readiness: httpObservations, Metrics: httpObservations,
-		Canary: CanaryObservation{GetStatuses: map[string]int{"1": 200, "2": 200, "3": 200}},
-		MissingProduction: []string{"system-domain", "root-plists", "reboot", "rollback", "udro", "operator", "reviewer"},
+		Canary:              CanaryObservation{GetStatuses: map[string]int{"1": 200, "2": 200, "3": 200}},
+		MissingProduction:   []string{"system-domain", "root-plists", "reboot", "rollback", "udro", "operator", "reviewer"},
 		ProductionRejection: "evidence-schema-unsupported", ProductionVerifierOK: false,
 	}
 }
@@ -193,4 +193,3 @@ func TestInstallationReceiptRequiresExactSystemCommands(t *testing.T) {
 		t.Fatalf("user-domain relabel in installation receipt accepted: %v", err)
 	}
 }
-

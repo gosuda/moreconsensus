@@ -14,9 +14,10 @@
 - A Pebble-backed distributed key-value example in its own Go module, including atomic Pebble persistence for EPaxOS records and applied key-value writes.
 - The key-value example exposes deterministic timestamp bounds, bounded staleness, and exact staleness reads over explicit record timestamps.
 - The example HTTP service is built explicitly with `go build -tags kvnode ./cmd/kvnode` from `examples/kv`.
-- The example HTTP service separates client, peer-replication, and administrative APIs onto `-listen`, `-peer-listen`, and `-admin-listen`, supports optional TLS via `-tls-cert`, `-tls-key`, and `-tls-ca`, and has configurable client-facing and peer deadline budgets via `-request-deadline-ms` and `-peer-deadline-ms`.
-- Request body limits are configured per plane with `-max-client-body-bytes`, `-max-peer-body-bytes`, and `-max-admin-body-bytes`.
-- Repository verification gates run from `tests/ci.sh`, including `tests/chaos_fault_campaign.sh` for focused core fault tests plus local Jepsen restart, transport-partition, storage-unavailable, and destructive-storage profiles. Current release validation is simulation/local-loopback scoped.
+- The example HTTP service separates client, peer-replication, and administrative listeners; production mode requires TLS 1.3 mutual authentication on all three planes and replica-bound peer URI SANs.
+- Request body limits are configured per plane. The production deployment argv uses a 2 MiB peer limit so 1 MiB commands plus codec overhead remain admissible.
+- The example service has a lifecycle-owned logical-tick driver, bounded queue/retry ownership, terminal storage/protocol failure handling, explicit Pebble resource settings, retention pressure/limit admission, and low-cardinality runtime metrics.
+- Repository verification uses focused behavior/race/fuzz tests, deterministic fault simulation for voter counts 1 through 7, and required bounded finite model checking. The larger finite TLC suite is manual.
 
 ## Documentation
 
@@ -43,16 +44,18 @@
 - Voter sets are sorted, unique, nonzero replica IDs with cluster size 1 through 7. Configuration changes must keep the voter count in that range.
 - The core starts no goroutines, performs no I/O, and does not call the OS wall clock. Non-TOQ protocol timing is deterministic logical ticks; explicit TOQ mode uses a caller-supplied synchronized-clock callback and caller-supplied conservative delay bounds that include one-way network delay plus clock-skew/synchronization margin.
 - Fast quorums use the optimized EPaxos paper threshold for odd supported cluster sizes and conservative thresholds for even sizes, with FP-deps-committed prefix evidence required before fast commit. Accept/AcceptReply carry sender-preserving recovery-only Accept-Deps evidence that is persisted, propagated through commit/prepare/evidence responses, and used by TryPreAccept committed stale-dependency checks without changing chosen execution attributes. Explicit EPaxos Revisited TOQ core behavior is implemented behind `Config.TOQ`; the embedding application remains responsible for real clock synchronization and delay measurement. The unbounded optimized-recovery proof and complete TLA coverage of the read-only evidence-query path remain non-claims.
-- Formal evidence is the finite TLC suite listed in `MODEL_EQ_REPORT.MD`; it is not an unbounded proof.
-- The HTTP KV example exposes separate client, peer, and admin listener planes. The peer replication endpoint is POST-only. TLS is optional transport security only; it does not add authentication or authorization.
+- Formal evidence is bounded finite model checking plus focused Go tests; it is not an exhaustive or unbounded proof. The larger configured TLC profile is manual finite model checking.
+- The HTTP KV example exposes separate client, peer, and admin listener planes. Production mode requires separate plane configurations, mutual TLS 1.3, and peer URI identity `spiffe://gosuda.org/moreconsensus/replica/<id>`. Client/admin CA membership is single-tenant authorization, not per-user or multi-tenant RBAC.
 - HTTP body limits are `-max-client-body-bytes`, `-max-peer-body-bytes`, and `-max-admin-body-bytes`. Scan result cardinality is bounded by `-max-scan-limit`; scans must use `prefix` or `start`/`end`.
 - Point `PUT` and `GET /kv/{key}` carry raw bytes. Transaction JSON accepts text `value` or binary-safe `value_b64`; scans return `value_b64` when the value is not valid UTF-8 JSON text.
 - Latest point reads wait for the key's consensus barrier. Latest scans in the HTTP KV node wait on an internal scan-barrier conflict key shared by that node's HTTP write path; this is not a protocol-native range/prefix predicate for arbitrary applications.
 - Bit-flipped persisted EPaxos records are detected by checksum and reject restart. The KV example has tested offline whole-directory restore, semantic checkpoint verification, explicit `RepairFromCheckpoint` replacement, and live-source `RecoverReplicaFromLiveCheckpoint` replacement for one stopped/corrupt member while a healthy quorum remains. In-place Pebble/WAL repair, checksum recomputation/deletion, synthesized reconstruction without a verified checkpoint, multi-replica/quorum-loss repair, and target-environment drills remain outside the current release claim.
+- Retention limits define a finite supported horizon for resident instances, durable records, and Pebble bytes. The implementation does not delete protocol history or claim certified EPaxos compaction or unbounded uptime.
 
 ## API contracts
 
 - Embedders must persist every `Ready.Records` entry before sending `Ready.Messages` or acknowledging `Ready.Committed` from the same batch. `Ready.MustSync` means durable records are present.
+- `ReadyInto` clones the frozen batch into caller-owned capacity without acknowledging it; retries remain identical until `Advance`. `RuntimeStats` and `IsExecuted` are allocation-free runtime queries and do not transfer ownership.
 - Embedders must apply `Ready.Committed` exactly once at the application layer before acknowledging those committed commands with `Advance`.
 - `Advance` accepts only an exact prefix of the outstanding `Ready`; invalid or out-of-order acknowledgements leave the batch outstanding for retry.
 - Storage implementations must return durable records with valid BLAKE3 checksums and must treat checksum mismatch as a hard load/apply error; recovery uses whole-directory replacement from a semantically verified checkpoint, not record deletion or checksum repair.

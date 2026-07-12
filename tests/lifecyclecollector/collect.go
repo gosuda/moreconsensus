@@ -18,29 +18,31 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gosuda.org/moreconsensus/epaxos"
 )
 
 type checkpointInspect struct {
-	Schema               string                  `json:"schema"`
-	CheckpointFormat     string                  `json:"checkpoint_format"`
-	ManifestVersion      int                     `json:"manifest_version"`
-	ManifestIdentity     string                  `json:"manifest_identity_blake3"`
-	SemanticStateDigest  string                  `json:"semantic_state_digest_blake3"`
-	RecordCount          int                     `json:"record_count"`
-	AppliedCount         int                     `json:"applied_count"`
-	HardState            inspectHardState        `json:"hard_state"`
-	ConfigurationHistory []map[string]any        `json:"configuration_history"`
-	SourceIdentity       string                  `json:"source_identity"`
-	ReleaseChecksum      string                  `json:"release_checksum"`
-	CurrentTargetClaim   bool                    `json:"current_target_claim"`
+	Schema               string           `json:"schema"`
+	CheckpointFormat     string           `json:"checkpoint_format"`
+	ManifestVersion      int              `json:"manifest_version"`
+	ManifestIdentity     string           `json:"manifest_identity_blake3"`
+	SemanticStateDigest  string           `json:"semantic_state_digest_blake3"`
+	RecordCount          int              `json:"record_count"`
+	AppliedCount         int              `json:"applied_count"`
+	HardState            inspectHardState `json:"hard_state"`
+	ConfigurationHistory []map[string]any `json:"configuration_history"`
+	SourceIdentity       string           `json:"source_identity"`
+	ReleaseChecksum      string           `json:"release_checksum"`
+	CurrentTargetClaim   bool             `json:"current_target_claim"`
 }
 
 type inspectHardState struct {
-	CodecVersion                   int   `json:"codec_version"`
+	CodecVersion                   int    `json:"codec_version"`
 	Digest                         string `json:"digest_blake3"`
 	Tick                           uint64 `json:"tick"`
-	CurrentConfigurationGeneration int   `json:"current_configuration_generation"`
-	CurrentVoters                  []int `json:"current_voters"`
+	CurrentConfigurationGeneration int    `json:"current_configuration_generation"`
+	CurrentVoters                  []int  `json:"current_voters"`
 }
 
 type directNode struct {
@@ -56,17 +58,26 @@ type processController struct {
 	mu    sync.Mutex
 }
 
+type tlsBinding struct {
+	caSHA   string
+	certSHA string
+}
+
 type lifecycleState struct {
 	cfg             collectConfig
 	store           *artifactStore
 	controller      *processController
 	ctx             context.Context
-	httpClient      *http.Client
+	clientHTTP      *http.Client
+	adminHTTP       *http.Client
 	profile         string
 	binarySHA       string
 	checkpointSHA   string
 	sourceTreeSHA   string
-	tlsCASHA        string
+	clientTLS       tlsBinding
+	adminTLS        tlsBinding
+	peerTLSCA       string
+	peerTLS         []peerTLSIdentity
 	drillID         string
 	startedAt       time.Time
 	preAt           time.Time
@@ -124,7 +135,15 @@ func collect(cfg collectConfig) (collectResult, error) {
 	if err != nil {
 		return collectResult{}, err
 	}
-	httpClient, tlsCASHA, err := newEvidenceHTTPClient(cfg)
+	clientHTTP, clientTLS, err := newEvidenceHTTPClient(cfg, "client")
+	if err != nil {
+		return collectResult{}, err
+	}
+	adminHTTP, adminTLS, err := newEvidenceHTTPClient(cfg, "admin")
+	if err != nil {
+		return collectResult{}, err
+	}
+	peerTLSCA, peerTLS, err := loadPeerTLSIdentities(cfg)
 	if err != nil {
 		return collectResult{}, err
 	}
@@ -138,17 +157,18 @@ func collect(cfg collectConfig) (collectResult, error) {
 	}
 	state := &lifecycleState{
 		cfg: cfg, store: store, ctx: context.Background(),
-		httpClient: httpClient, profile: profile,
-		binarySHA: binarySHA, checkpointSHA: checkpointSHA, sourceTreeSHA: sourceTreeSHA, tlsCASHA: tlsCASHA,
-		drillID: "lifecycle-" + time.Now().UTC().Format("20060102T150405Z"),
-		sourceIdentity: cfg.targetID + "/" + cfg.clusterID + "/node" + strconv.Itoa(cfg.sourceNode),
+		clientHTTP: clientHTTP, adminHTTP: adminHTTP, profile: profile,
+		binarySHA: binarySHA, checkpointSHA: checkpointSHA, sourceTreeSHA: sourceTreeSHA,
+		clientTLS: clientTLS, adminTLS: adminTLS, peerTLSCA: peerTLSCA, peerTLS: peerTLS,
+		drillID:         "lifecycle-" + time.Now().UTC().Format("20060102T150405Z"),
+		sourceIdentity:  cfg.targetID + "/" + cfg.clusterID + "/node" + strconv.Itoa(cfg.sourceNode),
 		releaseChecksum: "sha256:" + binarySHA,
-		stagePath: filepath.Join(filepath.Dir(cfg.dataPaths[cfg.sourceNode-1]), ".lifecycle-v2-restore-"+filepath.Base(cfg.dataPaths[cfg.sourceNode-1])),
-		liveQuarantine: filepath.Join(cfg.quarantinePath, "live-node"+strconv.Itoa(cfg.sourceNode)),
-		preKey: "lifecycle-v2-pre-" + time.Now().UTC().Format("20060102T150405Z"),
-		preValue: "pre-checkpoint-exactly-once-" + cfg.releaseID,
-		postKey: "lifecycle-v2-post-" + time.Now().UTC().Format("20060102T150405Z"),
-		postValue: "post-checkpoint-convergence-" + cfg.releaseID,
+		stagePath:       filepath.Join(filepath.Dir(cfg.dataPaths[cfg.sourceNode-1]), ".lifecycle-v2-restore-"+filepath.Base(cfg.dataPaths[cfg.sourceNode-1])),
+		liveQuarantine:  filepath.Join(cfg.quarantinePath, "live-node"+strconv.Itoa(cfg.sourceNode)),
+		preKey:          "lifecycle-v2-pre-" + time.Now().UTC().Format("20060102T150405Z"),
+		preValue:        "pre-checkpoint-exactly-once-" + cfg.releaseID,
+		postKey:         "lifecycle-v2-post-" + time.Now().UTC().Format("20060102T150405Z"),
+		postValue:       "post-checkpoint-convergence-" + cfg.releaseID,
 	}
 	state.controller = &processController{cfg: cfg}
 	if err := state.prepareCluster(); err != nil {
@@ -156,6 +176,9 @@ func collect(cfg collectConfig) (collectResult, error) {
 	}
 	defer state.controller.stopAll()
 	state.startedAt = time.Now().UTC()
+	if err := state.verifyMTLSRequired(); err != nil {
+		return collectResult{}, err
+	}
 	if err := state.addMountAndProvenance(); err != nil {
 		return collectResult{}, err
 	}
@@ -178,23 +201,42 @@ func collect(cfg collectConfig) (collectResult, error) {
 	return state.publishCollection()
 }
 
-func newEvidenceHTTPClient(cfg collectConfig) (*http.Client, string, error) {
+func newEvidenceHTTPClient(cfg collectConfig, plane string) (*http.Client, tlsBinding, error) {
 	transport := &http.Transport{Proxy: nil}
-	caSHA := ""
+	binding := tlsBinding{}
 	if cfg.mode == "production" {
-		payload, err := readSecureRegular(cfg.tlsCA)
+		caPath, certPath, keyPath := cfg.clientTLSCA, cfg.clientTLSCert, cfg.clientTLSKey
+		if plane == "admin" {
+			caPath, certPath, keyPath = cfg.adminTLSCA, cfg.adminTLSCert, cfg.adminTLSKey
+		} else if plane != "client" {
+			return nil, tlsBinding{}, fmt.Errorf("unknown TLS plane %q", plane)
+		}
+		caPayload, err := readSecureRegular(caPath)
 		if err != nil {
-			return nil, "", fmt.Errorf("production TLS CA: %w", err)
+			return nil, tlsBinding{}, fmt.Errorf("production %s TLS CA: %w", plane, err)
+		}
+		certPayload, err := readSecureRegular(certPath)
+		if err != nil {
+			return nil, tlsBinding{}, fmt.Errorf("production %s TLS certificate: %w", plane, err)
+		}
+		keyPayload, err := readSecurePrivateKey(keyPath)
+		if err != nil {
+			return nil, tlsBinding{}, fmt.Errorf("production %s TLS key: %w", plane, err)
 		}
 		roots := x509.NewCertPool()
-		if !roots.AppendCertsFromPEM(payload) {
-			return nil, "", errors.New("production TLS CA contains no parseable certificates")
+		if !roots.AppendCertsFromPEM(caPayload) {
+			return nil, tlsBinding{}, fmt.Errorf("production %s TLS CA contains no parseable certificates", plane)
+		}
+		certificate, err := tls.X509KeyPair(certPayload, keyPayload)
+		if err != nil {
+			return nil, tlsBinding{}, fmt.Errorf("production %s TLS identity: %w", plane, err)
 		}
 		transport.TLSClientConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    roots,
+			MinVersion:   tls.VersionTLS13,
+			RootCAs:      roots,
+			Certificates: []tls.Certificate{certificate},
 		}
-		caSHA = digestBytes(payload)
+		binding = tlsBinding{caSHA: digestBytes(caPayload), certSHA: digestBytes(certPayload)}
 	}
 	client := &http.Client{
 		Transport: transport,
@@ -203,7 +245,104 @@ func newEvidenceHTTPClient(cfg collectConfig) (*http.Client, string, error) {
 			return errors.New("lifecycle evidence probes refuse redirects")
 		},
 	}
-	return client, caSHA, nil
+	return client, binding, nil
+}
+
+func loadPeerTLSIdentities(cfg collectConfig) (string, []peerTLSIdentity, error) {
+	if cfg.mode != "production" {
+		return "", nil, nil
+	}
+	caPayload, err := readSecureRegular(cfg.peerTLSCA)
+	if err != nil {
+		return "", nil, fmt.Errorf("production peer TLS CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPayload) {
+		return "", nil, errors.New("production peer TLS CA contains no parseable certificates")
+	}
+	identities := make([]peerTLSIdentity, 0, 3)
+	for index := range 3 {
+		certPayload, err := readSecureRegular(cfg.peerTLSCerts[index])
+		if err != nil {
+			return "", nil, fmt.Errorf("production peer %d TLS certificate: %w", index+1, err)
+		}
+		keyPayload, err := readSecurePrivateKey(cfg.peerTLSKeys[index])
+		if err != nil {
+			return "", nil, fmt.Errorf("production peer %d TLS key: %w", index+1, err)
+		}
+		pair, err := tls.X509KeyPair(certPayload, keyPayload)
+		if err != nil || len(pair.Certificate) == 0 {
+			return "", nil, fmt.Errorf("production peer %d TLS identity is invalid: %w", index+1, err)
+		}
+		leaf, err := x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			return "", nil, fmt.Errorf("production peer %d TLS leaf: %w", index+1, err)
+		}
+		intermediates := x509.NewCertPool()
+		for _, encoded := range pair.Certificate[1:] {
+			certificate, err := x509.ParseCertificate(encoded)
+			if err != nil {
+				return "", nil, fmt.Errorf("production peer %d TLS intermediate: %w", index+1, err)
+			}
+			intermediates.AddCert(certificate)
+		}
+		for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth} {
+			if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{usage}}); err != nil {
+				return "", nil, fmt.Errorf("production peer %d TLS chain or extended key usage: %w", index+1, err)
+			}
+		}
+		peerURL, err := url.Parse(cfg.peerURLs[index])
+		if err != nil || peerURL.Hostname() == "" {
+			return "", nil, fmt.Errorf("production peer %d URL is invalid", index+1)
+		}
+		if err := leaf.VerifyHostname(peerURL.Hostname()); err != nil {
+			return "", nil, fmt.Errorf("production peer %d TLS hostname: %w", index+1, err)
+		}
+		wantURI := fmt.Sprintf("spiffe://gosuda.org/moreconsensus/replica/%d", index+1)
+		if len(leaf.URIs) != 1 || leaf.URIs[0].String() != wantURI {
+			return "", nil, fmt.Errorf("production peer %d TLS certificate must contain exactly URI SAN %s", index+1, wantURI)
+		}
+		identities = append(identities, peerTLSIdentity{
+			ReplicaID: index + 1, CertPath: cfg.peerTLSCerts[index],
+			CertSHA256: digestBytes(certPayload), URISAN: wantURI,
+		})
+	}
+	return digestBytes(caPayload), identities, nil
+}
+
+func evidenceTargetMatches(target *url.URL, base string) bool {
+	baseURL, err := url.Parse(base)
+	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" ||
+		target.Scheme != baseURL.Scheme || target.Host != baseURL.Host {
+		return false
+	}
+	basePath := strings.TrimSuffix(baseURL.EscapedPath(), "/")
+	targetPath := target.EscapedPath()
+	return basePath == "" || targetPath == basePath || strings.HasPrefix(targetPath, basePath+"/")
+}
+
+func (state *lifecycleState) doEvidenceRequest(request *http.Request) (*http.Response, error) {
+	var selected *http.Client
+	for _, endpoint := range state.cfg.clientURLs {
+		if evidenceTargetMatches(request.URL, endpoint) {
+			if selected != nil {
+				return nil, fmt.Errorf("ambiguous lifecycle evidence target %s", request.URL.Redacted())
+			}
+			selected = state.clientHTTP
+		}
+	}
+	for _, endpoint := range state.cfg.adminURLs {
+		if evidenceTargetMatches(request.URL, endpoint) {
+			if selected != nil {
+				return nil, fmt.Errorf("ambiguous lifecycle evidence target %s", request.URL.Redacted())
+			}
+			selected = state.adminHTTP
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("unknown lifecycle evidence target %s", request.URL.Redacted())
+	}
+	return selected.Do(request)
 }
 
 func validateCollectionPaths(cfg collectConfig) error {
@@ -426,7 +565,7 @@ func (state *lifecycleState) waitStopped(index int) error {
 	endpoint := strings.TrimRight(state.cfg.adminURLs[index], "/") + "/health"
 	for time.Now().Before(deadline) {
 		request, _ := http.NewRequest(http.MethodGet, endpoint, nil)
-		response, err := state.httpClient.Do(request)
+		response, err := state.doEvidenceRequest(request)
 		if err != nil {
 			return nil
 		}
@@ -441,7 +580,7 @@ func (state *lifecycleState) expectHTTP(method, endpoint string, body []byte, st
 	if err != nil {
 		return err
 	}
-	response, err := state.httpClient.Do(request)
+	response, err := state.doEvidenceRequest(request)
 	if err != nil {
 		return err
 	}
@@ -478,6 +617,165 @@ func (state *lifecycleState) assertOnAll(key, value string) error {
 	return nil
 }
 
+func (state *lifecycleState) verifyMTLSRequired() error {
+	if err := state.verifyClientAdminMTLSRequired(); err != nil {
+		return err
+	}
+	if state.cfg.mode != "production" {
+		return nil
+	}
+	return state.verifyPeerRuntimeAuthorization()
+}
+
+func (state *lifecycleState) verifyClientAdminMTLSRequired() error {
+	if state.cfg.mode != "production" {
+		return nil
+	}
+	planes := []struct {
+		name, base, caPath, probePath string
+		authenticated                 *http.Client
+	}{
+		{"client", state.cfg.clientURLs[0], state.cfg.clientTLSCA, "/kv/__mtls_requirement_probe__", state.clientHTTP},
+		{"admin", state.cfg.adminURLs[0], state.cfg.adminTLSCA, "/readyz", state.adminHTTP},
+	}
+	for _, plane := range planes {
+		target := strings.TrimRight(plane.base, "/") + plane.probePath
+		probeAuthenticated := func() error {
+			response, err := plane.authenticated.Get(target)
+			if err != nil {
+				return err
+			}
+			_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+			closeErr := response.Body.Close()
+			if readErr != nil {
+				return readErr
+			}
+			return closeErr
+		}
+		if err := probeAuthenticated(); err != nil {
+			return fmt.Errorf("%s plane authenticated control probe failed: %w", plane.name, err)
+		}
+		caPayload, err := readSecureRegular(plane.caPath)
+		if err != nil {
+			return err
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caPayload) {
+			return fmt.Errorf("%s plane CA contains no parseable certificates", plane.name)
+		}
+		transport := &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots}}
+		unauthenticated := &http.Client{
+			Timeout: state.cfg.requestTimeout, Transport: transport,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return errors.New("lifecycle evidence probes refuse redirects")
+			},
+		}
+		response, probeErr := unauthenticated.Get(target)
+		transport.CloseIdleConnections()
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		if probeErr == nil {
+			return fmt.Errorf("%s plane accepted a TLS client without a certificate", plane.name)
+		}
+		if err := probeAuthenticated(); err != nil {
+			return fmt.Errorf("%s plane control probe failed after unauthenticated rejection: %w", plane.name, err)
+		}
+		if _, err := state.store.addJSON(plane.name+"-mtls-required", map[string]any{
+			"schema": "moreconsensus.lifecycle-mtls-negative-probe.v1",
+			"plane":  plane.name, "target_origin": plane.base, "tls_version": "1.3",
+			"trusted_ca_sha256": digestBytes(caPayload), "client_certificate_present": false,
+			"handshake_rejected": true, "authenticated_control_before_and_after": true,
+		}, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (state *lifecycleState) verifyPeerRuntimeAuthorization() error {
+	caPayload, err := readSecureRegular(state.cfg.peerTLSCA)
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPayload) {
+		return errors.New("peer TLS CA contains no parseable certificates")
+	}
+	rejectRedirect := func(_ *http.Request, _ []*http.Request) error {
+		return errors.New("lifecycle evidence probes refuse redirects")
+	}
+	for destinationIndex := range 3 {
+		senderIndex := (destinationIndex + 1) % 3
+		certPayload, err := readSecureRegular(state.cfg.peerTLSCerts[senderIndex])
+		if err != nil {
+			return err
+		}
+		keyPayload, err := readSecurePrivateKey(state.cfg.peerTLSKeys[senderIndex])
+		if err != nil {
+			return err
+		}
+		certificate, err := tls.X509KeyPair(certPayload, keyPayload)
+		if err != nil {
+			return err
+		}
+		authTransport := &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13, RootCAs: roots, Certificates: []tls.Certificate{certificate},
+		}}
+		authenticated := &http.Client{Timeout: state.cfg.requestTimeout, Transport: authTransport, CheckRedirect: rejectRedirect}
+		target := strings.TrimRight(state.cfg.peerURLs[destinationIndex], "/") + "/epaxos/message"
+		post := func(client *http.Client, payload []byte) (int, error) {
+			response, err := client.Post(target, "application/octet-stream", bytes.NewReader(payload))
+			if err != nil {
+				return 0, err
+			}
+			defer response.Body.Close()
+			_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+			return response.StatusCode, readErr
+		}
+		if status, err := post(authenticated, []byte{0}); err != nil || status != http.StatusBadRequest {
+			return fmt.Errorf("peer %d authenticated TLS control probe status=%d err=%v", destinationIndex+1, status, err)
+		}
+		noCertTransport := &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots}}
+		noCertificate := &http.Client{Timeout: state.cfg.requestTimeout, Transport: noCertTransport, CheckRedirect: rejectRedirect}
+		response, noCertErr := noCertificate.Post(target, "application/octet-stream", bytes.NewReader([]byte{0}))
+		noCertTransport.CloseIdleConnections()
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		if noCertErr == nil {
+			return fmt.Errorf("peer %d accepted a TLS client without a certificate", destinationIndex+1)
+		}
+		senderID := epaxos.ReplicaID(senderIndex + 1)
+		spoofID := epaxos.ReplicaID((senderIndex+1)%3 + 1)
+		message := epaxos.Message{
+			Type: epaxos.MsgCommit, From: spoofID, To: epaxos.ReplicaID(destinationIndex + 1),
+			Ref:    epaxos.InstanceRef{Replica: spoofID, Instance: 1, Conf: 1},
+			Ballot: epaxos.Ballot{Replica: spoofID}, RecordBallot: epaxos.Ballot{Replica: spoofID},
+			Seq: 1, Deps: make([]epaxos.InstanceNum, 3), Command: epaxos.Command{Kind: epaxos.CommandNoop},
+		}
+		frame, err := epaxos.EncodeMessage(nil, message)
+		if err != nil {
+			return err
+		}
+		if status, err := post(authenticated, frame); err != nil || status != http.StatusForbidden {
+			return fmt.Errorf("peer %d certificate/message sender mismatch status=%d err=%v", destinationIndex+1, status, err)
+		}
+		authTransport.CloseIdleConnections()
+		if _, err := state.store.addJSON(fmt.Sprintf("peer-%d-authorization-required", destinationIndex+1), map[string]any{
+			"schema":                 "moreconsensus.lifecycle-peer-authorization-probe.v1",
+			"destination_replica_id": destinationIndex + 1, "authenticated_sender_replica_id": int(senderID),
+			"authenticated_sender_uri_san": state.peerTLS[senderIndex].URISAN,
+			"trusted_ca_sha256":            state.peerTLSCA, "tls_version": "1.3",
+			"authenticated_handshake_accepted": true, "no_certificate_handshake_rejected": true,
+			"certificate_message_sender_mismatch_rejected": true,
+		}, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (state *lifecycleState) addMountAndProvenance() error {
 	mount := map[string]any{
 		"schema": "moreconsensus.lifecycle-evidence-mount-plan.v1", "collection_root": state.cfg.stagingPath,
@@ -493,7 +791,16 @@ func (state *lifecycleState) addMountAndProvenance() error {
 		"release_id": state.cfg.releaseID, "target_id": state.cfg.targetID, "cluster_id": state.cfg.clusterID,
 		"kvnode_path": state.cfg.kvnodeBinary, "kvnode_sha256": state.binarySHA,
 		"kvcheckpoint_path": state.cfg.checkpointBinary, "kvcheckpoint_sha256": state.checkpointSHA,
-		"tls_mode": "server-auth-only", "tls_ca_path": state.cfg.tlsCA, "tls_ca_sha256": state.tlsCASHA,
+		"tls_mode":           "mutual-auth-separated-planes",
+		"client_tls_ca_path": state.cfg.clientTLSCA, "client_tls_ca_sha256": state.clientTLS.caSHA,
+		"client_tls_cert_path": state.cfg.clientTLSCert, "client_tls_cert_sha256": state.clientTLS.certSHA,
+		"client_tls_private_key_permissions_verified": state.cfg.mode == "production",
+		"admin_tls_ca_path":                           state.cfg.adminTLSCA, "admin_tls_ca_sha256": state.adminTLS.caSHA,
+		"admin_tls_cert_path": state.cfg.adminTLSCert, "admin_tls_cert_sha256": state.adminTLS.certSHA,
+		"admin_tls_private_key_permissions_verified": state.cfg.mode == "production",
+		"peer_tls_ca_path":                           state.cfg.peerTLSCA, "peer_tls_ca_sha256": state.peerTLSCA,
+		"peer_tls_identities":                       peerTLSClaims(state.peerTLS),
+		"peer_tls_private_key_permissions_verified": state.cfg.mode == "production",
 		"platform": "darwin", "architecture": "arm64", "profile": state.profile,
 	}
 	_, err := state.store.addJSON("release-provenance", provenance, time.Now().UTC())
@@ -597,10 +904,10 @@ func (state *lifecycleState) collectPrimaryCheckpoint() error {
 		return err
 	}
 	configurationRecord := map[string]any{
-		"schema": "moreconsensus.epaxos-configuration-history.v1",
-		"hard_state": state.hardStateMap(inspection.HardState),
+		"schema":                "moreconsensus.epaxos-configuration-history.v1",
+		"hard_state":            state.hardStateMap(inspection.HardState),
 		"configuration_history": inspection.ConfigurationHistory,
-		"verification_result": "pass",
+		"verification_result":   "pass",
 	}
 	if _, err := state.store.addJSON("configuration-history", configurationRecord, time.Now().UTC()); err != nil {
 		return err
@@ -982,13 +1289,13 @@ func (state *lifecycleState) collectDisasterAndRestore() error {
 	snapshotArtifact := state.artifact("checkpoint-snapshot")
 	if _, err := state.store.addJSON("staged-verification", map[string]any{
 		"schema": "moreconsensus.lifecycle-staged-verification.v1", "verified_at": utc(state.stagedAt),
-		"manifest_identity_blake3": state.stagedInspect.ManifestIdentity,
+		"manifest_identity_blake3":     state.stagedInspect.ManifestIdentity,
 		"semantic_state_digest_blake3": state.stagedInspect.SemanticStateDigest,
-		"hard_state_digest_blake3": state.stagedInspect.HardState.Digest,
-		"hard_state_tick": state.stagedInspect.HardState.Tick,
-		"configuration_generation": state.stagedInspect.HardState.CurrentConfigurationGeneration,
+		"hard_state_digest_blake3":     state.stagedInspect.HardState.Digest,
+		"hard_state_tick":              state.stagedInspect.HardState.Tick,
+		"configuration_generation":     state.stagedInspect.HardState.CurrentConfigurationGeneration,
 		"configuration_history_sha256": configurationArtifact.SHA256,
-		"record_count": state.stagedInspect.RecordCount, "applied_count": state.stagedInspect.AppliedCount,
+		"record_count":                 state.stagedInspect.RecordCount, "applied_count": state.stagedInspect.AppliedCount,
 		"snapshot_sha256": snapshotArtifact.SHA256, "checksum_result": "pass",
 		"configuration_result": "pass", "ownership_result": "pass",
 	}, state.stagedAt); err != nil {
@@ -1014,15 +1321,6 @@ func (state *lifecycleState) collectDisasterAndRestore() error {
 	return state.addCommand("restart", restartResult)
 }
 
-func (state *lifecycleState) curlProbeArgv() []string {
-	endpoint := strings.TrimRight(state.cfg.adminURLs[state.cfg.sourceNode-1], "/") + "/readyz"
-	argv := []string{"/usr/bin/curl", "--fail", "--silent", "--show-error"}
-	if state.cfg.mode == "production" {
-		argv = append(argv, "--proto", "=https", "--tlsv1.2", "--cacert", state.cfg.tlsCA)
-	}
-	return append(argv, endpoint)
-}
-
 func sameInspectionIdentity(left, right checkpointInspect) bool {
 	return left.ManifestIdentity == right.ManifestIdentity && left.SemanticStateDigest == right.SemanticStateDigest &&
 		left.HardState.Digest == right.HardState.Digest && left.HardState.Tick == right.HardState.Tick &&
@@ -1031,11 +1329,18 @@ func sameInspectionIdentity(left, right checkpointInspect) bool {
 }
 
 func (state *lifecycleState) collectPostRestore() error {
-	curlResult, err := runSuccessful(state.ctx, state.cfg.operationTimeout, state.curlProbeArgv(), nil)
-	if err != nil {
+	probeEndpoint := strings.TrimRight(state.cfg.adminURLs[state.cfg.sourceNode-1], "/") + "/readyz"
+	probeStarted := time.Now().UTC()
+	if err := state.expectHTTP(http.MethodGet, probeEndpoint, nil, http.StatusOK, ""); err != nil {
 		return err
 	}
-	if err := state.addCommand("post-restore-probes", curlResult); err != nil {
+	probeCompleted := time.Now().UTC()
+	probeArgv := []string{"internal-authenticated-http-probe", probeEndpoint}
+	probeResult := commandResult{
+		Argv: probeArgv, Command: commandString(probeArgv), StartedAt: probeStarted, CompletedAt: probeCompleted,
+		ExitCode: 0, Output: []byte("authenticated TLS 1.3 health probe succeeded\n"),
+	}
+	if err := state.addCommand("post-restore-probes", probeResult); err != nil {
 		return err
 	}
 	for index := range state.cfg.clientURLs {
@@ -1047,7 +1352,7 @@ func (state *lifecycleState) collectPostRestore() error {
 		}
 		scanURL := strings.TrimRight(state.cfg.clientURLs[index], "/") + "/scan?prefix=" + url.QueryEscape("lifecycle-v2-") + "&limit=10&barrier=" + url.QueryEscape(state.preKey+","+state.postKey)
 		request, _ := http.NewRequest(http.MethodGet, scanURL, nil)
-		response, err := state.httpClient.Do(request)
+		response, err := state.doEvidenceRequest(request)
 		if err != nil {
 			return err
 		}
@@ -1059,7 +1364,7 @@ func (state *lifecycleState) collectPostRestore() error {
 		probeID := fmt.Sprintf("probe-node%d", index+1)
 		probe := map[string]any{
 			"schema": "moreconsensus.lifecycle-node-probe.v1", "node": fmt.Sprintf("node%d", index+1),
-			"health_endpoint": strings.TrimRight(state.cfg.adminURLs[index], "/") + "/health",
+			"health_endpoint":    strings.TrimRight(state.cfg.adminURLs[index], "/") + "/health",
 			"readiness_endpoint": strings.TrimRight(state.cfg.adminURLs[index], "/") + "/readyz",
 			"pre_checkpoint_key": state.preKey, "pre_checkpoint_value_sha256": digestBytes([]byte(state.preValue)),
 			"post_checkpoint_key": state.postKey, "post_checkpoint_value_sha256": digestBytes([]byte(state.postValue)),
@@ -1135,14 +1440,14 @@ func (state *lifecycleState) collectPostRestore() error {
 		"schema": "moreconsensus.lifecycle-post-rejoin-checkpoint.v1", "checkpoint_argv": postCheckpoint.Argv,
 		"checkpoint_exit_code": postCheckpoint.ExitCode, "verify_argv": postVerify.Argv, "verify_exit_code": postVerify.ExitCode,
 		"manifest_identity_blake3": state.postInspect.ManifestIdentity,
-		"record_count": state.postInspect.RecordCount, "applied_count": state.postInspect.AppliedCount, "result": "pass",
+		"record_count":             state.postInspect.RecordCount, "applied_count": state.postInspect.AppliedCount, "result": "pass",
 	}, time.Now().UTC()); err != nil {
 		return err
 	}
 	if _, err := state.store.addJSON("convergence-observation", map[string]any{
 		"schema": "moreconsensus.lifecycle-convergence-observation.v1", "measurement_kind": "bounded-observable-convergence",
 		"window_started_at": utc(windowStarted), "observed_at": utc(state.convergenceAt),
-		"observation_window_seconds": durationSeconds(state.cfg.convergenceWindow),
+		"observation_window_seconds":                 durationSeconds(state.cfg.convergenceWindow),
 		"restored_node_served_post_checkpoint_value": true, "all_nodes_served_pre_checkpoint_value": true,
 		"all_nodes_served_post_checkpoint_value": true, "send_queues_stable": true,
 		"max_observed_send_queue_depth": state.maxQueueDepth, "post_rejoin_checkpoint_verified": true,
@@ -1154,11 +1459,11 @@ func (state *lifecycleState) collectPostRestore() error {
 	configurationArtifact := state.artifact("configuration-history")
 	if _, err := state.store.addJSON("integrity", map[string]any{
 		"schema": "moreconsensus.lifecycle-integrity.v1", "checked_at": utc(state.integrityAt),
-		"restored_manifest_identity_blake3": state.stagedInspect.ManifestIdentity,
-		"restored_hard_state_digest_blake3": state.stagedInspect.HardState.Digest,
-		"restored_configuration_generation": state.stagedInspect.HardState.CurrentConfigurationGeneration,
+		"restored_manifest_identity_blake3":     state.stagedInspect.ManifestIdentity,
+		"restored_hard_state_digest_blake3":     state.stagedInspect.HardState.Digest,
+		"restored_configuration_generation":     state.stagedInspect.HardState.CurrentConfigurationGeneration,
 		"restored_configuration_history_sha256": configurationArtifact.SHA256,
-		"restored_record_count": state.stagedInspect.RecordCount, "restored_applied_count": state.stagedInspect.AppliedCount,
+		"restored_record_count":                 state.stagedInspect.RecordCount, "restored_applied_count": state.stagedInspect.AppliedCount,
 		"post_rejoin_record_count": state.postInspect.RecordCount, "post_rejoin_applied_count": state.postInspect.AppliedCount,
 		"duplicate_applications": 0, "data_loss_records": 0, "exactly_once_check": "two unique canary keys observed once in bounded scans",
 		"repair_copy_operation": "pass", "result": "pass",
@@ -1175,8 +1480,8 @@ func (state *lifecycleState) collectPostRestore() error {
 	}
 	_, err = state.store.addJSON("objectives", map[string]any{
 		"schema": "moreconsensus.lifecycle-objectives.v1",
-		"rpo": map[string]any{"checkpoint_at": utc(state.checkpointAt), "disaster_at": utc(state.disasterAt), "measured_seconds": rpo, "threshold_seconds": durationSeconds(state.cfg.rpoThreshold), "result": "met"},
-		"rto": map[string]any{"disaster_at": utc(state.disasterAt), "service_restored_at": utc(state.serviceAt), "measured_seconds": rto, "threshold_seconds": durationSeconds(state.cfg.rtoThreshold), "result": "met"},
+		"rpo":    map[string]any{"checkpoint_at": utc(state.checkpointAt), "disaster_at": utc(state.disasterAt), "measured_seconds": rpo, "threshold_seconds": durationSeconds(state.cfg.rpoThreshold), "result": "met"},
+		"rto":    map[string]any{"disaster_at": utc(state.disasterAt), "service_restored_at": utc(state.serviceAt), "measured_seconds": rto, "threshold_seconds": durationSeconds(state.cfg.rtoThreshold), "result": "met"},
 	}, time.Now().UTC())
 	return err
 }
@@ -1184,7 +1489,7 @@ func (state *lifecycleState) collectPostRestore() error {
 func (state *lifecycleState) queueDepth(index int) (int, error) {
 	endpoint := strings.TrimRight(state.cfg.adminURLs[index], "/") + "/metrics"
 	request, _ := http.NewRequest(http.MethodGet, endpoint, nil)
-	response, err := state.httpClient.Do(request)
+	response, err := state.doEvidenceRequest(request)
 	if err != nil {
 		return 0, err
 	}
@@ -1255,8 +1560,13 @@ func (state *lifecycleState) publishCollection() (collectResult, error) {
 		MissingPrerequisites: missing, ExecutorIdentity: state.cfg.executorIdentity,
 		KVNodeBinary: state.cfg.kvnodeBinary, CheckpointBinary: state.cfg.checkpointBinary,
 		KVNodeSHA256: state.binarySHA, CheckpointSHA256: state.checkpointSHA,
-		TLSCAPath: state.cfg.tlsCA, TLSCASHA256: state.tlsCASHA,
-		SourceRevision: state.cfg.sourceRevision, SourceRoot: state.cfg.sourceRoot, SourceTreeSHA256: state.sourceTreeSHA, ReleaseID: state.cfg.releaseID,
+		ClientTLSCAPath: state.cfg.clientTLSCA, ClientTLSCASHA256: state.clientTLS.caSHA,
+		ClientTLSCertPath: state.cfg.clientTLSCert, ClientTLSCertSHA256: state.clientTLS.certSHA,
+		AdminTLSCAPath: state.cfg.adminTLSCA, AdminTLSCASHA256: state.adminTLS.caSHA,
+		AdminTLSCertPath: state.cfg.adminTLSCert, AdminTLSCertSHA256: state.adminTLS.certSHA,
+		PeerTLSCAPath: state.cfg.peerTLSCA, PeerTLSCASHA256: state.peerTLSCA,
+		PeerTLSIdentities: append([]peerTLSIdentity(nil), state.peerTLS...),
+		SourceRevision:    state.cfg.sourceRevision, SourceRoot: state.cfg.sourceRoot, SourceTreeSHA256: state.sourceTreeSHA, ReleaseID: state.cfg.releaseID,
 		Report: report, Artifacts: append([]rawArtifact(nil), state.store.artifacts...),
 	}
 	collectionSHA256, err := collectionDigest(collection)
@@ -1322,15 +1632,34 @@ func (state *lifecycleState) ensureIdentitiesUnchanged() error {
 		return fmt.Errorf("release binary changed during collection: kvnode=%s/%s kvcheckpoint=%s/%s", binarySHA, state.binarySHA, checkpointSHA, state.checkpointSHA)
 	}
 	if state.cfg.mode == "production" {
-		caPayload, err := readSecureRegular(state.cfg.tlsCA)
+		_, clientTLS, err := newEvidenceHTTPClient(state.cfg, "client")
 		if err != nil {
 			return err
 		}
-		if digestBytes(caPayload) != state.tlsCASHA {
-			return errors.New("production TLS CA changed during collection")
+		_, adminTLS, err := newEvidenceHTTPClient(state.cfg, "admin")
+		if err != nil {
+			return err
+		}
+		peerTLSCA, peerTLS, err := loadPeerTLSIdentities(state.cfg)
+		if err != nil {
+			return err
+		}
+		if clientTLS != state.clientTLS || adminTLS != state.adminTLS ||
+			tlsIdentityDigest("", "", "", "", peerTLSCA, peerTLS) != tlsIdentityDigest("", "", "", "", state.peerTLSCA, state.peerTLS) {
+			return errors.New("production TLS identity changed during collection")
 		}
 	}
 	return nil
+}
+
+func peerTLSClaims(peers []peerTLSIdentity) []map[string]any {
+	claims := make([]map[string]any, 0, len(peers))
+	for _, peer := range peers {
+		claims = append(claims, map[string]any{
+			"replica_id": peer.ReplicaID, "cert_sha256": peer.CertSHA256, "uri_san": peer.URISAN,
+		})
+	}
+	return claims
 }
 
 func (state *lifecycleState) buildReport() map[string]any {
@@ -1347,27 +1676,56 @@ func (state *lifecycleState) buildReport() map[string]any {
 		"cluster_id": state.cfg.clusterID, "release_id": state.cfg.releaseID, "source_revision": state.cfg.sourceRevision,
 		"binary_sha256": state.binarySHA, "provenance_artifact_id": "release-provenance",
 	}
+
 	evidenceClass := "target-data-lifecycle-darwin-v2"
 	releaseClaim := "target-data-lifecycle-criteria-met"
 	synthetic := false
+	scope := map[string]any{
+		"same_host": true, "loopback_only": true, "tls_mode": "mutual-auth-separated-planes",
+		"multi_host": false, "independent_failure_domains": false, "mtls": true,
+		"client_authorization": true, "peer_authorization": true, "multi_tenant_rbac": false, "production_capacity": false,
+		"client_tls_ca_sha256": state.clientTLS.caSHA, "client_tls_cert_sha256": state.clientTLS.certSHA,
+		"admin_tls_ca_sha256": state.adminTLS.caSHA, "admin_tls_cert_sha256": state.adminTLS.certSHA,
+		"peer_tls_ca_sha256": state.peerTLSCA, "peer_tls_identities": peerTLSClaims(state.peerTLS),
+		"tls_identity_sha256":               tlsIdentityDigest(state.clientTLS.caSHA, state.clientTLS.certSHA, state.adminTLS.caSHA, state.adminTLS.certSHA, state.peerTLSCA, state.peerTLS),
+		"client_mtls_rejection_artifact_id": "client-mtls-required",
+		"admin_mtls_rejection_artifact_id":  "admin-mtls-required",
+		"peer_authorization_artifact_ids": []string{
+			"peer-1-authorization-required", "peer-2-authorization-required", "peer-3-authorization-required",
+		},
+	}
 	if state.cfg.mode == "rehearsal" {
 		target["supervisor"] = "direct-process"
 		target["supervisor_domain"] = "none"
 		evidenceClass = "native-darwin-rehearsal-only"
 		releaseClaim = "none"
+		scope["tls_mode"] = "plaintext-rehearsal"
+		scope["mtls"] = false
+		scope["client_authorization"] = false
+		scope["peer_authorization"] = false
+		delete(scope, "client_tls_ca_sha256")
+		delete(scope, "client_tls_cert_sha256")
+		delete(scope, "admin_tls_ca_sha256")
+		delete(scope, "admin_tls_cert_sha256")
+		delete(scope, "peer_tls_ca_sha256")
+		delete(scope, "peer_tls_identities")
+		delete(scope, "client_mtls_rejection_artifact_id")
+		delete(scope, "admin_mtls_rejection_artifact_id")
+		delete(scope, "peer_authorization_artifact_ids")
+		delete(scope, "tls_identity_sha256")
 	}
 	return map[string]any{
 		"schema_version": "2.0.0", "verifier_version": verifierVersion,
 		"evidence_class": evidenceClass, "release_claim": releaseClaim, "synthetic_test_fixture": synthetic,
 		"generated_at": utc(time.Now().UTC()), "valid_until": utc(time.Now().UTC().Add(7 * 24 * time.Hour)),
 		"evidence_root": map[string]any{"filesystem": "apfs", "external": state.cfg.mode == "production", "mount_read_only": false, "mount_artifact_id": "evidence-mount"},
-		"scope": map[string]any{"same_host": true, "loopback_only": true, "tls_mode": "server-auth-only", "multi_host": false, "independent_failure_domains": false, "mtls": false, "client_authorization": false, "production_capacity": false},
-		"target": target,
-		"drill": map[string]any{"drill_id": state.drillID, "executor_identity": state.cfg.executorIdentity, "started_at": utc(state.startedAt), "completed_at": utc(state.completedAt)},
-		"pre_drill": map[string]any{"checked_at": utc(state.preAt), "nodes_observed": 3, "healthy_voters": 3, "result": "pass", "artifact_id": "pre-drill"},
+		"scope":         scope,
+		"target":        target,
+		"drill":         map[string]any{"drill_id": state.drillID, "executor_identity": state.cfg.executorIdentity, "started_at": utc(state.startedAt), "completed_at": utc(state.completedAt)},
+		"pre_drill":     map[string]any{"checked_at": utc(state.preAt), "nodes_observed": 3, "healthy_voters": 3, "result": "pass", "artifact_id": "pre-drill"},
 		"checkpoint": map[string]any{
 			"checkpoint_id": "checkpoint-node" + strconv.Itoa(state.cfg.sourceNode) + "-" + state.drillID,
-			"created_at": utc(state.checkpointAt), "source_node": "node" + strconv.Itoa(state.cfg.sourceNode), "source_store_identity": state.sourceIdentity,
+			"created_at":    utc(state.checkpointAt), "source_node": "node" + strconv.Itoa(state.cfg.sourceNode), "source_store_identity": state.sourceIdentity,
 			"checkpoint_format": "manifest-v1", "manifest_version": 1, "manifest_file_sha256": manifestArtifact.SHA256, "manifest_artifact_id": "checkpoint-manifest",
 			"manifest_identity_blake3": state.primaryInspect.ManifestIdentity, "semantic_state_digest_blake3": state.primaryInspect.SemanticStateDigest,
 			"hard_state": state.hardStateMap(state.primaryInspect.HardState), "configuration_history": state.primaryInspect.ConfigurationHistory,
@@ -1417,13 +1775,13 @@ func (state *lifecycleState) buildReport() map[string]any {
 			"checked_at": utc(state.integrityAt), "restored_manifest_identity_blake3": state.stagedInspect.ManifestIdentity,
 			"restored_hard_state_digest_blake3": state.stagedInspect.HardState.Digest, "restored_configuration_generation": state.stagedInspect.HardState.CurrentConfigurationGeneration,
 			"restored_configuration_history_sha256": configurationArtifact.SHA256,
-			"restored_record_count": state.stagedInspect.RecordCount, "restored_applied_count": state.stagedInspect.AppliedCount,
+			"restored_record_count":                 state.stagedInspect.RecordCount, "restored_applied_count": state.stagedInspect.AppliedCount,
 			"post_rejoin_record_count": state.postInspect.RecordCount, "post_rejoin_applied_count": state.postInspect.AppliedCount,
 			"duplicate_applications": 0, "data_loss_records": 0, "result": "pass", "artifact_id": "integrity",
 		},
 		"objectives": map[string]any{
-			"rpo": map[string]any{"checkpoint_at": utc(state.checkpointAt), "disaster_at": utc(state.disasterAt), "measured_seconds": rpo, "threshold_seconds": durationSeconds(state.cfg.rpoThreshold), "result": "met"},
-			"rto": map[string]any{"disaster_at": utc(state.disasterAt), "service_restored_at": utc(state.serviceAt), "measured_seconds": rto, "threshold_seconds": durationSeconds(state.cfg.rtoThreshold), "result": "met"},
+			"rpo":         map[string]any{"checkpoint_at": utc(state.checkpointAt), "disaster_at": utc(state.disasterAt), "measured_seconds": rpo, "threshold_seconds": durationSeconds(state.cfg.rpoThreshold), "result": "met"},
+			"rto":         map[string]any{"disaster_at": utc(state.disasterAt), "service_restored_at": utc(state.serviceAt), "measured_seconds": rto, "threshold_seconds": durationSeconds(state.cfg.rtoThreshold), "result": "met"},
 			"artifact_id": "objectives",
 		},
 		"observed_commands": state.commandRows,

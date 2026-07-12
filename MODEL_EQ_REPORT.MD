@@ -358,3 +358,20 @@ A release is production-complete only when every row above has current evidence 
 - `tla/EPaxosRevisited.tla` verifies finite explicit TOQ envelope, delayed assignment, pending-decision blocking, receiver `ProcessAt` processing, fast-wait, and chain-pruning obligations. It abstracts synchronized physical clocks, one-way-delay measurement, and sync-group construction into configured finite timestamps. `tla/TOQClockDiscipline.tla` separately checks a finite bounded-skew/bounded-delay contract that makes `ProcessAt` late enough for sync-group delivery before local processing; it still does not prove an operational clock-sync or delay-measurement implementation.
 - Membership-change validation, invalid Ready-content validation, logical-timer dispatch, checksum, wire-decoder tolerance, storage virtualization, transport fault control, storage fault control, destructive-storage control, checkpoint semantic validation, live-source checkpoint recovery, optional external Jepsen lifecycle tooling, and example KV apply/scan storage semantics are verified by implementation and Jepsen tests but outside the current TLA safety state.
 - Local Jepsen now covers loopback process restart with health-checked rejoin, transport partition, storage-unavailable, and destructive-storage removal that keeps a node down until original storage is restored. External multi-host deployment tooling exists for separately approved environments, but this simulation/local-loopback evidence bundle does not exercise those histories.
+
+## 2026 bounded hardening correspondence
+
+The required formal gate is `tests/tla_model_check_fast.sh`: bounded finite model checking of the 14 named Ready/Advance, quorum, paper-safety, Revisited, execution-pruning, optimized-recovery, timing-domain, RawNode-refinement, and sparse-prefix configurations. `tests/tla_model_check_runner.py` supplies per-job and overall deadlines, bounded parallelism, isolated TLC metadirs, and fail-closed classification. `tests/tla_model_check.sh` remains manual finite model checking. Neither profile is exhaustive or an unbounded proof.
+
+Direct implementation correspondence:
+
+| Model obligation | Implementation evidence | Boundary |
+| --- | --- | --- |
+| Frozen Ready retry, capped message tails, and prefix acknowledgement | `RawNode.ReadyInto`, `Ready.CloneInto`, and `Advance` in `epaxos/node.go`; Ready ownership/durability/cap tests | Caller receives an independent clone; internal capacity moves only across disjoint frozen/pending/next owners. |
+| Pinned-config vote identity and quorum counts | fixed-width masks and lazy vote sets in `epaxos/quorum.go` and `epaxos/node.go`; 1..7 voter, historical-config, duplicate, and invalid-sender tests | Fixed supported voter bound 1..7; no arbitrary membership proof. |
+| Deterministic progress and retry | `RawNode.Tick`, lifecycle-owned `protocolLoop`, manual tick-source tests, and transport retry ticks | No wall-clock value enters protocol state; kvnode keeps TOQ disabled. |
+| Durability before visibility | `DB.ApplyReady` atomically commits consensus records, hard state, KV mutations, and applied markers with `pebble.Sync`; `drainLocked` admits frames before `Advance` | Example-module evidence only; no storage-device certification. |
+| Bounded embedding ownership | capped Ready prefixes, queue/in-flight/retry counters, admission blocking, waiter completion, shutdown joining, and transport race tests | Finite configured capacities; not unbounded uptime. |
+| Retention without unsafe history deletion | `RuntimeStats`, `StorageStats`, retention pressure/limit transitions, and startup durable-record indexing | Finite horizon only; no certified protocol compaction. |
+
+The current-environment claim remains Darwin arm64, three same-host loopback processes, and deterministic simulated network faults. Missing evidence remains unbounded proof, certified protocol-state compaction, multi-host independent failure domains, and real-network fault behavior.

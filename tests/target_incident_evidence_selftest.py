@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,120 @@ DARWIN_INCIDENT_CLASSES = [
     "corrupted_checkpoint",
 ]
 
+
+def draft202012_validate(schema: dict[str, Any], instance: Any) -> None:
+    if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+        raise AssertionError("schema does not declare Draft 2020-12")
+    errors: list[str] = []
+
+    def resolve(reference: str) -> dict[str, Any]:
+        if not reference.startswith("#/"):
+            raise AssertionError(f"unsupported non-local schema reference {reference}")
+        value: Any = schema
+        for token in reference[2:].split("/"):
+            value = value[token.replace("~1", "/").replace("~0", "~")]
+        if not isinstance(value, dict):
+            raise AssertionError(f"schema reference {reference} is not an object")
+        return value
+
+    def declared_properties(node: dict[str, Any]) -> set[str]:
+        if "$ref" in node:
+            return declared_properties(resolve(node["$ref"]))
+        declared = set(node.get("properties", {}))
+        for branch in node.get("allOf", []):
+            declared.update(declared_properties(branch))
+        return declared
+
+    def check(node: dict[str, Any], value: Any, path: str) -> None:
+        if "$ref" in node:
+            check(resolve(node["$ref"]), value, path)
+        expected_type = node.get("type")
+        type_ok = {
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+            "string": isinstance(value, str),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+            "null": value is None,
+        }
+        if isinstance(expected_type, str) and not type_ok.get(expected_type, False):
+            errors.append(f"{path}: expected {expected_type}")
+            return
+        if isinstance(expected_type, list) and not any(type_ok.get(item, False) for item in expected_type):
+            errors.append(f"{path}: expected one of {expected_type}")
+            return
+        if "const" in node and value != node["const"]:
+            errors.append(f"{path}: const mismatch")
+        if "enum" in node and value not in node["enum"]:
+            errors.append(f"{path}: enum mismatch")
+        if isinstance(value, str):
+            if len(value) < node.get("minLength", 0):
+                errors.append(f"{path}: shorter than minLength")
+            if "pattern" in node and re.fullmatch(node["pattern"], value) is None:
+                errors.append(f"{path}: pattern mismatch")
+        if isinstance(value, int) and not isinstance(value, bool):
+            if "minimum" in node and value < node["minimum"]:
+                errors.append(f"{path}: below minimum")
+            if "maximum" in node and value > node["maximum"]:
+                errors.append(f"{path}: above maximum")
+        if isinstance(value, list):
+            if len(value) < node.get("minItems", 0):
+                errors.append(f"{path}: fewer than minItems")
+            if "maxItems" in node and len(value) > node["maxItems"]:
+                errors.append(f"{path}: more than maxItems")
+            if node.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value):
+                errors.append(f"{path}: items are not unique")
+            prefix_items = node.get("prefixItems", [])
+            for index, child_schema in enumerate(prefix_items):
+                if index < len(value):
+                    check(child_schema, value[index], f"{path}[{index}]")
+            items = node.get("items")
+            if items is False and len(value) > len(prefix_items):
+                errors.append(f"{path}: unexpected items after prefixItems")
+            elif isinstance(items, dict):
+                for index in range(len(prefix_items), len(value)):
+                    check(items, value[index], f"{path}[{index}]")
+        if isinstance(value, dict):
+            for key in node.get("required", []):
+                if key not in value:
+                    errors.append(f"{path}: missing required property {key}")
+            properties = node.get("properties", {})
+            for key, child_schema in properties.items():
+                if key in value:
+                    check(child_schema, value[key], f"{path}.{key}")
+            if node.get("additionalProperties") is False:
+                for key in set(value) - set(properties):
+                    errors.append(f"{path}: additional property {key}")
+            if node.get("unevaluatedProperties") is False:
+                allowed = declared_properties(node)
+                for key in set(value) - allowed:
+                    errors.append(f"{path}: unevaluated property {key}")
+        for branch in node.get("allOf", []):
+            check(branch, value, path)
+        if "oneOf" in node:
+            matches = 0
+            branch_errors: list[list[str]] = []
+            for branch in node["oneOf"]:
+                before = len(errors)
+                check(branch, value, path)
+                produced = errors[before:]
+                del errors[before:]
+                branch_errors.append(produced)
+                if not produced:
+                    matches += 1
+            if matches != 1:
+                errors.append(f"{path}: oneOf matched {matches} branches")
+        if "if" in node:
+            before = len(errors)
+            check(node["if"], value, path)
+            condition_errors = errors[before:]
+            del errors[before:]
+            if not condition_errors and "then" in node:
+                check(node["then"], value, path)
+
+    check(schema, instance, "$")
+    if errors:
+        raise AssertionError("Draft 2020-12 fixture validation failed: " + "; ".join(errors[:10]))
 
 def utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -304,6 +419,32 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
     target_id = "mc-kv-darwin24-arm64-launchd-3n-r1"
     environment = "native-darwin24-arm64-launchd-system-domain-v1"
     verifier_version = "target-incident-evidence-verifier/2.0"
+    client_tls_ca_sha = "21" * 32
+    client_tls_cert_sha = "32" * 32
+    admin_tls_ca_sha = "43" * 32
+    admin_tls_cert_sha = "54" * 32
+    peer_tls_ca_sha = "65" * 32
+    peer_tls_identities = [
+        {
+            "replica_id": index,
+            "cert_sha256": f"{index + 6:x}{index + 6:x}" * 32,
+            "uri_san": f"spiffe://gosuda.org/moreconsensus/replica/{index}",
+        }
+        for index in range(1, 4)
+    ]
+    tls_canonical = (
+        f"client-ca={client_tls_ca_sha}\n"
+        f"client-cert={client_tls_cert_sha}\n"
+        f"admin-ca={admin_tls_ca_sha}\n"
+        f"admin-cert={admin_tls_cert_sha}\n"
+        f"peer-ca={peer_tls_ca_sha}\n"
+    )
+    for peer in peer_tls_identities:
+        tls_canonical += (
+            f"peer-{peer['replica_id']}-cert={peer['cert_sha256']}\n"
+            f"peer-{peer['replica_id']}-uri={peer['uri_san']}\n"
+        )
+    tls_identity_sha = hashlib.sha256(tls_canonical.encode("ascii")).hexdigest()
     opened_at = now - timedelta(hours=6)
     manifest_relative = Path("manifest") / "release-manifest.json"
     manifest_path = root / manifest_relative
@@ -336,6 +477,23 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
         encoding="utf-8",
     )
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    external_dir = root / "external"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    scenario_bundle_path = external_dir / "scenario-bundle.json"
+    scenario_signature_path = external_dir / "scenario-bundle.sig"
+    scenario_trust_root_path = external_dir / "scenario-bundle-trust-root.pem"
+    scenario_bundle_path.write_text(
+        json.dumps({"schema": "incident-production-scenario-bundle-v1", "fixture": True}) + "\n",
+        encoding="utf-8",
+    )
+    scenario_signature_path.write_bytes(b"synthetic-signature")
+    scenario_trust_root_path.write_text(
+        "-----BEGIN PUBLIC KEY-----\nsynthetic-self-test\n-----END PUBLIC KEY-----\n",
+        encoding="ascii",
+    )
+    scenario_bundle_hash = hashlib.sha256(scenario_bundle_path.read_bytes()).hexdigest()
+    scenario_signature_hash = hashlib.sha256(scenario_signature_path.read_bytes()).hexdigest()
+    scenario_trust_root_hash = hashlib.sha256(scenario_trust_root_path.read_bytes()).hexdigest()
     artifacts: list[dict[str, Any]] = []
 
     def add_artifact(
@@ -416,16 +574,38 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
         "Observed runbook export binds the approved rollback boundary, abort criteria, "
         "quorum guard, and escalation path used during every drill.",
     )
+    mtls_rejection_artifacts = [
+        add_artifact(
+            f"{plane.upper()}-MTLS-REQUIRED",
+            "campaign",
+            "raw-command-output",
+            opened_at + timedelta(minutes=5 + index),
+            f"TLS 1.3 negative client-certificate probe for {plane} plane",
+            "TLS handshake rejected without a client certificate; authenticated controls succeeded before and after.",
+            result="expected-rejection",
+            exit_code=1,
+        )
+        for index, plane in enumerate(("client", "admin"))
+    ]
+    peer_authorization_artifacts = [
+        add_artifact(
+            f"PEER-{index}-AUTH-REQUIRED",
+            "campaign",
+            "raw-command-output",
+            opened_at + timedelta(minutes=7 + index),
+            "verify peer TLS and replica sender authorization",
+            "Authenticated malformed input reached the decoder, an unauthenticated TLS handshake was rejected, and a valid peer certificate carrying a mismatched EPaxos message origin was rejected.",
+            result="observed-success",
+            exit_code=0,
+        )
+        for index in range(1, 4)
+    ]
 
     class_nonclaims = {
         "process_crash_restart": ["not-host-reboot", "not-independent-failure-domain"],
         "one_node_unavailability": ["not-multi-host", "not-independent-failure-domain"],
-        "bad_config_rollback": ["not-client-or-peer-authorization-evidence"],
-        "certificate_secret_rotation": [
-            "not-mtls",
-            "not-client-authorization",
-            "not-peer-authorization",
-        ],
+        "bad_config_rollback": ["not-multi-tenant-rbac"],
+        "certificate_secret_rotation": ["not-multi-tenant-rbac"],
         "storage_pressure_failure": [
             "not-physical-apfs-failure",
             "not-enospc",
@@ -469,12 +649,11 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
             "reload_method": "rolling-launchd-restart",
             "old_certificate_sha256": hashlib.sha256(b"old-certificate").hexdigest(),
             "new_certificate_sha256": hashlib.sha256(b"new-certificate").hexdigest(),
-            "old_private_key_sha256": hashlib.sha256(b"old-private-key").hexdigest(),
-            "new_private_key_sha256": hashlib.sha256(b"new-private-key").hexdigest(),
             "private_key_material_collected": False,
             "tls_server_auth_verified": True,
-            "mtls_observed": False,
-            "client_authorization_observed": False,
+            "mtls_observed": True,
+            "client_authorization_observed": True,
+            "peer_authorization_observed": True,
         },
         "storage_pressure_failure": {
             "node": "node2",
@@ -620,6 +799,66 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
     )
     closed_at = reviewer_signed_at + timedelta(minutes=4)
     recorded_at = closed_at + timedelta(minutes=1)
+    scenario_artifact_ids = {
+        artifact_id
+        for drill in drills
+        for artifact_id in drill["evidence_artifact_ids"]
+    }
+    bundle_document = {
+        "schema": "incident-production-scenario-bundle-v1",
+        "identity": {
+            "target_id": target_id,
+            "cluster_id": "mc-kv-darwin24-3n-r1",
+            "environment": environment,
+            "release_id": release_id,
+            "source_revision": source_revision,
+            "source_digest": "ab" * 32,
+            "binary_sha256": binary_hash,
+            "manifest_sha256": manifest_hash,
+            "tls_identity_sha256": tls_identity_sha,
+            "built_at": utc(opened_at - timedelta(hours=1)),
+        },
+        "commander_approval_sha256": "bc" * 32,
+        "signer_identity": "external-scenario-attestor",
+        "opened_at": utc(opened_at),
+        "closed_at": utc(latest_drill_end),
+        "scenarios": [
+            {
+                "drill_id": drill["drill_id"],
+                "incident_class": drill["incident_class"],
+                "requested_scenario": drill["incident_class"],
+                "execution": "live",
+                "approved_at": drill["approved_at"],
+                "started_at": drill["started_at"],
+                "completed_at": drill["completed_at"],
+                "affected_nodes": drill["affected_nodes"],
+                "fault_exercised": True,
+                "quorum_safety_decision": "continue only while two of three voters remain ready; abort on quorum degradation",
+                "rollback_completed": True,
+                "recovery_observed": True,
+                "canaries_observed": True,
+                "artifact_ids": drill["evidence_artifact_ids"],
+                "observations": drill["observations"],
+            }
+            for drill in drills
+        ],
+        "artifacts": [
+            {
+                "artifact_id": artifact["artifact_id"],
+                "drill_id": artifact["drill_id"],
+                "kind": artifact["kind"],
+                "uri": f"file:artifacts/{artifact['artifact_id'].lower()}.json",
+                "sha256": artifact["sha256"],
+            }
+            for artifact in artifacts
+            if artifact["artifact_id"] in scenario_artifact_ids
+        ],
+    }
+    scenario_bundle_path.write_text(
+        json.dumps(bundle_document, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    scenario_bundle_hash = hashlib.sha256(scenario_bundle_path.read_bytes()).hexdigest()
     return {
         "schema_version": "2.0",
         "verifier_version": verifier_version,
@@ -643,7 +882,14 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
             "launchd_domain": "system",
             "storage_filesystem": "apfs",
             "network_scope": "same-host-loopback",
-            "tls_mode": "server-auth-only",
+            "tls_mode": "mutual-auth-separated-planes",
+            "client_tls_ca_sha256": client_tls_ca_sha,
+            "client_tls_cert_sha256": client_tls_cert_sha,
+            "admin_tls_ca_sha256": admin_tls_ca_sha,
+            "admin_tls_cert_sha256": admin_tls_cert_sha,
+            "peer_tls_ca_sha256": peer_tls_ca_sha,
+            "peer_tls_identities": peer_tls_identities,
+            "tls_identity_sha256": tls_identity_sha,
         },
         "topology": {
             "node_count": 3,
@@ -696,6 +942,13 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
             "release_manifest_uri": f"file:{manifest_relative.as_posix()}",
             "release_manifest_sha256": manifest_hash,
             "built_at": utc(opened_at - timedelta(hours=1)),
+            "scenario_bundle_uri": "file:external/scenario-bundle.json",
+            "scenario_bundle_sha256": scenario_bundle_hash,
+            "scenario_bundle_signature_uri": "file:external/scenario-bundle.sig",
+            "scenario_bundle_signature_sha256": scenario_signature_hash,
+            "scenario_bundle_trust_root_uri": "file:external/scenario-bundle-trust-root.pem",
+            "scenario_bundle_trust_root_sha256": scenario_trust_root_hash,
+            "scenario_bundle_signer_identity": "external-scenario-attestor",
         },
         "opened_at": utc(opened_at),
         "closed_at": utc(closed_at),
@@ -705,6 +958,8 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
         "raw_artifacts": artifacts,
         "operational_artifacts": {
             "topology_artifact_ids": topology_artifacts,
+            "mtls_rejection_artifact_ids": mtls_rejection_artifacts,
+            "peer_authorization_artifact_ids": peer_authorization_artifacts,
             "alert_artifact_ids": [alert_artifact],
             "runbook_artifact_ids": [runbook_artifact],
             "signoff_artifact_ids": [
@@ -737,9 +992,7 @@ def build_darwin_fixture(root: Path, now: datetime) -> dict[str, Any]:
         "nonclaims": {
             "multi_host": False,
             "independent_failure_domains": False,
-            "mtls": False,
-            "client_authorization": False,
-            "peer_authorization": False,
+            "multi_tenant_rbac": False,
             "production_capacity": False,
             "physical_storage_failure": False,
         },
@@ -1084,6 +1337,15 @@ def main() -> int:
 
         darwin_root = Path(temp_dir) / "darwin-v2-evidence"
         darwin_fixture = build_darwin_fixture(darwin_root, now)
+        draft202012_validate(darwin_schema, darwin_fixture)
+        schema_missing_bundle = copy.deepcopy(darwin_fixture)
+        del schema_missing_bundle["release_provenance"]["scenario_bundle_sha256"]
+        try:
+            draft202012_validate(darwin_schema, schema_missing_bundle)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("Draft 2020-12 schema accepted missing scenario bundle hash")
         darwin_fixture_path = darwin_root / "incident-v2.json"
         darwin_fixture_path.write_text(
             json.dumps(darwin_fixture, indent=2) + "\n",
@@ -1094,6 +1356,25 @@ def main() -> int:
             now,
             "truthful Darwin v2 synthetic fixture",
             evidence_root=darwin_root,
+        )
+        unrelated_bundle_root = Path(temp_dir) / "darwin-v2-unrelated-signed-bundle"
+        unrelated_bundle_fixture = build_darwin_fixture(unrelated_bundle_root, now)
+        unrelated_bundle_path = unrelated_bundle_root / "external" / "scenario-bundle.json"
+        unrelated_bundle = json.loads(unrelated_bundle_path.read_text(encoding="utf-8"))
+        unrelated_bundle["scenarios"][0]["observations"]["old_pid"] += 1000
+        unrelated_bundle_path.write_text(
+            json.dumps(unrelated_bundle, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        unrelated_bundle_fixture["release_provenance"]["scenario_bundle_sha256"] = hashlib.sha256(
+            unrelated_bundle_path.read_bytes()
+        ).hexdigest()
+        assert_invalid(
+            unrelated_bundle_fixture,
+            now,
+            "hash-valid but semantically unrelated signed scenario bundle",
+            test_mode=True,
+            evidence_root=unrelated_bundle_root,
         )
         darwin_cli = run_cli(
             [
@@ -1193,11 +1474,11 @@ def main() -> int:
         )
 
         false_nonclaim = copy.deepcopy(darwin_target)
-        false_nonclaim["nonclaims"]["mtls"] = True
+        false_nonclaim["nonclaims"]["multi_tenant_rbac"] = True
         assert_invalid(
             false_nonclaim,
             now,
-            "false mutual TLS claim",
+            "false multi-tenant RBAC claim",
             test_mode=False,
             evidence_root=darwin_root,
             expected_error="must equal false",
@@ -1209,14 +1490,14 @@ def main() -> int:
             for drill in false_authorization["drills"]
             if drill["incident_class"] == "certificate_secret_rotation"
         )
-        rotation["observations"]["client_authorization_observed"] = True
+        rotation["observations"]["client_authorization_observed"] = False
         assert_invalid(
             false_authorization,
             now,
-            "false client authorization claim",
+            "missing client authorization observation",
             test_mode=False,
             evidence_root=darwin_root,
-            expected_error="client_authorization_observed: must equal false",
+            expected_error="client_authorization_observed: must equal true",
         )
 
         linux_profile = copy.deepcopy(darwin_target)

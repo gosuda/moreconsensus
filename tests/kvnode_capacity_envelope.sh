@@ -47,9 +47,9 @@ Common inputs:
   KVNODE_CAPACITY_SCAN_LIMITS     Comma-separated scan limits. Default: 1,16,128
   KVNODE_CAPACITY_OUT_DIR         Output directory.
   KVNODE_CAPACITY_TIMEOUT_SECONDS curl per-request timeout. Default: 5
-  KVNODE_CAPACITY_ENVIRONMENT_LABEL       Single-line environment label.
-  KVNODE_CAPACITY_WORKLOAD_LABEL          Single-line workload label.
-  KVNODE_CAPACITY_REPORT         Optional 0600 report path.
+  KVNODE_CAPACITY_ENVIRONMENT_LABEL       Single-line environment label. Default: unspecified
+  KVNODE_CAPACITY_WORKLOAD_LABEL          Single-line workload label. Default: unspecified
+  KVNODE_CAPACITY_REPORT         Optional success report path; created with mode 0600.
 
 Resource inputs:
   KVNODE_PIDS                    Comma-separated kvnode PIDs.

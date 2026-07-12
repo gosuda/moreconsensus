@@ -28,26 +28,42 @@ type rawArtifact struct {
 	CapturedAt string `json:"captured_at"`
 }
 
+type peerTLSIdentity struct {
+	ReplicaID  int    `json:"replica_id"`
+	CertPath   string `json:"cert_path,omitempty"`
+	CertSHA256 string `json:"cert_sha256"`
+	URISAN     string `json:"uri_san"`
+}
+
 type collectionRecord struct {
-	Schema               string         `json:"schema"`
-	Mode                 string         `json:"mode"`
-	Profile              string         `json:"profile"`
-	ProductionEligible   bool           `json:"production_eligible"`
-	MissingPrerequisites []string       `json:"missing_prerequisites"`
-	ExecutorIdentity     string         `json:"executor_identity"`
-	KVNodeBinary         string         `json:"kvnode_binary"`
-	CheckpointBinary     string         `json:"kvcheckpoint_binary"`
-	KVNodeSHA256         string         `json:"kvnode_sha256"`
-	CheckpointSHA256     string         `json:"kvcheckpoint_sha256"`
-	TLSCAPath            string         `json:"tls_ca_path,omitempty"`
-	TLSCASHA256          string         `json:"tls_ca_sha256,omitempty"`
-	SourceRevision       string         `json:"source_revision"`
-	SourceRoot           string         `json:"source_root"`
-	SourceTreeSHA256     string         `json:"source_tree_sha256"`
-	ReleaseID            string         `json:"release_id"`
-	Report               map[string]any `json:"report"`
-	Artifacts            []rawArtifact  `json:"artifacts"`
-	CollectionSHA256     string         `json:"collection_sha256,omitempty"`
+	Schema               string            `json:"schema"`
+	Mode                 string            `json:"mode"`
+	Profile              string            `json:"profile"`
+	ProductionEligible   bool              `json:"production_eligible"`
+	MissingPrerequisites []string          `json:"missing_prerequisites"`
+	ExecutorIdentity     string            `json:"executor_identity"`
+	KVNodeBinary         string            `json:"kvnode_binary"`
+	CheckpointBinary     string            `json:"kvcheckpoint_binary"`
+	KVNodeSHA256         string            `json:"kvnode_sha256"`
+	CheckpointSHA256     string            `json:"kvcheckpoint_sha256"`
+	ClientTLSCAPath      string            `json:"client_tls_ca_path,omitempty"`
+	ClientTLSCASHA256    string            `json:"client_tls_ca_sha256,omitempty"`
+	ClientTLSCertPath    string            `json:"client_tls_cert_path,omitempty"`
+	ClientTLSCertSHA256  string            `json:"client_tls_cert_sha256,omitempty"`
+	AdminTLSCAPath       string            `json:"admin_tls_ca_path,omitempty"`
+	AdminTLSCASHA256     string            `json:"admin_tls_ca_sha256,omitempty"`
+	AdminTLSCertPath     string            `json:"admin_tls_cert_path,omitempty"`
+	AdminTLSCertSHA256   string            `json:"admin_tls_cert_sha256,omitempty"`
+	PeerTLSCAPath        string            `json:"peer_tls_ca_path,omitempty"`
+	PeerTLSCASHA256      string            `json:"peer_tls_ca_sha256,omitempty"`
+	PeerTLSIdentities    []peerTLSIdentity `json:"peer_tls_identities,omitempty"`
+	SourceRevision       string            `json:"source_revision"`
+	SourceRoot           string            `json:"source_root"`
+	SourceTreeSHA256     string            `json:"source_tree_sha256"`
+	ReleaseID            string            `json:"release_id"`
+	Report               map[string]any    `json:"report"`
+	Artifacts            []rawArtifact     `json:"artifacts"`
+	CollectionSHA256     string            `json:"collection_sha256,omitempty"`
 }
 
 type rehearsalEnvelope struct {
@@ -66,7 +82,7 @@ type collectResult struct {
 }
 
 type finalizeResult struct {
-	ReportPath   string
+	ReportPath    string
 	ArtifactCount int
 }
 
@@ -76,20 +92,20 @@ type rehearsalVerification struct {
 }
 
 type externalSignoff struct {
-	Schema           string `json:"schema"`
-	EvidenceRole     string `json:"evidence_role"`
-	Identity         string `json:"identity"`
-	Role             string `json:"role"`
-	AuthenticatedBy  string `json:"authenticated_by"`
-	SignedAt         string `json:"signed_at"`
-	Result           string `json:"result"`
-	TargetID         string `json:"target_id"`
-	ReleaseID        string `json:"release_id"`
-	SourceRevision   string `json:"source_revision"`
-	SourceTreeSHA256 string `json:"source_tree_sha256"`
-	BinarySHA256     string `json:"binary_sha256"`
-	CollectionSHA256 string `json:"collection_sha256"`
-	TLSCASHA256      string `json:"tls_ca_sha256"`
+	Schema            string `json:"schema"`
+	EvidenceRole      string `json:"evidence_role"`
+	Identity          string `json:"identity"`
+	Role              string `json:"role"`
+	AuthenticatedBy   string `json:"authenticated_by"`
+	SignedAt          string `json:"signed_at"`
+	Result            string `json:"result"`
+	TargetID          string `json:"target_id"`
+	ReleaseID         string `json:"release_id"`
+	SourceRevision    string `json:"source_revision"`
+	SourceTreeSHA256  string `json:"source_tree_sha256"`
+	BinarySHA256      string `json:"binary_sha256"`
+	CollectionSHA256  string `json:"collection_sha256"`
+	TLSIdentitySHA256 string `json:"tls_identity_sha256"`
 }
 
 type artifactStore struct {
@@ -205,15 +221,40 @@ func digestFile(path string) (string, error) {
 	return digestBytes(payload), nil
 }
 
+func tlsIdentityDigest(clientCA, clientCert, adminCA, adminCert, peerCA string, peers []peerTLSIdentity) string {
+	var canonical strings.Builder
+	fmt.Fprintf(&canonical, "client-ca=%s\nclient-cert=%s\nadmin-ca=%s\nadmin-cert=%s\npeer-ca=%s\n", clientCA, clientCert, adminCA, adminCert, peerCA)
+	for _, peer := range peers {
+		fmt.Fprintf(&canonical, "peer-%d-cert=%s\npeer-%d-uri=%s\n", peer.ReplicaID, peer.CertSHA256, peer.ReplicaID, peer.URISAN)
+	}
+	return digestBytes([]byte(canonical.String()))
+}
+
 var secureReadRaceHook func(string)
 
 func readSecureRegular(path string) ([]byte, error) {
+	return readSecureFile(path, false)
+}
+
+func readSecurePrivateKey(path string) ([]byte, error) {
+	return readSecureFile(path, true)
+}
+
+func validPrivateKeyMode(mode fs.FileMode) bool {
+	perm := mode.Perm()
+	return perm == 0o400 || perm == 0o600
+}
+
+func readSecureFile(path string, private bool) ([]byte, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
 	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s must be a regular non-symlink file", path)
+	}
+	if private && !validPrivateKeyMode(before.Mode()) {
+		return nil, fmt.Errorf("%s private key mode %04o must be 0400 or 0600", path, before.Mode().Perm())
 	}
 	if linkCount(before) != 1 {
 		return nil, fmt.Errorf("%s must not be hard-linked", path)
@@ -233,6 +274,9 @@ func readSecureRegular(path string) ([]byte, error) {
 	if !os.SameFile(before, after) || !after.Mode().IsRegular() || linkCount(after) != 1 {
 		return nil, fmt.Errorf("%s changed during secure open", path)
 	}
+	if private && !validPrivateKeyMode(after.Mode()) {
+		return nil, fmt.Errorf("%s private key mode %04o must be 0400 or 0600", path, after.Mode().Perm())
+	}
 	payload, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
@@ -243,6 +287,9 @@ func readSecureRegular(path string) ([]byte, error) {
 	}
 	if !os.SameFile(after, final) || final.Size() != int64(len(payload)) {
 		return nil, fmt.Errorf("%s changed during read", path)
+	}
+	if private && !validPrivateKeyMode(final.Mode()) {
+		return nil, fmt.Errorf("%s private key mode %04o must be 0400 or 0600", path, final.Mode().Perm())
 	}
 	return payload, nil
 }

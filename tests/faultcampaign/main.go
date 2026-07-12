@@ -19,7 +19,7 @@ import (
 const (
 	manifestVersion       = "faultcampaign-manifest/v1"
 	defaultSizes          = "1,2,3,4,5,6,7"
-	defaultFaults         = "loss,duplicate,reorder,asymmetric-partition,crash-restart,storage,rollback,malformed,overload"
+	defaultFaults         = "loss,duplicate,reorder,asymmetric-partition,crash-restart,storage,rollback,malformed,overload,admission,retention"
 	defaultSeed           = uint64(0x5eed)
 	defaultRequestTimeout = 3 * time.Second
 )
@@ -27,6 +27,7 @@ const (
 var supportedFaults = map[string]struct{}{
 	"loss": {}, "duplicate": {}, "reorder": {}, "asymmetric-partition": {},
 	"crash-restart": {}, "storage": {}, "rollback": {}, "malformed": {}, "overload": {},
+	"admission": {}, "retention": {},
 }
 
 type runnerConfig struct {

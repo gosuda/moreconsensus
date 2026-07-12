@@ -135,21 +135,30 @@ func inspect(config Config, runner commandRunner) (Inspection, error) {
 			transcripts[fmt.Sprintf("node_%d_plist_%s", node.ID, key)] = command
 		}
 		argumentHashes[node.Label] = argumentsHash(parsed.ProgramArguments)
-		certFact, keyFact, err := inspectNodeTLS(config, node)
+		tlsFacts, err := inspectNodeTLS(config, node)
 		if err != nil {
 			return Inspection{}, err
 		}
-		files[fmt.Sprintf("node_%d_certificate", node.ID)] = certFact
-		files[fmt.Sprintf("node_%d_private_key", node.ID)] = keyFact
+		for suffix, fact := range tlsFacts {
+			files[fmt.Sprintf("node_%d_%s", node.ID, suffix)] = fact
+		}
 	}
-	caPayload, caFact, err := readSecureRegular(config.CAPath, 16<<20)
-	if err != nil {
+	caFingerprints := make(map[string]map[string]struct{}, 3)
+	for plane, path := range map[string]string{"peer": config.PeerCAPath, "client": config.ClientCAPath, "admin": config.AdminCAPath} {
+		caPayload, caFact, err := readSecureRegular(path, 16<<20)
+		if err != nil {
+			return Inspection{}, err
+		}
+		fingerprints, err := certificateFingerprints(caPayload)
+		if err != nil {
+			return Inspection{}, fmt.Errorf("%s CA bundle: %w", plane, err)
+		}
+		caFingerprints[plane] = fingerprints
+		files[plane+"_ca_certificate"] = caFact
+	}
+	if err := requireDisjointCAFingerprints(caFingerprints); err != nil {
 		return Inspection{}, err
 	}
-	if pool := x509.NewCertPool(); !pool.AppendCertsFromPEM(caPayload) {
-		return Inspection{}, errors.New("CA path does not contain a parseable certificate")
-	}
-	files["ca_certificate"] = caFact
 
 	for key, root := range map[string]string{"data": filepath.Dir(config.Nodes[0].DataPath), "checkpoint": config.CheckpointRoot, "quarantine": config.QuarantineRoot, "log": filepath.Dir(config.Nodes[0].LogPath)} {
 		if _, err := secureDirectory(root, false); err != nil {
@@ -376,7 +385,6 @@ func validatePlistDocument(config Config, node NodeConfig, raw map[string]any) (
 	return parsed, nil
 }
 
-
 func stringValue(values map[string]any, key string) string {
 	value, _ := values[key].(string)
 	return value
@@ -387,12 +395,35 @@ func boolValue(values map[string]any, key string) bool {
 	return value
 }
 
-func inspectNodeTLS(config Config, node NodeConfig) (FileFact, FileFact, error) {
-	certPEM, certFact, err := readSecureRegular(node.ServerCertPath, 16<<20)
+func inspectNodeTLS(config Config, node NodeConfig) (map[string]FileFact, error) {
+	peerURL, _ := url.Parse(node.PeerURL)
+	clientURL, _ := url.Parse(node.ClientURL)
+	adminURL, _ := url.Parse(node.AdminURL)
+	identities := []struct {
+		name, caPath, certPath, keyPath, hostname, uri string
+	}{
+		{"peer", config.PeerCAPath, node.PeerCertPath, node.PeerKeyPath, peerURL.Hostname(), fmt.Sprintf("spiffe://gosuda.org/moreconsensus/replica/%d", node.ID)},
+		{"client", config.ClientCAPath, node.ClientCertPath, node.ClientKeyPath, clientURL.Hostname(), ""},
+		{"admin", config.AdminCAPath, node.AdminCertPath, node.AdminKeyPath, adminURL.Hostname(), ""},
+	}
+	facts := make(map[string]FileFact, 6)
+	for _, identity := range identities {
+		cert, key, err := inspectTLSIdentity(identity.caPath, identity.certPath, identity.keyPath, identity.hostname, identity.uri)
+		if err != nil {
+			return nil, fmt.Errorf("%s TLS identity: %w", identity.name, err)
+		}
+		facts[identity.name+"_certificate"] = cert
+		facts[identity.name+"_private_key"] = key
+	}
+	return facts, nil
+}
+
+func inspectTLSIdentity(caPath, certPath, keyPath, hostname, expectedURI string) (FileFact, FileFact, error) {
+	certPEM, certFact, err := readSecureRegular(certPath, 16<<20)
 	if err != nil {
 		return FileFact{}, FileFact{}, err
 	}
-	keyPEM, keyFact, err := readSecureRegular(node.ServerKeyPath, 1<<20)
+	keyPEM, keyFact, err := readSecureRegular(keyPath, 1<<20)
 	if err != nil {
 		return FileFact{}, FileFact{}, err
 	}
@@ -410,7 +441,7 @@ func inspectNodeTLS(config Config, node NodeConfig) (FileFact, FileFact, error) 
 	if err != nil {
 		return FileFact{}, FileFact{}, err
 	}
-	caPEM, _, err := readSecureRegular(config.CAPath, 16<<20)
+	caPEM, _, err := readSecureRegular(caPath, 16<<20)
 	if err != nil {
 		return FileFact{}, FileFact{}, err
 	}
@@ -429,11 +460,14 @@ func inspectNodeTLS(config Config, node NodeConfig) (FileFact, FileFact, error) 
 	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
 		return FileFact{}, FileFact{}, fmt.Errorf("server certificate chain verification: %w", err)
 	}
-	for _, raw := range []string{node.ClientURL, node.PeerURL, node.AdminURL} {
-		u, _ := url.Parse(raw)
-		if err := leaf.VerifyHostname(u.Hostname()); err != nil {
-			return FileFact{}, FileFact{}, fmt.Errorf("server certificate SAN does not cover %s: %w", u.Hostname(), err)
-		}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		return FileFact{}, FileFact{}, fmt.Errorf("client certificate chain verification: %w", err)
+	}
+	if err := leaf.VerifyHostname(hostname); err != nil {
+		return FileFact{}, FileFact{}, fmt.Errorf("certificate SAN does not cover %s: %w", hostname, err)
+	}
+	if expectedURI != "" && (len(leaf.URIs) != 1 || leaf.URIs[0].String() != expectedURI) {
+		return FileFact{}, FileFact{}, fmt.Errorf("peer certificate URI SAN must equal %s", expectedURI)
 	}
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
@@ -475,25 +509,37 @@ func bindingFromFacts(config Config, sourceHash string, files map[string]FileFac
 	plistHashes, certHashes, keyHashes := map[string]string{}, map[string]string{}, map[string]string{}
 	for _, node := range config.Nodes {
 		plist, plistOK := files[fmt.Sprintf("node_%d_plist", node.ID)]
-		cert, certOK := files[fmt.Sprintf("node_%d_certificate", node.ID)]
-		key, keyOK := files[fmt.Sprintf("node_%d_private_key", node.ID)]
-		if !plistOK || !certOK || !keyOK {
+		if !plistOK {
 			return Binding{}, fmt.Errorf("missing static file facts for node %d", node.ID)
 		}
 		plistHashes[node.Label] = plist.SHA256
-		certHashes[node.Label] = cert.SHA256
-		keyHashes[node.Label] = key.SHA256
+		for _, plane := range []string{"peer", "client", "admin"} {
+			cert, certOK := files[fmt.Sprintf("node_%d_%s_certificate", node.ID, plane)]
+			key, keyOK := files[fmt.Sprintf("node_%d_%s_private_key", node.ID, plane)]
+			if !certOK || !keyOK {
+				return Binding{}, fmt.Errorf("missing %s TLS static file facts for node %d", plane, node.ID)
+			}
+			certHashes[node.Label+"/"+plane] = cert.SHA256
+			keyHashes[node.Label+"/"+plane] = key.SHA256
+		}
 	}
-	ca, caOK := files["ca_certificate"]
+	caHashes := make(map[string]string, 3)
+	for _, plane := range []string{"peer", "client", "admin"} {
+		ca, ok := files[plane+"_ca_certificate"]
+		if !ok {
+			return Binding{}, fmt.Errorf("missing %s CA static file fact", plane)
+		}
+		caHashes[plane] = ca.SHA256
+	}
 	binary, binaryOK := files["binary"]
 	prior, priorOK := files["prior_binary"]
-	if !caOK || !binaryOK || !priorOK {
-		return Binding{}, errors.New("missing CA, active binary, or prior binary static file fact")
+	if !binaryOK || !priorOK {
+		return Binding{}, errors.New("missing active binary or prior binary static file fact")
 	}
 	return Binding{
 		TargetID: config.TargetID, TargetEnvironment: config.TargetEnvironment, ReleaseID: config.ReleaseID, Nonce: config.Nonce,
 		SourceRevision: config.SourceRevision, SourceTreeSHA256: sourceHash, BinarySHA256: binary.SHA256,
-		PriorBinarySHA256: prior.SHA256, PlistSHA256: plistHashes, CASHA256: ca.SHA256, CertificateSHA256: certHashes,
+		PriorBinarySHA256: prior.SHA256, PlistSHA256: plistHashes, CASHA256: caHashes, CertificateSHA256: certHashes,
 		PrivateKeySHA256: keyHashes, StatePublicKeyHash: publicKeyHash,
 	}, nil
 }
@@ -511,13 +557,20 @@ func verifyStaticBinding(config Config, expected Binding) error {
 		}
 		files[name] = fact
 	}
-	_, caFact, err := readSecureRegular(config.CAPath, 16<<20)
-	if err != nil {
-		return err
+	for plane, path := range map[string]string{"peer": config.PeerCAPath, "client": config.ClientCAPath, "admin": config.AdminCAPath} {
+		_, caFact, err := readSecureRegular(path, 16<<20)
+		if err != nil {
+			return err
+		}
+		files[plane+"_ca_certificate"] = caFact
 	}
-	files["ca_certificate"] = caFact
 	for _, node := range config.Nodes {
-		for suffix, path := range map[string]string{"plist": node.PlistPath, "certificate": node.ServerCertPath, "private_key": node.ServerKeyPath} {
+		for suffix, path := range map[string]string{
+			"plist":            node.PlistPath,
+			"peer_certificate": node.PeerCertPath, "peer_private_key": node.PeerKeyPath,
+			"client_certificate": node.ClientCertPath, "client_private_key": node.ClientKeyPath,
+			"admin_certificate": node.AdminCertPath, "admin_private_key": node.AdminKeyPath,
+		} {
 			_, fact, err := readSecureRegular(path, maxEvidenceFile)
 			if err != nil {
 				return err
@@ -539,6 +592,44 @@ func verifyStaticBinding(config Config, expected Binding) error {
 		return errors.New("release-bound source, binary, CA, plist, certificate, key, nonce, or state key changed")
 	}
 	return nil
+}
+
+func requireDisjointCAFingerprints(fingerprints map[string]map[string]struct{}) error {
+	for _, pair := range [][2]string{{"peer", "client"}, {"peer", "admin"}, {"client", "admin"}} {
+		for fingerprint := range fingerprints[pair[0]] {
+			if _, overlaps := fingerprints[pair[1]][fingerprint]; overlaps {
+				return fmt.Errorf("%s and %s CA bundles share trust anchor %s", pair[0], pair[1], fingerprint)
+			}
+		}
+	}
+	return nil
+}
+
+func certificateFingerprints(payload []byte) (map[string]struct{}, error) {
+	fingerprints := make(map[string]struct{})
+	for len(payload) > 0 {
+		block, rest := pem.Decode(payload)
+		if block == nil {
+			if len(bytes.TrimSpace(payload)) != 0 {
+				return nil, errors.New("contains non-PEM data")
+			}
+			break
+		}
+		payload = rest
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("contains unexpected PEM block %q", block.Type)
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		digest := sha256.Sum256(certificate.Raw)
+		fingerprints[fmt.Sprintf("%x", digest[:])] = struct{}{}
+	}
+	if len(fingerprints) == 0 {
+		return nil, errors.New("contains no certificates")
+	}
+	return fingerprints, nil
 }
 
 func buildAdminActionPlan(config Config, binding Binding) string {

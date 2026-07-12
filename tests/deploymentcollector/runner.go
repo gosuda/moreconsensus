@@ -44,7 +44,7 @@ func (nativeRunner) Run(ctx context.Context, argv []string) (commandOutput, erro
 	}
 	result := commandOutput{
 		Command: Command{Argv: append([]string(nil), argv...), ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String(), StartedAtUTC: utc(started), CompletedAtUTC: utc(completed)},
-		Stdout: []byte(stdout.String()), Stderr: []byte(stderr.String()),
+		Stdout:  []byte(stdout.String()), Stderr: []byte(stderr.String()),
 	}
 	return result, err
 }

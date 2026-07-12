@@ -222,7 +222,9 @@ candidate_scalar_keys_v2=(
   host_topology
   network_scope
   tls_scope
-  tls_ca_path
+  peer_tls_ca_path
+  client_tls_ca_path
+  admin_tls_ca_path
   mutual_tls
   client_authorization
   nonclaims
@@ -247,8 +249,12 @@ candidate_scalar_keys_v2=(
   node_1_admin_listener
   node_1_data_directory
   node_1_plist_path
-  node_1_tls_cert_path
-  node_1_tls_key_path
+  node_1_peer_tls_cert_path
+  node_1_peer_tls_key_path
+  node_1_client_tls_cert_path
+  node_1_client_tls_key_path
+  node_1_admin_tls_cert_path
+  node_1_admin_tls_key_path
   node_1_plist_sha256
   node_1_plutil_lint_result
   node_1_launchd_bootstrap_result
@@ -265,8 +271,12 @@ candidate_scalar_keys_v2=(
   node_2_admin_listener
   node_2_data_directory
   node_2_plist_path
-  node_2_tls_cert_path
-  node_2_tls_key_path
+  node_2_peer_tls_cert_path
+  node_2_peer_tls_key_path
+  node_2_client_tls_cert_path
+  node_2_client_tls_key_path
+  node_2_admin_tls_cert_path
+  node_2_admin_tls_key_path
   node_2_plist_sha256
   node_2_plutil_lint_result
   node_2_launchd_bootstrap_result
@@ -283,8 +293,12 @@ candidate_scalar_keys_v2=(
   node_3_admin_listener
   node_3_data_directory
   node_3_plist_path
-  node_3_tls_cert_path
-  node_3_tls_key_path
+  node_3_peer_tls_cert_path
+  node_3_peer_tls_key_path
+  node_3_client_tls_cert_path
+  node_3_client_tls_key_path
+  node_3_admin_tls_cert_path
+  node_3_admin_tls_key_path
   node_3_plist_sha256
   node_3_plutil_lint_result
   node_3_launchd_bootstrap_result
@@ -356,7 +370,9 @@ report_scalar_keys_v2=(
   host_topology
   network_scope
   tls_scope
-  tls_ca_path
+  peer_tls_ca_path
+  client_tls_ca_path
+  admin_tls_ca_path
   mutual_tls
   client_authorization
   nonclaims
@@ -381,8 +397,12 @@ report_scalar_keys_v2=(
   node_1_admin_listener
   node_1_data_directory
   node_1_plist_path
-  node_1_tls_cert_path
-  node_1_tls_key_path
+  node_1_peer_tls_cert_path
+  node_1_peer_tls_key_path
+  node_1_client_tls_cert_path
+  node_1_client_tls_key_path
+  node_1_admin_tls_cert_path
+  node_1_admin_tls_key_path
   node_1_plist_sha256
   node_1_plutil_lint_result
   node_1_launchd_bootstrap_result
@@ -399,8 +419,12 @@ report_scalar_keys_v2=(
   node_2_admin_listener
   node_2_data_directory
   node_2_plist_path
-  node_2_tls_cert_path
-  node_2_tls_key_path
+  node_2_peer_tls_cert_path
+  node_2_peer_tls_key_path
+  node_2_client_tls_cert_path
+  node_2_client_tls_key_path
+  node_2_admin_tls_cert_path
+  node_2_admin_tls_key_path
   node_2_plist_sha256
   node_2_plutil_lint_result
   node_2_launchd_bootstrap_result
@@ -417,8 +441,12 @@ report_scalar_keys_v2=(
   node_3_admin_listener
   node_3_data_directory
   node_3_plist_path
-  node_3_tls_cert_path
-  node_3_tls_key_path
+  node_3_peer_tls_cert_path
+  node_3_peer_tls_key_path
+  node_3_client_tls_cert_path
+  node_3_client_tls_key_path
+  node_3_admin_tls_cert_path
+  node_3_admin_tls_key_path
   node_3_plist_sha256
   node_3_plutil_lint_result
   node_3_launchd_bootstrap_result
@@ -902,52 +930,55 @@ canonical_program_arguments_sha256() {
   local peer_listener="$4"
   local admin_listener="$5"
   local data_directory="$6"
-  local tls_cert_path="$7"
-  local tls_key_path="$8"
-  local tls_ca_path="$9"
+  local peer_cert_path="$7"
+  local peer_key_path="$8"
+  local client_cert_path="$9"
+  local client_key_path="${10}"
+  local admin_cert_path="${11}"
+  local admin_key_path="${12}"
+  local peer_ca_path="${13}"
+  local client_ca_path="${14}"
+  local admin_ca_path="${15}"
   local output=""
+  local -a argv=(
+    "$binary_path"
+    -id "$node"
+    -listen "$client_listener"
+    -peer-listen "$peer_listener"
+    -admin-listen "$admin_listener"
+    -data "$data_directory"
+    -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291"
+    -request-deadline-ms 5000
+    -peer-deadline-ms 2000
+    -max-client-body-bytes 1048576
+    -max-peer-body-bytes 2097152
+    -max-admin-body-bytes 65536
+    -max-scan-limit 1000
+    -production=true
+    -peer-tls-cert "$peer_cert_path"
+    -peer-tls-key "$peer_key_path"
+    -peer-tls-ca "$peer_ca_path"
+    -client-tls-cert "$client_cert_path"
+    -client-tls-key "$client_key_path"
+    -client-client-ca "$client_ca_path"
+    -admin-tls-cert "$admin_cert_path"
+    -admin-tls-key "$admin_key_path"
+    -admin-client-ca "$admin_ca_path"
+    -pebble-cache-bytes 8388608
+    -pebble-memtable-bytes 4194304
+    -pebble-memtable-stop-writes 2
+    -pebble-max-open-files 1000
+    -pebble-max-concurrent-compactions 1
+    -pebble-bytes-per-sync 524288
+    -pebble-wal-bytes-per-sync 0
+    -retention-max-resident-instances 100000
+    -retention-max-durable-records 100000
+    -retention-max-data-bytes 10737418240
+  )
   if command -v sha256sum >/dev/null 2>&1; then
-    output="$(
-      printf '%s\0' \
-        "$binary_path" \
-        -id "$node" \
-        -listen "$client_listener" \
-        -peer-listen "$peer_listener" \
-        -admin-listen "$admin_listener" \
-        -data "$data_directory" \
-        -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291" \
-        -request-deadline-ms 5000 \
-        -peer-deadline-ms 2000 \
-        -max-client-body-bytes 1048576 \
-        -max-peer-body-bytes 1048576 \
-        -max-admin-body-bytes 65536 \
-        -max-scan-limit 1000 \
-        -tls-cert "$tls_cert_path" \
-        -tls-key "$tls_key_path" \
-        -tls-ca "$tls_ca_path" |
-        sha256sum
-    )" || fail "ProgramArguments-sha256-failed"
+    output="$(printf '%s\0' "${argv[@]}" | sha256sum)" || fail "ProgramArguments-sha256-failed"
   elif command -v shasum >/dev/null 2>&1; then
-    output="$(
-      printf '%s\0' \
-        "$binary_path" \
-        -id "$node" \
-        -listen "$client_listener" \
-        -peer-listen "$peer_listener" \
-        -admin-listen "$admin_listener" \
-        -data "$data_directory" \
-        -peers "1=https://127.0.0.1:19091,2=https://127.0.0.1:19191,3=https://127.0.0.1:19291" \
-        -request-deadline-ms 5000 \
-        -peer-deadline-ms 2000 \
-        -max-client-body-bytes 1048576 \
-        -max-peer-body-bytes 1048576 \
-        -max-admin-body-bytes 65536 \
-        -max-scan-limit 1000 \
-        -tls-cert "$tls_cert_path" \
-        -tls-key "$tls_key_path" \
-        -tls-ca "$tls_ca_path" |
-        shasum -a 256
-    )" || fail "ProgramArguments-sha256-failed"
+    output="$(printf '%s\0' "${argv[@]}" | shasum -a 256)" || fail "ProgramArguments-sha256-failed"
   else
     fail "missing-required-command-sha256sum-or-shasum"
   fi
@@ -1127,9 +1158,12 @@ validate_v2_target_artifact_contracts() {
   require_artifact_exact_line "$ARTIFACT_PATH" "graceful_durable_canary=pass" graceful-artifact-must-record-durable-canary
 
   artifact_path_for "$file" "$kind" "$base_dir" tls
-  require_artifact_exact_line "$ARTIFACT_PATH" "tls_scope=server-authentication-only" tls-artifact-must-record-server-auth-only
-  require_artifact_exact_line "$ARTIFACT_PATH" "mutual_tls=false" tls-artifact-must-record-no-mTLS
-  require_artifact_exact_line "$ARTIFACT_PATH" "client_authorization=false" tls-artifact-must-record-no-client-authorization
+  require_artifact_exact_line "$ARTIFACT_PATH" "tls_scope=mutual-auth-separated-planes" tls-artifact-must-record-separated-plane-mTLS
+  require_artifact_exact_line "$ARTIFACT_PATH" "mutual_tls=true" tls-artifact-must-record-mTLS
+  require_artifact_exact_line "$ARTIFACT_PATH" "client_authorization=true" tls-artifact-must-record-client-authorization
+  require_artifact_exact_line "$ARTIFACT_PATH" "peer_tls_ca_path=$(value_for_output "$file" peer_tls_ca_path)" tls-artifact-peer-CA-path-mismatch
+  require_artifact_exact_line "$ARTIFACT_PATH" "client_tls_ca_path=$(value_for_output "$file" client_tls_ca_path)" tls-artifact-client-CA-path-mismatch
+  require_artifact_exact_line "$ARTIFACT_PATH" "admin_tls_ca_path=$(value_for_output "$file" admin_tls_ca_path)" tls-artifact-admin-CA-path-mismatch
 
   artifact_path_for "$file" "$kind" "$base_dir" security_posture
   require_artifact_exact_line "$ARTIFACT_PATH" "launchd_domain=system" security-artifact-must-record-system-domain
@@ -1176,9 +1210,15 @@ validate_v2_semantics() {
   local plist_hashes="|"
   local argv_hash=""
   local canonical_argv_hash=""
-  local tls_ca_path=""
-  local tls_cert_path=""
-  local tls_key_path=""
+  local peer_ca_path=""
+  local client_ca_path=""
+  local admin_ca_path=""
+  local peer_cert_path=""
+  local peer_key_path=""
+  local client_cert_path=""
+  local client_key_path=""
+  local admin_cert_path=""
+  local admin_key_path=""
   local rollback_hash=""
   local argv_hashes="|"
   local before_uuid=""
@@ -1274,14 +1314,24 @@ validate_v2_semantics() {
   [[ "$(lowercase "$VALUE")" != "root" ]] || fail "service_user-must-not-be-root"
   require_exact "$file" host_topology single-darwin-host
   require_exact "$file" network_scope loopback-only
-  require_exact "$file" tls_scope server-authentication-only
-  get_required "$file" tls_ca_path
-  tls_ca_path="$VALUE"
-  require_absolute_path tls_ca_path "$tls_ca_path"
-  [[ "$tls_ca_path" == /var/db/moreconsensus/* ]] || fail "tls_ca_path-must-be-under-/var/db/moreconsensus"
-  require_exact "$file" mutual_tls false
-  require_exact "$file" client_authorization false
-  require_exact "$file" nonclaims same-host,loopback-only,no-independent-failure-domain,server-auth-tls-only,no-client-authorization,no-production-capacity,no-off-host-backup
+  require_exact "$file" tls_scope mutual-auth-separated-planes
+  ca_paths="|"
+  for plane in peer client admin; do
+    field="${plane}_tls_ca_path"
+    get_required "$file" "$field"
+    require_absolute_path "$field" "$VALUE"
+    [[ "$VALUE" == /var/db/moreconsensus/* ]] || fail "$field-must-be-under-/var/db/moreconsensus"
+    [[ "$ca_paths" != *"|$VALUE|"* ]] || fail "TLS-CA-paths-must-be-distinct"
+    ca_paths="${ca_paths}${VALUE}|"
+    case "$plane" in
+      peer) peer_ca_path="$VALUE" ;;
+      client) client_ca_path="$VALUE" ;;
+      admin) admin_ca_path="$VALUE" ;;
+    esac
+  done
+  require_exact "$file" mutual_tls true
+  require_exact "$file" client_authorization true
+  require_exact "$file" nonclaims same-host,loopback-only,no-independent-failure-domain,no-production-capacity,no-off-host-backup
 
   require_exact "$file" boot_observation real-host-reboot
   require_exact "$file" boot_observation_synthetic false
@@ -1343,14 +1393,24 @@ validate_v2_semantics() {
     require_exact "$file" "node_${node}_admin_listener" "$expected_admin"
     require_exact "$file" "node_${node}_data_directory" "$data_root/node${node}"
     require_exact "$file" "node_${node}_plist_path" "/Library/LaunchDaemons/${expected_label}.plist"
-    get_required "$file" "node_${node}_tls_cert_path"
-    tls_cert_path="$VALUE"
-    require_absolute_path "node_${node}_tls_cert_path" "$tls_cert_path"
-    [[ "$tls_cert_path" == /var/db/moreconsensus/* ]] || fail "node_${node}_tls_cert_path-must-be-under-/var/db/moreconsensus"
-    get_required "$file" "node_${node}_tls_key_path"
-    tls_key_path="$VALUE"
-    require_absolute_path "node_${node}_tls_key_path" "$tls_key_path"
-    [[ "$tls_key_path" == /var/db/moreconsensus/* ]] || fail "node_${node}_tls_key_path-must-be-under-/var/db/moreconsensus"
+    for plane in peer client admin; do
+      get_required "$file" "node_${node}_${plane}_tls_cert_path"
+      require_absolute_path "node_${node}_${plane}_tls_cert_path" "$VALUE"
+      [[ "$VALUE" == /var/db/moreconsensus/* ]] || fail "node_${node}_${plane}_tls_cert_path-must-be-under-/var/db/moreconsensus"
+      case "$plane" in
+        peer) peer_cert_path="$VALUE" ;;
+        client) client_cert_path="$VALUE" ;;
+        admin) admin_cert_path="$VALUE" ;;
+      esac
+      get_required "$file" "node_${node}_${plane}_tls_key_path"
+      require_absolute_path "node_${node}_${plane}_tls_key_path" "$VALUE"
+      [[ "$VALUE" == /var/db/moreconsensus/* ]] || fail "node_${node}_${plane}_tls_key_path-must-be-under-/var/db/moreconsensus"
+      case "$plane" in
+        peer) peer_key_path="$VALUE" ;;
+        client) client_key_path="$VALUE" ;;
+        admin) admin_key_path="$VALUE" ;;
+      esac
+    done
     get_required "$file" "node_${node}_plist_sha256"
     plist_hash="$VALUE"
     require_nonzero_sha256_value "node_${node}_plist_sha256" "$plist_hash"
@@ -1370,9 +1430,15 @@ validate_v2_semantics() {
         "$expected_peer" \
         "$expected_admin" \
         "$data_root/node${node}" \
-        "$tls_cert_path" \
-        "$tls_key_path" \
-        "$tls_ca_path"
+        "$peer_cert_path" \
+        "$peer_key_path" \
+        "$client_cert_path" \
+        "$client_key_path" \
+        "$admin_cert_path" \
+        "$admin_key_path" \
+        "$peer_ca_path" \
+        "$client_ca_path" \
+        "$admin_ca_path"
     )"
     [[ "$argv_hash" == "$canonical_argv_hash" ]] || fail "node_${node}_program_arguments_sha256-does-not-match-exact-ProgramArguments"
     case "$argv_hashes" in *"|${argv_hash}|"*) fail "node-ProgramArguments-hashes-must-be-distinct" ;; esac

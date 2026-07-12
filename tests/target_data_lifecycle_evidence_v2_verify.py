@@ -576,20 +576,77 @@ def validate_report(
             "mtls",
             "client_authorization",
             "production_capacity",
+            "peer_authorization",
+            "multi_tenant_rbac",
+            "client_tls_ca_sha256",
+            "client_tls_cert_sha256",
+            "admin_tls_ca_sha256",
+            "admin_tls_cert_sha256",
+            "peer_tls_ca_sha256",
+            "peer_tls_identities",
+            "tls_identity_sha256",
+            "client_mtls_rejection_artifact_id",
+            "admin_mtls_rejection_artifact_id",
+            "peer_authorization_artifact_ids",
         },
         "$.scope",
     )
     for key, expected_value in {
         "same_host": True,
         "loopback_only": True,
-        "tls_mode": "server-auth-only",
+        "tls_mode": "mutual-auth-separated-planes",
         "multi_host": False,
         "independent_failure_domains": False,
-        "mtls": False,
-        "client_authorization": False,
+        "mtls": True,
+        "client_authorization": True,
+        "peer_authorization": True,
+        "multi_tenant_rbac": False,
         "production_capacity": False,
     }.items():
         literal(scope[key], f"$.scope.{key}", expected_value)
+    for key in (
+        "client_tls_ca_sha256",
+        "client_tls_cert_sha256",
+        "admin_tls_ca_sha256",
+        "admin_tls_cert_sha256",
+        "peer_tls_ca_sha256",
+        "tls_identity_sha256",
+    ):
+        sha256(scope[key], f"$.scope.{key}")
+    raw_peer_identities = scope["peer_tls_identities"]
+    if not isinstance(raw_peer_identities, list) or len(raw_peer_identities) != 3:
+        fail("$.scope.peer_tls_identities must contain exactly three replica identities")
+    peer_identities: list[dict[str, Any]] = []
+    for index, raw_peer in enumerate(raw_peer_identities, start=1):
+        path = f"$.scope.peer_tls_identities[{index - 1}]"
+        peer = exact_object(raw_peer, {"replica_id", "cert_sha256", "uri_san"}, path)
+        integer(peer["replica_id"], f"{path}.replica_id", minimum=index, maximum=index)
+        sha256(peer["cert_sha256"], f"{path}.cert_sha256")
+        literal(peer["uri_san"], f"{path}.uri_san", f"spiffe://gosuda.org/moreconsensus/replica/{index}")
+        peer_identities.append(peer)
+    artifact_reference(scope["client_mtls_rejection_artifact_id"], "$.scope.client_mtls_rejection_artifact_id", references)
+    artifact_reference(scope["admin_mtls_rejection_artifact_id"], "$.scope.admin_mtls_rejection_artifact_id", references)
+    raw_peer_authorization_ids = scope["peer_authorization_artifact_ids"]
+    expected_peer_authorization_ids = [f"peer-{index}-authorization-required" for index in range(1, 4)]
+    if raw_peer_authorization_ids != expected_peer_authorization_ids:
+        fail("$.scope.peer_authorization_artifact_ids must contain the ordered per-replica authorization receipts")
+    for index, artifact_id in enumerate(raw_peer_authorization_ids):
+        artifact_reference(artifact_id, f"$.scope.peer_authorization_artifact_ids[{index}]", references)
+    canonical_tls_identity = (
+        f"client-ca={scope['client_tls_ca_sha256']}\n"
+        f"client-cert={scope['client_tls_cert_sha256']}\n"
+        f"admin-ca={scope['admin_tls_ca_sha256']}\n"
+        f"admin-cert={scope['admin_tls_cert_sha256']}\n"
+        f"peer-ca={scope['peer_tls_ca_sha256']}\n"
+    )
+    for peer in peer_identities:
+        replica_id = peer["replica_id"]
+        canonical_tls_identity += (
+            f"peer-{replica_id}-cert={peer['cert_sha256']}\n"
+            f"peer-{replica_id}-uri={peer['uri_san']}\n"
+        )
+    tls_identity = hashlib.sha256(canonical_tls_identity.encode("ascii")).hexdigest()
+    literal(scope["tls_identity_sha256"], "$.scope.tls_identity_sha256", tls_identity)
 
     target = exact_object(
         top["target"],
@@ -1153,6 +1210,71 @@ def validate_report(
         fail("evidence generated more than 24 hours after drill completion is stale")
 
     by_id = validate_artifacts(top["raw_artifacts"], report_path.parent.resolve(), references, started_at, generated_at)
+    for plane, artifact_key, ca_key in (
+        ("client", "client_mtls_rejection_artifact_id", "client_tls_ca_sha256"),
+        ("admin", "admin_mtls_rejection_artifact_id", "admin_tls_ca_sha256"),
+    ):
+        artifact_id = scope[artifact_key]
+        path = f"$.scope.{artifact_key}"
+        probe = exact_object(
+            artifact_json(by_id, artifact_id, path),
+            {
+                "schema",
+                "plane",
+                "target_origin",
+                "tls_version",
+                "trusted_ca_sha256",
+                "client_certificate_present",
+                "handshake_rejected",
+                "authenticated_control_before_and_after",
+            },
+            path,
+        )
+        literal(probe["schema"], f"{path}.schema", "moreconsensus.lifecycle-mtls-negative-probe.v1")
+        literal(probe["plane"], f"{path}.plane", plane)
+        origin = text(probe["target_origin"], f"{path}.target_origin")
+        if re.fullmatch(r"https://127\.0\.0\.1:[0-9]+", origin) is None:
+            fail(f"{path}.target_origin must be an exact loopback HTTPS origin")
+        literal(probe["tls_version"], f"{path}.tls_version", "1.3")
+        literal(probe["trusted_ca_sha256"], f"{path}.trusted_ca_sha256", scope[ca_key])
+        literal(probe["client_certificate_present"], f"{path}.client_certificate_present", False)
+        literal(probe["handshake_rejected"], f"{path}.handshake_rejected", True)
+        literal(probe["authenticated_control_before_and_after"], f"{path}.authenticated_control_before_and_after", True)
+    for destination_index, artifact_id in enumerate(raw_peer_authorization_ids, start=1):
+        path = f"$.scope.peer_authorization_artifact_ids[{destination_index - 1}]"
+        sender_id = destination_index % 3 + 1
+        probe = exact_object(
+            artifact_json(by_id, artifact_id, path),
+            {
+                "schema",
+                "destination_replica_id",
+                "authenticated_sender_replica_id",
+                "authenticated_sender_uri_san",
+                "trusted_ca_sha256",
+                "tls_version",
+                "authenticated_handshake_accepted",
+                "no_certificate_handshake_rejected",
+                "certificate_message_sender_mismatch_rejected",
+            },
+            path,
+        )
+        literal(probe["schema"], f"{path}.schema", "moreconsensus.lifecycle-peer-authorization-probe.v1")
+        literal(probe["destination_replica_id"], f"{path}.destination_replica_id", destination_index)
+        literal(probe["authenticated_sender_replica_id"], f"{path}.authenticated_sender_replica_id", sender_id)
+        literal(
+            probe["authenticated_sender_uri_san"],
+            f"{path}.authenticated_sender_uri_san",
+            f"spiffe://gosuda.org/moreconsensus/replica/{sender_id}",
+        )
+        literal(probe["trusted_ca_sha256"], f"{path}.trusted_ca_sha256", scope["peer_tls_ca_sha256"])
+        literal(probe["tls_version"], f"{path}.tls_version", "1.3")
+        literal(probe["authenticated_handshake_accepted"], f"{path}.authenticated_handshake_accepted", True)
+        literal(probe["no_certificate_handshake_rejected"], f"{path}.no_certificate_handshake_rejected", True)
+        literal(
+            probe["certificate_message_sender_mismatch_rejected"],
+            f"{path}.certificate_message_sender_mismatch_rejected",
+            True,
+        )
     require_artifact_digest(manifest_artifact_id, manifest_file_sha256, by_id, "$.checkpoint.manifest_file_sha256")
     require_artifact_digest(configuration_artifact_id, configuration_history_sha256, by_id, "$.checkpoint.configuration_history_sha256")
     require_artifact_digest(snapshot_artifact_id, snapshot_sha256, by_id, "$.checkpoint.snapshot_sha256")

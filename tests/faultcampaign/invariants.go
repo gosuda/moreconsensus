@@ -22,10 +22,10 @@ type durableInvariantResult struct {
 }
 
 type chosenTuple struct {
-	Ref     epaxos.InstanceRef  `json:"ref"`
-	Seq     uint64              `json:"seq"`
+	Ref     epaxos.InstanceRef   `json:"ref"`
+	Seq     uint64               `json:"seq"`
 	Deps    []epaxos.InstanceNum `json:"deps"`
-	Command epaxos.Command      `json:"command"`
+	Command epaxos.Command       `json:"command"`
 }
 
 func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations int) durableInvariantResult {
@@ -35,6 +35,7 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 		return result
 	}
 	allRecords := make([]map[epaxos.InstanceRef]epaxos.InstanceRecord, len(nodes))
+	allConfigs := make([]map[epaxos.ConfID]epaxos.ConfState, len(nodes))
 	chosen := make(map[epaxos.InstanceRef]chosenTuple)
 	var baselineExecuted map[epaxos.InstanceRef]struct{}
 	for nodeIndex, node := range nodes {
@@ -43,6 +44,20 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 			result.Error = fmt.Sprintf("open node %d durable store: %v", node.id, err)
 			return result
 		}
+		initial, err := database.EPaxosStorage().InitialState()
+		if err != nil {
+			_ = database.Close()
+			result.Error = fmt.Sprintf("load node %d initial state: %v", node.id, err)
+			return result
+		}
+		configs := make(map[epaxos.ConfID]epaxos.ConfState, len(initial.ConfigHistory)+1)
+		if initial.HardState.Conf.ID != 0 {
+			configs[initial.HardState.Conf.ID] = initial.HardState.Conf
+		}
+		for _, entry := range initial.ConfigHistory {
+			configs[entry.Conf.ID] = entry.Conf
+		}
+		allConfigs[nodeIndex] = configs
 		records := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
 		err = database.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
 			if !epaxos.VerifyRecordChecksum(record) {
@@ -55,6 +70,12 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 		if err != nil {
 			result.Error = fmt.Sprintf("load node %d records: %v", node.id, err)
 			return result
+		}
+		for ref := range records {
+			if _, ok := configs[ref.Conf]; !ok {
+				result.Error = fmt.Sprintf("node %d record %s references missing historical configuration %d", node.id, ref, ref.Conf)
+				return result
+			}
 		}
 		if closeErr != nil {
 			result.Error = fmt.Sprintf("close node %d durable store: %v", node.id, closeErr)
@@ -102,6 +123,12 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 		result.Error = fmt.Sprintf("executed mutations=%d below acknowledged mutations=%d", result.ExecutedMutationCount, expectedAcknowledgedMutations)
 		return result
 	}
+	for nodeIndex := 1; nodeIndex < len(allConfigs); nodeIndex++ {
+		if !sameDurableConfigurations(allConfigs[0], allConfigs[nodeIndex]) {
+			result.Error = fmt.Sprintf("node %d historical voter ordering diverges", nodes[nodeIndex].id)
+			return result
+		}
+	}
 	for _, records := range allRecords {
 		for ref := range baselineExecuted {
 			record, ok := records[ref]
@@ -125,7 +152,7 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 				continue
 			}
 			result.ConflictPairs++
-			if !dependsTransitively(leftRef, rightRef, base, make(map[epaxos.InstanceRef]struct{})) && !dependsTransitively(rightRef, leftRef, base, make(map[epaxos.InstanceRef]struct{})) {
+			if !dependsTransitively(leftRef, rightRef, base, allConfigs[0], make(map[epaxos.InstanceRef]struct{})) && !dependsTransitively(rightRef, leftRef, base, allConfigs[0], make(map[epaxos.InstanceRef]struct{})) {
 				result.Error = fmt.Sprintf("conflicting executed mutations %s and %s lack an exact dependency order", leftRef, rightRef)
 				return result
 			}
@@ -185,7 +212,25 @@ func commandsConflict(left, right epaxos.Command) bool {
 	return false
 }
 
-func dependsTransitively(from, target epaxos.InstanceRef, records map[epaxos.InstanceRef]epaxos.InstanceRecord, seen map[epaxos.InstanceRef]struct{}) bool {
+func sameDurableConfigurations(left, right map[epaxos.ConfID]epaxos.ConfState) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for id, leftConf := range left {
+		rightConf, ok := right[id]
+		if !ok || leftConf.ID != rightConf.ID || len(leftConf.Voters) != len(rightConf.Voters) {
+			return false
+		}
+		for index := range leftConf.Voters {
+			if leftConf.Voters[index] != rightConf.Voters[index] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func dependsTransitively(from, target epaxos.InstanceRef, records map[epaxos.InstanceRef]epaxos.InstanceRecord, configs map[epaxos.ConfID]epaxos.ConfState, seen map[epaxos.InstanceRef]struct{}) bool {
 	if from == target {
 		return true
 	}
@@ -197,12 +242,20 @@ func dependsTransitively(from, target epaxos.InstanceRef, records map[epaxos.Ins
 	if !ok {
 		return false
 	}
+	conf, known := configs[from.Conf]
+	if !known {
+		return false
+	}
 	for index, instance := range record.Deps {
-		if instance == 0 {
+		if instance == 0 || index >= len(conf.Voters) {
 			continue
 		}
-		dependency := epaxos.InstanceRef{Replica: epaxos.ReplicaID(index + 1), Instance: instance, Conf: from.Conf}
-		if dependency == target || dependsTransitively(dependency, target, records, seen) {
+		replica := conf.Voters[index]
+		if target.Conf == from.Conf && target.Replica == replica && target.Instance <= instance {
+			return true
+		}
+		dependency := epaxos.InstanceRef{Replica: replica, Instance: instance, Conf: from.Conf}
+		if dependency == target || dependsTransitively(dependency, target, records, configs, seen) {
 			return true
 		}
 	}

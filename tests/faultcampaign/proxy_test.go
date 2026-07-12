@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -57,7 +58,7 @@ func proxyMessage(t *testing.T, from, to epaxos.ReplicaID, instance epaxos.Insta
 	t.Helper()
 	message := epaxos.Message{
 		Type: epaxos.MsgPreAccept, From: from, To: to,
-		Ref: epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
+		Ref:    epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: from}, RecordBallot: epaxos.Ballot{Replica: from},
 		Seq: 1, Deps: []epaxos.InstanceNum{0, 0}, RecordStatus: epaxos.StatusPreAccepted,
 		Command: epaxos.Command{ID: epaxos.CommandID{Client: uint64(from), Sequence: uint64(instance)}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("key")}},
@@ -146,6 +147,101 @@ func TestFaultProxyDelayAndExplicitReverseRelease(t *testing.T) {
 	}
 	if !reflect.DeepEqual(instances, []epaxos.InstanceNum{2, 1}) {
 		t.Fatalf("release order=%v", instances)
+	}
+}
+
+func TestFaultProxyBlockKeepsAttemptOpenUntilRelease(t *testing.T) {
+	fixture := newProxyFixture(t)
+	if err := fixture.proxy.Schedule(ProxyAction{ID: 1, Kind: "block", From: 1, To: 2}); err != nil {
+		t.Fatal(err)
+	}
+	type postResult struct {
+		status int
+		err    error
+	}
+	body := proxyMessage(t, 1, 2, 1)
+	result := make(chan postResult, 1)
+	go func() {
+		response, err := fixture.client.Post(fixture.proxy.URL()+"/epaxos/message", "application/octet-stream", bytes.NewReader(body))
+		if err != nil {
+			result <- postResult{err: err}
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+		result <- postResult{status: response.StatusCode}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(fixture.proxy.HeldIDs()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("block action did not hold the request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case got := <-result:
+		t.Fatalf("blocked request completed before release: %#v", got)
+	default:
+	}
+	if fixture.count() != 0 {
+		t.Fatalf("blocked request reached upstream before release: count=%d", fixture.count())
+	}
+	if _, err := fixture.proxy.Release(fixture.proxy.HeldIDs()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil || got.status != http.StatusNoContent {
+			t.Fatalf("released result=%#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released request remained blocked")
+	}
+	if fixture.count() != 1 {
+		t.Fatalf("released upstream count=%d, want 1", fixture.count())
+	}
+}
+
+func TestFaultProxyBlockCancellationReleasesHeldRequest(t *testing.T) {
+	fixture := newProxyFixture(t)
+	if err := fixture.proxy.Schedule(ProxyAction{ID: 1, Kind: "block", From: 1, To: 2}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, fixture.proxy.URL()+"/epaxos/message", bytes.NewReader(proxyMessage(t, 1, 2, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		response, err := fixture.client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(fixture.proxy.HeldIDs()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("block action did not hold the cancellable request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("cancelled blocked request returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled blocked request did not return")
+	}
+	deadline = time.Now().Add(time.Second)
+	for len(fixture.proxy.HeldIDs()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled request remained held: %v", fixture.proxy.HeldIDs())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
