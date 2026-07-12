@@ -2049,8 +2049,10 @@ LEMMA RefinementStep ==
 BY ConcreteActionRefines, StutterRefines, SMT DEF NextOrStutter
 
 \* This arbitrary-history abstraction theorem is intentionally not named
-\* RawNodeRefinement.  That exact theorem is proved against the actual
-\* EPaxosRawNodeRefinement module in EPaxosInductiveRawNodeProof.tla.
+\* RawNodeRefinement.  It applies only to this module's restricted ConcreteNext.
+\* No checked theorem currently connects EPaxosRawNodeRefinement or arbitrary
+\* Go RawNode executions to this abstraction; that bridge remains an explicit
+\* proof obligation.
 THEOREM AbstractHistoryRefinement ==
     Spec => []MappingInvariant /\ []AbstractNext
 PROOF

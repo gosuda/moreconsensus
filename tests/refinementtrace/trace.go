@@ -194,6 +194,9 @@ func marshalSemanticTraces(sourceRevision string, formalSpec []byte, semanticTra
 			if event.Sequence != eventIndex+1 || event.Schema != semanticSchema || event.Kind == "" {
 				return nil, fmt.Errorf("trace %s semantic event %d has invalid identity", semanticTrace.id, eventIndex+1)
 			}
+			if err := validateSemanticTransition(semanticTrace.id, event); err != nil {
+				return nil, err
+			}
 			if _, ok := allowed[event.Action]; !ok {
 				return nil, fmt.Errorf("trace %s semantic event %d has unmapped mode action %q", semanticTrace.id, event.Sequence, event.Action)
 			}
