@@ -140,7 +140,7 @@ func TestRawNodeExportedTransitionCorrespondenceInventory(t *testing.T) {
 
 func TestFormalCorrespondenceReferencesExistingTLAArtifacts(t *testing.T) {
 	authorities := []string{
-		"../../MODEL_EQ_REPORT.md",
+		"../../MODEL_EQ_REPORT.MD",
 		"../../EPAXOS.MD",
 		"../../EPAXOS_IMPLEMENTATION_PROOF.md",
 		"../../RELEASE_SCOPE.md",
