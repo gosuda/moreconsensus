@@ -6,7 +6,8 @@
 // All externally visible work is returned through Ready.
 //
 // A typical integration loop persists records before sending messages or
-// acknowledging committed commands:
+// acknowledging committed commands. The application must apply
+// rd.Committed in the order provided by the slice:
 //
 //	for rn.HasReady() {
 //		rd := rn.Ready()
@@ -24,6 +25,9 @@
 //		}
 //		rd.Release()
 //	}
+//
+// `Ready.Committed` is already dependency-ordered; callers must not reorder or
+// parallelize entries across that slice.
 //
 // Advance accepts exact prefixes of the outstanding Ready. Applications may
 // acknowledge only records after partial durable writes, but messages and

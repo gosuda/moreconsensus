@@ -217,10 +217,12 @@ type CommandID struct {
 
 // Command is the application value proposed through EPaxos.
 //
-// Payload is opaque to the consensus core. ConflictKeys define the command's
-// commutativity relation: two user commands conflict when any conflict key is
-// byte-identical. Configuration changes conflict with every command. The core
-// never mutates Payload or ConflictKeys. Propose clones these slices unless
+// Payload is opaque to the consensus core. ConflictKeys are correctness
+// metadata, not an optimization hint: two user commands conflict when any
+// conflict key is byte-identical, so the application must include every
+// ordering-relevant key. Configuration changes and certified bootstrap
+// controls conflict with every non-noop command. The core never mutates
+// Payload or ConflictKeys. Propose clones these slices unless
 // Config.ZeroCopyProposals is true.
 type Command struct {
 	ID           CommandID
@@ -260,13 +262,19 @@ func (c Command) Clone() Command {
 // its Payload and ConflictKeys slices to the node.
 func (c Command) Borrow() Command { return c }
 
-// ConflictsWith reports whether two commands must be ordered by dependencies.
-func (c Command) ConflictsWith(other Command) bool {
+// commandHasGlobalConflictScope reports whether kind participates in the
+// protocol-wide non-noop conflict relation.
+func commandHasGlobalConflictScope(kind CommandKind) bool {
+	return kind == CommandConfChange || kind == CommandMembership
+}
+
+// commandsConflict is the single conflict relation used by public helpers and
+// protocol dependency/recovery paths.
+func commandsConflict(c, other Command) bool {
 	if c.Kind == CommandNoop || other.Kind == CommandNoop {
 		return false
 	}
-	if c.Kind == CommandConfChange || other.Kind == CommandConfChange ||
-		c.Kind == CommandMembership || other.Kind == CommandMembership {
+	if commandHasGlobalConflictScope(c.Kind) || commandHasGlobalConflictScope(other.Kind) {
 		return true
 	}
 	for _, a := range c.ConflictKeys {
@@ -277,6 +285,11 @@ func (c Command) ConflictsWith(other Command) bool {
 		}
 	}
 	return false
+}
+
+// ConflictsWith reports whether two commands must be ordered by dependencies.
+func (c Command) ConflictsWith(other Command) bool {
+	return commandsConflict(c, other)
 }
 
 // ConfChangeType identifies the membership operation in a configuration command.
@@ -602,7 +615,8 @@ func (a Attributes) Equal(b Attributes) bool {
 	return true
 }
 
-// CommittedCommand is emitted to the application after dependency ordering closes.
+// CommittedCommand is emitted to the application after dependency ordering
+// closes. The application must apply Ready.Committed in slice order.
 type CommittedCommand struct {
 	Ref     InstanceRef
 	Seq     uint64
@@ -628,6 +642,8 @@ func (c CommittedCommand) Clone() CommittedCommand {
 }
 
 // Ready batches records to persist, messages to send, and commands to apply.
+// Committed is already dependency-ordered; callers must preserve its slice
+// order when applying commands.
 type Ready struct {
 	HardState         HardState
 	ConfigHistory     []ConfigHistoryEntry

@@ -194,12 +194,16 @@ func (n *RawNode) installInstance(inst *instance) {
 	if inst == nil {
 		return
 	}
-	if replaced := n.instances[inst.rec.Ref]; replaced != nil && replaced != inst {
+	replaced := n.instances[inst.rec.Ref]
+	if replaced != nil && replaced != inst {
 		n.cancelTimersForRef(inst.rec.Ref)
 		releaseInstanceVolatile(replaced)
 	}
 	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
 	n.instances[inst.rec.Ref] = inst
+	if replaced != nil && replaced != inst {
+		n.rebuildConflictLane(laneFor(inst.rec.Ref))
+	}
 	if inst.rec.Status >= StatusCommitted {
 		n.noteCommitted(inst.rec.Ref)
 		releaseInstanceVolatile(inst)
@@ -473,7 +477,7 @@ func (n *RawNode) hasUnresolvedKnownConflict(view *executionView, base InstanceR
 		if other == nil || other.rec.Status == StatusNone || other.rec.Status >= StatusCommitted {
 			continue
 		}
-		if !inst.rec.Command.ConflictsWith(other.rec.Command) || n.dependencyKnownAfter(base, otherRef, StatusPreAccepted) {
+		if !commandsConflict(inst.rec.Command, other.rec.Command) || n.dependencyKnownAfter(base, otherRef, StatusPreAccepted) {
 			continue
 		}
 		blocked = true

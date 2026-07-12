@@ -29,6 +29,10 @@ type tryEvidenceKey struct {
 	conflict InstanceRef
 	ballot   Ballot
 }
+type conflictIndexKey struct {
+	conf ConfID
+	key  string
+}
 
 type instance struct {
 	rec             InstanceRecord
@@ -204,7 +208,9 @@ type RawNode struct {
 	acknowledgedHardState           HardState
 	nextInstance                    InstanceNum
 	instances                       map[InstanceRef]*instance
-	conflicts                       map[string]map[ReplicaID]InstanceRef
+	conflicts                       map[conflictIndexKey]map[instanceLane]InstanceRef
+	allConflicts                    map[instanceLane]InstanceRef
+	globalConflicts                 map[instanceLane]InstanceRef
 	executed                        executedTracker
 	pendingConf                     bool
 	appliedConfByBase               map[ConfID]InstanceRef
@@ -680,7 +686,9 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		maxConcurrentRecoveries:         cfg.MaxConcurrentRecoveries,
 		nextInstance:                    1,
 		instances:                       make(map[InstanceRef]*instance),
-		conflicts:                       make(map[string]map[ReplicaID]InstanceRef),
+		conflicts:                       make(map[conflictIndexKey]map[instanceLane]InstanceRef),
+		allConflicts:                    make(map[instanceLane]InstanceRef),
+		globalConflicts:                 make(map[instanceLane]InstanceRef),
 		executed:                        newExecutedTracker(),
 		committedThrough:                make(map[instanceLane]InstanceNum),
 		appliedConfByBase:               make(map[ConfID]InstanceRef),
@@ -3689,7 +3697,7 @@ func (n *RawNode) tryPreAcceptConflict(m Message) (InstanceRef, Status, bool) {
 	sortRefs(refs)
 	for _, ref := range refs {
 		other := n.instances[ref]
-		if ref == m.Ref || other.rec.Status == StatusNone || !candidate.Command.ConflictsWith(other.rec.Command) {
+		if ref == m.Ref || other.rec.Status == StatusNone || !commandsConflict(candidate.Command, other.rec.Command) {
 			continue
 		}
 		candidateDepends := n.attrsDependsOn(candidate.Attributes(), ref, m.Ref.Conf)
@@ -4390,16 +4398,19 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 	if len(n.instances) == 0 {
 		return Attributes{Seq: seq, Deps: deps}
 	}
-	addRef := func(ref InstanceRef, rec InstanceRecord) {
+	addRef := func(ref InstanceRef, rec InstanceRecord) bool {
 		if ref == exclude || rec.TOQPending || rec.Status == StatusNone || rec.Command.Kind == CommandNoop || ref.Conf != exclude.Conf {
-			return
+			return false
+		}
+		if !commandsConflict(cmd, rec.Command) {
+			return false
 		}
 		if n.skipTimedConflict(cmd, exclude, processAt, timedPreAccept, ref, rec) {
-			return
+			return false
 		}
 		idx, ok := conf.Index(ref.Replica)
 		if !ok {
-			return
+			return false
 		}
 		if ref.Instance > deps[idx] {
 			deps[idx] = ref.Instance
@@ -4407,43 +4418,64 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 		if rec.Seq >= seq {
 			seq = saturatingSeqIncrement(rec.Seq)
 		}
+		return true
+	}
+	addFallbackLane := func(lane instanceLane) {
+		var bestRef InstanceRef
+		var bestRec InstanceRecord
+		for ref, inst := range n.instances {
+			if inst == nil || laneFor(ref) != lane || ref == exclude || ref.Conf != exclude.Conf ||
+				inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop ||
+				!commandsConflict(cmd, inst.rec.Command) {
+				continue
+			}
+			if bestRef.IsZero() || lessRef(bestRef, ref) {
+				bestRef = ref
+				bestRec = inst.rec
+			}
+		}
+		if !bestRef.IsZero() {
+			addRef(bestRef, bestRec)
+		}
+	}
+	addIndexedLanes := func(index map[instanceLane]InstanceRef) {
+		for lane, ref := range index {
+			if lane.conf != exclude.Conf {
+				continue
+			}
+			inst := n.instances[ref]
+			if inst != nil && addRef(ref, inst.rec) {
+				continue
+			}
+			addFallbackLane(lane)
+		}
 	}
 	if cmd.Kind == CommandNoop {
 		return Attributes{Seq: seq, Deps: deps}
 	}
-	if cmd.Kind == CommandConfChange {
-		for ref, inst := range n.instances {
-			addRef(ref, inst.rec)
+	if commandHasGlobalConflictScope(cmd.Kind) {
+		addIndexedLanes(n.allConflicts)
+		if len(n.allConflicts) == 0 {
+			for ref, inst := range n.instances {
+				if inst != nil {
+					addRef(ref, inst.rec)
+				}
+			}
 		}
 	} else if timedPreAccept {
 		for ref, inst := range n.instances {
-			if cmd.ConflictsWith(inst.rec.Command) {
+			if inst != nil {
 				addRef(ref, inst.rec)
 			}
 		}
 	} else {
 		for _, key := range cmd.ConflictKeys {
-			for _, ref := range n.conflicts[string(key)] {
-				if ref == exclude || ref.Conf != exclude.Conf {
-					continue
-				}
-				idx, ok := conf.Index(ref.Replica)
-				if !ok {
-					continue
-				}
-				if ref.Instance > deps[idx] {
-					deps[idx] = ref.Instance
-				}
-			}
+			addIndexedLanes(n.conflicts[conflictIndexKey{conf: exclude.Conf, key: string(key)}])
 		}
+		addIndexedLanes(n.globalConflicts)
 	}
 	for ref, inst := range n.instances {
-		if inst.rec.Command.Kind == CommandConfChange {
-			addRef(ref, inst.rec)
-		}
-	}
-	for ref, inst := range n.instances {
-		if ref == exclude || ref.Conf != exclude.Conf || inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop {
+		if inst == nil || ref == exclude || ref.Conf != exclude.Conf || inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop {
 			continue
 		}
 		idx, ok := conf.Index(ref.Replica)
@@ -4574,23 +4606,68 @@ func addTryCandidate(candidates []tryCandidate, conf ConfState, rec InstanceReco
 	return append(candidates, candidate)
 }
 
-func (n *RawNode) indexConflicts(rec InstanceRecord) {
-	if rec.Command.Kind == CommandNoop {
+func (n *RawNode) ensureConflictIndexes() {
+	if n.conflicts == nil {
+		n.conflicts = make(map[conflictIndexKey]map[instanceLane]InstanceRef)
+	}
+	if n.allConflicts == nil {
+		n.allConflicts = make(map[instanceLane]InstanceRef)
+	}
+	if n.globalConflicts == nil {
+		n.globalConflicts = make(map[instanceLane]InstanceRef)
+	}
+}
+func (n *RawNode) conflictIndex(conf ConfID, key []byte) map[instanceLane]InstanceRef {
+	return n.conflicts[conflictIndexKey{conf: conf, key: string(key)}]
+}
+
+func updateConflictMaximum(index map[instanceLane]InstanceRef, ref InstanceRef) {
+	lane := laneFor(ref)
+	if old, ok := index[lane]; !ok || old.Instance < ref.Instance {
+		index[lane] = ref
+	}
+}
+
+func (n *RawNode) indexConflictRecord(rec InstanceRecord) {
+	if rec.Status < StatusPreAccepted || rec.TOQPending || rec.Command.Kind == CommandNoop {
 		return
 	}
-	if rec.Command.Kind == CommandConfChange {
+	n.ensureConflictIndexes()
+	updateConflictMaximum(n.allConflicts, rec.Ref)
+	if commandHasGlobalConflictScope(rec.Command.Kind) {
+		updateConflictMaximum(n.globalConflicts, rec.Ref)
 		return
 	}
 	for _, key := range rec.Command.ConflictKeys {
-		byReplica := n.conflicts[string(key)]
-		if byReplica == nil {
-			byReplica = make(map[ReplicaID]InstanceRef)
-			n.conflicts[string(key)] = byReplica
+		indexKey := conflictIndexKey{conf: rec.Ref.Conf, key: string(key)}
+		byLane := n.conflicts[indexKey]
+		if byLane == nil {
+			byLane = make(map[instanceLane]InstanceRef)
+			n.conflicts[indexKey] = byLane
 		}
-		if old, ok := byReplica[rec.Ref.Replica]; !ok || lessRef(old, rec.Ref) {
-			byReplica[rec.Ref.Replica] = rec.Ref
+		updateConflictMaximum(byLane, rec.Ref)
+	}
+}
+
+func (n *RawNode) rebuildConflictLane(lane instanceLane) {
+	n.ensureConflictIndexes()
+	for key, byLane := range n.conflicts {
+		delete(byLane, lane)
+		if len(byLane) == 0 {
+			delete(n.conflicts, key)
 		}
 	}
+	delete(n.allConflicts, lane)
+	delete(n.globalConflicts, lane)
+	for ref, inst := range n.instances {
+		if inst != nil && laneFor(ref) == lane {
+			n.indexConflictRecord(inst.rec)
+		}
+	}
+}
+
+func (n *RawNode) indexConflicts(rec InstanceRecord) {
+	n.indexConflictRecord(rec)
 }
 
 func attrsFromVotes(conf ConfState, votes *attrVoteSet) Attributes {

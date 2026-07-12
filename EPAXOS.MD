@@ -10,7 +10,8 @@ An application owns transport, persistence, and time. A replica is a determinist
 2. `Propose` or `ProposeConfChange` creates local EPaxos instances.
 3. `Step` applies one transport `Message` addressed to the local replica.
 4. `HasReady` and `Ready` expose records to persist, messages to send, and commands to apply.
-5. `Advance` confirms the caller completed the `Ready` obligations.
+5. The application applies `Ready.Committed` in slice order after the corresponding durable work succeeds.
+6. `Advance` confirms the caller completed the `Ready` obligations.
 
 The core starts no goroutines, performs no I/O, and does not call the OS wall clock directly. Non-TOQ timing uses logical ticks; TOQ mode reads time only through the caller-supplied `TOQClock` function. Storage and transport are virtualized by the embedding application and by tests.
 
@@ -35,7 +36,7 @@ Each command is stored in an `InstanceRecord` named by `(ReplicaID, InstanceNum,
 
 ## Commands and conflicts
 
-A command is opaque payload plus explicit conflict keys. Two user commands conflict when any conflict key is byte-identical. No-op recovery commands conflict with nothing. Configuration-change commands conflict with every non-noop command so membership updates are totally ordered with user commands.
+A command is an opaque payload plus explicit conflict keys. `ConflictKeys` are correctness metadata, not an optimization hint: the application must include every ordering-relevant key. Two user commands conflict when any conflict key is byte-identical. No-op recovery commands conflict with nothing. Configuration changes and certified bootstrap controls conflict with every non-noop command.
 
 The EPaxos dependency vector stores, for each voter in sorted configuration order, the latest known conflicting instance from that voter. The sequence number is one greater than the maximum sequence number of the dependencies observed while computing attributes.
 
@@ -121,7 +122,7 @@ The finite configuration evidence currently covers an executed add/remove durabl
 
 ## Ready contract
 
-`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` contains user commands that have passed dependency execution and must be applied by the embedding application before they are acknowledged. The embedding application must persist every record in a returned `Ready` before sending messages or acknowledging committed commands from that same batch. `MustSync` is true when durable records are present.
+`Ready.Records` are durable consensus state. `Ready.Messages` are transport work. `Ready.Committed` contains user commands that have passed dependency execution and must be applied by the embedding application in slice order before they are acknowledged. The embedding application must persist every record in a returned `Ready` before sending messages or acknowledging committed commands from that same batch. `MustSync` is true when durable records are present.
 
 `Advance` returns an error and acknowledges only an exact prefix of the outstanding `Ready`. The acknowledged values must match the records, messages, committed commands, and `MustSync` bit returned by `Ready`; otherwise `Advance` returns `ErrInvalidReady` and leaves the outstanding batch unchanged for retry. A record-only prefix is valid, which lets storage persist part of a batch without marking application commands executed. `Messages` or `Committed` acknowledgements are accepted only after all earlier `Records` from that outstanding batch are acknowledged. When `MaxReadyMessages` caps `Ready.Messages`, records and committed commands still appear in full; after their successful acknowledgement the remaining message tail appears in later `Ready` batches with `MustSync` false.
 
