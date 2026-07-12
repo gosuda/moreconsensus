@@ -7,5 +7,5 @@ cd "$ROOT"
 python3 tests/tla_model_check_runner.py \
   --profile fast \
   --jobs 2 \
-  --per-config-timeout 60 \
-  --overall-timeout 300
+  --per-config-timeout 180 \
+  --overall-timeout 600

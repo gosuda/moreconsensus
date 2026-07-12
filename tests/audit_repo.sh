@@ -55,3 +55,32 @@ for pattern in "${determinism_patterns[@]}"; do
     exit 1
   fi
 done
+
+python3 - <<'PY'
+from __future__ import annotations
+
+import subprocess
+import unicodedata
+from pathlib import Path
+
+root = Path.cwd()
+paths = subprocess.run(
+    ["git", "ls-files", "-z"],
+    cwd=root,
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.split(b"\0")
+for raw in paths:
+    if not raw:
+        continue
+    path = root / raw.decode("utf-8")
+    data = path.read_bytes()
+    if b"\0" in data:
+        continue
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    if any("HANGUL" in unicodedata.name(char, "") for char in text):
+        raise SystemExit(f"Hangul text is present in tracked file: {path}")
+PY

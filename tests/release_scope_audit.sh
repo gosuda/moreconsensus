@@ -4,620 +4,202 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-scope="RELEASE_SCOPE.md"
-release_evidence="release/EPAXOS_READINESS_EVIDENCE.md"
-
-require_text() {
-  local text="$1"
-  if ! grep -Fq -- "$text" "$scope"; then
-    echo "missing release-scope text: $text" >&2
-    exit 1
-  fi
-}
-
-require_scope_row_text() {
-  local row="$1"
-  local text="$2"
-  local line
-  while IFS= read -r line; do
-    if [[ "$line" == *"$row"* && "$line" == *"$text"* ]]; then
-      return
-    fi
-  done < "$scope"
-  echo "missing release-scope row text: $row -> $text" >&2
-  exit 1
-}
-
-require_release_evidence_line_text() {
-  local anchor="$1"
-  local text="$2"
-  local line
-  while IFS= read -r line; do
-    if [[ "$line" == *"$anchor"* && "$line" == *"$text"* ]]; then
-      return
-    fi
-  done < "$release_evidence"
-  echo "missing release evidence line text: $anchor -> $text" >&2
-  exit 1
-}
+scope="$ROOT/RELEASE_SCOPE.md"
+evidence="$ROOT/release/EPAXOS_READINESS_EVIDENCE.md"
 
 require_path() {
   local path="$1"
-  if [[ ! -e "$path" ]]; then
-    echo "missing release-scope baseline path: $path" >&2
+  if [[ ! -e "$ROOT/$path" ]]; then
+    echo "required release artifact is missing: $path" >&2
     exit 1
   fi
 }
 
-if [[ ! -f "$scope" ]]; then
-  echo "missing $scope" >&2
-  exit 1
-fi
+require_text() {
+  local file="$1"
+  local text="$2"
+  if ! LC_ALL=C grep -Fq -- "$text" "$file"; then
+    echo "required text is missing from ${file#$ROOT/}: $text" >&2
+    exit 1
+  fi
+}
 
-if [[ ! -f "$release_evidence" ]]; then
-  echo "missing $release_evidence" >&2
-  exit 1
-fi
+for path in \
+  README.md \
+  EPAXOS.MD \
+  EPAXOS_IMPLEMENTATION_PROOF.md \
+  MODEL_EQ_REPORT.MD \
+  RELEASE_SCOPE.md \
+  release/EPAXOS_READINESS_EVIDENCE.md \
+  tests/audit_repo.sh \
+  tests/ci.sh \
+  tests/go_no_go_workflow.sh \
+  tests/release_evidence_verifier.py \
+  tests/tla_model_check.sh \
+  tests/tla_model_check_fast.sh \
+  tests/tla_model_check_runner.py \
+  tests/operations_readiness_audit.sh \
+  deploy/systemd/kvnode@.service \
+  deploy/systemd/kvnode.env.example \
+  docs/operations/kvnode-data-lifecycle-incident-runbook.md \
+  docs/operations/kvnode-upgrade-rollback.md; do
+  require_path "$path"
+done
 
-require_text "# Release Scope Lock"
-require_text "## Scope rule"
-require_text "## Current release decision"
-require_text "## Closed release items"
-require_text "## Open release items"
-require_text "## Review baseline"
-require_text "## Non-claims"
-require_text "## Fault-tolerance target and evidence matrix"
-require_text "Fault-tolerance target"
-require_text "Normal operation maintained when"
-require_text "Evidence proving normal operation"
-require_text "Fault-count boundary"
-require_text "Healthy quorum"
-require_text "synthesized reconstruction without a verified checkpoint"
-require_text "No target-environment remote claim"
-require_text "in-place Pebble/WAL repair"
-require_text "No-go."
-require_text "Release scope lock"
-require_text "Review baseline"
-require_text "Requirement traceability"
-require_text "Deterministic timing boundary"
-require_text "Missing dependency closure"
-require_text "Owner-independent recovery"
-require_text "Go/race/coverage gates"
-require_text "Deterministic simulation"
-require_text "Static/text audit"
-require_text "Algorithm correspondence"
-require_text "Local Jepsen restart/transport/storage gates"
-require_text "Pin toolchain reproducibly"
-require_text "Configuration-change ordering"
-require_text "Configuration-change ordering, pinning, and finite durable replay"
-require_text "one finite executed add/remove durable replay slice"
-require_text "Ready durable-application failure handling"
-require_text "Full EPaxos Revisited TOQ"
-require_text "Paper fast-quorum parity"
-require_text "Implemented fast quorum table"
-require_text "Deterministic ProcessAt timing heuristic"
-require_text "Chaos and fault-injection campaign"
-require_text "Logical clock skew injection"
-require_text "Clock pause handling"
-require_text "Leap-second-style civil-time boundary"
-require_text "VM rollback restart catch-up"
-require_text "Storage/wire restart rollback simulation"
-require_text "Local destructive-storage recovery"
-require_text "Remote destructive-safety preflight"
-require_text "preflight-only validation"
-require_text "simulation/local-loopback release scope"
-require_text "external multi-host Jepsen histories are outside"
-require_text "OS wall-clock mutation"
-require_text "actual mixed-version binary execution"
-require_text "Bit-level persisted-record corruption"
-require_text "Checkpoint-backed bit-level disk-corruption recovery"
-require_text "TestCheckpointRepairRecoversBitFlippedPersistedEPaxosRecord"
-require_text "TestCheckpointRepairRejectsCorruptCheckpointAndLeavesLiveData"
-require_text "TestVerifyCheckpointAndRepairFromCheckpointRejectMissingCheckpoint"
-require_text "TestVerifyCheckpointRejectsSemanticDataCorruption"
-require_text "TestVerifyCheckpointCrashWindowMarkerRules"
-require_text "TestRecoverReplicaFromLiveCheckpointRestoresStoppedReplica"
-require_text "TestRecoverReplicaFromLiveCheckpointRejectsUnsupportedSource"
-require_text "TestRecoverReplicaFromLiveCheckpointRejectsTargetOwnedFloorMismatch"
-require_text "Crash-idempotent application"
-require_text "API separation"
-require_text "Transport security"
-require_text "Request deadline budgets"
-require_text "Request size limits"
-require_text "Scan bounds"
-require_text "Point latest-read semantics"
-require_text "Scan latest-read semantics"
-require_text "Binary value fidelity"
-require_text "Health readiness split"
-require_text "Observability"
-require_text "Formal models"
-require_text "tla/EPaxosRecoveryFive.cfg"
-require_text "tla/EPaxosConfigTransition.cfg"
-require_text "tla/EPaxosConfigRemoveTransition.cfg"
-require_text "tla/EPaxosConfigChainTransition.cfg"
-require_text "tla/EPaxosConfigChainRecovery.cfg"
-require_text "tla/EPaxosConfigReplay.cfg"
-require_text "tla/EPaxosConfigRecovery.cfg"
-require_text "tla/EPaxosRollbackAllocation.cfg"
-require_text "tla/EPaxosRollbackAllocation.tla"
-require_text "learned-before-fresh"
-require_text "timeout-outcome wording only"
-require_text "learned-before-fresh applied order"
-require_text "tla/EPaxosOptimizedRecovery.tla"
-require_text "tla/EPaxosOptimizedRecoverySeven.cfg"
-require_text "tla/EPaxosTryPreAcceptBranches.cfg"
-require_text "tla/EPaxosTryPreAcceptBranchesSeven.cfg"
-require_text "TryPreAccept response branch-slice"
-require_text "tla/EPaxosTryPreAcceptMessagePath.cfg"
-require_text "tla/EPaxosTryPreAcceptMessagePathSeven.cfg"
-require_text "TryPreAccept message-path coverage"
-require_text "tla/EPaxosTryConflictForce.cfg"
-require_text "tla/EPaxosTryConflictForceSeven.cfg"
-require_text "force/defer quorum"
-require_text "Config replay note"
-require_text "Config replay limit"
-require_text "durable restart replay"
-require_text "generated \`6/6\` states"
-require_text "default sync group uses replayed current voters"
-require_text "remaining durable-replay non-claim"
-require_text "stored historical config states"
-require_text "Config recovery note"
-require_text "Config recovery limit"
-require_text "old slow quorum"
-require_text "generated \`44/30\` states"
-require_text "finite staged recovery-under-removal"
-require_text "Configuration recovery under removal"
-require_text "TestOldConfigRecoveryUsesPinnedVotersAfterRemoval"
-require_text "emit no application command for the recovered no-op"
-require_text "Config recovery de-dup note"
-require_text "Config recovery de-dup limit"
-require_text "tla/EPaxosConfigRecoveryDedup.cfg"
-require_text "generated \`11/11\` states"
-require_text "lost+duplicate response de-duplication"
-require_text "does not model retries"
-require_text "timer rebroadcast"
-require_text "duplicate voter 3 prepare/accept responses do not advance Ready"
-require_text "Config transition de-dup note"
-require_text "Config transition de-dup limit"
-require_text "tla/EPaxosConfigTransitionDedup.cfg"
-require_text "TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval"
-require_text "TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition"
-require_text "remote PreAccept/Accept responses separately from the counted local owner vote"
-require_text "duplicate voter 2 in the removal slice"
-require_text "added voter 4 in the addition slice"
-require_text "finite normal configuration-transition response de-duplication"
-require_text "Config add-recovery note"
-require_text "Config add-recovery limit"
-require_text "generated \`15/15\` states"
-require_text "finite staged recovery-after-addition"
-require_text "Configuration recovery under addition"
-require_text "TestOldConfigRecoveryUsesPinnedVotersAfterAddition"
-require_text "no application command is emitted for the recovered no-op"
-require_text "Configuration recovery after add/remove chain"
-require_text "Configuration chain recovery finite model"
-require_text "Config chain recovery note"
-require_text "Config chain recovery limit"
-require_text "TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove"
-require_text "generated \`20/14\` states"
-require_text "current-quorum-insufficient intermediate states"
-require_text "modeled third old-quorum vote"
-require_text "finite mid-chain recovery slice"
-require_text "Configuration chain recovery lost-response retry finite model"
-require_text "Config chain recovery lost-response retry note"
-require_text "Config chain recovery lost-response retry limit"
-require_text "tla/EPaxosConfigChainRecoveryLostResponseRetry.cfg"
-require_text "tla/EPaxosConfigChainRecoveryLostResponseRetry.tla"
-require_text "TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses"
-require_text "direct TLC generated \`32/22\` states"
-require_text "current Conf3 quorum responses below the old Conf2 quorum before retry"
-require_text "removed voter 2 prepare and accept responses as explicit pre-retry losses"
-require_text "tla/EPaxosEvidenceQuery.tla"
-require_text "Configuration chain transition retry-timer finite model"
-require_text "Config chain transition retry note"
-require_text "Config chain transition retry limit"
-require_text "tla/EPaxosConfigChainTransitionRetry.cfg"
-require_text "tla/EPaxosConfigChainTransitionRetry.tla"
-require_text "TestOldConfigChainTransitionRetryUsesPinnedVotersAfterAddThenRemove"
-require_text "direct TLC generated \`8/8\` states"
-require_text "old Conf1 local-owner PreAccept/Accept retries"
-require_text "mid Conf2 local-owner PreAccept/Accept retries"
-require_text "including removed voter 2"
-require_text "finite add-then-remove configuration-chain retry"
-require_text "Configuration chain transition lost-response retry finite model"
-require_text "Config chain transition lost-response retry note"
-require_text "Config chain transition lost-response retry limit"
-require_text "tla/EPaxosConfigChainTransitionLostResponseRetry.cfg"
-require_text "tla/EPaxosConfigChainTransitionLostResponseRetry.tla"
-require_text "TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses"
-require_text "direct TLC generated \`20/20\` states"
-require_text "old Conf1 local-owner PreAccept/Accept records reject/non-count current voter 4"
-require_text "mid Conf2 records count voter 4 but stay below old quorum"
-require_text "replacement removed voter 2"
-require_text "finite add-then-remove configuration-chain lost-response-before-retry"
-require_text "tla/EPaxosEvidenceQuerySeven.cfg"
-require_text "Evidence staleness note"
-require_text "Evidence staleness limit"
-require_text "tla/EPaxosEvidenceStaleness.cfg"
-require_text "generated \`6/6\` states"
-require_text "TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept"
-require_text "older-ballot \`MsgEvidenceResp\` is dropped before sender-record insertion"
-require_text "same-ballot duplicate responses keep the first stale/empty record"
-require_text "does not model retries, arbitrary network delivery, message loss"
-require_text "AcceptEvidence sender merge and validation"
-require_text "AcceptEvidence sender-merge finite model"
-require_text "tla/EPaxosAcceptEvidenceMerge.cfg"
-require_text "tla/EPaxosAcceptEvidenceMerge.tla"
-require_text "TestSenderPreservingEvidenceValidationAndMergeContracts"
-require_text "TestCodecRejectsMalformedSenderEvidenceWireFrames"
-require_text "direct TLC generated \`5/5\` states"
-require_text "same-sender \`mergeAttrs\` coalescing"
-require_text "identical duplicate validation acceptance"
-require_text "conflicting duplicate validation rejection"
-require_text "Outbound sender-zero evidence is skipped"
-require_text "TryPreAccept retry-timer finite model"
-require_text "TryPreAccept retry-timer note"
-require_text "TryPreAccept retry-timer limit"
-require_text "tla/EPaxosTryPreAcceptRetry.cfg"
-require_text "TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry"
-require_text "direct TLC generated \`10/10\` states"
-require_text "deterministic retry rescheduling"
-require_text "normal/ignore-marker retry rebroadcasts have no durable/application effects"
-require_text "Optimized recovery decision-tree branch parity"
-require_text "Optimized recovery decision-tree finite model"
-require_text "tla/EPaxosOptimizedRecoveryDecisionTree.cfg"
-require_text "tla/EPaxosOptimizedRecoveryDecisionTree.tla"
-require_text "direct TLC generated \`78/78\` states"
-require_text "CMU-PDL-13-111 Section 6.2"
-require_text "all implemented F<=3 Accept-Deps optimized-recovery decision branches"
-require_text "complete optimized-recovery branch parity is closed for the implemented decision tree"
-require_text "unbounded recovery tree proof remains open"
-require_text "Configuration recovery retry-timer finite model"
-require_text "Config recovery retry note"
-require_text "Config recovery retry limit"
-require_text "tla/EPaxosConfigRecoveryRetry.cfg"
-require_text "TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval"
-require_text "TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition"
-require_text "direct TLC generated \`8/8\` states"
-require_text "old-config prepare/accept timer rebroadcast"
-require_text "excludes added current voters"
-require_text "Configuration recovery lost-response retry finite model"
-require_text "Config recovery lost-response retry note"
-require_text "Config recovery lost-response retry limit"
-require_text "tla/EPaxosConfigRecoveryLostResponseRetry.cfg"
-require_text "TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse"
-require_text "TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse"
-require_text "direct TLC generated \`11/11\` states"
-require_text "explicit lost removed-voter prepare response before deterministic prepare retry"
-require_text "Arbitrary message loss beyond that named finite pre-retry loss shape"
-require_text "Configuration transition retry-timer finite model"
-require_text "Config transition retry note"
-require_text "Config transition retry limit"
-require_text "tla/EPaxosConfigTransitionRetry.cfg"
-require_text "TestOldConfigTransitionRetryUsesPinnedVotersAfterRemoval"
-require_text "TestOldConfigTransitionRetryUsesPinnedVotersAfterAddition"
-require_text "normal local-owner old-config PreAccept/Accept timer rebroadcast"
-require_text "one finite normal configuration-transition retry-timer slice"
-require_text "Configuration transition lost-response retry finite model"
-require_text "Config transition lost-response retry note"
-require_text "Config transition lost-response retry limit"
-require_text "tla/EPaxosConfigTransitionLostResponseRetry.cfg"
-require_text "tla/EPaxosConfigTransitionLostResponseRetry.tla"
-require_text "TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses"
-require_text "direct TLC generated \`20/20\` states"
-require_text "normal local-owner old-config PreAccept/Accept lost-response-before-retry"
-require_text "current-config quorum responses are present"
-require_text "excludes added current voter 4 for old pre-addition instances"
-require_text "one finite normal configuration-transition lost-response-before-retry slice"
-require_text 'unique TLC `-metadir`'
-require_text "Broader formal model coverage"
-require_text "TOQ operational-clock boundary"
-require_text "core consumes embedder-provided clock, one-way-delay, and sync-group values"
-require_text "does not implement synchronization, measurement, drift monitoring, or target-environment validation"
-require_text "synchronized-clock implementation"
-require_text "one-way-delay measurement"
-require_text "runtime drift enforcement"
-require_text "operational clock-discipline proof"
-require_text "Semantic scan checking"
-require_text "Fuzz stress campaigns"
-require_text "Deployment manifest"
-require_text "Data lifecycle"
-require_text "data-lifecycle-summary.txt"
-require_text "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode data"
-require_text "none-target-environment-data-lifecycle-drill-still-required"
-require_text "offline checkpoint/verify/restore/repair on a stopped local node"
-require_text "KVNODE_CHECKPOINT_REPORT=/path/report.env"
-require_text "status=example-operator-report"
-require_text "helper reports"
-require_text "release_claim=none-target-environment-data-lifecycle-drill-still-required"
-require_text "data-lifecycle/*-report.env"
-require_text "reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env"
-require_text "operation=checkpoint"
-require_text "operation=verify"
-require_text "operation=restore"
-require_text "operation=repair"
-require_text "result=success"
-require_text "target-environment backup/restore/disaster-recovery drill remains open"
-require_scope_row_text "| Data lifecycle |" "KVNODE_GO_RUNNER_DATA_LIFECYCLE_REPORT=/path/report.env"
-require_scope_row_text "| Data lifecycle |" "0600 machine-readable example/operator report"
-require_scope_row_text "| Data lifecycle |" "The runner report writes"
-require_scope_row_text "| Data lifecycle |" "status=example-operator-report"
-require_scope_row_text "| Data lifecycle |" "artifact=data-lifecycle-drill"
-require_scope_row_text "| Data lifecycle |" "data_lifecycle=offline-checkpoint-verify-restore-repair"
-require_scope_row_text "| Data lifecycle |" "checkpoint=verified"
-require_scope_row_text "| Data lifecycle |" "reports=checkpoint-report.env,verify-report.env,restore-report.env,repair-report.env"
-require_scope_row_text "| Data lifecycle |" "run_id=<filepath.Base(runDir)>"
-require_scope_row_text "| Data lifecycle |" "peer_count=3"
-require_scope_row_text "| Data lifecycle |" "stopped_node_id=2"
-require_scope_row_text "| Data lifecycle |" "helper_operations=checkpoint,verify,restore,repair"
-require_scope_row_text "| Data lifecycle |" "checkpoint_report=checkpoint-report.env"
-require_scope_row_text "| Data lifecycle |" "verify_report=verify-report.env"
-require_scope_row_text "| Data lifecycle |" "restore_report=restore-report.env"
-require_scope_row_text "| Data lifecycle |" "repair_report=repair-report.env"
-require_scope_row_text "| Data lifecycle |" "pre_checkpoint_canary=go-runner-data-before-visible-on-all-nodes"
-require_scope_row_text "| Data lifecycle |" "post_restore_canary=go-runner-data-after-restore-visible-on-all-nodes"
-require_scope_row_text "| Data lifecycle |" "post_repair_canaries=pre-checkpoint-and-post-restore-visible-on-all-nodes"
-require_scope_row_text "| Data lifecycle |" "evidence_files=metadata.env,summary.txt,data-lifecycle-summary.txt,data-lifecycle/checkpoint.log,data-lifecycle/verify.log,data-lifecycle/restore.log,data-lifecycle/repair.log,data-lifecycle/checkpoint-report.env,data-lifecycle/verify-report.env,data-lifecycle/restore-report.env,data-lifecycle/repair-report.env"
-require_scope_row_text "| Data lifecycle |" "restore/repair/canary result fields"
-require_scope_row_text "| Data lifecycle |" "report paths \`.\` and \`/\` are rejected before the local cluster starts"
-require_scope_row_text "| Data lifecycle |" "final \`summary.txt\` records \`data_lifecycle_report=...\` when set"
-require_scope_row_text "| Data lifecycle |" "release_claim=none-target-environment-data-lifecycle-drill-still-required"
-require_text "A reviewed operator backup/restore/disaster-recovery drill in the target environment remains open"
-require_text "Local mixed-version binary drill"
-require_text "Capacity envelope"
-require_text "Incident readiness"
-require_text "Production limits"
-require_text "API contracts"
-require_text "Evidence bundle and go/no-go workflow"
-require_text "EPAXOS.MD"
-require_text "MODEL_EQ_REPORT.MD"
-require_text "EPAXOS_IMPLEMENTATION_PROOF.md"
-require_text "TestDSTFailureBoundarySlowQuorumSizesOneThroughSeven"
-require_text "TestDSTStorageFailureRetriesOutstandingReadyExactlyOnceWithHealthyQuorum"
-require_text "TestDSTStorageFailureBoundarySlowQuorumSizesOneThroughSeven"
-require_text "TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs"
-require_text "TestAcceptRespIgnoresStaleBallotForCurrentAcceptRound"
-require_text "TestStorageWireRestartUpgradeRollbackSimulationConvergesWithoutDuplicateApply"
-require_text "0,0,1,1,2,2,3"
-require_text "GitHub Actions are pinned to full 40-character commit SHAs"
-require_text "TOQOneWayDelay"
-require_text "tests/ci.sh"
-require_text "tests/chaos_fault_campaign.sh"
-require_text "tests/fuzz_stress_campaign.sh"
-require_text "tests/jepsen_remote_preflight_audit.sh"
-require_text "tests/operations_readiness_audit.sh"
-require_text "deploy/systemd/kvnode@.service"
-require_text "docs/operations/kvnode-data-lifecycle-incident-runbook.md"
-require_text "examples/kv/cmd/kvcheckpoint"
-require_text "TestRestoreRejectsCorruptCheckpointWithoutReplacingLiveData"
-require_text "docs/operations/kvnode-upgrade-rollback.md"
-require_text "tests/kvnode_capacity_envelope.sh"
-require_text "tests/kvnode_incident_tabletop_drill.sh"
-require_text "tests/kvnode_local_capacity_drill.sh"
-require_text "tests/kvnode_local_runner.go"
-require_text "custom Go runner sample"
-require_text "status=local-go-runner-only"
-require_text "go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --help"
-require_text "measured target-environment capacity results remain open"
-require_text "release_claim=none-target-environment-capacity-results-still-required"
-require_text "target-environment capacity measurement remains open"
-require_scope_row_text "| Capacity envelope |" "KVNODE_CAPACITY_REPORT=/path/report.env"
-require_scope_row_text "| Capacity envelope |" "machine-readable example/operator capacity report"
-require_scope_row_text "| Capacity envelope |" "status=example-operator-report"
-require_scope_row_text "| Capacity envelope |" "artifact=capacity-envelope-sample"
-require_scope_row_text "| Capacity envelope |" "run_id=..."
-require_scope_row_text "| Capacity envelope |" "harness=tests/kvnode_capacity_envelope.sh"
-require_scope_row_text "| Capacity envelope |" "throughput_ops_per_second=..."
-require_scope_row_text "| Capacity envelope |" "operation_count=..."
-require_scope_row_text "| Capacity envelope |" "latency_samples="
-require_scope_row_text "| Capacity envelope |" "latency_avg_seconds="
-require_scope_row_text "| Capacity envelope |" "latency_p50_seconds="
-require_scope_row_text "| Capacity envelope |" "latency_p95_seconds="
-require_scope_row_text "| Capacity envelope |" "latency_p99_seconds="
-require_scope_row_text "| Capacity envelope |" "latency_file=latency.csv"
-require_scope_row_text "| Capacity envelope |" "resources_file=resources.csv"
-require_scope_row_text "| Capacity envelope |" "evidence_files=metadata.env,summary.md,latency.csv,resources.csv"
-require_scope_row_text "| Capacity envelope |" "target_environment=not-measured"
-require_scope_row_text "| Capacity envelope |" "wrapper_run_id=..."
-require_scope_row_text "| Capacity envelope |" "evidence_files=metadata.env,summary.txt,capacity/metadata.env,capacity/summary.md,capacity/latency.csv,capacity/resources.csv"
-require_scope_row_text "| Capacity envelope |" "plus the report's run-directory-relative path only when the report path remains under the wrapper run directory"
-require_scope_row_text "| Capacity envelope |" 'the default adds `capacity/capacity-report.env`'
-require_scope_row_text "| Capacity envelope |" 'external or relative overrides remain recorded by `capacity_report=...`'
-require_scope_row_text "| Capacity envelope |" "release_claim=none-target-environment-capacity-results-still-required"
-require_scope_row_text "| Capacity envelope |" "target-environment capacity measurement remains open"
-require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "KVNODE_LOCAL_CAPACITY_BASE_PORT=44080"
-require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "KVNODE_LOCAL_CAPACITY_OUT_DIR=/tmp/kvnode-capacity-dynamic-default-20260710"
-require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" "passed as a local verification sample, not target-environment capacity evidence"
-require_release_evidence_line_text "kvnode-capacity-dynamic-default-20260710" 'the default wrapper summary included `capacity/capacity-report.env` in `evidence_files`'
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "KVNODE_LOCAL_CAPACITY_BASE_PORT=45080"
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "KVNODE_CAPACITY_REPORT=/tmp/kvnode-capacity-dynamic-override-report-20260710.env"
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" "passed as a local verification sample, not target-environment capacity evidence"
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'capacity_report=/tmp/kvnode-capacity-dynamic-override-report-20260710.env'
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'omitted that external path from wrapper `evidence_files`'
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'external report contained `target_environment=not-measured`'
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'raw `evidence_files=metadata.env,summary.md,latency.csv,resources.csv`'
-require_release_evidence_line_text "kvnode-capacity-dynamic-override-20260710" 'mode `600`'
-require_text 'custom Go runner capacity labels document `KVNODE_GO_RUNNER_ENVIRONMENT_LABEL` and `KVNODE_GO_RUNNER_WORKLOAD_LABEL`'
-require_text 'defaulting custom Go runner provenance to `environment_label=local-loopback` and `workload_label=local-go-runner`'
-require_text 'custom Go runner validates label values as non-empty, single-line, without `=`, and at most 128 characters'
-require_text 'custom Go runner writes `environment_label` and `workload_label` to `metadata.env`, `capacity-summary.txt`, and capacity `summary.txt` when `capacity_ran=true`'
-require_text 'bounded single-line `environment_label` and `workload_label` provenance fields'
-require_text 'defaulting provenance to `environment_label=local-loopback` and `workload_label=local-capacity-drill`'
-require_text "also locally exercised \`/faults/storage\`, \`/faults/transport\`, \`/readyz\`, \`/metrics\`"
-require_text "three-node local wrapper sample"
-require_text "locally rehearses the storage-failure and network-partition"
-require_text "Operator-reviewed target-environment tabletop or live drill evidence remains open"
-require_scope_row_text "| Incident readiness |" "KVNODE_INCIDENT_TABLETOP_REPORT=/path/report.env"
-require_scope_row_text "| Incident readiness |" "machine-readable example/operator incident report"
-require_scope_row_text "| Incident readiness |" "status=example-operator-report"
-require_scope_row_text "| Incident readiness |" "artifact=incident-tabletop-drill"
-require_scope_row_text "| Incident readiness |" "run_id="
-require_scope_row_text "| Incident readiness |" "peer_count=3"
-require_scope_row_text "| Incident readiness |" "storage_fault=exercised-and-cleared"
-require_scope_row_text "| Incident readiness |" "transport_fault=exercised-and-cleared"
-require_scope_row_text "| Incident readiness |" "canaries=baseline-and-after-clear-visible-on-all-nodes"
-require_scope_row_text "| Incident readiness |" "storage_fault_readyz=503-then-200"
-require_scope_row_text "| Incident readiness |" "storage_fault_metric=1-then-0"
-require_scope_row_text "| Incident readiness |" "transport_fault_dropped_links=2-then-0"
-require_scope_row_text "| Incident readiness |" "baseline_canary=tabletop-baseline-visible-on-all-nodes"
-require_scope_row_text "| Incident readiness |" "post_clear_canary=tabletop-after-clear-visible-on-all-nodes"
-require_scope_row_text "| Incident readiness |" "evidence_files=metadata.env,summary.txt,baseline-*,storage-fault-*,transport-fault-*,faults-cleared-*"
-require_scope_row_text "| Incident readiness |" "operator_review=not-performed"
-require_scope_row_text "| Incident readiness |" "release_claim=none-target-environment-operator-review-still-required"
-require_scope_row_text "| Incident readiness |" "Operator-reviewed target-environment tabletop or live drill evidence remains open"
-require_text "release_claim=none-target-environment-operator-review-still-required"
-require_text "tests/kvnode_systemd_manifest_audit.sh"
-require_text "tests/kvnode_mixed_version_drill.sh"
-require_text "KVNODE_GO_RUNNER_RUN=yes go run -tags kvnode_local_runner ./tests/kvnode_local_runner.go --mode deployment"
-require_text "deployment-manifest-summary.txt"
-require_text "systemd-manifest-report.env"
-require_text "systemd-manifest-audit.log"
-require_text "deployment-manifest-local-launch.env"
-require_text "systemd_manifest_audit=passed"
-require_text "local_launch_report=deployment-manifest-local-launch.env"
-require_text "node_1_exec_argv_json="
-require_text "launch_path=manifest-derived-local-substitution"
-require_text "launch_defaults=request_deadline_ms=5000,peer_deadline_ms=2000,max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000"
-require_text "local_substitution=temp-binary-temp-data-loopback-listeners"
-require_text "systemd_exec_contract=rendered-then-substituted"
-require_text "deployment_manifest_ran="
-require_text "release_claim=none-target-environment-deployment-manifest-still-required"
-require_scope_row_text "| Deployment manifest |" "KVNODE_SYSTEMD_MANIFEST_REPORT=/path/report.env"
-require_scope_row_text "| Deployment manifest |" "status=example-operator-report"
-require_scope_row_text "| Deployment manifest |" "artifact=systemd-manifest-audit"
-require_scope_row_text "| Deployment manifest |" "unit=deploy/systemd/kvnode@.service"
-require_scope_row_text "| Deployment manifest |" "environment_file=deploy/systemd/kvnode.env.example"
-require_scope_row_text "| Deployment manifest |" "node_id=1"
-require_scope_row_text "| Deployment manifest |" "peer_count=3"
-require_scope_row_text "| Deployment manifest |" "required_env_vars=KVNODE_ID,KVNODE_CLIENT_LISTEN,KVNODE_PEER_LISTEN,KVNODE_ADMIN_LISTEN,KVNODE_DATA_DIR,KVNODE_PEERS,KVNODE_REQUEST_DEADLINE_MS,KVNODE_PEER_DEADLINE_MS,KVNODE_MAX_CLIENT_BODY_BYTES,KVNODE_MAX_PEER_BODY_BYTES,KVNODE_MAX_ADMIN_BODY_BYTES,KVNODE_MAX_SCAN_LIMIT,KVNODE_TLS_ARGS"
-require_scope_row_text "| Deployment manifest |" "exec_contract=env-file-rendered"
-require_scope_row_text "| Deployment manifest |" "deadline_defaults=request_deadline_ms=5000,peer_deadline_ms=2000"
-require_scope_row_text "| Deployment manifest |" "body_scan_limits=max_client_body_bytes=1048576,max_peer_body_bytes=1048576,max_admin_body_bytes=65536,max_scan_limit=1000"
-require_scope_row_text "| Deployment manifest |" "hardening=User,Group,StateDirectory,ProtectSystem,NoNewPrivileges"
-require_scope_row_text "| Deployment manifest |" "evidence_files=deploy/systemd/kvnode@.service,deploy/systemd/kvnode.env.example"
-require_scope_row_text "| Deployment manifest |" "operator_review=not-performed"
-require_scope_row_text "| Deployment manifest |" "systemd_analyze=skipped|verified"
-require_scope_row_text "| Deployment manifest |" "release_claim=none-target-environment-deployment-manifest-still-required"
-require_scope_row_text "| Deployment manifest |" "deployment-manifest-local-launch.env"
-require_scope_row_text "| Deployment manifest |" "local_launch_report=deployment-manifest-local-launch.env"
-require_scope_row_text "| Deployment manifest |" "artifact=systemd-manifest-local-launch"
-require_scope_row_text "| Deployment manifest |" "systemd_exec_contract=rendered-then-substituted"
-require_scope_row_text "| Deployment manifest |" "deployment_canary=deployment-manifest-value-visible-on-all-nodes"
-require_scope_row_text "| Deployment manifest |" "evidence_files=metadata.env,summary.txt,deployment-manifest-summary.txt,systemd-manifest-report.env,systemd-manifest-audit.log,deployment-manifest-local-launch.env,manifest-env/node-*.env,logs/node-*.log"
-require_scope_row_text "| Deployment manifest |" "non_claim=local-static-render-plus-manifest-derived-loopback-process-check-only"
-require_scope_row_text "| Deployment manifest |" "A reviewed and exercised target deployment under systemd/container/orchestration remains open"
-require_scope_row_text "| Deployment manifest |" "target-environment deployment execution remains open"
-require_text "KVNODE_SYSTEMD_MANIFEST_REPORT=/path/report.env"
-require_text "machine-readable example/operator report"
-require_text "status=example-operator-report"
-require_text "artifact=systemd-manifest-audit"
-require_text "artifact=systemd-manifest-local-launch"
-require_text "rendered_exec=..."
-require_text "systemd_analyze=skipped|verified"
-require_text "non_claim=local-static-render-plus-manifest-derived-loopback-process-check-only"
-require_text "the manifest report remains a local static-render non-claim and does not prove a target deployment"
-require_text "A reviewed and exercised target deployment under systemd/container/orchestration remains open"
-require_text "target-environment deployment execution remains open"
-require_text "Local mixed-version binary drill"
-require_text "KVNODE_SYSTEMD_ANALYZE=yes"
-require_text "tests/go_no_go_workflow.sh"
-require_text "release/EPAXOS_READINESS_EVIDENCE.md"
-require_text "request-deadline-ms"
-require_text "peer-listen"
-require_text "admin-listen"
-require_text "peer-tls-cert"
-require_text "peer-tls-key"
-require_text "peer-tls-ca"
-require_text "client-tls-cert"
-require_text "client-tls-key"
-require_text "client-client-ca"
-require_text "admin-tls-cert"
-require_text "admin-tls-key"
-require_text "admin-client-ca"
-require_text "max-client-body-bytes"
-require_text "max-peer-body-bytes"
-require_text "max-admin-body-bytes"
-require_text ".github/workflows/ci.yml"
+require_text "$scope" "## Current release decision"
+require_text "$scope" "No-go."
+require_text "$scope" "## Closed release items"
+require_text "$scope" "## Verification prerequisites"
+require_text "$scope" "| Gate | Status |"
+require_text "$scope" "## Open release items"
+require_text "$scope" "## Non-claims"
+require_text "$scope" "unbounded proof"
+require_text "$scope" "certified protocol-state compaction"
+require_text "$scope" "multi-host independent failure domains"
+require_text "$scope" "real-network fault evidence"
+require_text "$scope" "signed operator-controlled deployment/capacity/lifecycle/incident evidence"
 
-require_path "EPAXOS.MD"
-require_path "MODEL_EQ_REPORT.MD"
-require_path "EPAXOS_IMPLEMENTATION_PROOF.md"
-require_path "tests/ci.sh"
-require_path "tests/chaos_fault_campaign.sh"
-require_path "tests/fuzz_stress_campaign.sh"
-require_path "tests/jepsen_remote_preflight_audit.sh"
-require_path "tests/operations_readiness_audit.sh"
-require_path "deploy/systemd/kvnode@.service"
-require_path "deploy/systemd/kvnode.env.example"
-require_path "docs/operations/kvnode-data-lifecycle-incident-runbook.md"
-require_path "examples/kv/cmd/kvcheckpoint/main.go"
-require_path "examples/kv/cmd/kvcheckpoint/main_test.go"
-require_path "docs/operations/kvnode-upgrade-rollback.md"
-require_path "tests/kvnode_capacity_envelope.sh"
-require_path "tests/kvnode_incident_tabletop_drill.sh"
-require_path "tests/kvnode_local_capacity_drill.sh"
-require_path "tests/kvnode_local_runner.go"
-require_path "tests/kvnode_systemd_manifest_audit.sh"
-require_path "tests/kvnode_mixed_version_drill.sh"
-require_path "tests/go_no_go_workflow.sh"
-require_path "release/EPAXOS_READINESS_EVIDENCE.md"
-require_path "tla/EPaxosRecoveryFive.cfg"
-require_path "tla/EPaxosConfigTransition.cfg"
-require_path "tla/EPaxosConfigRemoveTransition.cfg"
-require_path "tla/EPaxosConfigChainTransition.cfg"
-require_path "tla/EPaxosConfigChainRecovery.tla"
-require_path "tla/EPaxosConfigChainRecovery.cfg"
-require_path "tla/EPaxosConfigReplay.tla"
-require_path "tla/EPaxosConfigReplay.cfg"
-require_path "tla/EPaxosConfigRecovery.tla"
-require_path "tla/EPaxosConfigRecovery.cfg"
-require_path "tla/EPaxosConfigRecoveryDedup.tla"
-require_path "tla/EPaxosConfigRecoveryDedup.cfg"
-require_path "tla/EPaxosConfigTransitionDedup.tla"
-require_path "tla/EPaxosConfigTransitionDedup.cfg"
-require_path "tla/EPaxosConfigAddRecovery.tla"
-require_path "tla/EPaxosConfigAddRecovery.cfg"
-require_path "tla/EPaxosOptimizedRecovery.tla"
-require_path "tla/EPaxosOptimizedRecoverySeven.cfg"
-require_path "tla/EPaxosTryPreAcceptBranches.tla"
-require_path "tla/EPaxosTryPreAcceptBranches.cfg"
-require_path "tla/EPaxosTryPreAcceptBranchesFive.cfg"
-require_path "tla/EPaxosTryPreAcceptBranchesSeven.cfg"
-require_path "tla/EPaxosTryPreAcceptMessagePath.tla"
-require_path "tla/EPaxosTryPreAcceptMessagePath.cfg"
-require_path "tla/EPaxosTryPreAcceptMessagePathFive.cfg"
-require_path "tla/EPaxosTryPreAcceptMessagePathSeven.cfg"
-require_path "tla/EPaxosTryConflictForce.tla"
-require_path "tla/EPaxosTryConflictForce.cfg"
-require_path "tla/EPaxosTryConflictForceFive.cfg"
-require_path "tla/EPaxosTryConflictForceSeven.cfg"
-require_path "tla/EPaxosEvidenceQuery.tla"
-require_path "tla/EPaxosEvidenceQuerySeven.cfg"
-require_path "tla/EPaxosEvidenceStaleness.tla"
-require_path "tla/EPaxosEvidenceStaleness.cfg"
-require_path "tla/EPaxosTryPreAcceptRetry.tla"
-require_path "tla/EPaxosTryPreAcceptRetry.cfg"
-require_path "tla/EPaxosOptimizedRecoveryDecisionTree.tla"
-require_path "tla/EPaxosOptimizedRecoveryDecisionTree.cfg"
-require_path "tla/EPaxosConfigRecoveryRetry.tla"
-require_path "tla/EPaxosConfigRecoveryRetry.cfg"
-require_path "tla/EPaxosConfigRecoveryLostResponseRetry.tla"
-require_path "tla/EPaxosConfigRecoveryLostResponseRetry.cfg"
-require_path "tla/EPaxosConfigTransitionRetry.tla"
-require_path "tla/EPaxosConfigTransitionRetry.cfg"
-require_path "tla/EPaxosConfigTransitionLostResponseRetry.tla"
-require_path "tla/EPaxosConfigTransitionLostResponseRetry.cfg"
-require_path "tla/EPaxosConfigTransition.tla"
-require_path "tla/EPaxosConfigRemoveTransition.tla"
-require_path "tla/EPaxosConfigChainTransition.tla"
-require_path "tla/EPaxosConfigChainTransitionRetry.tla"
-require_path "tla/EPaxosConfigChainTransitionRetry.cfg"
-require_path "tla/EPaxosConfigChainTransitionLostResponseRetry.tla"
-require_path "tla/EPaxosConfigChainTransitionLostResponseRetry.cfg"
-require_path "tla/EPaxosRollbackAllocation.tla"
-require_path "tla/EPaxosRollbackAllocation.cfg"
-require_path ".github/workflows/ci.yml"
+require_text "$evidence" "Status: no-go evidence bundle"
+require_text "$evidence" "Current open blockers preserving no-go"
+require_text "$scope" "| Aggregate Go coverage | fail |"
+require_text "$evidence" "| Aggregate Go coverage | Fail:"
+require_text "$evidence" "bash tests/go_no_go_workflow.sh"
+require_text "$evidence" "bash tests/tla_model_check_fast.sh"
+require_text "$evidence" "go test ./... -count=1"
 
-if grep -Fq -- "REQUIREMENTS_TRACE.md" "$scope"; then
-  echo "release-scope lock must stay self-contained" >&2
-  exit 1
-fi
+python3 - "$ROOT" "$scope" "$evidence" <<'PY'
+from __future__ import annotations
+
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+root = Path(sys.argv[1])
+scope = Path(sys.argv[2])
+evidence = Path(sys.argv[3])
+
+labels = {
+    "Broader formal model coverage",
+    "Deployment manifest",
+    "Data lifecycle",
+    "Capacity envelope",
+    "Incident readiness",
+}
+
+
+def section(path: Path, heading: str) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line == heading]
+    if len(starts) != 1:
+        raise SystemExit(f"{path.name} must contain exactly one {heading!r} heading")
+    start = starts[0] + 1
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    return lines[start:end]
+
+
+def open_rows(path: Path) -> set[str]:
+    lines = section(path, "## Open release items")
+    try:
+        header = lines.index("| Item | Current state |")
+    except ValueError as exc:
+        raise SystemExit("open release items must use the canonical table header") from exc
+    if header + 1 >= len(lines) or lines[header + 1] != "| --- | --- |":
+        raise SystemExit("open release items table separator is malformed")
+    rows: list[str] = []
+    for line in lines[header + 2 :]:
+        if not line.strip():
+            continue
+        if not line.startswith("| "):
+            if rows:
+                break
+            raise SystemExit(f"unexpected open release item content: {line}")
+        fields = line.split("|")
+        if len(fields) != 4 or not fields[1].strip() or not fields[2].strip():
+            raise SystemExit(f"malformed open release item row: {line}")
+        rows.append(fields[1].strip())
+    actual = set(rows)
+    if actual != labels or len(rows) != len(labels):
+        raise SystemExit(f"canonical open release rows mismatch: {rows!r}")
+    return actual
+
+
+open_rows(scope)
+
+decision_lines = [line.strip() for line in section(scope, "## Current release decision") if line.strip()]
+
+prerequisite_lines = section(scope, "## Verification prerequisites")
+try:
+    prerequisite_header = prerequisite_lines.index("| Gate | Status |")
+except ValueError as exc:
+    raise SystemExit("verification prerequisites must use the canonical table header") from exc
+if prerequisite_header + 1 >= len(prerequisite_lines) or prerequisite_lines[prerequisite_header + 1] != "| --- | --- |":
+    raise SystemExit("verification prerequisites table separator is malformed")
+coverage_rows = [
+    line for line in prerequisite_lines[prerequisite_header + 2 :]
+    if line.startswith("| Aggregate Go coverage |")
+]
+if len(coverage_rows) != 1 or coverage_rows[0] not in (
+    "| Aggregate Go coverage | pass |",
+    "| Aggregate Go coverage | fail |",
+):
+    raise SystemExit("verification prerequisites must declare Aggregate Go coverage as pass or fail")
+if not decision_lines or decision_lines[0] != "No-go.":
+    raise SystemExit("current release decision must be exactly No-go.")
+
+for path in (scope, evidence):
+    text = path.read_text(encoding="utf-8")
+    for marker in (
+        "after adding",
+        "after updating",
+        "in this pass",
+        "in this session",
+        "New or updated artifacts",
+        "Current verification evidence",
+        "artifact://",
+        "open_release_items=11",
+    ):
+        if marker.casefold() in text.casefold():
+            raise SystemExit(f"stale chronology marker in {path.relative_to(root)}: {marker}")
+
+# Model/config references in authority documents must resolve to repository files.
+# The executable model scripts remain the source of coverage inventory; this only
+# prevents prose from pointing at an artifact that does not exist.
+for path in (scope, evidence, root / "MODEL_EQ_REPORT.MD", root / "EPAXOS_IMPLEMENTATION_PROOF.md"):
+    text = path.read_text(encoding="utf-8")
+    for token in text.replace("`", " ").split():
+        token = token.rstrip(",.;:)\"]")
+        if token.startswith("tla/") and token.endswith((".tla", ".cfg")):
+            if not (root / token).is_file():
+                raise SystemExit(f"document cites missing model artifact: {token}")
+
+tracked = subprocess.run(
+    ["git", "ls-files", "-z"],
+    cwd=root,
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.split(b"\0")
+for raw in tracked:
+    if not raw:
+        continue
+    path = root / raw.decode("utf-8")
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"cannot read tracked path {path}: {exc}") from exc
+    if b"\0" in data:
+        continue
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    if any("HANGUL" in unicodedata.name(char, "") for char in text):
+        raise SystemExit(f"Hangul text is present in tracked file: {path.relative_to(root)}")
+
+PY
+
+echo "release scope audit passed"

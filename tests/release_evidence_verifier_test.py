@@ -70,6 +70,15 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
             )
             hook.chmod(0o755)
 
+        coverage_hook = self.hook_root / "aggregate-go-coverage-verifier"
+        coverage_hook.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            ": > \"$(dirname \"$0\")/aggregate-go-coverage.ran\"\n",
+            encoding="utf-8",
+        )
+        coverage_hook.chmod(0o755)
+
 
     def write_scope(self, open_ids: list[str], decision: str) -> None:
         rows = "\n".join(f"| {ITEMS[item_id]} | Synthetic table state. |" for item_id in open_ids)
@@ -450,11 +459,20 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         self.assertIn("release_claim=none-synthetic-fixture-not-release-evidence", result.stdout)
         for item_id in ITEMS:
             self.assertTrue((self.hook_root / f"{item_id}.ran").is_file())
+        self.assertTrue((self.hook_root / "aggregate-go-coverage.ran").is_file())
 
 
         production_attempt = self.run_verifier(test_mode=False)
         self.assertNotEqual(production_attempt.returncode, 0, production_attempt.stdout)
         self.assertIn("closure index mode must be darwin-production-v2", production_attempt.stderr)
+
+    def test_failed_synthetic_coverage_gate_cannot_authorize_go(self) -> None:
+        coverage_hook = self.hook_root / "aggregate-go-coverage-verifier"
+        coverage_hook.write_text("#!/bin/sh\nset -eu\nexit 1\n", encoding="utf-8")
+        coverage_hook.chmod(0o755)
+        result = self.run_workflow()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("aggregate coverage status=fail", result.stderr)
 
     def test_all_five_open_without_index_preserves_no_go(self) -> None:
         (self.evidence_root / "release-closure-index.json").unlink()
@@ -464,6 +482,14 @@ class ReleaseEvidenceVerifierTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("release_decision=No-go.", result.stdout)
         self.assertIn("open_release_items=5", result.stdout)
+
+    def test_open_rows_cannot_declare_go_without_index(self) -> None:
+        (self.evidence_root / "release-closure-index.json").unlink()
+        self.write_scope(list(ITEMS), "Go.")
+        self.write_evidence(no_go=False)
+        result = self.run_workflow()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("release decision must be No-go.", result.stderr)
 
     def test_empty_open_table_without_records_fails(self) -> None:
         (self.evidence_root / "release-closure-index.json").unlink()

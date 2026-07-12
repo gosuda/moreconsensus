@@ -201,41 +201,37 @@ def parse_scope(scope_path: Path) -> tuple[str, list[str], list[str]]:
     except (OSError, UnicodeError) as exc:
         fail(f"cannot read release scope {scope_path}: {exc}")
 
-    decision_heading = [index for index, line in enumerate(lines) if line == "## Current release decision"]
-    if len(decision_heading) != 1:
-        fail("release scope must contain exactly one Current release decision heading")
-    decision = ""
-    for line in lines[decision_heading[0] + 1 :]:
-        if line.startswith("## "):
-            break
-        if line.strip():
-            decision = line.strip()
-            break
+    def section_after(heading: str) -> list[str]:
+        starts = [index for index, line in enumerate(lines) if line == heading]
+        if len(starts) != 1:
+            fail(f"release scope must contain exactly one {heading} heading")
+        start = starts[0] + 1
+        end = len(lines)
+        for index in range(start, len(lines)):
+            if lines[index].startswith("## "):
+                end = index
+                break
+        return lines[start:end]
+
+    decision_section = section_after("## Current release decision")
+    decision = next((line.strip() for line in decision_section if line.strip()), "")
     if decision not in ("Go.", "No-go."):
         fail(f"release decision must be exactly Go. or No-go.; got: {decision!r}")
 
-    open_heading = [index for index, line in enumerate(lines) if line == "## Open release items"]
-    if len(open_heading) != 1:
-        fail("release scope must contain exactly one Open release items heading")
-    section = lines[open_heading[0] + 1 :]
-    for index, line in enumerate(section):
-        if line.startswith("## "):
-            section = section[:index]
-            break
-
-    headers = [index for index, line in enumerate(section) if line == "| Item | Current state |"]
+    open_section = section_after("## Open release items")
+    headers = [index for index, line in enumerate(open_section) if line == "| Item | Current state |"]
     if len(headers) != 1:
         fail("open release table must contain exactly one '| Item | Current state |' header")
     header = headers[0]
-    if any(line.strip() for line in section[:header]):
+    if any(line.strip() for line in open_section[:header]):
         fail("open release section must not contain content before the authoritative table header")
-    if header + 1 >= len(section) or section[header + 1] != "| --- | --- |":
+    if header + 1 >= len(open_section) or open_section[header + 1] != "| --- | --- |":
         fail("open release table must use the exact two-column separator")
 
     open_ids: list[str] = []
     open_rows: list[str] = []
     table_started = False
-    for line in section[header + 2 :]:
+    for line in open_section[header + 2 :]:
         if not line.strip():
             if table_started:
                 break
@@ -247,11 +243,11 @@ def parse_scope(scope_path: Path) -> tuple[str, list[str], list[str]]:
         table_started = True
         match = re.fullmatch(r"\| ([^|]+?) \| (.+) \|", line)
         if match is None:
-            fail(f"malformed open release table row: {line}")
+            fail(f"malformed open release item row: {line}")
         label = match.group(1).strip()
         state = match.group(2).strip()
         if not label or not state:
-            fail(f"malformed open release table row: {line}")
+            fail(f"malformed open release item row: {line}")
         item_id = ITEM_LABELS.get(label)
         if item_id is None:
             fail(f"unknown authoritative open release item: {label}")
@@ -259,14 +255,36 @@ def parse_scope(scope_path: Path) -> tuple[str, list[str], list[str]]:
             fail(f"duplicate authoritative open release item: {item_id}")
         open_ids.append(item_id)
         open_rows.append(line)
-
-    expected_decision = "No-go." if open_ids else "Go."
-    if decision != expected_decision:
-        fail(
-            f"release decision must be {expected_decision} for {len(open_ids)} open authoritative items; "
-            f"got: {decision}"
-        )
     return decision, open_ids, open_rows
+
+def run_coverage_gate(
+    repository_root: Path,
+    *,
+    test_mode: bool,
+    test_hook_root: Path | None,
+) -> bool:
+    if test_mode:
+        if test_hook_root is None:
+            fail("synthetic coverage verifier hook root is required")
+        command_path = test_hook_root / "aggregate-go-coverage-verifier"
+        if command_path.is_symlink() or not command_path.is_file():
+            fail("synthetic coverage verifier hook is required")
+        command = [str(command_path)]
+    else:
+        command = ["bash", str(repository_root / "tests" / "go_coverage.sh")]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repository_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3600,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail(f"aggregate Go coverage gate could not run: {exc}")
+    return result.returncode == 0
 
 
 def validate_identity(value: Any, context: str, expected_role: str) -> tuple[str, str]:
@@ -990,6 +1008,8 @@ def verify(
     decision, open_ids, open_rows = parse_scope(scope_path)
     open_set = set(open_ids)
     closed_ids = [item_id for item_id in ITEM_IDS if item_id not in open_set]
+    if open_ids and decision != "No-go.":
+        fail(f"release decision must be No-go. for {len(open_ids)} open authoritative items")
 
     if evidence_root is None:
         if closed_ids:
@@ -1055,6 +1075,20 @@ def verify(
     if not test_mode:
         validate_external_evidence_root(evidence_root, repository_root, release_id)
         validate_repository_provenance(repository_root, source_revision, decision_revision)
+
+    if not open_ids:
+        coverage_ok = run_coverage_gate(
+            repository_root,
+            test_mode=test_mode,
+            test_hook_root=test_hook_root,
+        )
+        expected_decision = "Go." if coverage_ok else "No-go."
+        if decision != expected_decision:
+            status = "pass" if coverage_ok else "fail"
+            fail(
+                f"release decision must be {expected_decision} with aggregate coverage status={status}; "
+                f"got: {decision}"
+            )
 
     entries = index["records"]
     if not isinstance(entries, list):

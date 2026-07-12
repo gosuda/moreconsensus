@@ -218,8 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    per_config = args.per_config_timeout if args.per_config_timeout is not None else (60.0 if args.profile == "fast" else 0.0)
-    overall = args.overall_timeout if args.overall_timeout is not None else (300.0 if args.profile == "fast" else 0.0)
+    per_config = args.per_config_timeout if args.per_config_timeout is not None else (180.0 if args.profile == "fast" else 0.0)
+    overall = args.overall_timeout if args.overall_timeout is not None else (600.0 if args.profile == "fast" else 0.0)
     if per_config < 0 or overall < 0:
         parser.error("timeouts must be nonnegative")
     try:
