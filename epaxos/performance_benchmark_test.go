@@ -328,3 +328,83 @@ func residentInstanceBytes(inst *instance) uintptr {
 	}
 	return bytes
 }
+
+
+func growResidentNode(b *testing.B, n int) *RawNode {
+	b.Helper()
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	key := []byte("bench-key")
+	for i := 1; i <= n; i++ {
+		ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(i)}
+		rec := InstanceRecord{
+			Ref: ref, Status: StatusCommitted, Seq: uint64(i), Ballot: Ballot{Replica: 1},
+			Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{key}},
+		}
+		rec.Checksum = ChecksumRecord(rec)
+		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
+	}
+	return rn
+}
+
+func BenchmarkComputeAttrsResident1k(b *testing.B) {
+	rn := growResidentNode(b, 1000)
+	cmd := Command{Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+	exclude := InstanceRef{Conf: 1, Replica: 1, Instance: 1001}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = rn.computeAttrs(cmd, exclude)
+	}
+}
+
+func BenchmarkComputeAttrsResident100k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("100k resident bench")
+	}
+	rn := growResidentNode(b, 100000)
+	cmd := Command{Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+	exclude := InstanceRef{Conf: 1, Replica: 1, Instance: 100001}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = rn.computeAttrs(cmd, exclude)
+	}
+}
+
+func BenchmarkStepPreAcceptGrown(b *testing.B) {
+	rn := growResidentNode(b, 1000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(i + 1)}
+		cmd := Command{ID: CommandID{Client: 9, Sequence: uint64(i + 1)}, Payload: []byte("z"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+		msg := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 2}, Command: cmd}
+		_ = rn.Step(msg)
+	}
+}
+
+func BenchmarkRetireExecuted(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), RetainExecutedPerLane: 8})
+		if err != nil {
+			b.Fatal(err)
+		}
+		for j := 1; j <= 64; j++ {
+			ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(j)}
+			rec := InstanceRecord{
+				Ref: ref, Status: StatusExecuted, Seq: uint64(j), Ballot: Ballot{Replica: 1},
+				Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("k")}},
+			}
+			rec.Checksum = ChecksumRecord(rec)
+			rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
+			rn.executed.add(ref)
+		}
+		b.StartTimer()
+		rn.retireExecuted()
+	}
+}
