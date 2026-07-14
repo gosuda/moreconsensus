@@ -641,3 +641,38 @@ func assertExactKeyPostings(t *testing.T, e *conflictEngine, records map[Instanc
 		}
 	}
 }
+
+
+func TestWalkGlobalDescSkipsUnrelatedResidents(t *testing.T) {
+	t.Parallel()
+	var engine conflictEngine
+	lane := instanceLane{conf: 1, replica: 1}
+	// One old global at instance 1, then many ordinary residents.
+	global := InstanceRecord{
+		Ref: InstanceRef{Conf: 1, Replica: 1, Instance: 1},
+		Status: StatusCommitted, Seq: 1,
+		Command: Command{Kind: CommandConfChange, Payload: []byte("cfg")},
+	}
+	engine.apply(nil, global)
+	for i := InstanceNum(2); i <= 200; i++ {
+		rec := InstanceRecord{
+			Ref: InstanceRef{Conf: 1, Replica: 1, Instance: i},
+			Status: StatusCommitted, Seq: uint64(i),
+			Command: Command{Kind: CommandUser, Payload: []byte("u"), ConflictKeys: [][]byte{[]byte("k")}},
+		}
+		engine.apply(nil, rec)
+	}
+	visits := 0
+	var seen []InstanceNum
+	engine.walkGlobalDesc(lane, 200, func(instance InstanceNum, slot laneSlot) bool {
+		visits++
+		seen = append(seen, instance)
+		if !slot.global() {
+			t.Fatalf("yielded non-global instance %d", instance)
+		}
+		return true
+	})
+	if visits != 1 || len(seen) != 1 || seen[0] != 1 {
+		t.Fatalf("walkGlobalDesc visits=%d seen=%v, want only global instance 1", visits, seen)
+	}
+}

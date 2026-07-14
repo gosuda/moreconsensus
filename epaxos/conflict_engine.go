@@ -278,6 +278,58 @@ func walkRadixDesc(node *radixNode, prefix, from InstanceNum, limited bool, yiel
 	return true
 }
 
+// walkGlobalRadixDesc descends only subtrees that contain a global-eligible instance
+// (node.globalMax != 0 and within the from prefix), so unrelated residents are not visited.
+func walkGlobalRadixDesc(node *radixNode, prefix, from InstanceNum, limited bool, yield func(InstanceNum, laneSlot) bool) bool {
+	if node == nil || node.globalMax == 0 {
+		return true
+	}
+	if node.level == 0 {
+		last := uint(radixFanout - 1)
+		if limited {
+			last = uint(from) & (radixFanout - 1)
+		}
+		for idx := int(last); idx >= 0; idx-- {
+			if node.leaf.present&(uint64(1)<<uint(idx)) == 0 {
+				continue
+			}
+			instance := prefix | InstanceNum(idx)
+			if limited && instance > from {
+				continue
+			}
+			slot := node.leaf.slots[idx]
+			if !slot.global() || !slot.eligible() {
+				continue
+			}
+			if !yield(instance, slot) {
+				return false
+			}
+		}
+		return true
+	}
+	shift := radixBits * node.level
+	last := uint(radixFanout - 1)
+	if limited {
+		last = uint(from>>shift) & (radixFanout - 1)
+	}
+	for idx := int(last); idx >= 0; idx-- {
+		child := node.children[idx]
+		if child == nil || child.globalMax == 0 {
+			continue
+		}
+		childPrefix := prefix | InstanceNum(idx)<<shift
+		// Prune children whose entire key range is > from when limited.
+		if limited && childPrefix > from {
+			continue
+		}
+		childLimited := limited && uint(idx) == last
+		if !walkGlobalRadixDesc(child, childPrefix, from, childLimited, yield) {
+			return false
+		}
+	}
+	return true
+}
+
 func (t *laneTree) slot(instance InstanceNum) (laneSlot, bool) {
 	node := t.root
 	if node == nil || radixLevel(instance) > node.level {
@@ -676,13 +728,13 @@ func (e *conflictEngine) walkKeyDesc(conf ConfID, key []byte, lane instanceLane,
 }
 
 // walkGlobalDesc yields global-scope eligible residents for a lane descending from from.
+// Descent prunes radix subtrees with globalMax==0 so unrelated residents are not visited.
 func (e *conflictEngine) walkGlobalDesc(lane instanceLane, from InstanceNum, yield func(InstanceNum, laneSlot) bool) {
-	e.walkDesc(lane, from, func(instance InstanceNum, slot laneSlot) bool {
-		if !slot.global() || !slot.eligible() {
-			return true
-		}
-		return yield(instance, slot)
-	})
+	index := e.laneIndex[lane]
+	if index == nil || index.resident.root == nil || from == 0 {
+		return
+	}
+	walkGlobalRadixDesc(index.resident.root, 0, from, radixLevel(from) <= index.resident.root.level, yield)
 }
 
 func (e *conflictEngine) keyLaneSet(conf ConfID, keys [][]byte, yield func(instanceLane) bool) {
