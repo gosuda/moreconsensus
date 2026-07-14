@@ -241,6 +241,7 @@ func applyMutation(e HistoryEvent, state map[string]string) {
 				state[op.Key] = op.Value
 			}
 		}
+	case OpGet:
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"sync"
+	"time"
 
 	"gosuda.org/moreconsensus/epaxos"
 )
@@ -82,7 +83,10 @@ func newFaultProxy(listener net.Listener, upstream *url.URL, logWriter io.Writer
 		actionIDs: make(map[uint64]struct{}),
 		held:      make(map[uint64]heldRequest),
 	}
-	proxy.server = &http.Server{Handler: proxy}
+	proxy.server = &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	return proxy
 }
 
@@ -344,6 +348,7 @@ func (p *FaultProxy) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	copyHTTPHeader(w.Header(), firstHeader)
 	w.WriteHeader(firstStatus)
+	//nolint:gosec // G705: XSS is expected in fault proxy forwarding
 	_, _ = w.Write(firstBody)
 }
 
@@ -360,11 +365,6 @@ func (p *FaultProxy) takeMatchingActionLocked(decoded bool, from, to uint64) (Pr
 	return ProxyAction{}, false
 }
 
-func (p *FaultProxy) forward(method, requestURI string, header http.Header, body []byte) (int, []byte, error) {
-	status, _, responseBody, err := p.forwardWithHeader(method, requestURI, header, body)
-	return status, responseBody, err
-}
-
 func (p *FaultProxy) forwardWithHeader(method, requestURI string, header http.Header, body []byte) (int, http.Header, []byte, error) {
 	target := *p.upstream
 	relative, err := url.Parse(requestURI)
@@ -379,11 +379,14 @@ func (p *FaultProxy) forwardWithHeader(method, requestURI string, header http.He
 		return 0, nil, nil, err
 	}
 	copyHTTPHeader(forwardRequest.Header, header)
+	//nolint:gosec // G704: SSRF is intentional in proxy forwarding
 	response, err := p.client.Do(forwardRequest)
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		return response.StatusCode, response.Header.Clone(), nil, err

@@ -1,3 +1,4 @@
+// Package main implements the fault campaign tests.
 package main
 
 import (
@@ -16,6 +17,7 @@ func TestDurableJSONRetainsPriorArtifactOnEncodingFailure(t *testing.T) {
 	if err := writeJSONDurable(path, map[string]string{"status": "retained"}); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G304: path is controlled test path
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -23,6 +25,7 @@ func TestDurableJSONRetainsPriorArtifactOnEncodingFailure(t *testing.T) {
 	if err := writeJSONDurable(path, map[string]any{"unsupported": make(chan int)}); err == nil {
 		t.Fatal("encoding failure was not reported")
 	}
+	//nolint:gosec // G304: path is controlled test path
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("prior artifact was deleted after failure: %v", err)
@@ -90,6 +93,7 @@ func TestChecksumsAreSortedDeterministicAndDetectContentChanges(t *testing.T) {
 	if err := writeChecksums(root, []string{"b.log", "a.json"}); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G304: path is controlled test path
 	first, err := os.ReadFile(filepath.Join(root, "checksums.sha256"))
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +105,7 @@ func TestChecksumsAreSortedDeterministicAndDetectContentChanges(t *testing.T) {
 	if err := writeChecksums(root, []string{"a.json", "b.log"}); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G304: path is controlled test path
 	second, _ := os.ReadFile(filepath.Join(root, "checksums.sha256"))
 	if string(first) != string(second) {
 		t.Fatalf("deterministic checksum file changed:\nfirst=%s\nsecond=%s", first, second)
@@ -111,6 +116,7 @@ func TestChecksumsAreSortedDeterministicAndDetectContentChanges(t *testing.T) {
 	if err := writeChecksums(root, []string{"a.json", "b.log"}); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G304: path is controlled test path
 	third, _ := os.ReadFile(filepath.Join(root, "checksums.sha256"))
 	if string(first) == string(third) {
 		t.Fatal("checksum evidence did not change after artifact tampering")

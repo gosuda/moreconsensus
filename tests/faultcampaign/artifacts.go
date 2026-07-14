@@ -1,3 +1,4 @@
+// Package main implements the fault campaign tests.
 package main
 
 import (
@@ -18,6 +19,7 @@ func ensureArtifactDir(path string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		//nolint:gosec // G302: directory requires execute bit
 		if err := os.Chmod(created, 0o700); err != nil {
 			return "", err
 		}
@@ -39,6 +41,7 @@ func ensureArtifactDir(path string) (string, error) {
 	} else if err := os.MkdirAll(cleaned, 0o700); err != nil {
 		return "", err
 	}
+	//nolint:gosec // G302: directory requires execute bit
 	if err := os.Chmod(cleaned, 0o700); err != nil {
 		return "", err
 	}
@@ -97,11 +100,14 @@ func writeBytesDurable(path string, payload []byte) error {
 		return err
 	}
 	committed = true
+	//nolint:gosec // G304: dir is controlled artifact path
 	directory, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() {
+		_ = directory.Close()
+	}()
 	return directory.Sync()
 }
 
@@ -113,11 +119,14 @@ func fileSHA256(path string) (string, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("hash target %s must be a regular non-symlink file", path)
 	}
+	//nolint:gosec // G304: path is controlled artifact path
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
 		return "", err

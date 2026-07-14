@@ -167,6 +167,7 @@ func sourceTreeSHA256(roots []string) (string, error) {
 	sort.Strings(files)
 	hasher := sha256.New()
 	for _, path := range files {
+		//nolint:gosec // G304: path is controlled test path
 		payload, err := os.ReadFile(path)
 		if err != nil {
 			return "", err
@@ -231,6 +232,7 @@ func startNativeCluster(caseDir string, size int, binary string, timeout time.Du
 		}
 		upstream, _ := url.Parse("http://" + ports.addresses[size+id-1])
 		proxyLogPath := filepath.Join(logDir, fmt.Sprintf("proxy-%d.jsonl", id))
+		//nolint:gosec // G304: path is controlled test path
 		proxyLog, err := os.OpenFile(proxyLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			_ = proxyListener.Close()
@@ -312,6 +314,7 @@ func startNodeProcess(node *nodeProcess) error {
 	if err != nil {
 		return err
 	}
+	//nolint:gosec // G204: binary and args are validated via validateExternalCommand
 	command := exec.Command(node.binary, node.args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -365,11 +368,11 @@ func waitCondition(ctx context.Context, interval time.Duration, condition func()
 	defer ticker.Stop()
 	var last error
 	for {
-		if err := condition(); err == nil {
+		err := condition()
+		if err == nil {
 			return nil
-		} else {
-			last = err
 		}
+		last = err
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("condition timeout: %w", last)
@@ -514,7 +517,9 @@ func rawHTTPRequest(client *http.Client, method, target string, body []byte, con
 	if err != nil {
 		return 0, nil, err
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	responseBody, err := ioReadAllBounded(response.Body, 4<<20)
 	return response.StatusCode, responseBody, err
 }

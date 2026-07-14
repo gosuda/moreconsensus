@@ -9,22 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 )
-
-func pausePID(pid int) error {
-	if pid <= 0 {
-		return fmt.Errorf("invalid PID %d", pid)
-	}
-	return syscall.Kill(pid, syscall.SIGSTOP)
-}
-
-func resumePID(pid int) error {
-	if pid <= 0 {
-		return fmt.Errorf("invalid PID %d", pid)
-	}
-	return syscall.Kill(pid, syscall.SIGCONT)
-}
 
 func sampleDarwinProcess(ctx context.Context, pid int) (rssKiB uint64, fdCount int, err error) {
 	if pid <= 0 {

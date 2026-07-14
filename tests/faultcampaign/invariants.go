@@ -125,6 +125,7 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 	}
 	for nodeIndex := 1; nodeIndex < len(allConfigs); nodeIndex++ {
 		if !sameDurableConfigurations(allConfigs[0], allConfigs[nodeIndex]) {
+			//nolint:gosec // G602: length of allConfigs is len(nodes)
 			result.Error = fmt.Sprintf("node %d historical voter ordering diverges", nodes[nodeIndex].id)
 			return result
 		}

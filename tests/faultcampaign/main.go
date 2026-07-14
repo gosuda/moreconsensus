@@ -55,16 +55,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "faultcampaign: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "faultcampaign: %v\n", err)
 		return 2
 	}
 	host := hostEnvironment{GOOS: runtime.GOOS, EUID: os.Geteuid(), Lookup: os.Getenv}
 	if err := validateNativeDarwinHost(host); err != nil {
-		fmt.Fprintf(stderr, "faultcampaign: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "faultcampaign: %v\n", err)
 		return 2
 	}
 	if err := runCampaigns(cfg, stdout); err != nil {
-		fmt.Fprintf(stderr, "faultcampaign status=fail error=%v\n", err)
+		_, _ = fmt.Fprintf(stderr, "faultcampaign status=fail error=%v\n", err)
 		return 1
 	}
 	return 0
@@ -216,6 +216,7 @@ func runExternalOutput(ctx context.Context, argv []string, dir string) ([]byte, 
 	if err := validateExternalCommand(argv); err != nil {
 		return nil, err
 	}
+	//nolint:gosec // G204: command is validated via validateExternalCommand
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = dir
 	output, err := command.CombinedOutput()
