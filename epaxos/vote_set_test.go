@@ -4,8 +4,8 @@ import "testing"
 
 func TestFixedWidthVoteSetsForAllSupportedConfigurations(t *testing.T) {
 	for voters := 1; voters <= 7; voters++ {
-		t.Run(string(rune('0'+voters)), func(t *testing.T) {
-			conf := ConfState{ID: ConfID(10 + voters), Voters: makeIDs(voters)}
+		t.Run(string(rune('0'+voters)), func(t *testing.T) { //nolint:gosec // G115: test harness converts bounded int to rune
+			conf := ConfState{ID: ConfID(10 + voters), Voters: makeIDs(voters)} //nolint:gosec // G115: test harness converts bounded int index/count
 			var attrs attrVoteSet
 			var records recordVoteSet
 			var mask voterMask

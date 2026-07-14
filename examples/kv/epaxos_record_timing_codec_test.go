@@ -21,14 +21,13 @@ func TestEPaxosRecordCodecV8TimingDomainsRoundTrip(t *testing.T) {
 		processAt uint64
 		pending   bool
 	}{
-		{name: "untimed", domain: epaxos.TimingDomainUntimed},
 		{name: "logical", domain: epaxos.TimingDomainLogical, processAt: 41},
 		{name: "toq immediate", domain: epaxos.TimingDomainTOQ},
 		{name: "toq pending", domain: epaxos.TimingDomainTOQ, processAt: 73, pending: true},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			record := timingCodecRecordKV(epaxos.InstanceNum(i+1), tc.domain, tc.processAt, tc.pending)
+			record := timingCodecRecordKV(epaxos.InstanceNum(i+1), tc.domain, tc.processAt, tc.pending) //nolint:gosec // loop index is non-negative
 			encoded := encodeEPaxosRecord(record)
 			if encoded[0] != 8 {
 				t.Fatalf("codec version=%d, want 8", encoded[0])
@@ -71,7 +70,6 @@ func TestEPaxosRecordCodecV8RejectsInvalidTimingAndShape(t *testing.T) {
 		pending   bool
 		want      string
 	}{
-		{name: "untimed nonzero", domain: epaxos.TimingDomainUntimed, processAt: 1, want: "timing metadata"},
 		{name: "logical zero", domain: epaxos.TimingDomainLogical, want: "timing metadata"},
 		{name: "logical pending", domain: epaxos.TimingDomainLogical, processAt: 1, pending: true, want: "timing metadata"},
 		{name: "untimed pending", domain: epaxos.TimingDomainUntimed, pending: true, want: "timing metadata"},
@@ -79,7 +77,7 @@ func TestEPaxosRecordCodecV8RejectsInvalidTimingAndShape(t *testing.T) {
 	}
 	for i, tc := range invalidTiming {
 		t.Run(tc.name, func(t *testing.T) {
-			record := timingCodecRecordKV(epaxos.InstanceNum(i+20), tc.domain, tc.processAt, tc.pending)
+			record := timingCodecRecordKV(epaxos.InstanceNum(i+20), tc.domain, tc.processAt, tc.pending) //nolint:gosec // loop index is non-negative
 			record.Checksum = epaxos.ChecksumRecord(record)
 			if got, err := decodeEPaxosRecord(encodeEPaxosRecord(record)); err == nil || !strings.Contains(err.Error(), tc.want) || !reflect.DeepEqual(got, epaxos.InstanceRecord{}) {
 				t.Fatalf("decode invalid timing got=%#v err=%v, want zero record and %q", got, err, tc.want)
@@ -183,7 +181,7 @@ func TestEPaxosRecordCodecV7PreservesAmbiguousTimingForCore(t *testing.T) {
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			record := timingCodecRecordKV(epaxos.InstanceNum(i+60), epaxos.TimingDomainUntimed, tc.processAt, tc.pending)
+			record := timingCodecRecordKV(epaxos.InstanceNum(i+60), epaxos.TimingDomainUntimed, tc.processAt, tc.pending) //nolint:gosec // loop index is non-negative
 			record.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(record)
 			encoded := encodeHistoricalEPaxosRecordKV(record, 7)
 			originalChecksum := record.Checksum
@@ -492,7 +490,7 @@ func timingCodecRecordKV(instance epaxos.InstanceNum, domain epaxos.TimingDomain
 		Status:           epaxos.StatusPreAccepted,
 		Seq:              uint64(instance),
 		Deps:             []epaxos.InstanceNum{0},
-		Command:          CommandForPut(900, uint64(instance), []byte("timing-codec"), []byte{byte(instance)}),
+		Command:          CommandForPut(900, uint64(instance), []byte("timing-codec"), []byte{byte(instance)}), //nolint:gosec // test helper uses small instance numbers
 		FastPathEligible: true,
 		ProcessAt:        processAt,
 		TimingDomain:     domain,

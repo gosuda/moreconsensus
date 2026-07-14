@@ -152,12 +152,14 @@ func TestFormalCorrespondenceReferencesExistingTLAArtifacts(t *testing.T) {
 	authorities = append(authorities, modules...)
 	reference := regexp.MustCompile(`(?:tla/)?([A-Za-z][A-Za-z0-9_.-]*\.tla)`)
 	for _, authority := range authorities {
+		//nolint:gosec // G304: files come from a fixed list and tla glob under repo control
 		data, err := os.ReadFile(authority)
 		if err != nil {
 			t.Fatalf("read formal authority %s: %v", authority, err)
 		}
 		for _, match := range reference.FindAllSubmatch(data, -1) {
 			model := string(match[1])
+			//nolint:gosec // G304/G703: model comes from matching regex on repo files
 			if _, err := os.Stat(filepath.Join("../../tla", model)); err != nil {
 				t.Fatalf("%s references missing TLA artifact %s: %v", authority, model, err)
 			}

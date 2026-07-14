@@ -21,9 +21,9 @@ func newBootstrapTestFixture(t *testing.T, voters int, local ReplicaID) bootstra
 	for i := range identities {
 		identities[i] = VoterIdentity{Replica: ReplicaID(i + 1), Incarnation: 1}
 	}
-	target := VoterIdentity{Replica: ReplicaID(voters + 1), Incarnation: 1}
+	target := VoterIdentity{Replica: ReplicaID(voters + 1), Incarnation: 1} //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 	cluster := ClusterID{1, 2, 3}
-	planID := BootstrapID{9, byte(voters), byte(local)}
+	planID := BootstrapID{9, byte(voters), byte(local)} //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 	store := NewMemoryStorage()
 	store.Hard = HardState{Conf: conf.Clone()}
 	store.ConfigHistory = []ConfigHistoryEntry{{Conf: conf.Clone()}}

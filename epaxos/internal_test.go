@@ -298,7 +298,9 @@ func TestPrepareRecoveryPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := s.nodes[1].instances[ref]
-	s.nodes[1].startPrepare(inst)
+	if err := s.nodes[1].startPrepare(inst); err != nil {
+		panic(err)
+	}
 	s.drain()
 	if len(s.apps[1]) != 1 {
 		t.Fatalf("prepare path did not commit locally: %d", len(s.apps[1]))
@@ -331,12 +333,22 @@ func TestRejectPathsAndTimers(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := s.nodes[1].instances[ref]
-	s.nodes[1].onTimer(inst, timerPreAccept)
+	if err := s.nodes[1].onTimer(inst, timerPreAccept); err != nil {
+		panic(err)
+	}
 	s.nodes[1].startAccept(inst, inst.rec.Attributes())
-	s.nodes[1].onTimer(inst, timerAccept)
-	s.nodes[1].startPrepare(inst)
-	s.nodes[1].onTimer(inst, timerPrepare)
-	s.nodes[1].onTimer(inst, timerFastWait)
+	if err := s.nodes[1].onTimer(inst, timerAccept); err != nil {
+		panic(err)
+	}
+	if err := s.nodes[1].startPrepare(inst); err != nil {
+		panic(err)
+	}
+	if err := s.nodes[1].onTimer(inst, timerPrepare); err != nil {
+		panic(err)
+	}
+	if err := s.nodes[1].onTimer(inst, timerFastWait); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestEncodeMessageRejectsWireLimitOverflowWithoutAppending(t *testing.T) {

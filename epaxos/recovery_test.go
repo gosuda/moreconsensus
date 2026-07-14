@@ -16,7 +16,9 @@ func recoveryFinishPreAcceptedValidation(t *testing.T, store *MemoryStorage, rn 
 		for tick := uint64(1); tick < rn.retryTicks; tick++ {
 			recoveryPersistTickOnlyHardState(t, store, rn, "PreAccept slow fallback before retry deadline")
 		}
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		rd = rn.Ready()
 	}
 	if inst.phase == phaseAccept {
@@ -203,7 +205,9 @@ func TestRestartResumesForeignRecoveryBallot(t *testing.T) {
 			for tick := 1; tick < 5; tick++ {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "foreign recovery before deadline")
 			}
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			recoveryRequirePrepareRefs(t, rd.Messages, []InstanceRef{ref})
 			for _, m := range rd.Messages {
@@ -244,7 +248,9 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargets(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4})
 	recoveryApplyReady(t, store, restarted, rd)
@@ -336,7 +342,9 @@ func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.
 		recoveryPersistTickOnlyHardState(t, store, restarted, "mid-chain old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{2, 3, 4}, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -430,7 +438,9 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 		recoveryPersistTickOnlyHardState(t, store, restarted, "mid-chain old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{2, 3, 4}, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -467,7 +477,9 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	for tick := uint64(1); tick < recoveryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "mid-chain recovery prepare retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := restarted.Ready()
 	retryPrepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgPrepare, ref, []ReplicaID{2, 3, 4}, 4)
 	if retryPrepareBallot != prepareBallot {
@@ -503,7 +515,9 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	for tick := uint64(1); tick < retryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "mid-chain recovery accept retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry = restarted.Ready()
 	retryAcceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgAccept, ref, []ReplicaID{2, 3, 4}, 4)
 	if retryAcceptBallot != acceptBallot {
@@ -556,7 +570,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -567,7 +583,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	for tick := uint64(1); tick < recoveryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery prepare retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := restarted.Ready()
 	retryPrepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
 	if retryPrepareBallot != prepareBallot {
@@ -603,7 +621,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	for tick := uint64(1); tick < retryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery accept retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry = restarted.Ready()
 	retryAcceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
 	if retryAcceptBallot != acceptBallot {
@@ -642,7 +662,9 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -681,7 +703,9 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 	for tick := uint64(1); tick < retryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery accept retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := restarted.Ready()
 	retryAcceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
 	if retryAcceptBallot != acceptBallot {
@@ -732,7 +756,9 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -752,7 +778,9 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 	for tick := uint64(1); tick < recoveryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery prepare retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := restarted.Ready()
 	retryPrepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgPrepare, ref, []ReplicaID{1, 3, 4}, 4)
 	if retryPrepareBallot != prepareBallot {
@@ -820,7 +848,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3}, 3)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -831,7 +861,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 	for tick := uint64(1); tick < recoveryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery prepare retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := restarted.Ready()
 	retryPrepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgPrepare, ref, []ReplicaID{1, 3}, 3)
 	if retryPrepareBallot != prepareBallot {
@@ -862,7 +894,9 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 	for tick := uint64(1); tick < retryTicks; tick++ {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery accept retry before deadline")
 	}
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry = restarted.Ready()
 	retryAcceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, retry.Messages, MsgAccept, ref, []ReplicaID{1, 3}, 3)
 	if retryAcceptBallot != acceptBallot {
@@ -901,7 +935,9 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterAddition(t *testing.T) {
 		recoveryPersistTickOnlyHardState(t, store, restarted, "old-config recovery before deadline")
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := restarted.Ready()
 	prepareBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgPrepare, ref, []ReplicaID{1, 3}, 3)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -1010,7 +1046,9 @@ func TestOldConfigTransitionRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config transition retry before deadline")
 			}
 
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.msgType, ref, []ReplicaID{2, 3, 4}, cmd, tt.deps)
 			if retry.Ballot != tt.ballot {
@@ -1095,7 +1133,9 @@ func TestOldConfigTransitionRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config transition retry before deadline")
 			}
 
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.msgType, ref, []ReplicaID{2, 3}, cmd, tt.deps)
 			if retry.Ballot != tt.ballot {
@@ -1207,7 +1247,9 @@ func TestOldConfigChainTransitionRetryUsesPinnedVotersAfterAddThenRemove(t *test
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config chain transition retry before deadline")
 			}
 
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.msgType, tt.ref, tt.targets, cmd, tt.deps)
 			if retry.Ballot != ballot {
@@ -1332,7 +1374,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 			})
 
 			response := func(from ReplicaID, ballot Ballot) Message {
-				switch tt.status {
+				switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 				case StatusPreAccepted:
 					return Message{Type: tt.responseType, From: from, To: 1, Ref: tt.ref, Ballot: ballot, Seq: tt.seq, Deps: append([]InstanceNum(nil), tt.deps...), FastPathEligible: true}
 				case StatusAccepted:
@@ -1364,7 +1406,9 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 			for tick := uint64(1); tick < retryTicks; tick++ {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config transition retry before deadline after lost response")
 			}
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.retryType, tt.ref, tt.retryTargets, cmd, tt.deps)
 			if retry.Ballot != ballot {
@@ -1386,7 +1430,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 				t.Fatal(err)
 			}
 			rd = restarted.Ready()
-			switch tt.status {
+			switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 			case StatusPreAccepted:
 				rd = recoveryFinishPreAcceptedValidation(t, store, restarted, rd, tt.ref, tt.retryTargets, cmd, tt.seq, tt.deps)
 				accept := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgAccept, tt.ref, tt.retryTargets, cmd, tt.deps)
@@ -1505,7 +1549,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 			})
 
 			response := func(from ReplicaID, ballot Ballot) Message {
-				switch tt.status {
+				switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 				case StatusPreAccepted:
 					return Message{Type: tt.responseType, From: from, To: 1, Ref: tt.ref, Ballot: ballot, Seq: tt.seq, Deps: append([]InstanceNum(nil), tt.deps...), FastPathEligible: true}
 				case StatusAccepted:
@@ -1548,7 +1592,9 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 			for tick := uint64(1); tick < retryTicks; tick++ {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config chain transition retry before deadline after lost response")
 			}
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.retryType, tt.ref, tt.retryTargets, cmd, tt.deps)
 			if retry.Ballot != ballot {
@@ -1571,7 +1617,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 				t.Fatal(err)
 			}
 			rd = restarted.Ready()
-			switch tt.status {
+			switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 			case StatusPreAccepted:
 				rd = recoveryFinishPreAcceptedValidation(t, store, restarted, rd, tt.ref, tt.retryTargets, cmd, tt.seq, tt.deps)
 				accept := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgAccept, tt.ref, tt.retryTargets, cmd, tt.deps)
@@ -1654,7 +1700,9 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config transition removal retry before deadline")
 			}
 
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.retryType, ref, []ReplicaID{2, 3, 4}, cmd, tt.deps)
 			if retry.Seq != tt.seq {
@@ -1666,7 +1714,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 			recoveryRequireNoRecordOrApplicationEffects(t, restarted, rd, "old-config transition removal "+tt.name+" retry")
 			recoveryApplyReady(t, store, restarted, rd)
 
-			switch tt.status {
+			switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 			case StatusPreAccepted:
 				preAcceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), FastPathEligible: true}
@@ -1778,7 +1826,9 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 				recoveryPersistTickOnlyHardState(t, store, restarted, "old-config transition addition retry before deadline")
 			}
 
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			retry := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, tt.retryType, ref, []ReplicaID{2, 3}, cmd, tt.deps)
 			if retry.Seq != tt.seq {
@@ -1790,7 +1840,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 			recoveryRequireNoRecordOrApplicationEffects(t, restarted, rd, "old-config transition addition "+tt.name+" retry")
 			recoveryApplyReady(t, store, restarted, rd)
 
-			switch tt.status {
+			switch tt.status { //nolint:exhaustive // test table only constructs subset of Status values
 			case StatusPreAccepted:
 				preAcceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), FastPathEligible: true}
@@ -2145,7 +2195,9 @@ func recoveryPersistInitialHardState(t *testing.T, store *MemoryStorage, rn *Raw
 
 func recoveryPersistTickOnlyHardState(t *testing.T, store *MemoryStorage, rn *RawNode, context string) {
 	t.Helper()
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	recoveryRequireCurrentTickHardState(t, rn, rd, context)
 	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
@@ -2209,7 +2261,7 @@ func recoveryRequireMessageTargetsWithDepsWidth(t *testing.T, messages []Message
 			t.Fatalf("%s for %s sent to self: %#v", typ, ref, m)
 		}
 		seen[m.To] = m
-		switch typ {
+		switch typ { //nolint:exhaustive // test exercises subset of MessageType
 		case MsgPrepare:
 			if !commandEqual(m.Command, Command{}) ||
 				len(m.Deps) != 0 ||
@@ -2282,7 +2334,7 @@ func recoveryRequireMessageTargetsWithCommandAndDeps(t *testing.T, messages []Me
 		if len(m.Deps) != len(wantDeps) || !instanceNumsEqual(m.Deps, wantDeps) {
 			t.Fatalf("%s retry for %s deps = %v, want old config deps %v: %#v", typ, ref, m.Deps, wantDeps, m)
 		}
-		switch typ {
+		switch typ { //nolint:exhaustive // test exercises subset of MessageType
 		case MsgPreAccept, MsgAccept, MsgTryPreAccept:
 			if m.RecordBallot != (Ballot{}) || m.RecordStatus != StatusNone {
 				t.Fatalf("%s retry for %s exposed record metadata: %#v", typ, ref, m)
@@ -2379,17 +2431,6 @@ func messageTargets(messages map[ReplicaID]Message) []ReplicaID {
 	return targets
 }
 
-func recoveryRequireDependencyRefs(t *testing.T, got []InstanceRef, want []InstanceRef) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("dependency refs = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("dependency refs = %v, want %v", got, want)
-		}
-	}
-}
 
 func recoveryRequireNoPrepareRefs(t *testing.T, messages []Message, refs []InstanceRef) {
 	t.Helper()
@@ -2455,11 +2496,11 @@ func TestMaxUint64DependencyStartsBoundedExactRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	max := ^InstanceNum(0)
-	dependentRef := InstanceRef{Conf: 1, Replica: 7, Instance: max}
+	maxInst := ^InstanceNum(0)
+	dependentRef := InstanceRef{Conf: 1, Replica: 7, Instance: maxInst}
 	deps := make([]InstanceNum, 7)
 	for i := range deps {
-		deps[i] = max
+		deps[i] = maxInst
 	}
 	commit := Message{
 		Type:         MsgCommit,
@@ -2470,7 +2511,7 @@ func TestMaxUint64DependencyStartsBoundedExactRecovery(t *testing.T) {
 		RecordBallot: Ballot{Replica: 7},
 		Seq:          9,
 		Deps:         deps,
-		Command:      Command{ID: CommandID{Client: 700, Sequence: 1}, Payload: []byte("max-dependent")},
+		Command:      Command{ID: CommandID{Client: 700, Sequence: 1}, Payload: []byte("maxInst-dependent")},
 	}
 	if err := rn.Step(commit); err != nil {
 		t.Fatalf("MaxUint64 dependency commit failed: %v", err)

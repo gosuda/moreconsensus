@@ -11,8 +11,8 @@ const (
 	maxWireDeps           = 128
 	maxWireConflictKeys   = 128
 	maxWireAcceptEvidence = 128
-	maxWireCommandPayload  = 1 << 20
-	maxWireConflictKey     = 1 << 16
+	maxWireCommandPayload = 1 << 20
+	maxWireConflictKey    = 1 << 16
 )
 
 // DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
@@ -200,7 +200,7 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
 	p := parser{b: src[len(wireMagic) : len(src)-32], scratch: scratch}
-	m.Type = MessageType(p.uvarint())
+	m.Type = MessageType(p.uvarint8())
 	m.From = ReplicaID(p.uvarint())
 	m.To = ReplicaID(p.uvarint())
 	m.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
@@ -254,9 +254,16 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	for i := range m.AcceptEvidence {
 		m.AcceptEvidence[i].Sender = ReplicaID(p.uvarint())
 		m.AcceptEvidence[i].Seq = p.uvarint()
-		deps := int(p.uvarint())
+		depsCount := p.uvarint()
+		if p.err || depsCount > maxWireDeps {
+			return decodeMessageError(m, scratch, ErrInvalidMessage)
+		}
+		deps := int(depsCount)
 		if scratch != nil {
 			end := evidenceOffset + deps
+			if end > len(evidenceArena) {
+				return decodeMessageError(m, scratch, ErrInvalidMessage)
+			}
 			m.AcceptEvidence[i].Deps = evidenceArena[evidenceOffset:end:end]
 			evidenceOffset = end
 		} else {
@@ -270,12 +277,12 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	m.Command = p.command()
 	m.Reject = p.byte() == 1
 	m.RejectHint = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
-	m.RejectReason = RejectReason(p.uvarint())
+	m.RejectReason = RejectReason(p.uvarint8())
 	m.ConflictRef = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
-	m.ConflictStatus = Status(p.uvarint())
+	m.ConflictStatus = Status(p.uvarint8())
 	m.FastPathEligible = p.byte() == 1
 	m.DepsCommitted = p.uvarint()
-	m.RecordStatus = Status(p.uvarint())
+	m.RecordStatus = Status(p.uvarint8())
 	if p.err || len(p.b) != 0 {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
@@ -347,6 +354,15 @@ func (p *parser) uvarint() uint64 {
 	return v
 }
 
+func (p *parser) uvarint8() uint8 {
+	v := p.uvarint()
+	if v > uint64(^uint8(0)) {
+		p.err = true
+		return 0
+	}
+	return uint8(v)
+}
+
 func (p *parser) byte() byte {
 	if len(p.b) == 0 {
 		p.err = true
@@ -357,9 +373,9 @@ func (p *parser) byte() byte {
 	return v
 }
 
-func (p *parser) bytesBound(max uint64) []byte {
+func (p *parser) bytesBound(maxLen uint64) []byte {
 	n := p.uvarint()
-	if n > max || n > uint64(len(p.b)) {
+	if n > maxLen || n > uint64(len(p.b)) {
 		p.err = true
 		return nil
 	}
@@ -371,9 +387,8 @@ func (p *parser) bytes() []byte {
 	return p.bytesBound(^uint64(0))
 }
 
-
 func (p *parser) command() Command {
-	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: CommandKind(p.uvarint())}
+	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: CommandKind(p.uvarint8())}
 	c.Payload = p.bytesBound(maxWireCommandPayload)
 	keys := p.uvarint()
 	if keys > maxWireConflictKeys {

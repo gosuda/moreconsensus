@@ -7,14 +7,6 @@ import (
 	"fmt"
 )
 
-func pausePID(pid int) error {
-	return fmt.Errorf("process pause is available only on native Darwin")
-}
-
-func resumePID(pid int) error {
-	return fmt.Errorf("process resume is available only on native Darwin")
-}
-
-func sampleDarwinProcess(ctx context.Context, pid int) (uint64, int, error) {
+func sampleDarwinProcess(_ context.Context, _ int) (uint64, int, error) {
 	return 0, 0, fmt.Errorf("process resource sampling is available only on native Darwin")
 }

@@ -36,7 +36,7 @@ func slicesSameStorageAndShape[T any](left, right []T) bool {
 	if cap(left) == 0 {
 		return true
 	}
-	return unsafe.SliceData(left[:cap(left)]) == unsafe.SliceData(right[:cap(right)])
+	return unsafe.SliceData(left[:cap(left)]) == unsafe.SliceData(right[:cap(right)]) //nolint:gosec // G103: unsafe pointer arithmetic is confined to overlap detection.
 }
 
 func slicesPartiallyOverlap[T any](dst, src []T) bool {
@@ -47,8 +47,8 @@ func slicesPartiallyOverlap[T any](dst, src []T) bool {
 	if size == 0 {
 		return false
 	}
-	dstStart := uintptr(unsafe.Pointer(unsafe.SliceData(dst[:cap(dst)])))
-	srcStart := uintptr(unsafe.Pointer(unsafe.SliceData(src)))
+	dstStart := uintptr(unsafe.Pointer(unsafe.SliceData(dst[:cap(dst)]))) //nolint:gosec // G103: unsafe pointer arithmetic is confined to overlap detection.
+	srcStart := uintptr(unsafe.Pointer(unsafe.SliceData(src)))            //nolint:gosec // G103: unsafe pointer arithmetic is confined to overlap detection.
 	if dstStart == srcStart {
 		return false
 	}

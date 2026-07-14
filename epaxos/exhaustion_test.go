@@ -90,8 +90,8 @@ func TestRestartAtMaximumLocalInstanceRemainsExhausted(t *testing.T) {
 }
 
 func TestRecoveryTicksDefaultMultiplicationOverflow(t *testing.T) {
-	max := ^uint64(0)
-	exact := max / 3
+	maxTick := ^uint64(0)
+	exact := maxTick / 3
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), RetryTicks: exact})
 	if err != nil {
 		t.Fatalf("exact representable default RecoveryTicks: %v", err)
@@ -106,7 +106,7 @@ func TestRecoveryTicksDefaultMultiplicationOverflow(t *testing.T) {
 }
 
 func TestTimeOptimizationProcessAtCheckedBeforeMutation(t *testing.T) {
-	max := ^uint64(0)
+	maxTick := ^uint64(0)
 	exact, err := NewRawNode(Config{
 		ID:                    1,
 		Voters:                makeIDs(3),
@@ -119,15 +119,15 @@ func TestTimeOptimizationProcessAtCheckedBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, exact, 0)
-	exact.tick = max - 2
+	exact.tick = maxTick - 2
 	exact.currentHardState.Tick = exact.tick
 	exact.acknowledgedHardState = exact.currentHardState.Clone()
 	ref, err := exact.Propose(Command{ID: CommandID{Client: 303, Sequence: 1}, Payload: []byte("exact-max"), ConflictKeys: [][]byte{[]byte("exact-max-key")}})
 	if err != nil {
 		t.Fatalf("exact-Max ProcessAt proposal: %v", err)
 	}
-	if got := exact.instances[ref].rec.ProcessAt; got != max {
-		t.Fatalf("exact-Max ProcessAt=%d, want %d", got, max)
+	if got := exact.instances[ref].rec.ProcessAt; got != maxTick {
+		t.Fatalf("exact-Max ProcessAt=%d, want %d", got, maxTick)
 	}
 
 	overflow, err := NewRawNode(Config{
@@ -142,7 +142,7 @@ func TestTimeOptimizationProcessAtCheckedBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, overflow, 0)
-	overflow.tick = max - 2
+	overflow.tick = maxTick - 2
 	overflow.currentHardState.Tick = overflow.tick
 	overflow.acknowledgedHardState = overflow.currentHardState.Clone()
 	before := snapshotRemainingNodeProtocol(overflow)

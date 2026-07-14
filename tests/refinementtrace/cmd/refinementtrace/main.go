@@ -1,3 +1,4 @@
+// Package main is the entrypoint for the refinementtrace utility.
 package main
 
 import (
@@ -42,6 +43,7 @@ func capture(args []string) {
 	if err != nil {
 		fail("capture: %v", err)
 	}
+	//nolint:gosec // user-supplied CLI path is intentional
 	if err := os.WriteFile(*outPath, export, 0o600); err != nil {
 		fail("write trace export: %v", err)
 	}

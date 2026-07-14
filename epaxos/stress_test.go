@@ -21,7 +21,7 @@ func (r *stressRNG) next() uint64 {
 }
 
 func (r *stressRNG) intn(n int) int {
-	return int(r.next() % uint64(n))
+	return int(r.next() % uint64(n)) //nolint:gosec // G115: test harness converts bounded int index/count
 }
 
 type stressProposal struct {
@@ -90,9 +90,7 @@ func (s *stressTransportCluster) captureReady(id ReplicaID) {
 	if err := s.stores[id].ApplyReady(rd); err != nil {
 		s.t.Fatalf("apply ready %d: %v", id, err)
 	}
-	for _, c := range rd.Committed {
-		s.apps[id] = append(s.apps[id], c)
-	}
+	s.apps[id] = append(s.apps[id], rd.Committed...)
 	s.pending = append(s.pending, rd.Messages...)
 	if err := rn.Advance(rd); err != nil {
 		s.t.Fatalf("advance %d: %v", id, err)
@@ -155,11 +153,15 @@ func (s *stressTransportCluster) randomTransportStep() bool {
 func (s *stressTransportCluster) tickSome() {
 	if s.rng.intn(3) == 0 {
 		for _, id := range s.ids {
-			s.nodes[id].Tick()
+			if err := s.nodes[id].Tick(); err != nil {
+				s.t.Fatal(err)
+			}
 		}
 		return
 	}
-	s.nodes[s.ids[s.rng.intn(len(s.ids))]].Tick()
+	if err := s.nodes[s.ids[s.rng.intn(len(s.ids))]].Tick(); err != nil {
+		s.t.Fatal(err)
+	}
 }
 
 func (s *stressTransportCluster) restart(id ReplicaID) {
@@ -210,7 +212,9 @@ func (s *stressTransportCluster) driveUntilResolved(proposals []stressProposal) 
 			continue
 		}
 		for _, id := range s.ids {
-			s.nodes[id].Tick()
+			if err := s.nodes[id].Tick(); err != nil {
+				s.t.Fatal(err)
+			}
 		}
 	}
 	s.t.Fatalf("cluster did not resolve %d proposed instances: counts=%#v pending=%d", len(proposals), s.appCounts(), len(s.pending))
@@ -275,7 +279,7 @@ func stressCommand(size, index int, rng *stressRNG) Command {
 		keys = append(keys, []byte(fmt.Sprintf("pair-%d", index%2)))
 	}
 	return Command{
-		ID:           CommandID{Client: uint64(100 + index%size), Sequence: uint64(index + 1)},
+		ID:           CommandID{Client: uint64(100 + index%size), Sequence: uint64(index + 1)}, //nolint:gosec // G115: test harness converts bounded int index/count
 		Payload:      []byte(fmt.Sprintf("cmd-%02d", index)),
 		ConflictKeys: keys,
 	}

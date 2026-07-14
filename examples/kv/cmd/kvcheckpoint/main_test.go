@@ -615,7 +615,7 @@ func TestCheckpointCommandAuthenticatesSourceAndReleaseMetadata(t *testing.T) {
 	if info.SourceIdentity != "replica-1@darwin" || info.ReleaseChecksum != "sha256:release" || !info.CurrentTarget {
 		t.Fatalf("checkpoint info=%#v, want authenticated source and release metadata", info)
 	}
-	report, err := os.ReadFile(reportPath)
+	report, err := os.ReadFile(reportPath) //nolint:gosec // path constructed securely in test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +646,7 @@ func TestVerifyLegacyCommandIsExplicitAndNonClaiming(t *testing.T) {
 	reportPath := filepath.Join(t.TempDir(), "legacy-report.env")
 	t.Setenv("KVNODE_CHECKPOINT_REPORT", reportPath)
 	requireRun(t, []string{"verify", "--legacy", legacyDir}, 0, "")
-	report, err := os.ReadFile(reportPath)
+	report, err := os.ReadFile(reportPath) //nolint:gosec // path constructed securely in test
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,7 +851,7 @@ func checkpointTreeFingerprint(t *testing.T, root string) string {
 		if !entry.Type().IsRegular() {
 			return nil
 		}
-		payload, err := os.ReadFile(path)
+		payload, err := os.ReadFile(path) //nolint:gosec // path constructed securely in test
 		if err != nil {
 			return err
 		}
@@ -906,7 +906,7 @@ func createCheckpointedDataDir(t *testing.T, key string, value string) (string, 
 
 func requireOperationReport(t *testing.T, reportPath string, operation string, dataDir string, checkpointDir string) {
 	t.Helper()
-	report, err := os.ReadFile(reportPath)
+	report, err := os.ReadFile(reportPath) //nolint:gosec // path constructed securely in test
 	if err != nil {
 		t.Fatal(err)
 	}

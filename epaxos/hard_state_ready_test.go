@@ -58,7 +58,9 @@ func TestTickReadyPersistsAndRestartsLogicalTime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		panic(err)
+	}
 	rd := rn.Ready()
 	if rd.HardState.Tick != 1 || rd.HardState.Conf.ID != 1 || !rd.MustSync {
 		t.Fatalf("tick-only Ready = %#v, want complete hard state at tick 1", rd)
@@ -84,7 +86,9 @@ func TestTickReadyPersistsAndRestartsLogicalTime(t *testing.T) {
 	if err := rn.Advance(rd); err != nil {
 		t.Fatal(err)
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	next := rn.Ready()
 	if next.HardState.Tick != 2 {
 		t.Fatalf("next hard-state tick = %d, want 2", next.HardState.Tick)
@@ -102,7 +106,9 @@ func TestOutstandingReadyFrozenWhileTickAndStepAccumulate(t *testing.T) {
 		t.Fatalf("initial frozen Ready = %#v", frozen)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	msg := Message{
 		Type:    MsgPreAccept,
@@ -189,7 +195,9 @@ func TestInvalidHardStateAcknowledgementsStutter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	canonical := rn.Ready()
 	if canonical.HardState.Tick != 1 {
 		t.Fatalf("canonical hard-state tick = %d, want 1", canonical.HardState.Tick)
@@ -316,7 +324,9 @@ func TestReadyHardStateCloneReleaseAndAckValidationAllocations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	clone := rd.Clone()
 	clone.HardState.Conf.Voters[0] = 9
@@ -408,7 +418,9 @@ func TestTickGeneratedRetryIsFencedByHardState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := rn.Ready()
 	if retry.HardState.Tick != 1 || retry.HardState.Conf.ID != 1 || !retry.MustSync {
 		t.Fatalf("retry Ready is not fenced by tick 1 hard state: %#v", retry)

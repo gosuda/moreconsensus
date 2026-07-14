@@ -216,6 +216,8 @@ func commandKindName(kind epaxos.CommandKind) string {
 		return "noop"
 	case epaxos.CommandConfChange:
 		return "config-change"
+	case epaxos.CommandMembership:
+		return "membership"
 	default:
 		return "unknown-" + strconv.FormatUint(uint64(kind), 10)
 	}

@@ -660,8 +660,8 @@ func checkpointDependenciesAssignedForStateWithOrder(rec epaxos.InstanceRecord, 
 			component, currentKnown := order.component[rec.Ref]
 			dependencyComponent, dependencyKnown := order.component[depRef]
 			if currentKnown && dependencyKnown {
-				switch {
-				case component == dependencyComponent:
+				switch component {
+				case dependencyComponent:
 					required = checkpointExecutionLess(state.records[depRef], rec)
 				default:
 					_, required = order.dependencies[component][dependencyComponent]
@@ -846,7 +846,7 @@ func verifyCheckpointConfigurationHistory(state *checkpointState) error {
 		applied[rec.Ref.Conf] = rec
 	}
 
-	history := make(map[epaxos.ConfID]epaxos.ConfState, int(current.ID))
+	history := make(map[epaxos.ConfID]epaxos.ConfState)
 	history[current.ID] = current.Clone()
 	for successorID := current.ID; successorID > 1; successorID-- {
 		baseID := successorID - 1
@@ -932,6 +932,8 @@ func verifyCheckpointConfigRecord(rec epaxos.InstanceRecord, base epaxos.ConfSta
 		return nil
 	}
 	switch result.Outcome {
+	case epaxos.ConfChangeOutcomeUnspecified:
+		return fmt.Errorf("%w: configuration record %s has unspecified outcome", epaxos.ErrInvalidConfig, rec.Ref)
 	case epaxos.ConfChangeApplied:
 		if !valid || !checkpointSameConf(successor, result.Conf) {
 			return fmt.Errorf("%w: applied configuration outcome for %s does not match its command", epaxos.ErrInvalidConfig, rec.Ref)
@@ -1095,7 +1097,7 @@ func encodeCheckpointManifest(manifest checkpointManifest) []byte {
 	out = binary.BigEndian.AppendUint64(out, manifest.recordCount)
 	out = binary.BigEndian.AppendUint64(out, manifest.appliedCount)
 	out = append(out, manifest.hardStateDigest[:]...)
-	out = binary.BigEndian.AppendUint32(out, uint32(len(manifest.files)))
+	out = binary.BigEndian.AppendUint32(out, uint32(len(manifest.files))) //nolint:gosec // files count is verified to be within uint32 range by collectCheckpointFiles and verification checks
 	for _, file := range manifest.files {
 		out = checkpointAppendString(out, file.path)
 		out = binary.BigEndian.AppendUint64(out, file.size)
@@ -1107,7 +1109,7 @@ func encodeCheckpointManifest(manifest checkpointManifest) []byte {
 }
 
 func checkpointAppendString(dst []byte, value string) []byte {
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(value)))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(value))) //nolint:gosec // string length is bounded by checkpointManifestMaxField via validateCheckpointRelativePath and metadata validation
 	return append(dst, value...)
 }
 
@@ -1142,9 +1144,13 @@ func (p *checkpointManifestParser) uint64() uint64 {
 	return binary.BigEndian.Uint64(value)
 }
 
-func (p *checkpointManifestParser) string(max int) string {
+func (p *checkpointManifestParser) string(maxLen int) string {
+	if maxLen < 0 {
+		p.err = true
+		return ""
+	}
 	size := p.uint32()
-	if p.err || size > uint32(max) {
+	if p.err || size > uint32(maxLen) { //nolint:gosec // maxLen is verified non-negative and is bounded by checkpointManifestMaxField
 		p.err = true
 		return ""
 	}
@@ -1239,7 +1245,7 @@ func readCheckpointManifest(checkpointDir string) (checkpointManifest, []byte, e
 	if info.Size() < 0 || info.Size() > checkpointManifestMaxSize {
 		return checkpointManifest{}, nil, fmt.Errorf("kv: checkpoint manifest has invalid size")
 	}
-	encoded, err := os.ReadFile(manifestPath)
+	encoded, err := os.ReadFile(manifestPath) //nolint:gosec // manifestPath is a controlled configuration path
 	if err != nil {
 		return checkpointManifest{}, nil, err
 	}
@@ -1356,7 +1362,14 @@ func collectCheckpointFiles(checkpointDir string, hashFiles bool) ([]checkpointM
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("kv: checkpoint entry %q is not a regular file", filePath)
 		}
-		file := checkpointManifestFile{path: relative, size: uint64(info.Size())}
+		sz := info.Size()
+		if sz < 0 {
+			return fmt.Errorf("kv: checkpoint entry %q has negative size %d", filePath, sz)
+		}
+		if len(files) >= checkpointManifestMaxFiles {
+			return fmt.Errorf("kv: checkpoint file count exceeds max limit %d", checkpointManifestMaxFiles)
+		}
+		file := checkpointManifestFile{path: relative, size: uint64(sz)} //nolint:gosec // file size is verified non-negative
 		if hashFiles {
 			digest, size, err := checkpointFileDigest(filePath)
 			if err != nil {
@@ -1388,9 +1401,12 @@ func checkpointFileDigest(filePath string) ([32]byte, uint64, error) {
 	if err != nil {
 		return [32]byte{}, 0, err
 	}
+	if size < 0 {
+		return [32]byte{}, 0, fmt.Errorf("kv: negative file size while hashing %q", filePath)
+	}
 	var digest [32]byte
 	copy(digest[:], hasher.Sum(digest[:0]))
-	return digest, uint64(size), nil
+	return digest, uint64(size), nil //nolint:gosec // file size is verified non-negative
 }
 
 func compareCheckpointFiles(manifestFiles, actualFiles []checkpointManifestFile) error {
@@ -1496,7 +1512,7 @@ func restoreCheckpointDirectory(dataDir, checkpointDir string, verify func(strin
 	if err := checkpointRename(tmp, cleanData); err != nil {
 		if oldMoved {
 			if rollbackErr := checkpointRename(backup, cleanData); rollbackErr != nil {
-				return fmt.Errorf("kv: restore rename failed: %v; rollback failed: %w", err, rollbackErr)
+				return fmt.Errorf("kv: restore rename failed: %w; rollback failed: %w", err, rollbackErr)
 			}
 		}
 		return err

@@ -772,7 +772,7 @@ func TestDueRecoveryTimersShareBoundedFairDriveBudget(t *testing.T) {
 
 func TestLiveOldQuorumAfterFencerCrashesCanFinalizeButCannotChooseOrdinaryWork(t *testing.T) {
 	for voters := 3; voters <= 6; voters++ {
-		t.Run(string(rune('0'+voters)), func(t *testing.T) {
+		t.Run(string(rune('0'+voters)), func(t *testing.T) { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 			fixture, plan := standaloneBootstrapPlan(t, voters)
 			frontier := standaloneFrontier(plan, 0)
 			quorum := slowQuorumSize(voters)

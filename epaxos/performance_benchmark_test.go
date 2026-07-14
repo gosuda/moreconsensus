@@ -175,7 +175,9 @@ func BenchmarkOptimizedRecovery(b *testing.B) {
 		ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
 		inst := &instance{rec: InstanceRecord{Ref: ref, Status: StatusNone, Deps: n.q.deps()}}
 		n.instances[ref] = inst
-		n.startPrepare(inst)
+		if err := n.startPrepare(inst); err != nil {
+			panic(err)
+		}
 		ballot := inst.rec.Ballot
 		rd := n.Ready()
 		if err = n.Advance(rd); err != nil {
@@ -288,14 +290,14 @@ func BenchmarkLiveInstanceRetention(b *testing.B) {
 			var resident uintptr
 			for i := range corpus {
 				rec := InstanceRecord{
-					Ref:    InstanceRef{Replica: ReplicaID(i%voters + 1), Instance: InstanceNum(i/voters + 1), Conf: 1},
+					Ref:    InstanceRef{Replica: ReplicaID(i%voters + 1), Instance: InstanceNum(i/voters + 1), Conf: 1}, //nolint:gosec // G115: benchmark converts bounded int index/count
 					Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1},
 					Status: StatusExecuted, Seq: uint64(i + 1),
-					Deps: make([]InstanceNum, voters, voters),
+					Deps: make([]InstanceNum, voters),
 					Command: Command{
 						Kind:         CommandUser,
-						Payload:      make([]byte, 64, 64),
-						ConflictKeys: [][]byte{make([]byte, len("fixed-conflict-key"), len("fixed-conflict-key"))},
+						Payload:      make([]byte, 64),
+						ConflictKeys: [][]byte{make([]byte, len("fixed-conflict-key"))},
 					},
 				}
 				corpus[i] = instance{rec: rec, phase: phaseCommitted}

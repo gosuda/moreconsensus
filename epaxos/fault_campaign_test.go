@@ -24,26 +24,26 @@ var faultCampaignDimensions = []string{
 }
 
 type faultCampaignCell struct {
-	Size          int
-	Dimension     string
-	Disposition   string
-	Reason        string
-	Counter       string
+	Size        int
+	Dimension   string
+	Disposition string
+	Reason      string
+	Counter     string
 }
 
 func faultCampaignManifest() []faultCampaignCell {
 	cells := make([]faultCampaignCell, 0, 7*len(faultCampaignDimensions))
 	counter := map[string]string{
-		"loss":                 "drop",
-		"duplicate":            "duplicate",
-		"reorder":              "reorder",
-		"asymmetric-partition": "partition",
-		"crash-restart":        "crash",
-		"storage-failure":      "storage-failure",
-		"clock-rollback":       "clock-rollback",
-		"malformed-input":      "malformed",
+		"loss":                  "drop",
+		"duplicate":             "duplicate",
+		"reorder":               "reorder",
+		"asymmetric-partition":  "partition",
+		"crash-restart":         "crash",
+		"storage-failure":       "storage-failure",
+		"clock-rollback":        "clock-rollback",
+		"malformed-input":       "malformed",
 		"membership-transition": "membership",
-		"bounded-overload":     "overload",
+		"bounded-overload":      "overload",
 	}
 	for size := 1; size <= 7; size++ {
 		for _, dimension := range faultCampaignDimensions {
@@ -98,12 +98,12 @@ func faultCampaignSeed(base uint64, cell faultCampaignCell) uint64 {
 		hash ^= uint64(cell.Dimension[index])
 		hash *= 1099511628211
 	}
-	return base ^ uint64(cell.Size)*0x9e3779b97f4a7c15 ^ hash
+	return base ^ uint64(cell.Size)*0x9e3779b97f4a7c15 ^ hash //nolint:gosec // G115: test harness converts bounded int index/count
 }
 
 func faultCampaignOperation(size int, sequence uint64, suffix string) faultClientOperation {
 	return faultClientOperation{
-		Client:   uint64(size*1000) + sequence,
+		Client:   uint64(size*1000) + sequence, //nolint:gosec // G115: test harness converts bounded int index/count
 		Sequence: sequence,
 		Kind:     "put",
 		Writes:   []faultKV{{Key: "campaign-key", Value: fmt.Sprintf("N%d-%s-%d", size, suffix, sequence)}},
@@ -333,7 +333,7 @@ func faultRunCampaignCell(t *testing.T, cell faultCampaignCell, seed uint64) (*f
 				Reason: "safe add-voter bootstrap/catch-up is not exposed by the public API; this cell exercises only the supported remove transition",
 			})
 		}
-		removed := ReplicaID(cell.Size)
+		removed := ReplicaID(cell.Size) //nolint:gosec // G115: test harness converts bounded int index/count
 		faultMustAction(t, h, faultSimAction{Kind: faultActionPartition, From: 1, To: removed})
 		change := ConfChange{Type: ConfChangeRemoveVoter, Replica: removed}
 		receipt := faultMustAction(t, h, faultSimAction{Kind: faultActionConfChange, Node: 1, ConfChange: &change})

@@ -1,3 +1,4 @@
+// Package refinementtrace implements formal spec correspondence and refinement tracing.
 package refinementtrace
 
 import (
@@ -10,6 +11,7 @@ import (
 	"regexp"
 )
 
+// Format is the canonical format string of the specification trace.
 const (
 	Format       = "moreconsensus-shaped-spec-trace-v1"
 	ReplayPrefix = "FORMAL_CLOSURE_TRACE_REPLAY "
@@ -22,6 +24,7 @@ var (
 	commitmentPattern = regexp.MustCompile(`^S[0-9]{2}:[0-9]{3}:[0-9a-f]{64}$`)
 )
 
+// Bundle represents a group of traces along with metadata.
 type Bundle struct {
 	Deterministic    bool    `json:"deterministic"`
 	FormalSpecSHA256 string  `json:"formal_spec_sha256"`
@@ -30,17 +33,20 @@ type Bundle struct {
 	Traces           []Trace `json:"traces"`
 }
 
+// Trace represents an individual execution trace consisting of events.
 type Trace struct {
 	TraceID string  `json:"trace_id"`
 	Events  []Event `json:"events"`
 }
 
+// Event represents a single step/event in a trace.
 type Event struct {
 	Step       int    `json:"step"`
 	GoEvent    string `json:"go_event"`
 	SpecAction string `json:"spec_action"`
 }
 
+// ReplayMarker contains the output metadata of a trace replay.
 type ReplayMarker struct {
 	Deterministic    bool   `json:"deterministic"`
 	FormalSpecSHA256 string `json:"formal_spec_sha256"`

@@ -110,13 +110,21 @@ func TestDirectProtocolBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := rn.instances[ref2]
-	rn.handlePreAcceptResp(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref2, Ballot: Ballot{Number: 5, Replica: 2}, Reject: true, RejectHint: Ballot{Number: 5, Replica: 2}, Deps: rn.q.deps()})
+	if err := rn.handlePreAcceptResp(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref2, Ballot: Ballot{Number: 5, Replica: 2}, Reject: true, RejectHint: Ballot{Number: 5, Replica: 2}, Deps: rn.q.deps()}); err != nil {
+		panic(err)
+	}
 	if inst.phase != phasePrepare {
 		t.Fatal("reject did not start prepare")
 	}
-	rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref2, RecordStatus: StatusAccepted, Ballot: Ballot{Number: 6, Replica: 2}, RecordBallot: Ballot{Number: 6, Replica: 2}, Seq: 3, Deps: rn.q.deps(), Command: inst.rec.Command})
-	rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref2, RecordStatus: StatusAccepted, Ballot: Ballot{Number: 6, Replica: 2}, RecordBallot: Ballot{Number: 6, Replica: 2}, Seq: 3, Deps: rn.q.deps(), Command: inst.rec.Command})
-	rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 3, To: 1, Ref: ref2, RecordStatus: StatusCommitted, Ballot: Ballot{Number: 7, Replica: 3}, RecordBallot: Ballot{Number: 7, Replica: 3}, Seq: 4, Deps: rn.q.deps(), Command: inst.rec.Command})
+	if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref2, RecordStatus: StatusAccepted, Ballot: Ballot{Number: 6, Replica: 2}, RecordBallot: Ballot{Number: 6, Replica: 2}, Seq: 3, Deps: rn.q.deps(), Command: inst.rec.Command}); err != nil {
+		panic(err)
+	}
+	if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref2, RecordStatus: StatusAccepted, Ballot: Ballot{Number: 6, Replica: 2}, RecordBallot: Ballot{Number: 6, Replica: 2}, Seq: 3, Deps: rn.q.deps(), Command: inst.rec.Command}); err != nil {
+		panic(err)
+	}
+	if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 3, To: 1, Ref: ref2, RecordStatus: StatusCommitted, Ballot: Ballot{Number: 7, Replica: 3}, RecordBallot: Ballot{Number: 7, Replica: 3}, Seq: 4, Deps: rn.q.deps(), Command: inst.rec.Command}); err != nil {
+		panic(err)
+	}
 	rn.startAccept(inst, inst.rec.Attributes())
 	rn.commit(inst, inst.rec.Attributes())
 }
@@ -132,13 +140,19 @@ func TestAcceptResponseAndConfigBranches(t *testing.T) {
 	}
 	inst := rn.instances[ref]
 	rn.startAccept(inst, inst.rec.Attributes())
-	rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 9, Replica: 2}, Reject: true, RejectHint: Ballot{Number: 9, Replica: 2}, Deps: rn.q.deps()})
+	if err := rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 9, Replica: 2}, Reject: true, RejectHint: Ballot{Number: 9, Replica: 2}, Deps: rn.q.deps()}); err != nil {
+		panic(err)
+	}
 	inst.phase = phaseAccept
 	inst.rec.Status = StatusAccepted
 	inst.rec.RecordBallot = inst.rec.Ballot
 	inst.accOK = 0
-	rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()})
-	rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()})
+	if err := rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()}); err != nil {
+		panic(err)
+	}
+	if err := rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()}); err != nil {
+		panic(err)
+	}
 	rn.enqueueRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 99, Conf: 1}, Deps: rn.q.deps(), Command: Command{Kind: CommandNoop}})
 	rn.enqueueMessage(Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}, Deps: rn.q.deps()})
 	if _, err := FastQuorum(0); err == nil {
@@ -183,7 +197,9 @@ func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
 	}
 	advanceOK(t, rn, initial)
 	for tick := uint64(1); tick < 4; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			panic(err)
+		}
 		tickReady := rn.Ready()
 		wantTick := HardState{Conf: wantInitial.Conf, Tick: tick}
 		if !tickReady.HardState.Equal(wantTick) || !tickReady.MustSync ||
@@ -196,7 +212,9 @@ func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
 		advanceOK(t, rn, tickReady)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		panic(err)
+	}
 	if inst.phase != phasePrepare {
 		t.Fatalf("foreign accepted recovery phase = %d, want prepare after recovery deadline", inst.phase)
 	}

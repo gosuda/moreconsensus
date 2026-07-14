@@ -82,7 +82,7 @@ func TestRestoreCheckpointCopiesAbsentAndPresentDataDirectories(t *testing.T) {
 	if err := restoreCheckpointDirectory(absentData, checkpointDir, nil); err != nil {
 		t.Fatalf("RestoreCheckpoint absent data dir failed: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(absentData, "nested/value"))
+	got, err := os.ReadFile(filepath.Join(absentData, "nested/value")) //nolint:gosec // path constructed securely in test
 	if err != nil || string(got) != "checkpoint-value" {
 		t.Fatalf("restored absent data value=%q err=%v", got, err)
 	}
@@ -100,7 +100,7 @@ func TestRestoreCheckpointCopiesAbsentAndPresentDataDirectories(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(presentData, "old")); !os.IsNotExist(err) {
 		t.Fatalf("old data file still exists after restore: %v", err)
 	}
-	got, err = os.ReadFile(filepath.Join(presentData, "CURRENT"))
+	got, err = os.ReadFile(filepath.Join(presentData, "CURRENT")) //nolint:gosec // path constructed securely in test
 	if err != nil || string(got) != "checkpoint-current" {
 		t.Fatalf("restored present data current=%q err=%v", got, err)
 	}
@@ -142,26 +142,26 @@ func TestCopyCheckpointFileErrorBranches(t *testing.T) {
 func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 	cases := []struct {
 		name string
-		hook func(t *testing.T, dataDir string, checkpointDir string, sentinel error)
+		hook func(_ *testing.T, dataDir string, checkpointDir string, sentinel error)
 		want string
 	}{
 		{
 			name: "mkdir parent",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				checkpointMkdirAll = func(string, os.FileMode) error { return sentinel }
 			},
 			want: "sentinel",
 		},
 		{
 			name: "mkdir temp",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				checkpointMkdirTemp = func(string, string) (string, error) { return "", sentinel }
 			},
 			want: "sentinel",
 		},
 		{
 			name: "mkdir backup temp",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				calls := 0
 				checkpointMkdirTemp = func(dir, pattern string) (string, error) {
 					calls++
@@ -175,21 +175,21 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 		},
 		{
 			name: "walk dir",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				checkpointWalkDir = func(string, fs.WalkDirFunc) error { return sentinel }
 			},
 			want: "sentinel",
 		},
 		{
 			name: "remove backup staging dir",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				checkpointRemove = func(string) error { return sentinel }
 			},
 			want: "sentinel",
 		},
 		{
 			name: "stat data dir",
-			hook: func(t *testing.T, dataDir string, _ string, sentinel error) {
+			hook: func(_ *testing.T, dataDir string, _ string, sentinel error) {
 				checkpointStat = func(path string) (os.FileInfo, error) {
 					if path == dataDir {
 						return nil, sentinel
@@ -201,7 +201,7 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 		},
 		{
 			name: "move old data",
-			hook: func(t *testing.T, dataDir string, _ string, sentinel error) {
+			hook: func(_ *testing.T, dataDir string, _ string, sentinel error) {
 				checkpointRename = func(oldpath, newpath string) error {
 					if oldpath == dataDir {
 						return sentinel
@@ -213,7 +213,7 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 		},
 		{
 			name: "final rename rollback succeeds",
-			hook: func(t *testing.T, dataDir string, _ string, sentinel error) {
+			hook: func(_ *testing.T, dataDir string, _ string, sentinel error) {
 				failedFinal := false
 				checkpointRename = func(oldpath, newpath string) error {
 					if oldpath == dataDir {
@@ -230,7 +230,7 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 		},
 		{
 			name: "final rename rollback fails",
-			hook: func(t *testing.T, dataDir string, _ string, sentinel error) {
+			hook: func(_ *testing.T, dataDir string, _ string, sentinel error) {
 				failedFinal := false
 				rollback := errors.New("rollback failed")
 				checkpointRename = func(oldpath, newpath string) error {
@@ -251,7 +251,7 @@ func TestRestoreCheckpointHookedErrorBranches(t *testing.T) {
 		},
 		{
 			name: "remove old backup",
-			hook: func(t *testing.T, _ string, _ string, sentinel error) {
+			hook: func(_ *testing.T, _ string, _ string, sentinel error) {
 				checkpointRemoveAll = func(path string) error {
 					if strings.Contains(path, ".pre-restore-") {
 						return sentinel

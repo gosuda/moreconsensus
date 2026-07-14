@@ -110,7 +110,7 @@ func TestReadyReleaseClearsHeadersAndBackingArraysWithoutAllocation(t *testing.T
 		allocRecords[0] = InstanceRecord{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
 		allocMessages[0] = Message{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
 		allocCommitted[0] = CommittedCommand{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
-		ready := Ready{Records: allocRecords[:], Messages: allocMessages[:], Committed: allocCommitted[:], MustSync: true}
+		ready := Ready{Records: allocRecords, Messages: allocMessages, Committed: allocCommitted, MustSync: true} //nolint:gocritic // unslice: keep explicit slice form in test fixture
 		ready.Release()
 	})
 	if allocs != 0 {
@@ -938,7 +938,7 @@ func deterministicShortByteSeeds() [][]byte {
 		seed := make([]byte, n)
 		for i := range seed {
 			state = state*1664525 + 1013904223
-			seed[i] = byte(state >> 24)
+			seed[i] = byte(state >> 24) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 		}
 		seeds = append(seeds, seed)
 	}
@@ -1048,31 +1048,31 @@ func countMaterializedDependenciesInView(rn *RawNode, view *executionView, base 
 
 func TestDependencyIteratorAllocationIndependentOfEndpoint(t *testing.T) {
 	small, smallBase := dependencyIteratorAllocationNode(t, 8)
-	max, maxBase := dependencyIteratorAllocationNode(t, ^InstanceNum(0))
-	if got, want := countMaterializedDependencies(small, smallBase), countMaterializedDependencies(max, maxBase); got != want || got != 2 {
-		t.Fatalf("iterator cardinality small/max = %d/%d, want 2/2", got, want)
+	maxNode, maxBase := dependencyIteratorAllocationNode(t, ^InstanceNum(0))
+	if got, want := countMaterializedDependencies(small, smallBase), countMaterializedDependencies(maxNode, maxBase); got != want || got != 2 {
+		t.Fatalf("iterator cardinality small/maxNode = %d/%d, want 2/2", got, want)
 	}
 	countMaterializedDependencies(small, smallBase)
-	countMaterializedDependencies(max, maxBase)
+	countMaterializedDependencies(maxNode, maxBase)
 	smallAllocs := testing.AllocsPerRun(100, func() {
 		dependencyIteratorCountSink = countMaterializedDependencies(small, smallBase)
 	})
 	maxAllocs := testing.AllocsPerRun(100, func() {
-		dependencyIteratorCountSink = countMaterializedDependencies(max, maxBase)
+		dependencyIteratorCountSink = countMaterializedDependencies(maxNode, maxBase)
 	})
 	if smallAllocs != maxAllocs {
-		t.Fatalf("iterator allocations depend on endpoint: small=%v max=%v", smallAllocs, maxAllocs)
+		t.Fatalf("iterator allocations depend on endpoint: small=%v maxNode=%v", smallAllocs, maxAllocs)
 	}
 	smallView := small.newExecutionView()
-	maxView := max.newExecutionView()
+	maxView := maxNode.newExecutionView()
 	smallPrimitiveAllocs := testing.AllocsPerRun(100, func() {
 		dependencyIteratorCountSink = countMaterializedDependenciesInView(small, &smallView, smallBase)
 	})
 	maxPrimitiveAllocs := testing.AllocsPerRun(100, func() {
-		dependencyIteratorCountSink = countMaterializedDependenciesInView(max, &maxView, maxBase)
+		dependencyIteratorCountSink = countMaterializedDependenciesInView(maxNode, &maxView, maxBase)
 	})
 	if smallPrimitiveAllocs != 0 || maxPrimitiveAllocs != 0 {
-		t.Fatalf("warmed dependency iterator allocated: small=%v max=%v", smallPrimitiveAllocs, maxPrimitiveAllocs)
+		t.Fatalf("warmed dependency iterator allocated: small=%v maxNode=%v", smallPrimitiveAllocs, maxPrimitiveAllocs)
 	}
 }
 

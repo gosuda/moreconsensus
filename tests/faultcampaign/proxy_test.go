@@ -76,7 +76,9 @@ func (f *proxyFixture) post(t *testing.T, body []byte) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	_, _ = io.Copy(io.Discard, response.Body)
 	return response.StatusCode
 }
@@ -167,7 +169,9 @@ func TestFaultProxyBlockKeepsAttemptOpenUntilRelease(t *testing.T) {
 			result <- postResult{err: err}
 			return
 		}
-		defer response.Body.Close()
+		defer func() {
+			_ = response.Body.Close()
+		}()
 		_, _ = io.Copy(io.Discard, response.Body)
 		result <- postResult{status: response.StatusCode}
 	}()
@@ -287,7 +291,9 @@ func TestFaultProxyDuplicateFailsIfEitherForwardFails(t *testing.T) {
 	if err := proxy.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer proxy.Close()
+	defer func() {
+		_ = proxy.Close()
+	}()
 	if err := proxy.Schedule(ProxyAction{ID: 1, Kind: "duplicate", From: 1, To: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +301,9 @@ func TestFaultProxyDuplicateFailsIfEitherForwardFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	if response.StatusCode != http.StatusBadGateway || calls != 2 {
 		t.Fatalf("duplicate status=%d calls=%d, want 502 and two attempts", response.StatusCode, calls)
 	}

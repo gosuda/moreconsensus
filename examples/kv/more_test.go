@@ -483,7 +483,7 @@ func TestVerifyCheckpointAndRepairFromCheckpointRejectMissingCheckpoint(t *testi
 	}{
 		{
 			name: "verify",
-			call: func(t *testing.T, checkpoint string) error {
+			call: func(_ *testing.T, checkpoint string) error {
 				return VerifyCheckpoint(checkpoint)
 			},
 		},
@@ -2232,7 +2232,7 @@ func checkpointPutRecord(ref epaxos.InstanceRef, key, value string) epaxos.Insta
 		Ballot:  epaxos.Ballot{Replica: ref.Replica},
 		Status:  epaxos.StatusCommitted,
 		Seq:     uint64(ref.Instance),
-		Deps:    make([]epaxos.InstanceNum, max(int(ref.Replica), 1)),
+		Deps:    make([]epaxos.InstanceNum, max(int(ref.Replica), 1)), //nolint:gosec // replica ID is small in tests
 		Command: CommandForPut(99, uint64(ref.Instance), []byte(key), []byte(value)),
 	})
 }

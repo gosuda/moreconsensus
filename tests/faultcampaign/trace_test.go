@@ -146,6 +146,7 @@ func TestReadTraceRejectsTrailingJSON(t *testing.T) {
 	if err := writeTraceDurable(path, validTestTrace(3)); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:gosec // G304: path is controlled test path
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)

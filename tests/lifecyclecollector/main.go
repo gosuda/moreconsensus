@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -436,12 +435,4 @@ func pathContains(parent, child string) bool {
 
 func durationSeconds(value time.Duration) int {
 	return int(value / time.Second)
-}
-
-func parsePositiveInt(value, name string) (int, error) {
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return 0, fmt.Errorf("%s must be positive", name)
-	}
-	return parsed, nil
 }

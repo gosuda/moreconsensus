@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+func TestDecodeMessageRejectsOversizedMessageType(t *testing.T) {
+	valid, _ := evidenceScratchTestMessages()
+	valid.Type = MessageType(1)
+	encoded := mustEncodeMessageSeed(valid)
+	frame := append([]byte(nil), encoded[:len(wireMagic)]...)
+	frame = binary.AppendUvarint(frame, 257)
+	frame = append(frame, encoded[len(wireMagic)+1:]...)
+
+	var got Message
+	if err := DecodeMessage(frame, &got); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("oversized message type error = %v, want ErrInvalidMessage", err)
+	}
+}
+
 func TestDecodeMessageWithScratchReusesAcceptEvidenceWithoutAllocation(t *testing.T) {
 	large, small := evidenceScratchTestMessages()
 	largeEncoded := mustEncodeMessageSeed(large)

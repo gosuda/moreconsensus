@@ -54,13 +54,13 @@ type TimestampBounds struct {
 }
 
 // TimestampAtOrBefore returns bounds that expose the newest version at or before max.
-func TimestampAtOrBefore(max uint64) TimestampBounds {
-	return TimestampBounds{mode: timestampAtOrBefore, max: max}
+func TimestampAtOrBefore(maxTS uint64) TimestampBounds {
+	return TimestampBounds{mode: timestampAtOrBefore, max: maxTS}
 }
 
 // TimestampWithinBounds returns bounds that expose versions in the inclusive interval [min, max].
-func TimestampWithinBounds(min, max uint64) TimestampBounds {
-	return TimestampBounds{mode: timestampWithin, min: min, max: max}
+func TimestampWithinBounds(minTS, maxTS uint64) TimestampBounds {
+	return TimestampBounds{mode: timestampWithin, min: minTS, max: maxTS}
 }
 
 // ExactTimestamp returns bounds that expose only versions written at ts.
@@ -70,11 +70,11 @@ func ExactTimestamp(ts uint64) TimestampBounds {
 
 // BoundedStaleness returns timestamp bounds relative to a caller-provided reference timestamp.
 func BoundedStaleness(reference, maxStaleness uint64) TimestampBounds {
-	min := uint64(0)
+	minTS := uint64(0)
 	if reference > maxStaleness {
-		min = reference - maxStaleness
+		minTS = reference - maxStaleness
 	}
-	return TimestampWithinBounds(min, reference)
+	return TimestampWithinBounds(minTS, reference)
 }
 
 // ExactStaleness returns exact timestamp bounds relative to a caller-provided reference timestamp.
@@ -105,9 +105,10 @@ func (b TimestampBounds) seekUpper() (uint64, bool) {
 	switch b.mode {
 	case timestampAtOrBefore, timestampWithin, timestampExact:
 		return b.max, true
-	default:
+	case timestampLatest, timestampEmpty:
 		return 0, false
 	}
+	return 0, false
 }
 
 type timestampMatch int
@@ -120,6 +121,8 @@ const (
 
 func (b TimestampBounds) classify(ts uint64) timestampMatch {
 	switch b.mode {
+	case timestampLatest:
+		// All timestamps are visible under latest mode.
 	case timestampAtOrBefore:
 		if ts > b.max {
 			return timestampTooNew
@@ -135,7 +138,7 @@ func (b TimestampBounds) classify(ts uint64) timestampMatch {
 		if ts > b.max {
 			return timestampTooNew
 		}
-		if ts < b.max {
+		if ts < b.min {
 			return timestampTooOld
 		}
 	case timestampEmpty:
@@ -315,17 +318,17 @@ func (db *DB) loadNextTime() (uint64, error) {
 		return 0, err
 	}
 	defer func() { _ = iter.Close() }()
-	var max uint64
+	var maxTS uint64
 	for valid := iter.First(); valid; valid = iter.Next() {
 		_, ts, ok := DecodeDataKey(iter.Key(), db.cf)
-		if ok && ts > max {
-			max = ts
+		if ok && ts > maxTS {
+			maxTS = ts
 		}
 	}
 	if err := iter.Error(); err != nil {
 		return 0, err
 	}
-	return max + 1, nil
+	return maxTS + 1, nil
 }
 
 func (db *DB) nextRecordTime() uint64 {
@@ -567,9 +570,9 @@ func (db *DB) GetWithBounds(key []byte, bounds TimestampBounds) ([]byte, bool, e
 		return nil, false, err
 	}
 	defer func() { _ = iter.Close() }()
-	valid := false
-	if max, ok := bounds.seekUpper(); ok {
-		valid = iter.SeekGE(EncodeDataKey(nil, db.cf, key, max))
+	var valid bool
+	if maxTS, ok := bounds.seekUpper(); ok {
+		valid = iter.SeekGE(EncodeDataKey(nil, db.cf, key, maxTS))
 	} else {
 		valid = iter.First()
 	}
@@ -579,6 +582,8 @@ func (db *DB) GetWithBounds(key []byte, bounds TimestampBounds) ([]byte, bool, e
 			continue
 		}
 		switch bounds.classify(ts) {
+		case timestampVisible:
+			// Read the value below.
 		case timestampTooNew:
 			continue
 		case timestampTooOld:
@@ -649,6 +654,8 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 			continue
 		}
 		switch opt.Bounds.classify(ts) {
+		case timestampVisible:
+			// Process the value below.
 		case timestampTooNew:
 			continue
 		case timestampTooOld:

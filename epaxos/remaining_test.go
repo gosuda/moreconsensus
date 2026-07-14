@@ -196,7 +196,9 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	inst := &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 9, Conf: 1}, Status: StatusCommitted, Deps: zr.q.deps(), Command: Command{Kind: CommandNoop}}, phase: phaseCommitted}
 	zr.startAccept(inst, inst.rec.Attributes())
 	zr.commit(inst, inst.rec.Attributes())
-	zr.schedule(inst, timerAccept, 0)
+	if err := zr.schedule(inst, timerAccept, 0); err != nil {
+		panic(err)
+	}
 }
 
 func TestProposeRejectsNonEmptyNoopWithoutDurableMutation(t *testing.T) {
@@ -544,14 +546,18 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 	}
 
 	for tick := uint64(1); tick < 3; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		if inst.phase != phasePreAccept {
 			t.Fatalf("phase after tick %d = %d, want preaccept before fast-wait deadline", tick, inst.phase)
 		}
 		remainingApplyHardStateOnly(t, rn, tick)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	if inst.phase != phaseAccept {
 		t.Fatalf("phase at fast-wait deadline = %d, want accept", inst.phase)
 	}
@@ -614,7 +620,9 @@ func TestTimeOptimizationRetryCannotBypassFastWaitDeadline(t *testing.T) {
 	}
 
 	for tick := uint64(1); tick < 3; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		if inst.phase != phasePreAccept {
 			t.Fatalf("phase after retry tick %d = %d, want preaccept", tick, inst.phase)
 		}
@@ -629,7 +637,9 @@ func TestTimeOptimizationRetryCannotBypassFastWaitDeadline(t *testing.T) {
 		advanceOK(t, rn, retry)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	if inst.phase != phaseAccept {
 		t.Fatalf("phase at fast-wait deadline = %d, want accept", inst.phase)
 	}
@@ -699,7 +709,9 @@ func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
 	}
 
 	for tick := uint64(1); tick < 3; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		if inst.phase != phasePreAccept {
 			t.Fatalf("phase after tick %d = %d, want preaccept before fast-wait deadline", tick, inst.phase)
 		}
@@ -1166,9 +1178,13 @@ func TestOutboundPreAcceptProcessAtCarriesCreatedTickOnRetries(t *testing.T) {
 	}
 	advanceOK(t, rn, rd)
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	remainingApplyHardStateOnly(t, rn, 1)
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := rn.Ready()
 	if len(retry.Records) != 0 || len(retry.Committed) != 0 {
 		t.Fatalf("preaccept retry changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Committed)
@@ -1192,11 +1208,15 @@ func TestInboundFuturePreAcceptTimingWaitsForProcessAt(t *testing.T) {
 		t.Fatalf("future preaccept produced ready work before ProcessAt: %#v", rn.Ready())
 	}
 	for tick := uint64(1); tick < msg.ProcessAt; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		remainingApplyHardStateOnly(t, rn, tick)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	if len(rd.Records) != 1 || rd.Records[0].Ref != ref || rd.Records[0].Status != StatusPreAccepted {
 		t.Fatalf("due preaccept records = %#v, want one pre-accepted record for %s", rd.Records, ref)
@@ -1299,10 +1319,14 @@ func TestDuePreAcceptTimingOrdersByProcessAtAndRef(t *testing.T) {
 	if rn.HasReady() {
 		t.Fatalf("queued future preaccepts produced ready before due tick: %#v", rn.Ready())
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	remainingApplyHardStateOnly(t, rn, 1)
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	if got, want := recordRefs(rd.Records), []InstanceRef{first, second}; !slices.Equal(got, want) {
 		t.Fatalf("records due at same ProcessAt arrived in order %v, want deterministic ref order %v; records=%#v", got, want, rd.Records)
@@ -1315,7 +1339,9 @@ func TestDuePreAcceptTimingOrdersByProcessAtAndRef(t *testing.T) {
 	}
 	advanceOK(t, rn, rd)
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	laterReady := rn.Ready()
 	if got, want := recordRefs(laterReady.Records), []InstanceRef{later}; !slices.Equal(got, want) {
 		t.Fatalf("later ProcessAt records = %v, want only %s; records=%#v", got, later, laterReady.Records)
@@ -1348,9 +1374,13 @@ func TestDeferredPreAcceptTimingClonesCommandBuffers(t *testing.T) {
 	msg.Command.Payload[1] = 'Z'
 	msg.Command.ConflictKeys[0][1] = 'W'
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	remainingApplyHardStateOnly(t, rn, 1)
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	if len(rd.Records) != 1 {
 		t.Fatalf("deferred preaccept records = %#v, want one record", rd.Records)
@@ -1801,9 +1831,13 @@ func TestRemainingResponseBranches(t *testing.T) {
 	putAttrVoteSet(inst.preOK)
 	inst.preOK = nil
 	resp := Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Seq: inst.rec.Seq, Deps: inst.rec.Deps}
-	rn.handlePreAcceptResp(resp)
+	if err := rn.handlePreAcceptResp(resp); err != nil {
+		panic(err)
+	}
 	before := inst.preOK.len()
-	rn.handlePreAcceptResp(resp)
+	if err := rn.handlePreAcceptResp(resp); err != nil {
+		panic(err)
+	}
 	if inst.preOK.len() != before {
 		t.Fatal("duplicate preaccept response changed votes")
 	}
@@ -1818,7 +1852,9 @@ func TestRemainingResponseBranches(t *testing.T) {
 		}
 		inst := &instance{rec: rec}
 		rn.instances[rec.Ref] = inst
-		rn.startPrepare(inst)
+		if err := rn.startPrepare(inst); err != nil {
+			panic(err)
+		}
 		return rn, inst, inst.rec.Ballot
 	}
 
@@ -1831,12 +1867,16 @@ func TestRemainingResponseBranches(t *testing.T) {
 			Command: Command{Payload: []byte("local")},
 		})
 		resp := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: prepRef, RecordStatus: StatusAccepted, Ballot: ballot, RecordBallot: Ballot{Replica: 2}, Seq: 2, Deps: []InstanceNum{0, 2, 0, 0, 0}, Command: Command{Payload: []byte("accepted-2")}}
-		rn.handlePrepareResp(resp)
+		if err := rn.handlePrepareResp(resp); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phasePrepare {
 			t.Fatalf("single prepare response formed quorum: phase=%d", prep.phase)
 		}
 		votes := prep.prepareOK.len()
-		rn.handlePrepareResp(resp)
+		if err := rn.handlePrepareResp(resp); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phasePrepare || prep.prepareOK.len() != votes {
 			t.Fatalf("duplicate prepare response changed recovery state: phase=%d votes=%d want phase=%d votes=%d", prep.phase, prep.prepareOK.len(), phasePrepare, votes)
 		}
@@ -1844,7 +1884,9 @@ func TestRemainingResponseBranches(t *testing.T) {
 		resp.Seq = 3
 		resp.Deps = []InstanceNum{0, 0, 3, 0, 0}
 		resp.Command = Command{Payload: []byte("accepted-3")}
-		rn.handlePrepareResp(resp)
+		if err := rn.handlePrepareResp(resp); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phaseAccept {
 			t.Fatalf("distinct prepare quorum did not start accept: phase=%d", prep.phase)
 		}
@@ -1860,7 +1902,9 @@ func TestRemainingResponseBranches(t *testing.T) {
 			Deps:    []InstanceNum{7, 0, 0},
 			Command: Command{Payload: []byte("accepted-local")},
 		})
-		rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: committedRef, RecordStatus: StatusCommitted, Ballot: ballot, RecordBallot: Ballot{Replica: 2}, Seq: 4, Deps: []InstanceNum{0, 0, 4}, Command: committedCommand})
+		if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: committedRef, RecordStatus: StatusCommitted, Ballot: ballot, RecordBallot: Ballot{Replica: 2}, Seq: 4, Deps: []InstanceNum{0, 0, 4}, Command: committedCommand}); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phaseCommitted || prep.rec.Status != StatusCommitted || prep.rec.Seq != 4 || !bytes.Equal(prep.rec.Command.Payload, committedCommand.Payload) {
 			t.Fatalf("committed prepare response not chosen: phase=%d record=%#v", prep.phase, prep.rec)
 		}
@@ -1876,7 +1920,9 @@ func TestRemainingResponseBranches(t *testing.T) {
 			Deps:    []InstanceNum{5, 0, 0},
 			Command: Command{Payload: []byte("preaccepted")},
 		})
-		rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: prepRef, RecordStatus: StatusAccepted, Ballot: ballot, RecordBallot: Ballot{Replica: 2}, Seq: 4, Deps: []InstanceNum{0, 7, 0}, Command: acceptedCommand})
+		if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: prepRef, RecordStatus: StatusAccepted, Ballot: ballot, RecordBallot: Ballot{Replica: 2}, Seq: 4, Deps: []InstanceNum{0, 7, 0}, Command: acceptedCommand}); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phaseAccept || prep.rec.Status != StatusAccepted || !bytes.Equal(prep.rec.Command.Payload, acceptedCommand.Payload) {
 			t.Fatalf("accepted prepare response not selected over preaccepted: phase=%d record=%#v", prep.phase, prep.rec)
 		}
@@ -1888,7 +1934,9 @@ func TestRemainingResponseBranches(t *testing.T) {
 	t.Run("non-owner none quorum starts noop accept", func(t *testing.T) {
 		nonOwnerRef := InstanceRef{Replica: 2, Instance: 25, Conf: 1}
 		rn, prep, ballot := startPrepared(t, 3, InstanceRecord{Ref: nonOwnerRef, Status: StatusNone})
-		rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: nonOwnerRef, RecordStatus: StatusNone, Ballot: ballot, Deps: rn.q.deps()})
+		if err := rn.handlePrepareResp(Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: nonOwnerRef, RecordStatus: StatusNone, Ballot: ballot, Deps: rn.q.deps()}); err != nil {
+			t.Fatal(err)
+		}
 		if prep.phase != phaseAccept || prep.rec.Status != StatusAccepted {
 			t.Fatalf("non-owner StatusNone quorum did not start accept: phase=%d record=%#v", prep.phase, prep.rec)
 		}
@@ -2534,10 +2582,14 @@ func TestRestartRetransmitsLocalUncommittedInstances(t *testing.T) {
 			}
 			remainingApplyHardStateOnly(t, restarted, 0)
 			for tick := uint64(1); tick < tt.ticks; tick++ {
-				restarted.Tick()
+				if err := restarted.Tick(); err != nil {
+					t.Fatal(err)
+				}
 				remainingApplyHardStateOnly(t, restarted, tick)
 			}
-			restarted.Tick()
+			if err := restarted.Tick(); err != nil {
+				t.Fatal(err)
+			}
 			rd := restarted.Ready()
 			if len(rd.Messages) != 2 {
 				t.Fatalf("retry messages = %#v", rd.Messages)
@@ -2623,16 +2675,16 @@ func TestExecutedTrackerKeepsSparseExactHolesAndCheckedMax(t *testing.T) {
 	one := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: 1}
 	two := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: 2}
 	three := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: 3}
-	max := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: ^InstanceNum(0)}
+	maxRef := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: ^InstanceNum(0)}
 
 	tracker.add(one)
 	tracker.add(three)
-	tracker.add(max)
+	tracker.add(maxRef)
 	if got := tracker.prefix(lane); got != 1 {
 		t.Fatalf("sparse executed frontier = %d, want 1", got)
 	}
-	if !tracker.contains(three) || !tracker.contains(max) || tracker.contains(two) {
-		t.Fatalf("sparse exact membership lost: one=%v two=%v three=%v max=%v", tracker.contains(one), tracker.contains(two), tracker.contains(three), tracker.contains(max))
+	if !tracker.contains(three) || !tracker.contains(maxRef) || tracker.contains(two) {
+		t.Fatalf("sparse exact membership lost: one=%v two=%v three=%v maxRef=%v", tracker.contains(one), tracker.contains(two), tracker.contains(three), tracker.contains(maxRef))
 	}
 	tracker.add(two)
 	if got := tracker.prefix(lane); got != 3 {

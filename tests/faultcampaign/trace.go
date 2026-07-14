@@ -207,11 +207,14 @@ func isPeerFault(kind string) bool {
 }
 
 func readTrace(path string) (FaultTrace, error) {
+	//nolint:gosec // G304: path is controlled trace path
 	file, err := os.Open(path)
 	if err != nil {
 		return FaultTrace{}, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	var trace FaultTrace

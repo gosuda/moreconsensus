@@ -89,7 +89,9 @@ func runCampaigns(cfg runnerConfig, stdout io.Writer) error {
 	if len(entries) != 0 {
 		return fmt.Errorf("refusing to overwrite nonempty campaign artifact root %s", artifactRoot)
 	}
-	fmt.Fprintf(stdout, "faultcampaign phase=artifacts path=%s\n", artifactRoot)
+	if _, err := fmt.Fprintf(stdout, "faultcampaign phase=artifacts path=%s\n", artifactRoot); err != nil {
+		return fmt.Errorf("write campaign status: %w", err)
+	}
 	buildContext, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	build, err := buildCampaignBinaries(buildContext, artifactRoot)
 	cancel()
@@ -145,7 +147,9 @@ func runCampaigns(cfg runnerConfig, stdout io.Writer) error {
 		if status != "reproduced" {
 			return fmt.Errorf("replay explicitly reported nondeterminism: %s", reason)
 		}
-		fmt.Fprintf(stdout, "faultcampaign replay=pass digest=%s artifacts=%s\n", observed.TerminalDigest, caseDir)
+		if _, err := fmt.Fprintf(stdout, "faultcampaign replay=pass digest=%s artifacts=%s\n", observed.TerminalDigest, caseDir); err != nil {
+			return fmt.Errorf("write campaign status: %w", err)
+		}
 		return nil
 	}
 
@@ -155,15 +159,21 @@ func runCampaigns(cfg runnerConfig, stdout io.Writer) error {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(stdout, "faultcampaign phase=case size=%d profile=%s artifacts=%s\n", size, profile, caseDir)
+			if _, err := fmt.Fprintf(stdout, "faultcampaign phase=case size=%d profile=%s artifacts=%s\n", size, profile, caseDir); err != nil {
+				return fmt.Errorf("write campaign status: %w", err)
+			}
 			trace, err := runOneCampaign(cfg, build, size, profile, caseDir, nil)
 			if err != nil {
-				return fmt.Errorf("N=%d profile=%s: %w", size, profile, err)
+				return fmt.Errorf("n=%d profile=%s: %w", size, profile, err)
 			}
-			fmt.Fprintf(stdout, "faultcampaign case=pass size=%d profile=%s digest=%s\n", size, profile, trace.TerminalDigest)
+			if _, err := fmt.Fprintf(stdout, "faultcampaign case=pass size=%d profile=%s digest=%s\n", size, profile, trace.TerminalDigest); err != nil {
+				return fmt.Errorf("write campaign status: %w", err)
+			}
 		}
 	}
-	fmt.Fprintf(stdout, "faultcampaign status=pass artifacts=%s\n", artifactRoot)
+	if _, err := fmt.Fprintf(stdout, "faultcampaign status=pass artifacts=%s\n", artifactRoot); err != nil {
+		return fmt.Errorf("write campaign status: %w", err)
+	}
 	return nil
 }
 
@@ -188,6 +198,7 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 		cfg: cfg, build: build, size: size, profile: profile, caseDir: caseDir,
 		recorder: newHistoryRecorder(cfg.requestTimeout),
 		prefix:   fmt.Sprintf("fc-%d-%s-%x", size, strings.ReplaceAll(profile, "-", "_"), cfg.seed),
+		//nolint:gosec // G404: weak random is fine for test generation
 		rng:      rand.New(rand.NewPCG(cfg.seed, uint64(size)<<32|uint64(len(profile)))),
 	}
 	manifest := state.manifest("starting", "")
@@ -362,18 +373,19 @@ func (r *historyRecorder) execute(node int, baseURL string, operation HistoryEve
 	} else {
 		switch operation.Kind {
 		case OpGet:
-			if status == http.StatusOK {
+			switch status {
+			case http.StatusOK:
 				operation.Result = ResultOK
 				operation.Found = true
 				operation.Value = string(responseBody)
-			} else if status == http.StatusNotFound {
+			case http.StatusNotFound:
 				operation.Result = ResultOK
 				operation.Found = false
 				operation.Value = ""
-			} else {
+			default:
 				operation.Result = ResultFail
 			}
-		default:
+		case OpPut, OpDelete, OpTxn:
 			if status == http.StatusNoContent {
 				operation.Result = ResultOK
 			} else {
@@ -446,23 +458,29 @@ func (s *campaignState) runBaseline() error {
 		return err
 	}
 	read := s.get(1, alpha)
-	if err := requireAcknowledged(read, "baseline read"); err != nil || !read.Found || read.Value != "one" {
-		return fmt.Errorf("baseline read mismatch: event=%#v error=%v", read, err)
+	if err := requireAcknowledged(read, "baseline read"); err != nil {
+		return fmt.Errorf("baseline read mismatch: event=%#v error=%w", read, err)
+	} else if !read.Found || read.Value != "one" {
+		return fmt.Errorf("baseline read mismatch: event=%#v", read)
 	}
 	transaction := []TxnOperation{{Key: beta, Value: "two"}, {Key: gamma, Value: "three"}}
 	if err := requireAcknowledged(s.txn(1, transaction), "baseline transaction"); err != nil {
 		return err
 	}
 	read = s.get(1, beta)
-	if err := requireAcknowledged(read, "baseline transaction read"); err != nil || !read.Found || read.Value != "two" {
-		return fmt.Errorf("baseline transaction read mismatch: event=%#v error=%v", read, err)
+	if err := requireAcknowledged(read, "baseline transaction read"); err != nil {
+		return fmt.Errorf("baseline transaction read mismatch: event=%#v error=%w", read, err)
+	} else if !read.Found || read.Value != "two" {
+		return fmt.Errorf("baseline transaction read mismatch: event=%#v", read)
 	}
 	if err := requireAcknowledged(s.delete(1, alpha), "baseline delete"); err != nil {
 		return err
 	}
 	read = s.get(1, alpha)
-	if err := requireAcknowledged(read, "baseline deleted read"); err != nil || read.Found {
-		return fmt.Errorf("baseline delete was not observable: event=%#v error=%v", read, err)
+	if err := requireAcknowledged(read, "baseline deleted read"); err != nil {
+		return fmt.Errorf("baseline delete was not observable: event=%#v error=%w", read, err)
+	} else if read.Found {
+		return fmt.Errorf("baseline delete was not observable: event=%#v", read)
 	}
 	return nil
 }
@@ -614,6 +632,7 @@ func (s *campaignState) runAsymmetricPartition() error {
 	f := s.size - slow
 	if f > 0 {
 		for offset := range f {
+			//nolint:gosec // G115: size conversion is safe
 			from := uint64(s.size - offset)
 			if err := s.setDirectedDrop(1, from, 1, true, "asymmetric-partition-progress"); err != nil {
 				return err
@@ -627,6 +646,7 @@ func (s *campaignState) runAsymmetricPartition() error {
 		}
 	}
 	for offset := range s.size - 1 {
+		//nolint:gosec // G115: size conversion is safe
 		from := uint64(s.size - offset)
 		if err := s.setDirectedDrop(1, from, 1, true, "asymmetric-partition-fail-closed"); err != nil {
 			return err
@@ -865,6 +885,7 @@ func (s *campaignState) runMalformedFrames() error {
 		{kind: "oversized-frame", body: bytes.Repeat([]byte{0xff}, (2<<20)+1), want: http.StatusRequestEntityTooLarge},
 	}
 	for _, testCase := range cases {
+		//nolint:gosec // G115: safe conversion
 		action := s.planAction(testCase.kind, target.id, 0, uint64(target.id), true, "direct peer listener hardening probe")
 		status, response, err := rawHTTPRequest(s.recorder.client, http.MethodPost, target.peerURL+"/epaxos/message", testCase.body, "application/octet-stream")
 		if err == nil && status != testCase.want {
@@ -908,6 +929,7 @@ func (s *campaignState) runOverload() error {
 	results := make(chan HistoryEvent, operations)
 	var workers sync.WaitGroup
 	for operation := range operations {
+		//nolint:gosec // G115: s.size is positive
 		node := 1 + int(s.rng.Uint64N(uint64(s.size)))
 		workers.Add(1)
 		go func(index, nodeID int) {
@@ -1006,8 +1028,11 @@ func (s *campaignState) runAdmissionPressure() error {
 		snapshots := make([]admissionSnapshot, 0, len(s.cluster.nodes))
 		for _, node := range s.cluster.nodes {
 			status, body, err := rawHTTPRequest(s.recorder.client, http.MethodGet, node.adminURL+"/metrics", nil, "")
-			if err != nil || status != http.StatusOK {
-				return nil, fmt.Errorf("node %d admission metrics status=%d error=%v", node.id, status, err)
+			if err != nil {
+				return nil, fmt.Errorf("node %d admission metrics: %w", node.id, err)
+			}
+			if status != http.StatusOK {
+				return nil, fmt.Errorf("node %d admission metrics status=%d", node.id, status)
 			}
 			metrics := string(body)
 			queued, err := prometheusUint(metrics, "kvnode_transport_queued_frames")
@@ -1027,6 +1052,7 @@ func (s *campaignState) runAdmissionPressure() error {
 				return nil, err
 			}
 			snapshots = append(snapshots, admissionSnapshot{blocked: blocked, queued: queued, inflight: inflight, retrying: retrying})
+			//nolint:gosec // G115: capacity is positive
 			if queued+inflight > uint64(capacity) || retrying > uint64(capacity) {
 				return nil, fmt.Errorf("node %d exceeded transport ownership bounds queued=%d inflight=%d retry=%d", node.id, queued, inflight, retrying)
 			}
@@ -1116,8 +1142,11 @@ func (s *campaignState) runRetentionPressure() error {
 			return fmt.Errorf("retention pressure write failed unexpectedly: %#v", event)
 		}
 		status, body, err := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/metrics", nil, "")
-		if err != nil || status != http.StatusOK {
-			return fmt.Errorf("retention metrics status=%d error=%v", status, err)
+		if err != nil {
+			return fmt.Errorf("retention metrics error: %w", err)
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("retention metrics status=%d", status)
 		}
 		level, err := prometheusUint(string(body), "kvnode_retention_level")
 		if err != nil {
@@ -1142,8 +1171,11 @@ func (s *campaignState) runRetentionPressure() error {
 				return fmt.Errorf("retention pressure accepted new proposal: %#v", rejected)
 			}
 			status, afterBody, err := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/metrics", nil, "")
-			if err != nil || status != http.StatusOK {
-				return fmt.Errorf("retention post-rejection metrics status=%d error=%v", status, err)
+			if err != nil {
+				return fmt.Errorf("retention post-rejection metrics error: %w", err)
+			}
+			if status != http.StatusOK {
+				return fmt.Errorf("retention post-rejection metrics status=%d", status)
 			}
 			after, err := prometheusUint(string(afterBody), "kvnode_storage_durable_instance_records")
 			if err != nil {
@@ -1153,8 +1185,11 @@ func (s *campaignState) runRetentionPressure() error {
 				return fmt.Errorf("durable instance count decreased under retention pressure: before=%d after=%d", before, after)
 			}
 			status, _, err = rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/livez", nil, "")
-			if err != nil || status != http.StatusOK {
-				return fmt.Errorf("retention pressure liveness status=%d error=%v", status, err)
+			if err != nil {
+				return fmt.Errorf("retention pressure liveness error: %w", err)
+			}
+			if status != http.StatusOK {
+				return fmt.Errorf("retention pressure liveness status=%d", status)
 			}
 			s.receipt(action, "bounded-retention-pressure", uint64(operation+1), true, "")
 			return nil
@@ -1215,7 +1250,10 @@ func (s *campaignState) postHealCanary() error {
 	cancel()
 	if err != nil {
 		status, body, readyErr := rawHTTPRequest(s.recorder.client, http.MethodGet, s.cluster.nodes[0].adminURL+"/readyz", nil, "")
-		return fmt.Errorf("%w; readiness status=%d body=%q error=%v", err, status, strings.TrimSpace(string(body)), readyErr)
+		if readyErr != nil {
+			return fmt.Errorf("%w; readiness error: %w", err, readyErr)
+		}
+		return fmt.Errorf("%w; readiness status=%d body=%q", err, status, strings.TrimSpace(string(body)))
 	}
 	for _, node := range s.cluster.nodes {
 		var event HistoryEvent
@@ -1248,6 +1286,7 @@ func (s *campaignState) observeUnknownMutations() error {
 			for _, operation := range event.Txn {
 				keys[operation.Key] = struct{}{}
 			}
+		case OpGet:
 		}
 	}
 	ordered := make([]string, 0, len(keys))
@@ -1273,6 +1312,7 @@ func (s *campaignState) verifyTerminalOnAll(terminal map[string]string) error {
 			for _, operation := range event.Txn {
 				keys[operation.Key] = struct{}{}
 			}
+		case OpGet:
 		}
 	}
 	for _, node := range s.cluster.nodes {
@@ -1340,6 +1380,7 @@ func (s *campaignState) runCheckpointCommand(label string, arguments ...string) 
 	}
 	context, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	//nolint:gosec // G204: command execution is controlled and validated
 	command := exec.CommandContext(context, argv[0], argv[1:]...)
 	command.Env = append(os.Environ(), "KVNODE_CHECKPOINT_REPORT="+reportPath)
 	output, err := command.CombinedOutput()

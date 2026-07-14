@@ -230,7 +230,7 @@ func TestDSTFailureBoundarySlowQuorumSizesOneThroughSeven(t *testing.T) {
 				s.omit(id)
 			}
 
-			cmd := dstPut(1000+uint64(tc.n), 1, "slow-quorum-"+strconv.Itoa(tc.n), "progress")
+			cmd := dstPut(1000+uint64(tc.n), 1, "slow-quorum-"+strconv.Itoa(tc.n), "progress") //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 			ref, err := s.nodes[1].Propose(cmd)
 			if err != nil {
 				t.Fatal(err)
@@ -266,7 +266,7 @@ func TestDSTFailureBoundarySlowQuorumSizesOneThroughSeven(t *testing.T) {
 				s.omit(id)
 			}
 
-			cmd := dstPut(2000+uint64(tc.n), 1, "slow-quorum-"+strconv.Itoa(tc.n), "after-heal")
+			cmd := dstPut(2000+uint64(tc.n), 1, "slow-quorum-"+strconv.Itoa(tc.n), "after-heal") //nolint:gosec // G115: test harness converts bounded int index/count
 			ref, err := s.nodes[1].Propose(cmd)
 			if err != nil {
 				t.Fatal(err)
@@ -301,7 +301,7 @@ func TestDSTStorageFailureBoundarySlowQuorumSizesOneThroughSeven(t *testing.T) {
 					s.stores[id].FailWrites = true
 				}
 
-				cmd := dstPut(3000+uint64(n*10+failedCount), 1, "storage-boundary-"+strconv.Itoa(n), "progress-"+strconv.Itoa(failedCount))
+				cmd := dstPut(3000+uint64(n*10+failedCount), 1, "storage-boundary-"+strconv.Itoa(n), "progress-"+strconv.Itoa(failedCount)) //nolint:gosec // G115: test harness converts bounded int index/count
 				ref, err := s.nodes[1].Propose(cmd)
 				if err != nil {
 					t.Fatal(err)
@@ -334,7 +334,7 @@ func TestDSTStorageFailureBoundarySlowQuorumSizesOneThroughSeven(t *testing.T) {
 				s.stores[id].FailWrites = true
 			}
 
-			cmd := dstPut(4000+uint64(n), 1, "storage-boundary-"+strconv.Itoa(n), "after-restore")
+			cmd := dstPut(4000+uint64(n), 1, "storage-boundary-"+strconv.Itoa(n), "after-restore") //nolint:gosec // G115: test harness converts bounded int index/count
 			ref, err := s.nodes[1].Propose(cmd)
 			if err != nil {
 				t.Fatal(err)
@@ -701,7 +701,7 @@ func dstHighestReplicaIDs(n, count int) []ReplicaID {
 	}
 	ids := make([]ReplicaID, 0, count)
 	for id := n - count + 1; id <= n; id++ {
-		ids = append(ids, ReplicaID(id))
+		ids = append(ids, ReplicaID(id)) //nolint:gosec // G115: test harness converts bounded int index/count
 	}
 	return ids
 }
@@ -880,9 +880,7 @@ func dstDriveAllowingStorageFailures(t *testing.T, s *simCluster, rounds int) in
 				blockedWrites++
 				continue
 			}
-			for _, c := range rd.Committed {
-				s.apps[id] = append(s.apps[id], c)
-			}
+			s.apps[id] = append(s.apps[id], rd.Committed...)
 			for _, m := range rd.Messages {
 				if !s.deliver(m) {
 					s.delayed = append(s.delayed, m)
@@ -902,7 +900,9 @@ func dstTickAllAllowingStorageFailures(t *testing.T, s *simCluster, ticks int) i
 	for range ticks {
 		for _, id := range s.ids() {
 			if !s.paused[id] {
-				s.nodes[id].Tick()
+				if err := s.nodes[id].Tick(); err != nil {
+					panic(err)
+				}
 			}
 		}
 		blockedWrites += dstDriveAllowingStorageFailures(t, s, 100)

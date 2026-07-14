@@ -130,7 +130,7 @@ func validateBootstrapFrontier(f BootstrapFrontier, base ConfState) error {
 		if coverage > InstanceNum(maxBootstrapSparseRefs-totalCoverage) {
 			return ErrBootstrapBounds
 		}
-		totalCoverage += int(coverage)
+		totalCoverage += int(coverage) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 		for j, instance := range lane.Sparse {
 			if instance == 0 || instance <= lane.CompactedExecutedThrough || instance > lane.ObservedThrough ||
 				(j > 0 && lane.Sparse[j-1] >= instance) {
@@ -340,6 +340,7 @@ func (c ReadyCertificate) Clone() ReadyCertificate {
 // BootstrapPhase is the durable phase of a voter plan.
 type BootstrapPhase uint8
 
+// BootstrapPhase values describe voter-plan progress.
 const (
 	BootstrapPhaseUnspecified BootstrapPhase = iota
 	BootstrapPhasePreparing
@@ -356,6 +357,7 @@ const (
 // BootstrapOutcome is a terminal replicated membership-control outcome.
 type BootstrapOutcome uint8
 
+// BootstrapOutcome values describe terminal bootstrap results.
 const (
 	BootstrapOutcomeUnspecified BootstrapOutcome = iota
 	BootstrapOutcomeActivated
@@ -424,6 +426,7 @@ func (r BootstrapRecord) Clone() BootstrapRecord {
 // LocalVoterStatus is the durable local admission state.
 type LocalVoterStatus uint8
 
+// LocalVoterStatus values describe local admission eligibility.
 const (
 	LocalVoterStatusUnspecified LocalVoterStatus = iota
 	LocalVoterStatusStaged
@@ -523,6 +526,7 @@ type BootstrapStatusSnapshot struct {
 // BootstrapExit selects one reserved terminal control ref for recovery.
 type BootstrapExit uint8
 
+// BootstrapExit values select reserved terminal controls.
 const (
 	BootstrapExitActivate BootstrapExit = iota + 1
 	BootstrapExitAbort
@@ -531,6 +535,7 @@ const (
 // BootstrapMessageType identifies an authenticated out-of-band bootstrap message.
 type BootstrapMessageType uint8
 
+// BootstrapMessageType values identify bootstrap control messages.
 const (
 	BootstrapMsgFenceRequest BootstrapMessageType = iota + 1
 	BootstrapMsgFenceAck
@@ -1405,6 +1410,8 @@ func validateBootstrapRecord(record BootstrapRecord) error {
 		if record.Outcome != BootstrapOutcomeAborted || record.TerminalRef != record.Plan.Reservations.Abort {
 			return ErrBootstrapControl
 		}
+	case BootstrapPhaseUnspecified, BootstrapPhasePreparing, BootstrapPhasePrepared, BootstrapPhaseLocalFenced, BootstrapPhaseFenced, BootstrapPhaseCertified, BootstrapPhaseTargetReady, BootstrapPhaseFinalizing:
+		fallthrough
 	default:
 		if record.Outcome != BootstrapOutcomeUnspecified || !record.TerminalRef.IsZero() {
 			return ErrBootstrapControl
@@ -1455,6 +1462,8 @@ func validateMembershipResult(record InstanceRecord) error {
 		if !confStateIsZero(result.Successor) || record.ConfChangeResult.Outcome == ConfChangeApplied {
 			return fmt.Errorf("%w: rejected membership result has successor", ErrInvalidConfig)
 		}
+	case BootstrapOutcomeUnspecified:
+		fallthrough
 	default:
 		return fmt.Errorf("%w: unknown membership outcome", ErrInvalidConfig)
 	}
@@ -1523,7 +1532,7 @@ func DecodeBootstrapMessage(src []byte, message *BootstrapMessage) error {
 	if p.uvarint() != bootstrapWireVersion {
 		return ErrInvalidBootstrapMessage
 	}
-	message.Type = BootstrapMessageType(p.uvarint())
+	message.Type = BootstrapMessageType(p.uvarint8())
 	p.fixed((*[32]byte)(&message.Cluster))
 	p.fixed((*[32]byte)(&message.Plan))
 	message.From = ReplicaID(p.uvarint())
@@ -1657,6 +1666,15 @@ func (p *bootstrapParser) uvarint() uint64 {
 	return value
 }
 
+func (p *bootstrapParser) uvarint8() uint8 {
+	v := p.uvarint()
+	if v > uint64(^uint8(0)) {
+		p.err = true
+		return 0
+	}
+	return uint8(v)
+}
+
 func (p *bootstrapParser) fixed(dst *[32]byte) {
 	if p.err || len(p.b) < len(dst) {
 		p.err = true
@@ -1666,9 +1684,9 @@ func (p *bootstrapParser) fixed(dst *[32]byte) {
 	p.b = p.b[len(dst):]
 }
 
-func (p *bootstrapParser) bytes(max int) []byte {
+func (p *bootstrapParser) bytes(maxLen int) []byte {
 	length := p.uvarint()
-	if p.err || length > uint64(max) || length > uint64(len(p.b)) {
+	if p.err || length > uint64(maxLen) || length > uint64(len(p.b)) { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 		p.err = true
 		return nil
 	}
@@ -2823,6 +2841,7 @@ func (n *RawNode) admitWhileFenced(message Message) error {
 			if message.Command.Kind == CommandUser && len(message.Command.Payload) == 0 {
 				return nil
 			}
+		case MsgPreAccept, MsgAccept, MsgCommit, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
 		}
 		wire, err := decodeMembershipCommand(message.Command)
 		if err != nil || wire.Operation != operation || wire.Plan.Request.Plan != state.record.Plan.Request.Plan {
@@ -2858,6 +2877,7 @@ func (n *RawNode) admitWhileFenced(message Message) error {
 		if inst == nil {
 			return ErrBootstrapContradiction
 		}
+	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
 	}
 	return nil
 }
