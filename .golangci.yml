@@ -4,6 +4,9 @@ run:
   go: "1.26"
 
 linters:
+  # govet: DEFAULT analyzer set only. Do NOT set enable-all (fieldalignment/shadow noise).
+  # All of errcheck, errorlint, exhaustive, gocritic, gosec, govet, ineffassign, revive,
+  # staticcheck, unused, wastedassign stay enabled — R9 correctness/style gate.
   enable:
     - errcheck
     - errorlint
@@ -19,8 +22,6 @@ linters:
   settings:
     exhaustive:
       default-signifies-exhaustive: false
-    govet:
-      enable-all: true
     staticcheck:
       checks:
         - all
