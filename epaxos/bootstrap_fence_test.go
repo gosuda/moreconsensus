@@ -1,6 +1,7 @@
 package epaxos
 
 import (
+	"encoding/binary"
 	"bytes"
 	"errors"
 	"reflect"
@@ -433,5 +434,47 @@ func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *t
 	}
 	if err := set.AddAuthenticated(conflictTotal, 1, 1); !errors.Is(err, ErrBootstrapChunkConflict) {
 		t.Fatalf("same-index total conflict err=%v", err)
+	}
+}
+
+
+func TestDecodeBootstrapMessageRejectsOversizedType(t *testing.T) {
+	f := newBootstrapTestFixture(t, 1, 1)
+	plan := prepareBootstrapPlan(t, f)
+	message, err := BuildBootstrapMessage(BootstrapMessage{
+		Type: BootstrapMsgReadyQuery, Cluster: f.cluster, Plan: plan.Request.Plan,
+		From: 1, FromIncarnation: 1, To: 1, BaseID: plan.Request.Base.ID,
+		BaseDigest: plan.RequestDigest, Payload: []byte("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeBootstrapMessage(nil, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Replace the type uvarint (immediately after magic+version) with 257 so it
+	// would truncate to BootstrapMsgFenceRequest without range checking.
+	frame := append([]byte(nil), encoded[:len(bootstrapWireMagic)]...)
+	// re-encode version then oversized type then rest after original version+type
+	// Parse original after magic: version uvarint then type uvarint.
+	rest := encoded[len(bootstrapWireMagic):]
+	_, nVer := binary.Uvarint(rest)
+	if nVer <= 0 {
+		t.Fatal("version uvarint")
+	}
+	_, nType := binary.Uvarint(rest[nVer:])
+	if nType <= 0 {
+		t.Fatal("type uvarint")
+	}
+	frame = append(frame, rest[:nVer]...)
+	frame = binary.AppendUvarint(frame, 257)
+	frame = append(frame, rest[nVer+nType:]...)
+	var got BootstrapMessage
+	if err := DecodeBootstrapMessage(frame, &got); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("oversized bootstrap type err=%v, want ErrInvalidBootstrapMessage; got=%#v", err, got)
+	}
+	if got.Type != 0 || got.From != 0 || len(got.Payload) != 0 {
+		t.Fatalf("failed decode left residue: %#v", got)
 	}
 }

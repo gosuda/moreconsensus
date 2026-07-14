@@ -1532,7 +1532,7 @@ func DecodeBootstrapMessage(src []byte, message *BootstrapMessage) error {
 	if p.uvarint() != bootstrapWireVersion {
 		return ErrInvalidBootstrapMessage
 	}
-	message.Type = BootstrapMessageType(p.uvarint()) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
+	message.Type = BootstrapMessageType(p.uvarint8())
 	p.fixed((*[32]byte)(&message.Cluster))
 	p.fixed((*[32]byte)(&message.Plan))
 	message.From = ReplicaID(p.uvarint())
@@ -1664,6 +1664,15 @@ func (p *bootstrapParser) uvarint() uint64 {
 	}
 	p.b = p.b[n:]
 	return value
+}
+
+func (p *bootstrapParser) uvarint8() uint8 {
+	v := p.uvarint()
+	if v > uint64(^uint8(0)) {
+		p.err = true
+		return 0
+	}
+	return uint8(v)
 }
 
 func (p *bootstrapParser) fixed(dst *[32]byte) {
