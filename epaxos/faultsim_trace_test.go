@@ -217,10 +217,10 @@ func faultWriteTrace(path string, trace faultTrace) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
+	return os.WriteFile(path, data, 0o600)
 }
 
 func faultReadTrace(path string) (faultTrace, error) {
