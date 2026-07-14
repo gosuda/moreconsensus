@@ -445,6 +445,12 @@ type Config struct {
 	// MaxDeferredRecordLoads bounds deferred messages waiting on async record
 	// loads for folded instances. Zero selects the package default of 256.
 	MaxDeferredRecordLoads int
+	// RetainExecutedPerLane is the per-lane resident tail of executed instances
+	// kept after fold (0 selects default 1024).
+	RetainExecutedPerLane int
+	// MaxResidentInstances fails local Propose when engine.residentCount exceeds
+	// the bound (0 = unlimited).
+	MaxResidentInstances int
 	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
 	// slices instead of cloning them. When true, the caller transfers ownership
 	// of those slices and must not mutate or reuse them while they remain
@@ -910,6 +916,10 @@ type RuntimeStats struct {
 	OldestUnexecutedAgeTicks uint64
 	// RecordLoadMisses counts ProvideRecordLoad results with Found=false.
 	RecordLoadMisses uint64
+	// PayloadStubInstances counts residents with dropped command payloads.
+	PayloadStubInstances uint64
+	// FoldedInstances counts instances folded out of the resident map.
+	FoldedInstances uint64
 }
 
 // StatusSnapshot is a copy-only view of node state for diagnostics and tests.
@@ -951,6 +961,8 @@ var (
 	ErrUnrequestedRecordLoad = errors.New("epaxos: unrequested record load")
 	// ErrInvalidRecord reports a record that fails checksum validation.
 	ErrInvalidRecord = errors.New("epaxos: invalid record")
+	// ErrResidentInstancesExceeded reports Propose backpressure when the resident set is too large.
+	ErrResidentInstancesExceeded = errors.New("epaxos: resident instances exceed configured bound")
 	// ErrBallotExhausted reports that no strictly greater ballot is representable.
 	ErrBallotExhausted = errors.New("epaxos: ballot exhausted")
 	// ErrInstanceExhausted reports that no further local instance number is representable.

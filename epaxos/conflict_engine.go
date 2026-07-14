@@ -844,6 +844,21 @@ func (i *laneIndex) addRetiredSeq(through InstanceNum, seq uint64) {
 	}
 }
 
+func (e *conflictEngine) canAdvanceFold(lane instanceLane, through InstanceNum) bool {
+	index := e.laneIndex[lane]
+	if index == nil || through <= index.folded {
+		return through == 0 || (index != nil && through == index.folded)
+	}
+	for instance := index.folded + 1; ; instance++ {
+		if !index.pendingFold.contains(instance) {
+			return false
+		}
+		if instance == through {
+			return true
+		}
+	}
+}
+
 func (e *conflictEngine) advanceFold(lane instanceLane, through InstanceNum) {
 	index := e.ensureLane(lane)
 	if through < index.folded {

@@ -228,6 +228,10 @@ type RawNode struct {
 	pendingRecordLoadMessages       int
 	maxDeferredRecordLoads          int
 	recordLoadMisses                uint64
+	retainExecutedPerLane           int
+	maxResidentInstances            int
+	payloadStubInstances            uint64
+	foldedInstances                 uint64
 	tryEvidenceChecks               map[tryEvidenceKey]map[ReplicaID]InstanceRecord
 	committedThrough                map[instanceLane]InstanceNum
 	maxDependencyRecoveriesPerDrive int
@@ -661,6 +665,15 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	if cfg.MaxDeferredRecordLoads == 0 {
 		cfg.MaxDeferredRecordLoads = 256
 	}
+	if cfg.RetainExecutedPerLane < 0 {
+		return nil, fmt.Errorf("%w: RetainExecutedPerLane must be non-negative", ErrInvalidConfig)
+	}
+	if cfg.RetainExecutedPerLane == 0 {
+		cfg.RetainExecutedPerLane = 1024
+	}
+	if cfg.MaxResidentInstances < 0 {
+		return nil, fmt.Errorf("%w: MaxResidentInstances must be non-negative", ErrInvalidConfig)
+	}
 	if cfg.LegacyProcessAtDomain != nil && *cfg.LegacyProcessAtDomain > TimingDomainTOQ {
 		return nil, fmt.Errorf("%w: unknown legacy ProcessAt timing domain", ErrInvalidConfig)
 	}
@@ -700,6 +713,8 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		toqRuntimes:                     make(map[ConfID]toqRuntime),
 		maxDeferredPreAccepts:           cfg.MaxDeferredPreAccepts,
 		maxDeferredRecordLoads:          cfg.MaxDeferredRecordLoads,
+		retainExecutedPerLane:           cfg.RetainExecutedPerLane,
+		maxResidentInstances:            cfg.MaxResidentInstances,
 		pendingRecordLoads:              make(map[InstanceRef]*recordLoadWait),
 		maxReadyMessages:                cfg.MaxReadyMessages,
 		maxDependencyRecoveriesPerDrive: cfg.MaxDependencyRecoveriesPerDrive,
@@ -1804,6 +1819,9 @@ func (n *RawNode) requireLocalVoterForConf(conf ConfState) error {
 
 // Propose creates a new local EPaxos instance for an application command.
 func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
+	if n.maxResidentInstances > 0 && n.engine.residentCount() >= n.maxResidentInstances {
+		return InstanceRef{}, ErrResidentInstancesExceeded
+	}
 	if cmd.Kind == CommandConfChange {
 		return InstanceRef{}, fmt.Errorf("%w: use ProposeConfChange", ErrInvalidConfig)
 	}
@@ -1833,6 +1851,9 @@ func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 
 // ProposeConfChange proposes a validated membership change encoded as a consensus command.
 func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
+	if n.maxResidentInstances > 0 && n.engine.residentCount() >= n.maxResidentInstances {
+		return InstanceRef{}, ErrResidentInstancesExceeded
+	}
 	if cc.Type == ConfChangeAddVoter {
 		return InstanceRef{}, ErrVoterCertificateRequired
 	}
@@ -2114,6 +2135,8 @@ func (n *RawNode) RuntimeStats() RuntimeStats {
 		FrozenReadyRecords:   len(n.frozenReady.Records) + len(n.frozenReady.BootstrapRecords),
 		FrozenReadyMessages:  len(n.frozenReady.Messages) + len(n.frozenReady.BootstrapMessages),
 		RecordLoadMisses:     n.recordLoadMisses,
+		PayloadStubInstances: n.payloadStubInstances,
+		FoldedInstances:      n.foldedInstances,
 		PendingReadyRecords:  len(n.pendingReady.Records) + len(n.pendingReady.BootstrapRecords),
 		PendingReadyMessages: len(n.pendingReady.Messages) + len(n.pendingReady.BootstrapMessages),
 		NextReadyRecords:     len(n.nextReady.Records) + len(n.nextReady.BootstrapRecords),
@@ -2228,6 +2251,7 @@ func (n *RawNode) Advance(rd Ready) error {
 
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.applyBootstrapDurability(rd.BootstrapRecords)
+	n.retireExecuted()
 
 	if n.frozenReady.Empty() {
 		n.awaitAdvance = false
@@ -4581,12 +4605,25 @@ func (n *RawNode) ProvideRecordLoad(res RecordLoadResult) error {
 	delete(n.pendingRecordLoads, res.Ref)
 	for _, msg := range msgs {
 		if err := n.Step(msg); err != nil {
-			// continue replaying; surface first error? brief: replay in order
-			// Keep going for determinism of rest; return last? Return first error.
 			return err
 		}
 	}
+	n.maybeRefoldLoaded(rec.Ref)
 	return nil
+}
+
+func (n *RawNode) maybeRefoldLoaded(ref InstanceRef) {
+	inst := n.instances[ref]
+	if inst == nil || inst.rec.Status != StatusExecuted {
+		return
+	}
+	if ref.Instance > n.engine.foldedThrough(laneFor(ref)) {
+		return
+	}
+	rec := inst.rec.Clone()
+	n.engine.foldRecord(rec)
+	delete(n.instances, ref)
+	n.foldedInstances++
 }
 
 func validateRecordChecksum(rec InstanceRecord) error {
