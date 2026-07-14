@@ -128,11 +128,19 @@ func verifyRehearsalReport(report map[string]any, root string, collection collec
 	if err := verifyRetainedSourceTree(collection, "rehearsal"); err != nil {
 		return err
 	}
-	if binaryDigest, err := verifyMachOArm64(collection.KVNodeBinary); err != nil || binaryDigest != collection.KVNodeSHA256 {
-		return fmt.Errorf("rehearsal kvnode binary identity changed or was relabeled: digest=%s err=%v", binaryDigest, err)
+	binaryDigest, err := verifyMachOArm64(collection.KVNodeBinary)
+	if err != nil {
+		return fmt.Errorf("rehearsal kvnode binary verification failed: %w", err)
 	}
-	if binaryDigest, err := verifyMachOArm64(collection.CheckpointBinary); err != nil || binaryDigest != collection.CheckpointSHA256 {
-		return fmt.Errorf("rehearsal kvcheckpoint binary identity changed or was relabeled: digest=%s err=%v", binaryDigest, err)
+	if binaryDigest != collection.KVNodeSHA256 {
+		return fmt.Errorf("rehearsal kvnode binary identity changed or was relabeled: digest=%s, want %s", binaryDigest, collection.KVNodeSHA256)
+	}
+	binaryDigest, err = verifyMachOArm64(collection.CheckpointBinary)
+	if err != nil {
+		return fmt.Errorf("rehearsal kvcheckpoint binary verification failed: %w", err)
+	}
+	if binaryDigest != collection.CheckpointSHA256 {
+		return fmt.Errorf("rehearsal kvcheckpoint binary identity changed or was relabeled: digest=%s, want %s", binaryDigest, collection.CheckpointSHA256)
 	}
 	artifacts, err := reportArtifacts(report)
 	if err != nil {
@@ -312,11 +320,19 @@ func finalize(cfg finalizeConfig) (finalizeResult, error) {
 	if err := verifyRetainedTLSIdentity(collection); err != nil {
 		return finalizeResult{}, err
 	}
-	if binaryDigest, err := verifyMachOArm64(collection.KVNodeBinary); err != nil || binaryDigest != collection.KVNodeSHA256 {
-		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvnode release binary changed: digest=%s err=%v", binaryDigest, err)
+	binaryDigest, err := verifyMachOArm64(collection.KVNodeBinary)
+	if err != nil {
+		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvnode release binary verification failed: %w", err)
 	}
-	if binaryDigest, err := verifyMachOArm64(collection.CheckpointBinary); err != nil || binaryDigest != collection.CheckpointSHA256 {
-		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvcheckpoint release binary changed: digest=%s err=%v", binaryDigest, err)
+	if binaryDigest != collection.KVNodeSHA256 {
+		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvnode release binary changed: digest=%s, want %s", binaryDigest, collection.KVNodeSHA256)
+	}
+	binaryDigest, err = verifyMachOArm64(collection.CheckpointBinary)
+	if err != nil {
+		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvcheckpoint release binary verification failed: %w", err)
+	}
+	if binaryDigest != collection.CheckpointSHA256 {
+		return finalizeResult{}, fmt.Errorf("production non-claim: exact kvcheckpoint release binary changed: digest=%s, want %s", binaryDigest, collection.CheckpointSHA256)
 	}
 	if err := verifyArtifactClosure(cfg.stagingPath, collection.Artifacts, requiredCollectedArtifactIDs); err != nil {
 		return finalizeResult{}, err
@@ -416,6 +432,7 @@ func finalize(cfg finalizeConfig) (finalizeResult, error) {
 	if err != nil {
 		return finalizeResult{}, fmt.Errorf("create UDRO APFS image: %w output=%s", err, strings.TrimSpace(string(createResult.Output)))
 	}
+	//nolint:gosec // G304: staging temporary path under controller control
 	imageFile, err := os.Open(imageTemporary)
 	if err != nil {
 		return finalizeResult{}, err
@@ -443,6 +460,7 @@ func finalize(cfg finalizeConfig) (finalizeResult, error) {
 	defer func() {
 		if !mounted {
 			_, _ = runSubprocess(context.Background(), cfg.operationTimeout, []string{"/usr/bin/hdiutil", "detach", cfg.mountPath}, nil)
+			//nolint:gosec // G703: mount path under config control
 			_ = os.Remove(cfg.mountPath)
 		}
 	}()
@@ -582,6 +600,7 @@ func requireReadOnlyMount(path string) error {
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return err
 	}
+	//nolint:gosec // G115: stat.Flags is a non-negative mount-flag bitmask
 	if err := requireReadOnlyFlags(uint64(stat.Flags)); err != nil {
 		return fmt.Errorf("production non-claim: APFS image mount is not physically read-only: %w", err)
 	}

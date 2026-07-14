@@ -456,10 +456,12 @@ func (controller *processController) startDirect(index int) error {
 		return err
 	}
 	logPath := filepath.Join(logDir, fmt.Sprintf("node%d.log", index+1))
+	//nolint:gosec // G304: test staging log path under controller control
 	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
+	//nolint:gosec // G204: subprocess launched with controlled argv
 	command := exec.Command(argv[0], argv[1:]...)
 	command.Stdout, command.Stderr = log, log
 	if err := command.Start(); err != nil {
@@ -729,12 +731,16 @@ func (state *lifecycleState) verifyPeerRuntimeAuthorization() error {
 			if err != nil {
 				return 0, err
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
 			return response.StatusCode, readErr
 		}
-		if status, err := post(authenticated, []byte{0}); err != nil || status != http.StatusBadRequest {
-			return fmt.Errorf("peer %d authenticated TLS control probe status=%d err=%v", destinationIndex+1, status, err)
+		status, err := post(authenticated, []byte{0})
+		if err != nil {
+			return fmt.Errorf("peer %d authenticated TLS control probe: %w", destinationIndex+1, err)
+		}
+		if status != http.StatusBadRequest {
+			return fmt.Errorf("peer %d authenticated TLS control probe status=%d, want %d", destinationIndex+1, status, http.StatusBadRequest)
 		}
 		noCertTransport := &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots}}
 		noCertificate := &http.Client{Timeout: state.cfg.requestTimeout, Transport: noCertTransport, CheckRedirect: rejectRedirect}
@@ -758,8 +764,12 @@ func (state *lifecycleState) verifyPeerRuntimeAuthorization() error {
 		if err != nil {
 			return err
 		}
-		if status, err := post(authenticated, frame); err != nil || status != http.StatusForbidden {
-			return fmt.Errorf("peer %d certificate/message sender mismatch status=%d err=%v", destinationIndex+1, status, err)
+		status, err = post(authenticated, frame)
+		if err != nil {
+			return fmt.Errorf("peer %d certificate/message sender mismatch: %w", destinationIndex+1, err)
+		}
+		if status != http.StatusForbidden {
+			return fmt.Errorf("peer %d certificate/message sender mismatch status=%d, want %d", destinationIndex+1, status, http.StatusForbidden)
 		}
 		authTransport.CloseIdleConnections()
 		if _, err := state.store.addJSON(fmt.Sprintf("peer-%d-authorization-required", destinationIndex+1), map[string]any{
@@ -1108,11 +1118,13 @@ func (state *lifecycleState) buildCorruptRejection(root string) (string, string,
 		return "", "", "", err
 	}
 	manifest := filepath.Join(root, "CHECKPOINT-MANIFEST")
+	//nolint:gosec // G304: staging manifest path under controller control
 	payload, err := os.ReadFile(manifest)
 	if err != nil || len(payload) < 2 {
 		return "", "", "", fmt.Errorf("read corrupt rejection manifest: %w", err)
 	}
 	payload[len(payload)/2] ^= 1
+	//nolint:gosec // G703: path traversal taint analysis is safe
 	if err := os.WriteFile(manifest, payload, 0o600); err != nil {
 		return "", "", "", err
 	}
@@ -1124,10 +1136,12 @@ func (state *lifecycleState) buildTruncatedRejection(root string) (string, strin
 		return "", "", "", err
 	}
 	manifest := filepath.Join(root, "CHECKPOINT-MANIFEST")
+	//nolint:gosec // G304: staging manifest path under controller control
 	payload, err := os.ReadFile(manifest)
 	if err != nil || len(payload) < 2 {
 		return "", "", "", fmt.Errorf("read truncated rejection manifest: %w", err)
 	}
+	//nolint:gosec // G703: path traversal taint analysis is safe
 	if err := os.WriteFile(manifest, payload[:len(payload)/2], 0o600); err != nil {
 		return "", "", "", err
 	}
@@ -1212,6 +1226,7 @@ func (state *lifecycleState) collectLegacyAndRepair() error {
 }
 
 func mustReadFile(path string) []byte {
+	//nolint:gosec // G304: read file path under controller control
 	payload, _ := os.ReadFile(path)
 	return payload
 }
@@ -1358,8 +1373,11 @@ func (state *lifecycleState) collectPostRestore() error {
 		}
 		payload, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		_ = response.Body.Close()
-		if readErr != nil || response.StatusCode != http.StatusOK || !bytes.Contains(payload, []byte(state.preKey)) || !bytes.Contains(payload, []byte(state.postKey)) {
-			return fmt.Errorf("node%d bounded scan failed status=%d body=%q err=%v", index+1, response.StatusCode, payload, readErr)
+		if readErr != nil {
+			return fmt.Errorf("node%d bounded scan read failed: %w", index+1, readErr)
+		}
+		if response.StatusCode != http.StatusOK || !bytes.Contains(payload, []byte(state.preKey)) || !bytes.Contains(payload, []byte(state.postKey)) {
+			return fmt.Errorf("node%d bounded scan failed status=%d body=%q", index+1, response.StatusCode, payload)
 		}
 		probeID := fmt.Sprintf("probe-node%d", index+1)
 		probe := map[string]any{
@@ -1495,8 +1513,11 @@ func (state *lifecycleState) queueDepth(index int) (int, error) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	payload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if err != nil || response.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("metrics node%d status=%d err=%v", index+1, response.StatusCode, err)
+	if err != nil {
+		return 0, fmt.Errorf("metrics node%d request failed: %w", index+1, err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("metrics node%d status=%d", index+1, response.StatusCode)
 	}
 	for _, line := range strings.Split(string(payload), "\n") {
 		fields := strings.Fields(line)

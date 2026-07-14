@@ -295,6 +295,7 @@ func TestProductionHTTPSProbeUsesSeparateMutualTLSIdentityAndVerifiesIPSAN(t *te
 
 func TestProductionTLSRejectsReadablePrivateKeysAndAmbiguousTargets(t *testing.T) {
 	materials := makeTLSMaterials(t, true)
+	//nolint:gosec // G302: deliberately set to 0o644 to test rejection of readable keys
 	if err := os.Chmod(materials.clientKeyPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -373,6 +374,7 @@ func writeMachOFixture(t *testing.T, root, name string, cpu macho.Cpu) string {
 	binary.LittleEndian.PutUint32(header[8:12], 0)
 	binary.LittleEndian.PutUint32(header[12:16], 2)
 	path := filepath.Join(root, name)
+	//nolint:gosec // G306: mock executable fixture needs execute permission
 	if err := os.WriteFile(path, header, 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -390,6 +392,7 @@ func TestMachOReleaseBinaryFixtureIsHostIndependent(t *testing.T) {
 		t.Fatalf("amd64 fixture err=%v", err)
 	}
 	notMachO := filepath.Join(root, "not-mach-o")
+	//nolint:gosec // G306: mock executable fixture needs execute permission
 	if err := os.WriteFile(notMachO, []byte("not a Mach-O executable"), 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -504,15 +507,6 @@ func rewriteCollectionAndEnvelope(t *testing.T, fixture *rehearsalFixture) {
 	envelopePayload, _ := canonicalJSON(fixture.envelope)
 	replaceFixtureFile(t, filepath.Join(fixture.root, "collection.json"), collectionPayload)
 	replaceFixtureFile(t, fixture.reportPath, envelopePayload)
-}
-
-func rewriteRehearsalEnvelope(t *testing.T, fixture *rehearsalFixture) {
-	t.Helper()
-	payload, err := canonicalJSON(fixture.envelope)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replaceFixtureFile(t, fixture.reportPath, payload)
 }
 
 func replaceFixtureFile(t *testing.T, path string, payload []byte) {

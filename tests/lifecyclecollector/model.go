@@ -262,6 +262,7 @@ func readSecureFile(path string, private bool) ([]byte, error) {
 	if secureReadRaceHook != nil {
 		secureReadRaceHook(path)
 	}
+	//nolint:gosec // G304: path checked securely and is under controller control
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -352,6 +353,7 @@ func writeAtomic(path string, payload []byte, mode fs.FileMode) error {
 }
 
 func syncDirectory(path string) error {
+	//nolint:gosec // G304: directory path is staging path under control
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
@@ -394,6 +396,7 @@ func runSubprocess(parent context.Context, timeout time.Duration, argv []string,
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	result := commandResult{Argv: append([]string(nil), argv...), Command: commandString(argv), StartedAt: time.Now().UTC(), ExitCode: -1}
+	//nolint:gosec // G204: subprocess launched with controlled argv
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	if environment != nil {
 		command.Env = environment
@@ -425,6 +428,7 @@ func commandString(argv []string) string {
 	quoted := make([]string, len(argv))
 	for index, argument := range argv {
 		if argument != "" && strings.IndexFunc(argument, func(character rune) bool {
+			//nolint:staticcheck // QF1001: disjunction of allowed characters is cleaner than conjunction of negated terms
 			return !(character == '/' || character == '.' || character == '_' || character == ':' || character == '-' || character == '=' ||
 				(character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9'))
 		}) == -1 {
@@ -507,6 +511,7 @@ func snapshotTree(root string) (treeSnapshot, error) {
 		item := treeEntry{Path: relative, Mode: info.Mode().String(), Size: info.Size(), Device: device, Inode: inode}
 		_, _ = io.WriteString(hash, relative+"\x00"+info.Mode().String()+"\x00"+strconv.FormatInt(info.Size(), 10)+"\x00")
 		if info.Mode().IsRegular() {
+			//nolint:gosec // G304: file path inside staging tree
 			payload, err := os.ReadFile(path)
 			if err != nil {
 				return err
@@ -543,15 +548,15 @@ func directoryIdentity(path string) (string, error) {
 	return fmt.Sprintf("apfs-dev%d-ino%d", device, inode), nil
 }
 
-func independentTrees(source, copy treeSnapshot) error {
-	if source.TreeSHA256 != copy.TreeSHA256 {
-		return fmt.Errorf("backup content digest differs: source=%s backup=%s", source.TreeSHA256, copy.TreeSHA256)
+func independentTrees(source, backup treeSnapshot) error {
+	if source.TreeSHA256 != backup.TreeSHA256 {
+		return fmt.Errorf("backup content digest differs: source=%s backup=%s", source.TreeSHA256, backup.TreeSHA256)
 	}
-	if len(source.Entries) != len(copy.Entries) {
+	if len(source.Entries) != len(backup.Entries) {
 		return errors.New("backup entry count differs")
 	}
-	byPath := make(map[string]treeEntry, len(copy.Entries))
-	for _, entry := range copy.Entries {
+	byPath := make(map[string]treeEntry, len(backup.Entries))
+	for _, entry := range backup.Entries {
 		byPath[entry.Path] = entry
 	}
 	for _, sourceEntry := range source.Entries {
@@ -698,6 +703,7 @@ func sourceTreeIdentity(root string) (string, string, error) {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return "", "", fmt.Errorf("source identity refuses non-regular path %s (%s)", relative, info.Mode())
 		}
+		//nolint:gosec // G304: file path inside staging tree
 		payload, err := os.ReadFile(path)
 		if err != nil {
 			return "", "", err
