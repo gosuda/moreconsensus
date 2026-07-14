@@ -233,7 +233,7 @@ func TestVerifyCheckpointRejectsManifestAndFileAttacks(t *testing.T) {
 				for _, file := range manifest.files {
 					if strings.HasPrefix(file.path, "OPTIONS-") {
 						path := filepath.Join(checkpointDir, filepath.FromSlash(file.path))
-						out, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+						out, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0) //nolint:gosec // path constructed securely in test
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -343,7 +343,7 @@ func TestRestoreAndRepairRejectInvalidCheckpointWithoutMutation(t *testing.T) {
 			if err := operation.call(dataDir, checkpointDir); err == nil || !strings.Contains(err.Error(), "file count mismatch") {
 				t.Fatalf("%s error=%v, want manifest rejection", operation.name, err)
 			}
-			value, err := os.ReadFile(sentinel)
+			value, err := os.ReadFile(sentinel) //nolint:gosec // path constructed securely in test
 			if err != nil || string(value) != "unchanged" {
 				t.Fatalf("%s mutated live data: value=%q err=%v", operation.name, value, err)
 			}
@@ -462,7 +462,7 @@ func decodedCheckpointManifestForMutation(t *testing.T, checkpointDir string) ch
 
 func readCheckpointManifestBytes(t *testing.T, checkpointDir string) []byte {
 	t.Helper()
-	encoded, err := os.ReadFile(filepath.Join(checkpointDir, checkpointManifestName))
+	encoded, err := os.ReadFile(filepath.Join(checkpointDir, checkpointManifestName)) //nolint:gosec // path constructed securely in test
 	if err != nil {
 		t.Fatal(err)
 	}

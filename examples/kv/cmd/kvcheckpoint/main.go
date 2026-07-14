@@ -26,19 +26,19 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  kvcheckpoint checkpoint DATA_DIR CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint verify CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint verify --legacy CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint inspect CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint inspect --intent restore --require-source-identity ID --require-release-checksum SHA256 CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint restore DATA_DIR CHECKPOINT_DIR")
-	fmt.Fprintln(w, "  kvcheckpoint repair DATA_DIR CHECKPOINT_DIR")
-	fmt.Fprintln(w, "optional:")
-	fmt.Fprintln(w, "  KVNODE_CHECKPOINT_REPORT=/path/report.env writes a success report after a completed operation")
-	fmt.Fprintln(w, "  KVNODE_CHECKPOINT_SOURCE_IDENTITY and KVNODE_RELEASE_CHECKSUM are authenticated into new manifests when set")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Status: offline example/operator helper only. Stop the kvnode process before checkpoint, restore, or repair.")
+	_, _ = fmt.Fprintln(w, "usage:")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint checkpoint DATA_DIR CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint verify CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint verify --legacy CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint inspect CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint inspect --intent restore --require-source-identity ID --require-release-checksum SHA256 CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint restore DATA_DIR CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "  kvcheckpoint repair DATA_DIR CHECKPOINT_DIR")
+	_, _ = fmt.Fprintln(w, "optional:")
+	_, _ = fmt.Fprintln(w, "  KVNODE_CHECKPOINT_REPORT=/path/report.env writes a success report after a completed operation")
+	_, _ = fmt.Fprintln(w, "  KVNODE_CHECKPOINT_SOURCE_IDENTITY and KVNODE_RELEASE_CHECKSUM are authenticated into new manifests when set")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Status: offline example/operator helper only. Stop the kvnode process before checkpoint, restore, or repair.")
 }
 
 func run(args []string, stderr io.Writer) int {
@@ -59,11 +59,11 @@ func run(args []string, stderr io.Writer) int {
 		}
 		info, err := checkpoint(args[1], args[2])
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint checkpoint failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint checkpoint failed: %v\n", err)
 			return 1
 		}
 		if err := writeOperationReport("checkpoint", args[1], args[2], info); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint checkpoint report failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint checkpoint report failed: %v\n", err)
 			return 1
 		}
 		return 0
@@ -83,33 +83,33 @@ func run(args []string, stderr io.Writer) int {
 			info, err = kv.VerifyCheckpointWithInfo(checkpointDir)
 		}
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint verify failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint verify failed: %v\n", err)
 			return 1
 		}
 		if err := writeOperationReport("verify", "", checkpointDir, info); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint verify report failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint verify report failed: %v\n", err)
 			return 1
 		}
 		return 0
 	case "inspect":
 		options, checkpointDir, err := parseInspectArgs(args[1:])
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
 			return 2
 		}
 		inspection, err := inspectCheckpoint(checkpointDir)
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
 			return 1
 		}
 		if err := validateInspectExpectations(inspection, options); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint inspect failed: %v\n", err)
 			return 1
 		}
 		encoder := json.NewEncoder(inspectStdout)
 		encoder.SetEscapeHTML(false)
 		if err := encoder.Encode(inspection); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint inspect failed: write metadata: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint inspect failed: write metadata: %v\n", err)
 			return 1
 		}
 		return 0
@@ -120,11 +120,11 @@ func run(args []string, stderr io.Writer) int {
 		}
 		info, err := restoreVerified(args[1], args[2])
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint restore failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint restore failed: %v\n", err)
 			return 1
 		}
 		if err := writeOperationReport("restore", args[1], args[2], info); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint restore report failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint restore report failed: %v\n", err)
 			return 1
 		}
 		return 0
@@ -134,16 +134,16 @@ func run(args []string, stderr io.Writer) int {
 			return 2
 		}
 		if err := kv.RepairFromCheckpoint(args[1], args[2]); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint repair failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint repair failed: %v\n", err)
 			return 1
 		}
 		info, err := kv.VerifyCheckpointWithInfo(args[1])
 		if err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint repair report state failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint repair report state failed: %v\n", err)
 			return 1
 		}
 		if err := writeOperationReport("repair", args[1], args[2], info); err != nil {
-			fmt.Fprintf(stderr, "kvcheckpoint repair report failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "kvcheckpoint repair report failed: %v\n", err)
 			return 1
 		}
 		return 0
@@ -161,7 +161,7 @@ func writeOperationReport(operation, dataDir, checkpointDir string, info kv.Chec
 	if reportPath == "." || reportPath == string(filepath.Separator) {
 		return fmt.Errorf("report path must name a file")
 	}
-	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil { //nolint:gosec // path traversal is acceptable for this CLI operator tool
 		return err
 	}
 	content := fmt.Sprintf("status=example-operator-report\noperation=%s\nresult=success\ndata_dir=%s\ncheckpoint_dir=%s\ncheckpoint_format=%s\nmanifest_version=%d\nmanifest_identity=%s\nsemantic_state_digest=%s\nrecord_count=%d\napplied_count=%d\nhard_state_digest=%s\nsource_identity=%s\nrelease_checksum=%s\ncurrent_target_claim=%t\nevidence_class=bounded-data-lifecycle\n",
@@ -179,14 +179,14 @@ func writeOperationReport(operation, dataDir, checkpointDir string, info kv.Chec
 		strconv.Quote(info.ReleaseChecksum),
 		info.CurrentTarget,
 	)
-	return os.WriteFile(reportPath, []byte(content), 0o600)
+	return os.WriteFile(reportPath, []byte(content), 0o600) //nolint:gosec // path traversal is acceptable for this CLI operator tool
 }
 
 func checkpoint(dataDir, checkpointDir string) (kv.CheckpointInfo, error) {
 	if checkpointDir == "" {
 		return kv.CheckpointInfo{}, fmt.Errorf("checkpoint path must be non-empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(checkpointDir), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(checkpointDir), 0o700); err != nil { //nolint:gosec // path traversal is acceptable for this CLI operator tool
 		return kv.CheckpointInfo{}, err
 	}
 	db, err := kv.Open(dataDir)
@@ -373,7 +373,7 @@ func inspectCheckpoint(checkpointDir string) (checkpointInspection, error) {
 
 func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxos.InstanceRecord) ([]checkpointConfiguration, error) {
 	if hardState.Conf.ID == 0 || len(hardState.Conf.Voters) == 0 {
-		return nil, fmt.Errorf("checkpoint hard state has no current configuration")
+		return nil, fmt.Errorf("empty checkpoint hard-state configuration")
 	}
 	applied := make(map[epaxos.ConfID]epaxos.InstanceRecord)
 	for _, record := range records {
@@ -387,8 +387,12 @@ func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxo
 		applied[record.Ref.Conf] = record
 	}
 
+	if uint64(hardState.Conf.ID) > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("configuration generation ID %d is too large", hardState.Conf.ID)
+	}
+
 	currentVoters := append([]epaxos.ReplicaID(nil), hardState.Conf.Voters...)
-	history := make([]checkpointConfiguration, int(hardState.Conf.ID))
+	history := make([]checkpointConfiguration, int(hardState.Conf.ID)) //nolint:gosec // checked for overflow above
 	for generation := hardState.Conf.ID; generation > 1; generation-- {
 		base := generation - 1
 		record, ok := applied[base]
@@ -403,7 +407,7 @@ func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxo
 		if err != nil {
 			return nil, fmt.Errorf("checkpoint configuration record %s: %w", record.Ref, err)
 		}
-		history[int(generation)-1] = checkpointConfiguration{
+		history[int(generation)-1] = checkpointConfiguration{ //nolint:gosec // generation <= Conf.ID which is checked above
 			Generation:     uint64(generation),
 			BaseGeneration: uint64(base),
 			Voters:         checkpointVoterNumbers(currentVoters),

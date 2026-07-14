@@ -239,7 +239,7 @@ func encodeEPaxosHardState(hardState epaxos.HardState) []byte {
 	out := make([]byte, payloadSize+epaxosHardStateChecksumSize)
 	out[0] = epaxosHardStateCodec
 	binary.BigEndian.PutUint64(out[1:9], uint64(hardState.Conf.ID))
-	out[9] = byte(voterCount)
+	out[9] = byte(voterCount) //nolint:gosec // voterCount is validated to be between 1 and 7 by validateEPaxosHardState
 	offset := 10
 	for _, voter := range hardState.Conf.Voters {
 		binary.BigEndian.PutUint64(out[offset:offset+8], uint64(voter))
@@ -337,7 +337,7 @@ func stageAndCountEPaxosRecords(batch txnBatch, records []epaxos.InstanceRecord,
 		if _, exists := durableRefs[rec.Ref]; !exists {
 			duplicate := false
 			for previous := 0; previous < index; previous++ {
-				if records[previous].Ref == rec.Ref {
+				if records[previous].Ref == rec.Ref { //nolint:gosec // previous is bounded by index, which is strictly less than len(records)
 					duplicate = true
 					break
 				}
@@ -549,7 +549,10 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 	if version >= 8 && statusValue > uint64(epaxos.StatusExecuted) {
 		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos record status")
 	}
-	rec.Status = epaxos.Status(statusValue)
+	if statusValue > 255 {
+		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos record status")
+	}
+	rec.Status = epaxos.Status(statusValue) //nolint:gosec // statusValue is verified to fit in uint8
 	if version < 5 && rec.Status != epaxos.StatusNone {
 		rec.RecordBallot = rec.Ballot
 	}
@@ -607,7 +610,10 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 	if version >= 8 && commandKind > uint64(epaxos.CommandConfChange) {
 		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos command kind")
 	}
-	rec.Command = epaxos.Command{ID: epaxos.CommandID{Client: commandClient, Sequence: commandSequence}, Kind: epaxos.CommandKind(commandKind)}
+	if commandKind > 255 {
+		return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos command kind")
+	}
+	rec.Command = epaxos.Command{ID: epaxos.CommandID{Client: commandClient, Sequence: commandSequence}, Kind: epaxos.CommandKind(commandKind)} //nolint:gosec // commandKind is verified to fit in uint8
 	rec.Command.Payload = append([]byte(nil), p.bytes()...)
 	keys := p.uvarint()
 	if keys > 128 {
@@ -634,6 +640,8 @@ func decodeEPaxosRecord(src []byte) (epaxos.InstanceRecord, error) {
 		rec.FastPathEligible = fastPathEligible == 1
 		if version >= 8 {
 			switch rec.TimingDomain {
+			case epaxos.TimingDomainTOQ:
+				// TimingDomainTOQ permits all ProcessAt/pending combinations; no validation required.
 			case epaxos.TimingDomainUntimed:
 				if rec.ProcessAt != 0 || rec.TOQPending {
 					return epaxos.InstanceRecord{}, fmt.Errorf("kv: bad epaxos timing metadata")
