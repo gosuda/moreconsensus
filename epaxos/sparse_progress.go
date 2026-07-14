@@ -36,11 +36,32 @@ func newExecutedTracker() executedTracker {
 }
 
 func (tracker *executedTracker) contains(ref InstanceRef) bool {
-	if tracker == nil || tracker.exact == nil {
+	if tracker == nil || ref.IsZero() || ref.Instance == 0 {
+		return false
+	}
+	if tracker.through != nil {
+		if through := tracker.through[laneFor(ref)]; ref.Instance <= through {
+			return true
+		}
+	}
+	if tracker.exact == nil {
 		return false
 	}
 	_, ok := tracker.exact[ref]
 	return ok
+}
+
+// forgetExactThrough drops exact entries for a contiguous executed prefix that
+// is already represented by through[lane].
+func (tracker *executedTracker) forgetExactThrough(lane instanceLane, through InstanceNum) {
+	if tracker == nil || tracker.exact == nil || through == 0 {
+		return
+	}
+	for ref := range tracker.exact {
+		if laneFor(ref) == lane && ref.Instance <= through {
+			delete(tracker.exact, ref)
+		}
+	}
 }
 
 func (tracker *executedTracker) prefix(lane instanceLane) InstanceNum {

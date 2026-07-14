@@ -79,6 +79,12 @@ type deferredPreAcceptKey struct {
 	from   ReplicaID
 }
 
+type recordLoadWait struct {
+	messages []Message
+	// requested is true once the ref has been placed into a Ready.RecordLoads batch.
+	requested bool
+}
+
 type deferredPreAccept struct {
 	key     deferredPreAcceptKey
 	message Message
@@ -217,6 +223,15 @@ type RawNode struct {
 	logicalPreAccepts               deferredPreAcceptHeap
 	toqPreAccepts                   deferredPreAcceptHeap
 	deferredIndex                   map[deferredPreAcceptKey]*deferredPreAccept
+	// pendingRecordLoads defers inbound messages until ProvideRecordLoad for a folded ref.
+	pendingRecordLoads              map[InstanceRef]*recordLoadWait
+	pendingRecordLoadMessages       int
+	maxDeferredRecordLoads          int
+	recordLoadMisses                uint64
+	retainExecutedPerLane           int
+	maxResidentInstances            int
+	payloadStubInstances            uint64
+	foldedInstances                 uint64
 	tryEvidenceChecks               map[tryEvidenceKey]map[ReplicaID]InstanceRecord
 	committedThrough                map[instanceLane]InstanceNum
 	maxDependencyRecoveriesPerDrive int
@@ -644,6 +659,21 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	if cfg.MaxDeferredPreAccepts == 0 {
 		cfg.MaxDeferredPreAccepts = 4096
 	}
+	if cfg.MaxDeferredRecordLoads < 0 {
+		return nil, fmt.Errorf("%w: MaxDeferredRecordLoads must be non-negative", ErrInvalidConfig)
+	}
+	if cfg.MaxDeferredRecordLoads == 0 {
+		cfg.MaxDeferredRecordLoads = 256
+	}
+	if cfg.RetainExecutedPerLane < 0 {
+		return nil, fmt.Errorf("%w: RetainExecutedPerLane must be non-negative", ErrInvalidConfig)
+	}
+	if cfg.RetainExecutedPerLane == 0 {
+		cfg.RetainExecutedPerLane = 1024
+	}
+	if cfg.MaxResidentInstances < 0 {
+		return nil, fmt.Errorf("%w: MaxResidentInstances must be non-negative", ErrInvalidConfig)
+	}
 	if cfg.LegacyProcessAtDomain != nil && *cfg.LegacyProcessAtDomain > TimingDomainTOQ {
 		return nil, fmt.Errorf("%w: unknown legacy ProcessAt timing domain", ErrInvalidConfig)
 	}
@@ -682,6 +712,10 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		toqClock:                        toqClock,
 		toqRuntimes:                     make(map[ConfID]toqRuntime),
 		maxDeferredPreAccepts:           cfg.MaxDeferredPreAccepts,
+		maxDeferredRecordLoads:          cfg.MaxDeferredRecordLoads,
+		retainExecutedPerLane:           cfg.RetainExecutedPerLane,
+		maxResidentInstances:            cfg.MaxResidentInstances,
+		pendingRecordLoads:              make(map[InstanceRef]*recordLoadWait),
 		maxReadyMessages:                cfg.MaxReadyMessages,
 		maxDependencyRecoveriesPerDrive: cfg.MaxDependencyRecoveriesPerDrive,
 		maxConcurrentRecoveries:         cfg.MaxConcurrentRecoveries,
@@ -1785,6 +1819,9 @@ func (n *RawNode) requireLocalVoterForConf(conf ConfState) error {
 
 // Propose creates a new local EPaxos instance for an application command.
 func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
+	if n.maxResidentInstances > 0 && n.engine.residentCount() >= n.maxResidentInstances {
+		return InstanceRef{}, ErrResidentInstancesExceeded
+	}
 	if cmd.Kind == CommandConfChange {
 		return InstanceRef{}, fmt.Errorf("%w: use ProposeConfChange", ErrInvalidConfig)
 	}
@@ -1814,6 +1851,9 @@ func (n *RawNode) Propose(cmd Command) (InstanceRef, error) {
 
 // ProposeConfChange proposes a validated membership change encoded as a consensus command.
 func (n *RawNode) ProposeConfChange(cc ConfChange) (InstanceRef, error) {
+	if n.maxResidentInstances > 0 && n.engine.residentCount() >= n.maxResidentInstances {
+		return InstanceRef{}, ErrResidentInstancesExceeded
+	}
 	if cc.Type == ConfChangeAddVoter {
 		return InstanceRef{}, ErrVoterCertificateRequired
 	}
@@ -2065,7 +2105,7 @@ func (n *RawNode) Step(m Message) error {
 	case MsgTryPreAcceptResp:
 		return n.handleTryPreAcceptResp(m)
 	case MsgEvidence:
-		n.handleEvidence(m)
+		return n.handleEvidence(m)
 	case MsgEvidenceResp:
 		n.handleEvidenceResp(m)
 	}
@@ -2094,6 +2134,9 @@ func (n *RawNode) RuntimeStats() RuntimeStats {
 		ActiveRecoveries:     n.activeRecoveryCount(),
 		FrozenReadyRecords:   len(n.frozenReady.Records) + len(n.frozenReady.BootstrapRecords),
 		FrozenReadyMessages:  len(n.frozenReady.Messages) + len(n.frozenReady.BootstrapMessages),
+		RecordLoadMisses:     n.recordLoadMisses,
+		PayloadStubInstances: n.payloadStubInstances,
+		FoldedInstances:      n.foldedInstances,
 		PendingReadyRecords:  len(n.pendingReady.Records) + len(n.pendingReady.BootstrapRecords),
 		PendingReadyMessages: len(n.pendingReady.Messages) + len(n.pendingReady.BootstrapMessages),
 		NextReadyRecords:     len(n.nextReady.Records) + len(n.nextReady.BootstrapRecords),
@@ -2203,10 +2246,12 @@ func (n *RawNode) Advance(rd Ready) error {
 	n.frozenReady.Messages = consumeReadyPrefix(n.frozenReady.Messages, len(rd.Messages))
 	n.frozenReady.BootstrapMessages = consumeReadyPrefix(n.frozenReady.BootstrapMessages, len(rd.BootstrapMessages))
 	n.frozenReady.Committed = consumeReadyPrefix(n.frozenReady.Committed, len(rd.Committed))
+	n.frozenReady.RecordLoads = consumeReadyPrefix(n.frozenReady.RecordLoads, len(rd.RecordLoads))
 	n.frozenReady.MustSync = readyHasDurableUpdate(n.frozenReady)
 
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.applyBootstrapDurability(rd.BootstrapRecords)
+	n.retireExecuted()
 
 	if n.frozenReady.Empty() {
 		n.awaitAdvance = false
@@ -2237,6 +2282,7 @@ func (n *RawNode) validateReadyAck(rd Ready) error {
 		len(rd.Messages) > len(n.frozenReady.Messages) ||
 		len(rd.BootstrapMessages) > len(n.frozenReady.BootstrapMessages) ||
 		len(rd.Committed) > len(n.frozenReady.Committed) ||
+		len(rd.RecordLoads) > len(n.frozenReady.RecordLoads) ||
 		(rd.LocalVoterState != nil && n.frozenReady.LocalVoterState == nil) ||
 		(rd.AllocatorFloor != 0 && rd.AllocatorFloor != n.frozenReady.AllocatorFloor) {
 		return ErrInvalidReady
@@ -2812,6 +2858,9 @@ func (n *RawNode) handleCommit(m Message) error {
 
 func (n *RawNode) handlePrepare(m Message) error {
 	resp := Message{Type: MsgPrepareResp, From: n.id, To: m.From, Ref: m.Ref, Ballot: m.Ballot}
+	if n.needsRecordLoad(m.Ref) {
+		return n.deferRecordLoad(m.Ref, m)
+	}
 	inst := n.instances[m.Ref]
 	if inst != nil && inst.rec.TOQPending {
 		return nil
@@ -2885,7 +2934,10 @@ func (n *RawNode) handlePrepare(m Message) error {
 	return nil
 }
 
-func (n *RawNode) handleEvidence(m Message) {
+func (n *RawNode) handleEvidence(m Message) error {
+	if n.needsRecordLoad(m.Ref) {
+		return n.deferRecordLoad(m.Ref, m)
+	}
 	resp := Message{Type: MsgEvidenceResp, From: n.id, To: m.From, Ref: m.Ref, ConflictRef: m.ConflictRef, Ballot: m.Ballot, Deps: n.depsForConf(m.Ref.Conf), RecordStatus: StatusNone}
 	inst := n.instances[m.Ref]
 	if inst != nil && !inst.rec.TOQPending {
@@ -2909,6 +2961,7 @@ func (n *RawNode) handleEvidence(m Message) {
 		resp.TOQ = recordUsesTOQ(inst.rec)
 	}
 	n.enqueueMessage(resp)
+	return nil
 }
 
 func (n *RawNode) handleEvidenceResp(m Message) {
@@ -4468,6 +4521,122 @@ func (n *RawNode) readyRecord(rec InstanceRecord) InstanceRecord {
 
 func inboundCommand(cmd Command) Command { return cmd.Clone() }
 
+
+func (n *RawNode) needsRecordLoad(ref InstanceRef) bool {
+	if ref.IsZero() || ref.Instance == 0 {
+		return false
+	}
+	if n.instances[ref] != nil {
+		return false
+	}
+	lane := laneFor(ref)
+	return ref.Instance <= n.engine.foldedThrough(lane)
+}
+
+// deferRecordLoad queues m until ProvideRecordLoad(ref). Returns false if capacity exceeded.
+func (n *RawNode) deferRecordLoad(ref InstanceRef, m Message) error {
+	if n.pendingRecordLoads == nil {
+		n.pendingRecordLoads = make(map[InstanceRef]*recordLoadWait)
+	}
+	wait := n.pendingRecordLoads[ref]
+	if wait == nil {
+		if n.pendingRecordLoadMessages >= n.maxDeferredRecordLoads {
+			return fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredRecordLoadFull)
+		}
+		wait = &recordLoadWait{}
+		n.pendingRecordLoads[ref] = wait
+		// enqueue request into next Ready batch
+		target := n.readyTarget()
+		target.RecordLoads = append(target.RecordLoads, ref)
+		// keep sorted unique later at Ready() freeze; also sort now for stability
+		sortRefs(target.RecordLoads)
+		// dedup adjacent
+		out := target.RecordLoads[:0]
+		var last InstanceRef
+		for i, r := range target.RecordLoads {
+			if i == 0 || r != last {
+				out = append(out, r)
+				last = r
+			}
+		}
+		target.RecordLoads = out
+		wait.requested = true
+	}
+	if n.pendingRecordLoadMessages >= n.maxDeferredRecordLoads {
+		return fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredRecordLoadFull)
+	}
+	wait.messages = append(wait.messages, m.Clone())
+	n.pendingRecordLoadMessages++
+	return nil
+}
+
+// ProvideRecordLoad supplies a durable record (or miss) for a prior RecordLoads request.
+func (n *RawNode) ProvideRecordLoad(res RecordLoadResult) error {
+	wait := n.pendingRecordLoads[res.Ref]
+	if wait == nil {
+		return ErrUnrequestedRecordLoad
+	}
+	if !res.Found {
+		n.recordLoadMisses++
+		n.pendingRecordLoadMessages -= len(wait.messages)
+		delete(n.pendingRecordLoads, res.Ref)
+		return nil
+	}
+	rec := res.Record
+	if rec.Ref != res.Ref && !res.Ref.IsZero() {
+		// allow Ref on result to define
+		if rec.Ref.IsZero() {
+			rec.Ref = res.Ref
+		}
+	}
+	if err := validateRecordChecksum(rec); err != nil {
+		return err
+	}
+	// install through chokepoint
+	inst := n.instances[rec.Ref]
+	if inst == nil {
+		inst = &instance{rec: rec, phase: phaseFromStatus(rec.Status)}
+		n.installInstance(inst)
+	} else {
+		n.setInstanceRecord(inst, rec)
+	}
+	msgs := wait.messages
+	n.pendingRecordLoadMessages -= len(msgs)
+	delete(n.pendingRecordLoads, res.Ref)
+	for _, msg := range msgs {
+		if err := n.Step(msg); err != nil {
+			return err
+		}
+	}
+	n.maybeRefoldLoaded(rec.Ref)
+	return nil
+}
+
+func (n *RawNode) maybeRefoldLoaded(ref InstanceRef) {
+	inst := n.instances[ref]
+	if inst == nil || inst.rec.Status != StatusExecuted {
+		return
+	}
+	if ref.Instance > n.engine.foldedThrough(laneFor(ref)) {
+		return
+	}
+	rec := inst.rec.Clone()
+	n.engine.foldRecord(rec)
+	delete(n.instances, ref)
+	n.foldedInstances++
+}
+
+func validateRecordChecksum(rec InstanceRecord) error {
+	if rec.Checksum == ([32]byte{}) {
+		return ErrInvalidRecord
+	}
+	want := ChecksumRecord(rec)
+	if rec.Checksum != want {
+		return ErrInvalidRecord
+	}
+	return nil
+}
+
 func (n *RawNode) setInstanceRecord(inst *instance, rec InstanceRecord) {
 	previous := inst.rec.Clone()
 	n.engine.apply(&previous, rec)
@@ -4476,6 +4645,89 @@ func (n *RawNode) setInstanceRecord(inst *instance, rec InstanceRecord) {
 
 func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 	return n.computeAttrsAt(cmd, exclude, 0, false)
+}
+
+// VisitConflicts yields resident in-flight instances that conflict with cmd.
+// Folded history is not enumerated. yield returns false to stop early.
+// The walk is designed to avoid heap allocation in the steady state.
+func (n *RawNode) VisitConflicts(cmd Command, yield func(InstanceRef, Status) bool) {
+	if n == nil || yield == nil || cmd.Kind == CommandNoop {
+		return
+	}
+	confID := n.currentHardState.Conf.ID
+	stop := false
+	visit := func(ref InstanceRef, status Status) bool {
+		if !yield(ref, status) {
+			stop = true
+			return false
+		}
+		return true
+	}
+	if commandHasGlobalConflictScope(cmd.Kind) {
+		n.engine.lanes(confID, func(lane instanceLane) bool {
+			if stop {
+				return false
+			}
+			resident, _ := n.engine.maxEligibleAny(lane)
+			n.engine.walkDesc(lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+				if stop || !slot.eligible() {
+					return !stop
+				}
+				ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+				inst := n.instances[ref]
+				if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+					return true
+				}
+				return visit(ref, inst.rec.Status)
+			})
+			return !stop
+		})
+		return
+	}
+	n.engine.keyLaneSet(confID, cmd.ConflictKeys, func(lane instanceLane) bool {
+		if stop {
+			return false
+		}
+		for _, key := range cmd.ConflictKeys {
+			if stop {
+				break
+			}
+			resident, _ := n.engine.keyMax(confID, key, lane)
+			n.engine.walkKeyDesc(confID, key, lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+				if stop || !slot.eligible() {
+					return !stop
+				}
+				ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+				inst := n.instances[ref]
+				if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+					return true
+				}
+				return visit(ref, inst.rec.Status)
+			})
+		}
+		return !stop
+	})
+	if stop {
+		return
+	}
+	n.engine.lanes(confID, func(lane instanceLane) bool {
+		if stop {
+			return false
+		}
+		resident, _ := n.engine.globalMax(lane)
+		n.engine.walkGlobalDesc(lane, resident, func(instance InstanceNum, _ laneSlot) bool {
+			if stop {
+				return false
+			}
+			ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+			inst := n.instances[ref]
+			if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+				return true
+			}
+			return visit(ref, inst.rec.Status)
+		})
+		return !stop
+	})
 }
 
 func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uint64, timedPreAccept bool) Attributes {
