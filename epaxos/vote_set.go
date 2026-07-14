@@ -46,7 +46,7 @@ func newAttrVote(conf ConfState, seq uint64, deps []InstanceNum, depsCommitted u
 	if len(conf.Voters) < 1 || len(conf.Voters) > 7 || len(deps) != len(conf.Voters) {
 		return attrVote{}, false
 	}
-	vote := attrVote{seq: seq, width: uint8(len(deps)), depsCommitted: depsCommitted, fastPathEligible: fastPathEligible}
+	vote := attrVote{seq: seq, width: uint8(len(deps)), depsCommitted: depsCommitted, fastPathEligible: fastPathEligible} //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 	copy(vote.deps[:], deps)
 	return vote, true
 }

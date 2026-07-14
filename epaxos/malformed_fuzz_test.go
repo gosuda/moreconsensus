@@ -26,7 +26,7 @@ func FuzzDecodeMessageWithScratchNeverPanics(f *testing.F) {
 	f.Add([]byte(nil))
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01})
 	f.Add(encoded)
-	f.Fuzz(func(t *testing.T, frame []byte) {
+	f.Fuzz(func(_ *testing.T, frame []byte) {
 		scratch := DecodeScratch{
 			Deps:               make([]InstanceNum, 0, 7),
 			AcceptDeps:         make([]InstanceNum, 0, 7),
@@ -124,7 +124,7 @@ func FuzzRestartNeverPanicsOnMalformedChecksummedRecord(f *testing.F) {
 	f.Add([]byte(nil))
 	f.Add([]byte{1, 1, 1, byte(StatusCommitted), byte(CommandNoop), 3})
 	f.Add([]byte{0xff, 0, 2, 0xff, 0xff, 9, 9, 9})
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(_ *testing.T, data []byte) {
 		at := func(i int) byte {
 			if len(data) == 0 {
 				return 0

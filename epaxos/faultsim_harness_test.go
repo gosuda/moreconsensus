@@ -43,12 +43,12 @@ const (
 type faultCrashCut string
 
 const (
-	faultCrashBeforeReady                    faultCrashCut = "before-ready"
-	faultCrashAfterFrozenReady               faultCrashCut = "after-frozen-ready-before-persistence"
-	faultCrashAfterPersistence               faultCrashCut = "after-records-hard-state-before-application"
-	faultCrashAfterApplication               faultCrashCut = "after-application-before-advance"
-	faultCrashAfterAdvance                   faultCrashCut = "after-advance-before-executed-persistence"
-	faultCrashAfterExecutedPersistence       faultCrashCut = "after-executed-persistence"
+	faultCrashBeforeReady              faultCrashCut = "before-ready"
+	faultCrashAfterFrozenReady         faultCrashCut = "after-frozen-ready-before-persistence"
+	faultCrashAfterPersistence         faultCrashCut = "after-records-hard-state-before-application"
+	faultCrashAfterApplication         faultCrashCut = "after-application-before-advance"
+	faultCrashAfterAdvance             faultCrashCut = "after-advance-before-executed-persistence"
+	faultCrashAfterExecutedPersistence faultCrashCut = "after-executed-persistence"
 )
 
 type faultKV struct {
@@ -160,8 +160,8 @@ func (r faultOperationResponse) equal(other faultOperationResponse) bool {
 }
 
 type faultApplicationEvent struct {
-	Ref      InstanceRef           `json:"ref"`
-	Command  Command               `json:"command"`
+	Ref      InstanceRef            `json:"ref"`
+	Command  Command                `json:"command"`
 	Response faultOperationResponse `json:"response,omitempty"`
 }
 
@@ -232,12 +232,12 @@ func (a *faultApplicationImage) apply(committed []CommittedCommand) ([]faultAppl
 }
 
 type faultHistoryOperation struct {
-	Operation faultClientOperation  `json:"operation"`
-	Proposer  ReplicaID             `json:"proposer"`
-	Ref       InstanceRef           `json:"ref"`
-	Invoke    uint64                `json:"invoke"`
-	Complete  uint64                `json:"complete,omitempty"`
-	Result    string                `json:"result"`
+	Operation faultClientOperation   `json:"operation"`
+	Proposer  ReplicaID              `json:"proposer"`
+	Ref       InstanceRef            `json:"ref"`
+	Invoke    uint64                 `json:"invoke"`
+	Complete  uint64                 `json:"complete,omitempty"`
+	Result    string                 `json:"result"`
 	Response  faultOperationResponse `json:"response,omitempty"`
 }
 
@@ -294,23 +294,23 @@ func (e faultEnvelope) clone() faultEnvelope {
 func (e faultEnvelope) bytes() []byte { return append([]byte(nil), e.wire...) }
 
 type faultSimAction struct {
-	Kind        string                `json:"kind"`
-	Node        ReplicaID             `json:"node,omitempty"`
-	Envelope    uint64                `json:"envelope,omitempty"`
-	From        ReplicaID             `json:"from,omitempty"`
-	To          ReplicaID             `json:"to,omitempty"`
-	Count       int                   `json:"count,omitempty"`
-	Clock       uint64                `json:"clock,omitempty"`
-	Cut         faultCrashCut         `json:"cut,omitempty"`
-	Image       string                `json:"image,omitempty"`
-	Name        string                `json:"name,omitempty"`
-	Enabled     bool                  `json:"enabled,omitempty"`
-	Mutation    string                `json:"mutation,omitempty"`
-	Reason      string                `json:"reason,omitempty"`
-	Data        []byte                `json:"data,omitempty"`
-	Operation   *faultClientOperation `json:"operation,omitempty"`
-	ConfChange  *ConfChange           `json:"conf_change,omitempty"`
-	Required    bool                  `json:"required,omitempty"`
+	Kind       string                `json:"kind"`
+	Node       ReplicaID             `json:"node,omitempty"`
+	Envelope   uint64                `json:"envelope,omitempty"`
+	From       ReplicaID             `json:"from,omitempty"`
+	To         ReplicaID             `json:"to,omitempty"`
+	Count      int                   `json:"count,omitempty"`
+	Clock      uint64                `json:"clock,omitempty"`
+	Cut        faultCrashCut         `json:"cut,omitempty"`
+	Image      string                `json:"image,omitempty"`
+	Name       string                `json:"name,omitempty"`
+	Enabled    bool                  `json:"enabled,omitempty"`
+	Mutation   string                `json:"mutation,omitempty"`
+	Reason     string                `json:"reason,omitempty"`
+	Data       []byte                `json:"data,omitempty"`
+	Operation  *faultClientOperation `json:"operation,omitempty"`
+	ConfChange *ConfChange           `json:"conf_change,omitempty"`
+	Required   bool                  `json:"required,omitempty"`
 }
 
 func (a faultSimAction) clone() faultSimAction {
@@ -356,22 +356,22 @@ type faultReplica struct {
 }
 
 type faultSimHarness struct {
-	cfg          faultSimConfig
-	ids          []ReplicaID
-	replicas     map[ReplicaID]*faultReplica
-	envelopes    map[uint64]faultEnvelope
-	envelopeState map[uint64]faultEnvelopeState
-	partitions   map[[2]ReplicaID]bool
-	clocks       map[ReplicaID]uint64
-	nextEnvelope uint64
-	step         uint64
-	actions      []faultSimAction
-	receipts     []faultActionReceipt
-	counters     map[string]uint64
-	history      []faultHistoryOperation
-	historyByID  map[CommandID]int
-	outstanding  int
-	failClosed   []faultFailClosedCheck
+	cfg               faultSimConfig
+	ids               []ReplicaID
+	replicas          map[ReplicaID]*faultReplica
+	envelopes         map[uint64]faultEnvelope
+	envelopeState     map[uint64]faultEnvelopeState
+	partitions        map[[2]ReplicaID]bool
+	clocks            map[ReplicaID]uint64
+	nextEnvelope      uint64
+	step              uint64
+	actions           []faultSimAction
+	receipts          []faultActionReceipt
+	counters          map[string]uint64
+	history           []faultHistoryOperation
+	historyByID       map[CommandID]int
+	outstanding       int
+	failClosed        []faultFailClosedCheck
 	lastProgressBound int
 }
 
@@ -1184,12 +1184,12 @@ func faultSameCommand(a, b Command) bool {
 }
 
 type faultTerminalRecord struct {
-	Node   ReplicaID
-	Hard   HardState
-	Config []ConfState
+	Node    ReplicaID
+	Hard    HardState
+	Config  []ConfState
 	Records []InstanceRecord
-	State  []faultKV
-	Log    []faultApplicationEvent
+	State   []faultKV
+	Log     []faultApplicationEvent
 }
 
 type faultTerminalEnvelope struct {

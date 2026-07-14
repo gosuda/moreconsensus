@@ -44,7 +44,7 @@ func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, ClusterID, []VoterIdentity) {
 	t.Helper()
 	ids := makeIDs(voters)
-	cluster := ClusterID{0x51, byte(voters)}
+	cluster := ClusterID{0x51, byte(voters)} //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 	identities := make([]VoterIdentity, voters+1)
 	for i := range identities {
 		identities[i] = VoterIdentity{Replica: ReplicaID(i + 1), Incarnation: 1}
@@ -140,9 +140,7 @@ func (s *simCluster) drain() {
 				s.t.Fatalf("apply ready %d: %v", id, err)
 			}
 			s.committedCommands += uint64(len(rd.Committed))
-			for _, c := range rd.Committed {
-				s.apps[id] = append(s.apps[id], c)
-			}
+			s.apps[id] = append(s.apps[id], rd.Committed...)
 			for _, m := range rd.Messages {
 				if !s.deliver(m) {
 					s.delayed = append(s.delayed, m)
@@ -182,7 +180,9 @@ func (s *simCluster) tickAll(n int) {
 	for range n {
 		for _, id := range s.ids() {
 			if !s.paused[id] {
-				s.nodes[id].Tick()
+				if err := s.nodes[id].Tick(); err != nil {
+					panic(err)
+				}
 				s.logicalTicks++
 			}
 		}
@@ -196,7 +196,9 @@ func (s *simCluster) tickOnly(id ReplicaID, n int) {
 		s.t.Fatalf("tickOnly called on paused node %d", id)
 	}
 	for range n {
-		s.nodes[id].Tick()
+		if err := s.nodes[id].Tick(); err != nil {
+			panic(err)
+		}
 		s.drain()
 	}
 }
@@ -207,7 +209,9 @@ func (s *simCluster) tickBurst(id ReplicaID, n int) {
 		s.t.Fatalf("tickBurst called on paused node %d", id)
 	}
 	for range n {
-		s.nodes[id].Tick()
+		if err := s.nodes[id].Tick(); err != nil {
+			s.t.Fatal(err)
+		}
 	}
 	s.drain()
 }
@@ -275,7 +279,7 @@ func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
 	for size := 1; size <= 7; size++ {
 		t.Run(fmt.Sprintf("n=%d", size), func(t *testing.T) {
 			s := newSimCluster(t, size, false)
-			_, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: uint64(size)}, Payload: []byte("set"), ConflictKeys: [][]byte{[]byte("k")}})
+			_, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: uint64(size)}, Payload: []byte("set"), ConflictKeys: [][]byte{[]byte("k")}}) //nolint:gosec // G115: test harness converts bounded int index/count
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1226,8 +1230,12 @@ func TestPausedClockDoesNotTickOrProcessReadyUntilResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 7 {
-		s.nodes[1].Tick()
-		s.nodes[3].Tick()
+		if err := s.nodes[1].Tick(); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.nodes[3].Tick(); err != nil {
+			t.Fatal(err)
+		}
 		s.drain()
 	}
 	if got := s.nodes[2].Status().Tick; got != pausedTick {
@@ -1565,10 +1573,10 @@ func TestSparseMaxPrefixBuildsMaterializedSCCButBlocksOnFirstHole(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	max := ^InstanceNum(0)
+	maxInst := ^InstanceNum(0)
 	left := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
-	right := InstanceRef{Conf: 1, Replica: 2, Instance: max}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: left, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, max, 0}, Command: Command{Kind: CommandNoop}}})
+	right := InstanceRef{Conf: 1, Replica: 2, Instance: maxInst}
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: left, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInst, 0}, Command: Command{Kind: CommandNoop}}})
 	rn.installInstance(&instance{rec: InstanceRecord{Ref: right, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}}})
 	view := rn.newExecutionView()
 	components := rn.executionComponents(&view)

@@ -120,8 +120,8 @@ func TestBallotNextCheckedBoundaries(t *testing.T) {
 		})
 	}
 
-	max := Ballot{Epoch: ^uint64(0), Number: ^uint64(0), Replica: 2}
-	got, err := max.Next(1)
+	maxBallot := Ballot{Epoch: ^uint64(0), Number: ^uint64(0), Replica: 2}
+	got, err := maxBallot.Next(1)
 	if !errors.Is(err, ErrBallotExhausted) || got != (Ballot{}) {
 		t.Fatalf("absolute exhaustion = %#v, %v, want zero, %v", got, err, ErrBallotExhausted)
 	}
@@ -152,6 +152,8 @@ func recoveryBoundaryRejectFixture(t *testing.T, typ MessageType, hint Ballot) (
 	case MsgPrepareResp:
 		inst.phase = phasePrepare
 		inst.prepareOK = testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: inst.rec.Clone()})
+	case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+		fallthrough
 	default:
 		t.Fatalf("unsupported reject fixture %s", typ)
 	}
@@ -189,10 +191,10 @@ func TestRejectPathsIncrementObservedBallotExactlyOnce(t *testing.T) {
 }
 
 func TestStepBallotExhaustionIsTypedAndHasNoEffect(t *testing.T) {
-	max := Ballot{Epoch: ^uint64(0), Number: ^uint64(0), Replica: 2}
+	maxBallot := Ballot{Epoch: ^uint64(0), Number: ^uint64(0), Replica: 2}
 	for _, typ := range []MessageType{MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp} {
 		t.Run(typ.String(), func(t *testing.T) {
-			rn, inst, msg := recoveryBoundaryRejectFixture(t, typ, max)
+			rn, inst, msg := recoveryBoundaryRejectFixture(t, typ, maxBallot)
 			before := snapshotRecoveryBoundary(rn, inst)
 			err := rn.Step(msg)
 			if !errors.Is(err, ErrBallotExhausted) {
@@ -257,7 +259,9 @@ func TestTickBallotExhaustionStuttersWithoutEffects(t *testing.T) {
 		Command:      Command{Kind: CommandNoop},
 	}), phase: phaseIdle}
 	rn.instances[ref] = inst
-	rn.schedule(inst, timerPrepare, 1)
+	if err := rn.schedule(inst, timerPrepare, 1); err != nil {
+		panic(err)
+	}
 	before := snapshotRecoveryBoundary(rn, inst)
 
 	err := rn.Tick()
@@ -323,11 +327,11 @@ func TestEpochCarryBallotIsRecoveryAcrossValidationRestartAndFastGuard(t *testin
 
 func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T) {
 	for _, voters := range []int{3, 5, 7} {
-		t.Run(string(rune('0'+voters))+" voters", func(t *testing.T) {
+		t.Run(string(rune('0'+voters))+" voters", func(t *testing.T) { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 			store := NewMemoryStorage()
 			rn := recoveryBoundaryNode(t, 1, voters, store)
 			ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 600 + uint64(voters), Sequence: 1}, Payload: []byte("restart-prepare"), ConflictKeys: [][]byte{[]byte("restart-prepare-key")}}
+			cmd := Command{ID: CommandID{Client: 600 + uint64(voters), Sequence: 1}, Payload: []byte("restart-prepare"), ConflictKeys: [][]byte{[]byte("restart-prepare-key")}} //nolint:gosec // G115: test harness converts bounded int index/count
 			inst := &instance{rec: checkedRecord(InstanceRecord{
 				Ref:          ref,
 				Ballot:       Ballot{Replica: ref.Replica},
@@ -419,7 +423,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 			if same {
 				name = "same tuple"
 			}
-			t.Run(string(rune('0'+voters))+" voters/"+name, func(t *testing.T) {
+			t.Run(string(rune('0'+voters))+" voters/"+name, func(t *testing.T) { //nolint:gosec // G115: test harness converts bounded int to rune
 				coordinator := recoveryBoundaryNode(t, 1, voters, nil)
 				follower := recoveryBoundaryNode(t, 2, voters, nil)
 				ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}

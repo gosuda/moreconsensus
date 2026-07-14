@@ -221,10 +221,10 @@ func TestRevisitedChainPruningDoesNotBypassUnknownDependency(t *testing.T) {
 
 func TestRevisitedSparseMaxPrefixPrunesOnlyExactWitness(t *testing.T) {
 	rn := revisitedRawNode(t)
-	max := ^InstanceNum(0)
+	maxInstance := ^InstanceNum(0)
 	base := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
-	witness := InstanceRef{Conf: 1, Replica: 2, Instance: max}
-	revisitedInstall(rn, InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, max, 0}, Command: Command{Kind: CommandNoop}})
+	witness := InstanceRef{Conf: 1, Replica: 2, Instance: maxInstance}
+	revisitedInstall(rn, InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInstance, 0}, Command: Command{Kind: CommandNoop}})
 	revisitedInstall(rn, InstanceRecord{Ref: witness, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}})
 	view := rn.newExecutionView()
 	component := revisitedComponentContaining(rn.executionComponents(&view), base)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -269,6 +270,8 @@ func messageCarriesValue(message Message) bool {
 	case MsgTryPreAcceptResp:
 		return (!message.Reject && message.RecordStatus >= StatusPreAccepted) ||
 			(message.Reject && message.RejectReason == RejectAcceptedTarget)
+	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence:
+		fallthrough
 	default:
 		return false
 	}
@@ -284,6 +287,8 @@ func (n *RawNode) messageTimingDomainEnabled(message Message) bool {
 	}
 	switch message.Type {
 	case MsgAccept, MsgCommit:
+	case MsgPreAccept, MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+		fallthrough
 	default:
 		return false
 	}
@@ -524,6 +529,8 @@ func validateConfChangeResult(rec InstanceRecord) error {
 		if !confStateIsZero(result.Conf) {
 			return invalid("has configuration voters on a rejected result")
 		}
+	case ConfChangeOutcomeUnspecified:
+		fallthrough
 	default:
 		return invalid("has no terminal configuration result")
 	}
@@ -550,9 +557,9 @@ func validateStoredInstanceRecord(rec InstanceRecord, conf ConfState) error {
 		return invalid("has invalid timing metadata")
 	}
 	commandValid := commandValidForConfiguration(rec.Command, rec.Ref, conf)
-	if !commandValid && !(rec.Command.Kind == CommandConfChange &&
-		rec.Status == StatusExecuted &&
-		rec.ConfChangeResult.Outcome == ConfChangeRejectedInvalid) {
+	if !commandValid && (rec.Command.Kind != CommandConfChange ||
+		rec.Status != StatusExecuted ||
+		rec.ConfChangeResult.Outcome != ConfChangeRejectedInvalid) {
 		return invalid("has an invalid command")
 	}
 	if err := validateConfChangeResult(rec); err != nil {
@@ -805,7 +812,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 				!VerifyRecordChecksumWithoutTimingDomain(rec) && !VerifyRecordChecksumWithoutConfChangeResult(rec) {
 				return ErrChecksumMismatch
 			}
-			if rec.Command.Kind == CommandNoop {
+			if rec.Command.Kind == CommandNoop { //nolint:gocritic // ifElseChain: status dispatch keeps explicit ordering
 				if cfg.LegacyProcessAtDomain == nil {
 					return fmt.Errorf("%w: durable no-op record %s has ambiguous legacy timing domain", ErrInvalidConfig, rec.Ref)
 				}
@@ -924,7 +931,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 	heap.Init(&n.logicalPreAccepts)
 	heap.Init(&n.toqPreAccepts)
 	restartTimerError := func(err error) error {
-		if err == ErrLogicalTimeExhausted && n.tick == ^uint64(0) {
+		if errors.Is(err, ErrLogicalTimeExhausted) && n.tick == ^uint64(0) {
 			return nil
 		}
 		return err
@@ -974,6 +981,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 			if err := restartTimerError(n.schedule(inst, timerPrepare, n.recoveryTicks)); err != nil {
 				return nil, err
 			}
+		case phaseTryPreAccept, phaseCommitted:
 		}
 	}
 	n.beginDrive()
@@ -1011,7 +1019,7 @@ func sameReplicaIDs(a, b []ReplicaID) bool {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i] != b[i] { //nolint:gosec // G602: index is guarded by matching slice lengths.
 			return false
 		}
 	}
@@ -1026,6 +1034,8 @@ func phaseFromStatus(s Status) phase {
 		return phaseAccept
 	case StatusCommitted, StatusExecuted:
 		return phaseCommitted
+	case StatusNone:
+		fallthrough
 	default:
 		return phaseIdle
 	}
@@ -1093,6 +1103,7 @@ func (n *RawNode) seedLocalRestartVote(inst *instance) {
 		}
 		inst.prepareOK = getRecordVoteSet()
 		inst.prepareOK.add(n.confFor(inst.rec.Ref.Conf), n.id, inst.rec)
+	case phaseIdle, phaseTryPreAccept, phaseCommitted:
 	}
 }
 
@@ -1339,6 +1350,7 @@ func (n *RawNode) replayExecutedConfigRecords(records []InstanceRecord) error {
 				if !applied && !checkpoint {
 					return fmt.Errorf("%w: superseded configuration command %s has no applied successor", ErrInvalidConfig, rec.Ref)
 				}
+			case ConfChangeOutcomeUnspecified, ConfChangeApplied:
 			}
 		}
 	}
@@ -2070,6 +2082,7 @@ func (n *RawNode) Step(m Message) error {
 	return nil
 }
 
+// HasReady reports whether Ready has unacknowledged work.
 func (n *RawNode) HasReady() bool {
 	return n.awaitAdvance || !n.pendingReady.Empty() || !n.currentHardState.Equal(n.acknowledgedHardState)
 }
@@ -3194,7 +3207,9 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 		return
 	}
 	n.broadcast(MsgAccept, inst.rec)
-	n.schedule(inst, timerAccept, n.retryTicks)
+	if err := n.schedule(inst, timerAccept, n.retryTicks); err != nil {
+		panic(err) // Tick prevents logical-clock exhaustion before scheduling.
+	}
 }
 
 func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses voterMask, countInitialLeader bool) {
@@ -3235,7 +3250,9 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 		return
 	}
 	n.broadcastTryPreAccept(inst)
-	n.schedule(inst, timerTryPreAccept, n.retryTicks)
+	if err := n.schedule(inst, timerTryPreAccept, n.retryTicks); err != nil {
+		panic(err) // Tick prevents logical-clock exhaustion before scheduling.
+	}
 }
 
 func (n *RawNode) handleTryPreAccept(m Message) error {
@@ -4453,7 +4470,7 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 	if cmd.Kind == CommandNoop {
 		return Attributes{Seq: seq, Deps: deps}
 	}
-	if commandHasGlobalConflictScope(cmd.Kind) {
+	if commandHasGlobalConflictScope(cmd.Kind) { //nolint:gocritic // ifElseChain: attrs path keeps explicit ordering
 		addIndexedLanes(n.allConflicts)
 		if len(n.allConflicts) == 0 {
 			for ref, inst := range n.instances {
@@ -4759,6 +4776,8 @@ func (n *RawNode) wouldReplaceInstance(m Message, current *instance, ordered boo
 		}
 		rec := n.acceptRecord(m, current)
 		return current.rec.Status != StatusAccepted || !instanceRecordEqual(current.rec, rec)
+	case MsgPreAcceptResp, MsgAcceptResp, MsgCommit, MsgPrepare, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+		fallthrough
 	default:
 		return false
 	}
@@ -5017,6 +5036,8 @@ func (n *RawNode) responseTimingTransition(m Message) (*instance, bool, bool, bo
 		prospective[m.From] = InstanceRecord{Ref: m.Ref, Ballot: m.Ballot, RecordBallot: m.RecordBallot, Status: m.RecordStatus, Seq: m.Seq, Deps: append([]InstanceNum(nil), m.Deps...), AcceptSeq: m.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), m.AcceptDeps...), AcceptEvidence: cloneAcceptEvidence(m.AcceptEvidence), Command: m.Command.Clone(), FastPathEligible: m.FastPathEligible, ProcessAt: m.ProcessAt, TimingDomain: timingDomainFromMessage(m)}
 		_, failClosed := n.tryEvidenceDecision(inst, key, prospective)
 		return inst, failClosed, failClosed, false
+	case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+		fallthrough
 	default:
 		return inst, false, false, false
 	}
@@ -5061,6 +5082,7 @@ func (n *RawNode) preflightTimingStep(m Message) error {
 		}
 	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp:
 		inst, advanceGeneration, retryTimer, recoveryTimer = n.responseTimingTransition(m)
+	case MsgCommit, MsgEvidence:
 	}
 	generationDelta := uint64(0)
 	if advanceGeneration {
@@ -5072,6 +5094,7 @@ func (n *RawNode) preflightTimingStep(m Message) error {
 			if retryTimer {
 				generationDelta = n.startAcceptGenerationDelta(inst)
 			}
+		case MsgPreAccept, MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence:
 		}
 	}
 	if !advanceGeneration && !retryTimer && !recoveryTimer {
@@ -5137,6 +5160,7 @@ func (n *RawNode) preflightRecoveryStep(m Message) error {
 				base = inst.rec.Ballot
 			}
 		}
+	case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence, MsgEvidenceResp:
 	}
 	if base == (Ballot{}) {
 		return nil

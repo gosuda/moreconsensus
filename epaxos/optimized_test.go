@@ -149,7 +149,9 @@ func optimizedStartRecovery(t *testing.T, voters int, ref InstanceRef) (*RawNode
 	rn := optimizedNewRawNode(t, 1, voters)
 	inst := &instance{rec: InstanceRecord{Ref: ref, Status: StatusNone, Deps: rn.q.deps()}}
 	rn.instances[ref] = inst
-	rn.startPrepare(inst)
+	if err := rn.startPrepare(inst); err != nil {
+		panic(err)
+	}
 	ballot := inst.rec.Ballot
 	rd := rn.Ready()
 	advanceOK(t, rn, rd)

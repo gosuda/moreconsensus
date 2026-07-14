@@ -311,9 +311,13 @@ func TestTOQPendingRetryCannotStartAcceptBeforeProcessAt(t *testing.T) {
 		t.Fatalf("preaccept votes = %d, want slow quorum %d", got, want)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	applyTOQHardStateOnly(t, store, rn, 1)
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := rn.Ready()
 	for _, msg := range retry.Messages {
 		if msg.Type == MsgAccept {
@@ -378,9 +382,13 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 		t.Fatalf("restart conflict index before ProcessAt = %#v, want only preexisting conflict %s", byLane, conflictRef)
 	}
 
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	applyTOQHardStateOnly(t, store, restarted, 1)
-	restarted.Tick()
+	if err := restarted.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	beforeProcessAtRetry := restarted.Ready()
 	if len(beforeProcessAtRetry.Records) != 0 || len(beforeProcessAtRetry.Committed) != 0 {
 		t.Fatalf("TOQ retry before ProcessAt produced durable/application work: records=%#v committed=%#v", beforeProcessAtRetry.Records, beforeProcessAtRetry.Committed)
@@ -1603,6 +1611,8 @@ func rnDepsForValidation(typ MessageType, conf ConfState) []InstanceNum {
 	switch typ {
 	case MsgPreAcceptResp, MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp:
 		return make([]InstanceNum, len(conf.Voters))
+	case MsgPreAccept, MsgAcceptResp, MsgPrepare, MsgEvidence, MsgEvidenceResp:
+		fallthrough
 	default:
 		return nil
 	}

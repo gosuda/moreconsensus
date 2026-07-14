@@ -523,6 +523,7 @@ func validateLocalVoterState(state LocalVoterState) error {
 		if contains {
 			return fmt.Errorf("%w: ineligible voter remains present", ErrInvalidConfig)
 		}
+	case LocalVoterStatusUnspecified:
 	}
 	return nil
 }

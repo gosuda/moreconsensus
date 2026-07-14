@@ -17,16 +17,16 @@ import (
 const faultTraceVersion = 1
 
 type faultTrace struct {
-	Version        int                    `json:"version"`
-	SourceRevision string                 `json:"source_revision"`
-	Config         faultSimConfig         `json:"config"`
-	Seed           uint64                 `json:"seed"`
-	Actions        []faultSimAction       `json:"actions"`
+	Version        int                     `json:"version"`
+	SourceRevision string                  `json:"source_revision"`
+	Config         faultSimConfig          `json:"config"`
+	Seed           uint64                  `json:"seed"`
+	Actions        []faultSimAction        `json:"actions"`
 	Operations     []faultHistoryOperation `json:"operations"`
-	Receipts       []faultActionReceipt   `json:"receipts"`
-	Counters       map[string]uint64      `json:"counters"`
-	TerminalHash   string                 `json:"terminal_hash"`
-	Oracle         faultOracleResult      `json:"oracle"`
+	Receipts       []faultActionReceipt    `json:"receipts"`
+	Counters       map[string]uint64       `json:"counters"`
+	TerminalHash   string                  `json:"terminal_hash"`
+	Oracle         faultOracleResult       `json:"oracle"`
 }
 
 func faultSourceRevision() string {
@@ -67,9 +67,9 @@ func faultRepositoryRevision() string {
 	}
 	for {
 		gitDirectory := filepath.Join(directory, ".git")
-		head, headErr := os.ReadFile(filepath.Join(gitDirectory, "HEAD"))
+		head, headErr := os.ReadFile(filepath.Join(gitDirectory, "HEAD")) //nolint:gosec // G304: test fixture path is under repository control.
 		if headErr != nil {
-			pointer, pointerErr := os.ReadFile(gitDirectory)
+			pointer, pointerErr := os.ReadFile(gitDirectory) //nolint:gosec // G304: test fixture path is under repository control.
 			if pointerErr == nil {
 				value := strings.TrimSpace(string(pointer))
 				if strings.HasPrefix(value, "gitdir: ") {
@@ -77,7 +77,7 @@ func faultRepositoryRevision() string {
 					if !filepath.IsAbs(gitDirectory) {
 						gitDirectory = filepath.Join(directory, gitDirectory)
 					}
-					head, headErr = os.ReadFile(filepath.Join(gitDirectory, "HEAD"))
+					head, headErr = os.ReadFile(filepath.Join(gitDirectory, "HEAD")) //nolint:gosec // G304: test fixture path is under repository control.
 				}
 			}
 		}
@@ -87,10 +87,10 @@ func faultRepositoryRevision() string {
 				return value
 			}
 			reference := strings.TrimSpace(strings.TrimPrefix(value, "ref: "))
-			if revision, err := os.ReadFile(filepath.Join(gitDirectory, filepath.FromSlash(reference))); err == nil {
+			if revision, err := os.ReadFile(filepath.Join(gitDirectory, filepath.FromSlash(reference))); err == nil { //nolint:gosec // G304: test opens controlled fixture path under temp dir
 				return strings.TrimSpace(string(revision))
 			}
-			if packed, err := os.ReadFile(filepath.Join(gitDirectory, "packed-refs")); err == nil {
+			if packed, err := os.ReadFile(filepath.Join(gitDirectory, "packed-refs")); err == nil { //nolint:gosec // G304: test opens controlled fixture path under temp dir
 				for _, line := range strings.Split(string(packed), "\n") {
 					fields := strings.Fields(line)
 					if len(fields) == 2 && fields[1] == reference {
@@ -217,14 +217,14 @@ func faultWriteTrace(path string, trace faultTrace) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, 0o600) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 }
 
 func faultReadTrace(path string) (faultTrace, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: test opens controlled fixture path under temp dir
 	if err != nil {
 		return faultTrace{}, err
 	}

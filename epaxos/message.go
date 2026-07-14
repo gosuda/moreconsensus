@@ -62,6 +62,7 @@ func (t MessageType) String() string {
 // RejectReason classifies TryPreAccept recovery rejections.
 type RejectReason uint8
 
+// RejectReason values explain rejected protocol messages.
 const (
 	RejectNone RejectReason = iota
 	RejectStaleBallot
@@ -294,6 +295,7 @@ func (m Message) Validate(conf ConfState) error {
 		if m.From != m.Ballot.Replica {
 			return ErrInvalidMessage
 		}
+	case MsgPreAcceptResp, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp:
 	}
 	validRef := func(ref InstanceRef) bool {
 		return ref.Replica != 0 && ref.Instance != 0 && ref.Conf == conf.ID && conf.Contains(ref.Replica)
@@ -306,7 +308,7 @@ func (m Message) Validate(conf ConfState) error {
 		if !conflictPresent {
 			return ErrInvalidMessage
 		}
-	} else if conflictPresent && !(m.Type == MsgTryPreAcceptResp && m.Reject) {
+	} else if conflictPresent && (m.Type != MsgTryPreAcceptResp || !m.Reject) {
 		return ErrInvalidMessage
 	}
 	if m.IgnoreDependency != (TryPreAcceptIgnore{}) {
@@ -369,6 +371,8 @@ func (m Message) Validate(conf ConfState) error {
 				if !m.Reject || m.RejectReason != RejectAcceptedTarget {
 					return ErrInvalidMessage
 				}
+			case MsgPreAccept, MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence:
+				fallthrough
 			default:
 				return ErrInvalidMessage
 			}
@@ -405,6 +409,7 @@ func (m Message) Validate(conf ConfState) error {
 			if m.RecordStatus >= StatusPreAccepted && m.Seq == 0 {
 				return ErrInvalidMessage
 			}
+		case MsgAcceptResp, MsgPrepare, MsgEvidence:
 		}
 	}
 	if (m.AcceptSeq == 0) != (len(m.AcceptDeps) == 0) {
@@ -423,6 +428,8 @@ func (m Message) Validate(conf ConfState) error {
 			if !m.Reject || m.RejectReason != RejectAcceptedTarget {
 				return ErrInvalidMessage
 			}
+		case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+			fallthrough
 		default:
 			return ErrInvalidMessage
 		}
@@ -453,6 +460,8 @@ func (m Message) Validate(conf ConfState) error {
 		if hasAcceptMetadata && (!m.Reject || m.RejectReason != RejectAcceptedTarget) {
 			return ErrInvalidMessage
 		}
+	case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+		fallthrough
 	default:
 		if hasAcceptMetadata {
 			return ErrInvalidMessage
@@ -466,6 +475,8 @@ func (m Message) Validate(conf ConfState) error {
 	if m.ProcessAt != 0 {
 		switch m.Type {
 		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidenceResp:
+		case MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence:
+			fallthrough
 		default:
 			return ErrInvalidMessage
 		}
@@ -482,6 +493,8 @@ func (m Message) Validate(conf ConfState) error {
 				m.RecordBallot != (Ballot{Replica: m.Ref.Replica}) {
 				return ErrInvalidMessage
 			}
+		case MsgPreAccept, MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
+			fallthrough
 		default:
 			return ErrInvalidMessage
 		}
@@ -547,9 +560,13 @@ func (m Message) Validate(conf ConfState) error {
 				if m.RejectHint != (Ballot{}) {
 					return ErrInvalidMessage
 				}
+			case RejectNone, RejectAcceptedTarget:
+				fallthrough
 			default:
 				return ErrInvalidMessage
 			}
+		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence, MsgEvidenceResp:
+			fallthrough
 		default:
 			return ErrInvalidMessage
 		}

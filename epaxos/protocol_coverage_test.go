@@ -464,7 +464,9 @@ func TestDependencyPredicatesConservativelyRejectMissingConfigKnowledge(t *testi
 
 func TestTryPreAcceptTimerRebroadcastsOnlyWhileInTryPhase(t *testing.T) {
 	rn, inst, ref := protocolTryInstance(t, 3, 1)
-	rn.onTimer(inst, timerTryPreAccept)
+	if err := rn.onTimer(inst, timerTryPreAccept); err != nil {
+		panic(err)
+	}
 	rd := rn.Ready()
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, to)
@@ -497,7 +499,9 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 		unrelatedTargetKey: {},
 	}
 
-	rn.onTimer(inst, timerTryPreAccept)
+	if err := rn.onTimer(inst, timerTryPreAccept); err != nil {
+		panic(err)
+	}
 	if _, ok := rn.tryEvidenceChecks[staleTargetKey]; ok {
 		t.Fatalf("TryPreAccept timer left stale evidence check for target: %#v", rn.tryEvidenceChecks)
 	}
@@ -526,11 +530,15 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 		t.Fatalf("accepted first TryPreAccept retry Ready left outstanding work: %#v", rn.Ready())
 	}
 	for tick := uint64(1); tick < rn.retryTicks; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
 	}
 
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	retry := rn.Ready()
 	for _, to := range []ReplicaID{2, 3} {
 		msg := optimizedRequireMessage(t, retry.Messages, MsgTryPreAccept, to)
@@ -1203,7 +1211,9 @@ func TestPendingEvidenceTimeoutFallsBackToSlowAccept(t *testing.T) {
 	rn.instances[target] = inst
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{{target: target, conflict: conflict, ballot: inst.rec.Ballot}: {}}
 
-	rn.onTimer(inst, timerTryPreAccept)
+	if err := rn.onTimer(inst, timerTryPreAccept); err != nil {
+		panic(err)
+	}
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("pending evidence timeout phase/status = %d/%s, want slow accept/%s", inst.phase, inst.rec.Status, StatusAccepted)
 	}
@@ -1752,7 +1762,7 @@ func TestReorderedPreAcceptDoesNotDowngradeAcceptedRecord(t *testing.T) {
 
 func TestNormalFastPathAdoptsCoveringRemoteTupleAtPaperQuorum(t *testing.T) {
 	for _, voters := range []int{3, 5, 7} {
-		t.Run(string(rune('0'+voters))+"-voters", func(t *testing.T) {
+		t.Run(string(rune('0'+voters))+"-voters", func(t *testing.T) { //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
 			rn := protocolCoverageNewRawNode(t, 1, voters)
 			cmd := optimizedTestCommand("covering-normal-fast", "covering-normal-fast-key")
 			ref, err := rn.Propose(cmd)
@@ -1779,7 +1789,7 @@ func TestNormalFastPathAdoptsCoveringRemoteTupleAtPaperQuorum(t *testing.T) {
 			covering.Seq++
 			covering.Deps[1] = dependency.Instance
 			neededRemote := rn.fastQuorumForConf(ref.Conf) - 1
-			for id := ReplicaID(2); id < ReplicaID(2+neededRemote); id++ {
+			for id := ReplicaID(2); id < ReplicaID(2+neededRemote); id++ { //nolint:gosec // G115: test harness converts bounded int index/count
 				if err := rn.Step(Message{Type: MsgPreAcceptResp, From: id,
 					To:     1,
 					Ref:    ref,
@@ -1822,7 +1832,9 @@ func TestRecoveryRecomputesAttrsForUnsafePreAcceptedCandidate(t *testing.T) {
 	rec.Checksum = ChecksumRecord(rec)
 	inst := &instance{rec: rec, phase: phaseIdle}
 	rn.instances[target] = inst
-	rn.startPrepare(inst)
+	if err := rn.startPrepare(inst); err != nil {
+		panic(err)
+	}
 	if err := rn.Step(Message{
 		Type:             MsgPrepareResp,
 		From:             2,
@@ -1869,10 +1881,14 @@ func TestPromisedFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
 
 	deadline := rn.recoveryTicks * 2
 	for tick := uint64(1); tick < deadline; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	if !rd.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: deadline}) || !rd.MustSync {
 		t.Fatalf("takeover Ready hard state = %#v, want tick %d", rd.HardState, deadline)
@@ -1901,10 +1917,14 @@ func TestTryPreAcceptFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
 
 	deadline := rn.recoveryTicks * 2
 	for tick := uint64(1); tick < deadline; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		protocolCoverageAdvanceHardStateOnly(t, rn, tick)
 	}
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	rd := rn.Ready()
 	if !rd.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: deadline}) || !rd.MustSync {
 		t.Fatalf("TryPreAccept takeover Ready hard state = %#v, want tick %d", rd.HardState, deadline)
@@ -1923,9 +1943,13 @@ func TestLateTimedPreAcceptFallsBackToConservativeConflictOrdering(t *testing.T)
 		t.Fatal(err)
 	}
 	protocolCoverageAdvanceHardStateOnly(t, rn, 0)
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	protocolCoverageAdvanceHardStateOnly(t, rn, 1)
-	rn.Tick()
+	if err := rn.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	protocolCoverageAdvanceHardStateOnly(t, rn, 2)
 
 	key := "late-timed-conflict"
@@ -2065,7 +2089,9 @@ func TestUnresolvedKnownConflictStartsRecoveryOnAnyHealthyReplica(t *testing.T) 
 	deadline := rn.recoveryTicks * 2
 	var rd Ready
 	for tick := uint64(1); tick <= deadline; tick++ {
-		rn.Tick()
+		if err := rn.Tick(); err != nil {
+			t.Fatal(err)
+		}
 		inst := rn.instances[blocker]
 		if inst != nil && inst.phase == phasePrepare {
 			rd = rn.Ready()
@@ -2450,6 +2476,7 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 			message.RecordBallot = Ballot{Replica: ref.Replica}
 			message.RecordStatus = StatusAccepted
 			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
+		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
 		}
 		return message
 	}
@@ -2654,6 +2681,7 @@ func TestTimedNoopMessagesRejectWithoutMutation(t *testing.T) {
 			message.RecordBallot = Ballot{Replica: ref.Replica}
 			message.RecordStatus = StatusAccepted
 			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
+		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
 		}
 		return message
 	}

@@ -397,9 +397,7 @@ func (n *RawNode) firstPrefixBlocker(base InstanceRef, lane instanceLane, throug
 			if inst == nil || inst.rec.Status < StatusCommitted {
 				return true, ref
 			}
-			if n.dependencyKnownAfter(base, ref, StatusCommitted) {
-				discharged = true
-			} else {
+			if !n.dependencyKnownAfter(base, ref, StatusCommitted) {
 				return true, InstanceRef{}
 			}
 		}
@@ -675,6 +673,8 @@ func (n *RawNode) tryExecute() {
 					inst.rec.MembershipResult, inst.rec.ConfChangeResult = n.applyMembershipControl(ref, inst.rec.Command)
 					inst.rec.Checksum = ChecksumRecord(inst.rec)
 					n.enqueueRecord(inst.rec)
+				case CommandNoop:
+					fallthrough
 				default:
 					inst.rec.Checksum = ChecksumRecord(inst.rec)
 					n.enqueueRecord(inst.rec)

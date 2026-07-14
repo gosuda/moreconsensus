@@ -7,17 +7,17 @@ import (
 )
 
 type faultOracleResult struct {
-	OK                  bool   `json:"ok"`
-	Linearizable        bool   `json:"linearizable"`
-	ChosenAgreement     bool   `json:"chosen_agreement"`
-	ExactlyOnce         bool   `json:"exactly_once_application"`
-	ConflictOrder       bool   `json:"converged_conflict_order"`
-	ConvergedState      bool   `json:"converged_state"`
-	MinorityFailClosed  bool   `json:"minority_fail_closed"`
-	DurableSlowQuorum   bool   `json:"durable_slow_quorum"`
-	HealedLiveness      bool   `json:"healed_liveness"`
-	LogicalStepBound    int    `json:"logical_step_bound,omitempty"`
-	Error               string `json:"error,omitempty"`
+	OK                 bool   `json:"ok"`
+	Linearizable       bool   `json:"linearizable"`
+	ChosenAgreement    bool   `json:"chosen_agreement"`
+	ExactlyOnce        bool   `json:"exactly_once_application"`
+	ConflictOrder      bool   `json:"converged_conflict_order"`
+	ConvergedState     bool   `json:"converged_state"`
+	MinorityFailClosed bool   `json:"minority_fail_closed"`
+	DurableSlowQuorum  bool   `json:"durable_slow_quorum"`
+	HealedLiveness     bool   `json:"healed_liveness"`
+	LogicalStepBound   int    `json:"logical_step_bound,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 func faultOracleExpectedNodes(h *faultSimHarness) []ReplicaID {
@@ -534,12 +534,12 @@ func TestFaultCrashCutsReplayExactly(t *testing.T) {
 	}
 	for cutIndex, cut := range cuts {
 		t.Run(string(cut), func(t *testing.T) {
-			h, err := newFaultSimHarness(faultSimConfig{Size: 1, Seed: uint64(100 + cutIndex)})
+			h, err := newFaultSimHarness(faultSimConfig{Size: 1, Seed: uint64(100 + cutIndex)}) //nolint:gosec // G115: test harness converts bounded int index/count
 			if err != nil {
 				t.Fatal(err)
 			}
 			faultMustAction(t, h, faultSimAction{Kind: faultActionPump, Required: true})
-			op := faultClientOperation{Client: 500 + uint64(cutIndex), Sequence: 1, Kind: "put", Writes: []faultKV{{Key: "cut", Value: string(cut)}}}
+			op := faultClientOperation{Client: 500 + uint64(cutIndex), Sequence: 1, Kind: "put", Writes: []faultKV{{Key: "cut", Value: string(cut)}}} //nolint:gosec // G115: test harness converts bounded int index/count
 			faultMustAction(t, h, faultSimAction{Kind: faultActionPropose, Node: 1, Operation: &op})
 			faultMustAction(t, h, faultSimAction{Kind: faultActionCrash, Node: 1, Cut: cut})
 			refs := []InstanceRef{}
@@ -547,7 +547,7 @@ func TestFaultCrashCutsReplayExactly(t *testing.T) {
 				ref, _ := h.refFor(op.commandID())
 				refs = append(refs, ref)
 			}
-			canary := faultClientOperation{Client: 900 + uint64(cutIndex), Sequence: 1, Kind: "put", Writes: []faultKV{{Key: "canary", Value: string(cut)}}}
+			canary := faultClientOperation{Client: 900 + uint64(cutIndex), Sequence: 1, Kind: "put", Writes: []faultKV{{Key: "canary", Value: string(cut)}}} //nolint:gosec // G115: test harness converts bounded int index/count
 			faultMustAction(t, h, faultSimAction{Kind: faultActionPropose, Node: 1, Operation: &canary})
 			canaryRef, _ := h.refFor(canary.commandID())
 			refs = append(refs, canaryRef)
