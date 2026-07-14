@@ -190,6 +190,11 @@ for cfg in tla/KVOmissionRecovery.cfg; do
 done
 
 run_tlc tla/Quorum.tla tla/Quorum.cfg
+
+for cfg in tla/EPaxosRetirePrefix.cfg; do
+  run_tlc tla/EPaxosRetirePrefix.tla "$cfg"
+done
+
 for cfg in tla/EPaxosVoterBootstrapSize1.cfg tla/EPaxosVoterBootstrapSize2.cfg tla/EPaxosVoterBootstrapSize3.cfg tla/EPaxosVoterBootstrapSize4.cfg tla/EPaxosVoterBootstrapSize5.cfg tla/EPaxosVoterBootstrapSize6.cfg tla/EPaxosVoterBootstrapCrashPrefix.cfg tla/EPaxosVoterBootstrapRace.cfg tla/EPaxosVoterBootstrapFair.cfg; do
   run_tlc tla/EPaxosVoterBootstrap.tla "$cfg"
 done
