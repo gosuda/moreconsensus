@@ -28,6 +28,7 @@ BOOTSTRAP_PROFILE = (
 )
 
 FAST_PROFILE = (
+    ("tla/EPaxosRetirePrefix.tla", "tla/EPaxosRetirePrefix.cfg"),
     ("tla/ReadyAdvance.tla", "tla/ReadyAdvance.cfg"),
     ("tla/ReadyAdvance.tla", "tla/ReadyAdvanceCapped.cfg"),
     ("tla/Quorum.tla", "tla/Quorum.cfg"),
@@ -46,6 +47,7 @@ FAST_PROFILE = (
 )
 
 FULL_PROFILE = (
+    ("tla/EPaxosRetirePrefix.tla", "tla/EPaxosRetirePrefix.cfg"),
     *(("tla/EPaxos.tla", cfg) for cfg in ("tla/EPaxos.cfg", "tla/EPaxosKVConflict.cfg", "tla/EPaxosThreeReplica.cfg")),
     *(("tla/ReadyAdvance.tla", cfg) for cfg in ("tla/ReadyAdvance.cfg", "tla/ReadyAdvanceCapped.cfg")),
     *(("tla/EPaxosResponses.tla", cfg) for cfg in ("tla/EPaxosResponses.cfg", "tla/EPaxosResponsesFive.cfg")),
