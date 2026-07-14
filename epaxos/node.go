@@ -30,10 +30,6 @@ type tryEvidenceKey struct {
 	conflict InstanceRef
 	ballot   Ballot
 }
-type conflictIndexKey struct {
-	conf ConfID
-	key  string
-}
 
 type instance struct {
 	rec             InstanceRecord
@@ -209,9 +205,7 @@ type RawNode struct {
 	acknowledgedHardState           HardState
 	nextInstance                    InstanceNum
 	instances                       map[InstanceRef]*instance
-	conflicts                       map[conflictIndexKey]map[instanceLane]InstanceRef
-	allConflicts                    map[instanceLane]InstanceRef
-	globalConflicts                 map[instanceLane]InstanceRef
+	engine                          conflictEngine
 	executed                        executedTracker
 	pendingConf                     bool
 	appliedConfByBase               map[ConfID]InstanceRef
@@ -693,9 +687,6 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		maxConcurrentRecoveries:         cfg.MaxConcurrentRecoveries,
 		nextInstance:                    1,
 		instances:                       make(map[InstanceRef]*instance),
-		conflicts:                       make(map[conflictIndexKey]map[instanceLane]InstanceRef),
-		allConflicts:                    make(map[instanceLane]InstanceRef),
-		globalConflicts:                 make(map[instanceLane]InstanceRef),
 		executed:                        newExecutedTracker(),
 		committedThrough:                make(map[instanceLane]InstanceNum),
 		appliedConfByBase:               make(map[ConfID]InstanceRef),
@@ -917,7 +908,6 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 			n.observeInstanceRef(rec.Ref)
 		}
 		if rec.Status >= StatusPreAccepted && !rec.TOQPending {
-			n.indexConflicts(rec)
 			if rec.TimingDomain == TimingDomainTOQ && n.toqEnabled && (!n.toqClosed || rec.ProcessAt > n.toqClosedThrough) {
 				n.toqClosed = true
 				n.toqClosedThrough = rec.ProcessAt
@@ -1734,16 +1724,17 @@ func (n *RawNode) handleLocalTOQPreAccept(m Message) {
 		return
 	}
 	attrs := n.computeAttrsAt(inst.rec.Command, inst.rec.Ref, m.ProcessAt, true)
-	inst.rec.Status = StatusPreAccepted
-	inst.rec.Seq = attrs.Seq
-	inst.rec.Deps = append([]InstanceNum(nil), attrs.Deps...)
-	inst.rec.FastPathEligible = true
-	inst.rec.ProcessAt = m.ProcessAt
-	inst.rec.TOQPending = false
+	next := inst.rec.Clone()
+	next.Status = StatusPreAccepted
+	next.Seq = attrs.Seq
+	next.Deps = append([]InstanceNum(nil), attrs.Deps...)
+	next.FastPathEligible = true
+	next.ProcessAt = m.ProcessAt
+	next.TOQPending = false
+	next.RecordBallot = next.Ballot
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
 	inst.processAt = m.ProcessAt
-	inst.rec.RecordBallot = inst.rec.Ballot
-	inst.rec.Checksum = ChecksumRecord(inst.rec)
-	n.indexConflicts(inst.rec)
 	if inst.preOK == nil {
 		inst.preOK = getAttrVoteSet()
 	}
@@ -1957,7 +1948,6 @@ func (n *RawNode) propose(cmd Command) (InstanceRef, error) {
 		return InstanceRef{}, ErrInvalidConfig
 	}
 	n.installInstance(inst)
-	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	if n.slowQuorumForConf(ref.Conf) == 1 {
 		n.commit(inst, rec.Attributes())
@@ -2514,7 +2504,6 @@ func (n *RawNode) handlePreAccept(m Message, ordered bool) error {
 	n.observeInstanceRef(rec.Ref)
 	inst := &instance{rec: rec, phase: phaseIdle, processAt: m.ProcessAt, generation: generation}
 	n.installInstance(inst)
-	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
 	if err := n.scheduleRecovery(inst); err != nil {
@@ -2709,7 +2698,6 @@ func (n *RawNode) handleAccept(m Message) error {
 	n.observeInstanceRef(rec.Ref)
 	inst := &instance{rec: rec, phase: phaseIdle, processAt: rec.ProcessAt, generation: generation}
 	n.installInstance(inst)
-	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
 	if err := n.scheduleRecovery(inst); err != nil {
@@ -2816,7 +2804,6 @@ func (n *RawNode) handleCommit(m Message) error {
 	rec.Checksum = ChecksumRecord(rec)
 	n.observeInstanceRef(rec.Ref)
 	n.installInstance(&instance{rec: rec, phase: phaseCommitted, processAt: rec.ProcessAt})
-	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
 	n.tryExecute()
@@ -3007,9 +2994,10 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	for _, id := range responders {
 		rec := prepareResponseRecord(inst, conf, id)
 		if rec.Status >= StatusCommitted {
-			inst.rec = rec.Clone()
-			inst.rec.Status = StatusCommitted
-			inst.rec.Checksum = ChecksumRecord(inst.rec)
+			next := rec.Clone()
+			next.Status = StatusCommitted
+			next.Checksum = ChecksumRecord(next)
+			n.setInstanceRecord(inst, next)
 			n.commit(inst, inst.rec.Attributes())
 			return nil
 		}
@@ -3035,9 +3023,12 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 		}
 	}
 	if foundAccepted {
-		inst.rec.Command = chosen.Command.Clone()
-		inst.rec.ProcessAt = chosen.ProcessAt
-		inst.rec.TimingDomain = chosen.TimingDomain
+		next := inst.rec.Clone()
+		next.Command = chosen.Command.Clone()
+		next.ProcessAt = chosen.ProcessAt
+		next.TimingDomain = chosen.TimingDomain
+		next.Checksum = ChecksumRecord(next)
+		n.setInstanceRecord(inst, next)
 		inst.processAt = chosen.ProcessAt
 		n.startAccept(inst, attrs)
 		return nil
@@ -3075,36 +3066,45 @@ func (n *RawNode) handlePrepareResp(m Message) error {
 	}
 	for _, candidate := range candidates {
 		if candidate.voters.len() >= n.tryWitnessQuorumForConf(inst.rec.Ref.Conf) {
-			inst.rec.Command = candidate.rec.Command.Clone()
-			inst.rec.ProcessAt = candidate.rec.ProcessAt
-			inst.rec.TimingDomain = candidate.rec.TimingDomain
+			next := inst.rec.Clone()
+			next.Command = candidate.rec.Command.Clone()
+			next.ProcessAt = candidate.rec.ProcessAt
+			next.TimingDomain = candidate.rec.TimingDomain
+			next.Checksum = ChecksumRecord(next)
+			n.setInstanceRecord(inst, next)
 			inst.processAt = candidate.rec.ProcessAt
 			n.startTryPreAccept(inst, candidate.rec.Attributes(), candidate.voters, true)
 			return nil
 		}
 	}
 	if foundPreAccepted {
-		inst.rec.Command = chosen.Command.Clone()
-		inst.rec.ProcessAt = chosen.ProcessAt
-		inst.rec.TimingDomain = chosen.TimingDomain
+		next := inst.rec.Clone()
+		next.Command = chosen.Command.Clone()
+		next.ProcessAt = chosen.ProcessAt
+		next.TimingDomain = chosen.TimingDomain
+		next.Checksum = ChecksumRecord(next)
+		n.setInstanceRecord(inst, next)
 		inst.processAt = chosen.ProcessAt
 		attrs = mergeAttrs(attrs, n.computeAttrs(inst.rec.Command, inst.rec.Ref))
 		n.startAccept(inst, attrs)
 		return nil
 	}
 
+	next := inst.rec.Clone()
 	if _, _, control := n.findBootstrapControl(inst.rec.Ref); control {
 		command, ok := n.membershipAllNoneCommand(inst.rec.Ref)
 		if !ok {
 			return ErrBootstrapControl
 		}
-		inst.rec.Command = command
+		next.Command = command
 	} else {
-		inst.rec.Command = Command{Kind: CommandNoop}
+		next.Command = Command{Kind: CommandNoop}
 	}
-	inst.rec.ProcessAt = 0
-	inst.rec.TimingDomain = TimingDomainUntimed
-	inst.rec.TOQPending = false
+	next.ProcessAt = 0
+	next.TimingDomain = TimingDomainUntimed
+	next.TOQPending = false
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
 	inst.processAt = 0
 	n.startAccept(inst, Attributes{Seq: 1, Deps: n.depsForConf(m.Ref.Conf)})
 	return nil
@@ -3186,18 +3186,21 @@ func (n *RawNode) startAccept(inst *instance, attrs Attributes) {
 	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
 	n.removeDeferredPreAccepts(inst.rec.Ref)
 	releaseInstanceVolatile(inst)
-	clearRecordAcceptEvidence(&inst.rec)
+	next := inst.rec.Clone()
+	clearRecordAcceptEvidence(&next)
+	next.Status = StatusAccepted
+	next.Seq = attrs.Seq
+	next.Deps = append([]InstanceNum(nil), attrs.Deps...)
+	next.FastPathEligible = false
+	next.TOQPending = false
+	next.RecordBallot = next.Ballot
+	n.ensureRecordDeps(&next)
+	evidenceAttrs := mergeAttrs(next.Attributes(), n.computeAttrs(next.Command, next.Ref))
+	mergeAcceptEvidence(&next, evidenceAttrs)
+	mergeOwnAcceptEvidence(&next, n.id, evidenceAttrs)
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
 	inst.phase = phaseAccept
-	inst.rec.Status = StatusAccepted
-	inst.rec.Seq = attrs.Seq
-	inst.rec.Deps = append([]InstanceNum(nil), attrs.Deps...)
-	inst.rec.FastPathEligible = false
-	inst.rec.TOQPending = false
-	inst.rec.RecordBallot = inst.rec.Ballot
-	n.ensureRecordDeps(&inst.rec)
-	evidenceAttrs := mergeAttrs(inst.rec.Attributes(), n.computeAttrs(inst.rec.Command, inst.rec.Ref))
-	mergeAcceptEvidence(&inst.rec, evidenceAttrs)
-	mergeOwnAcceptEvidence(&inst.rec, n.id, evidenceAttrs)
 	inst.rec.Checksum = ChecksumRecord(inst.rec)
 	inst.accOK.add(n.confFor(inst.rec.Ref.Conf), n.id)
 	inst.generation++
@@ -3224,18 +3227,20 @@ func (n *RawNode) startTryPreAccept(inst *instance, attrs Attributes, witnesses 
 	}
 	n.removeDeferredPreAccepts(inst.rec.Ref)
 	releaseInstanceVolatile(inst)
+	next := inst.rec.Clone()
+	next.Status = StatusPreAccepted
+	next.Seq = attrs.Seq
+	next.Deps = append([]InstanceNum(nil), attrs.Deps...)
+	next.FastPathEligible = false
+	next.TOQPending = false
+	next.RecordBallot = next.Ballot
+	clearRecordAcceptEvidence(&next)
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
 	inst.phase = phaseTryPreAccept
-	inst.rec.Status = StatusPreAccepted
-	inst.rec.Seq = attrs.Seq
-	inst.rec.Deps = append([]InstanceNum(nil), attrs.Deps...)
-	inst.rec.FastPathEligible = false
-	inst.rec.TOQPending = false
-	inst.rec.RecordBallot = inst.rec.Ballot
-	clearRecordAcceptEvidence(&inst.rec)
 	inst.tryDeferred = nil
 	inst.tryIgnored = nil
 	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
-	inst.rec.Checksum = ChecksumRecord(inst.rec)
 	inst.tryOK = witnesses
 	if countInitialLeader {
 		inst.tryOK.add(conf, inst.rec.Ref.Replica)
@@ -3348,7 +3353,6 @@ func (n *RawNode) handleTryPreAccept(m Message) error {
 	}
 	inst := &instance{rec: rec, phase: phaseIdle, generation: generation}
 	n.installInstance(inst)
-	n.indexConflicts(rec)
 	n.enqueueRecord(rec)
 	n.markPendingConf(rec)
 	if err := n.scheduleRecovery(inst); err != nil {
@@ -3707,42 +3711,98 @@ func clearTryEvidenceRecords(records map[ReplicaID]InstanceRecord) {
 }
 func (n *RawNode) tryPreAcceptConflict(m Message) (InstanceRef, Status, bool) {
 	candidate := InstanceRecord{Ref: m.Ref, Seq: m.Seq, Deps: m.Deps, Command: m.Command}
-	refs := make([]InstanceRef, 0, len(n.instances))
-	for ref := range n.instances {
-		refs = append(refs, ref)
+	var conflictRef InstanceRef
+	conflictStatus := StatusNone
+	considerConflict := func(ref InstanceRef, status Status) {
+		if conflictRef.IsZero() || lessRef(ref, conflictRef) {
+			conflictRef = ref
+			conflictStatus = status
+		}
 	}
-	sortRefs(refs)
-	for _, ref := range refs {
-		other := n.instances[ref]
-		if ref == m.Ref || other.rec.Status == StatusNone || !commandsConflict(candidate.Command, other.rec.Command) {
-			continue
+	considerRetired := func(lane instanceLane, instance InstanceNum) {
+		if instance == 0 {
+			return
+		}
+		ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+		if ref != m.Ref && !n.attrsDependsOn(candidate.Attributes(), ref, m.Ref.Conf) {
+			considerConflict(ref, StatusExecuted)
+		}
+	}
+	considerRecord := func(ref InstanceRef, other *instance) {
+		if other == nil || ref == m.Ref || other.rec.Status == StatusNone || !commandsConflict(candidate.Command, other.rec.Command) {
+			return
 		}
 		candidateDepends := n.attrsDependsOn(candidate.Attributes(), ref, m.Ref.Conf)
 		otherAttrs := other.rec.Attributes()
-		otherDepends := n.attrsDependsOn(otherAttrs, m.Ref, other.rec.Ref.Conf)
-		if otherDepends {
-			continue
+		if n.attrsDependsOn(otherAttrs, m.Ref, other.rec.Ref.Conf) {
+			return
 		}
 		if !candidateDepends {
-			return ref, other.rec.Status, true
+			considerConflict(ref, other.rec.Status)
+			return
 		}
 		if other.rec.Status >= StatusCommitted && m.IgnoreDependency.Ref == ref {
-			continue
+			return
 		}
 		if other.rec.Status >= StatusCommitted {
 			if n.recordAcceptEvidenceDependsOn(other.rec, m.Ref) {
-				continue
+				return
 			}
 		} else if acceptAttrs, ok := other.rec.AcceptAttributes(); ok && n.attrsDependsOn(acceptAttrs, m.Ref, other.rec.Ref.Conf) {
-			continue
+			return
 		}
 		sameLeaderPreAccepted := ref.Replica == m.Ref.Replica && other.rec.Status == StatusPreAccepted
 		if otherAttrs.Seq >= candidate.Seq && !sameLeaderPreAccepted {
-			return ref, other.rec.Status, true
+			considerConflict(ref, other.rec.Status)
 		}
 	}
-	return InstanceRef{}, StatusNone, false
+
+	if candidate.Command.Kind != CommandNoop {
+		if commandHasGlobalConflictScope(candidate.Command.Kind) {
+			n.engine.lanes(m.Ref.Conf, func(lane instanceLane) bool {
+				resident, retired := n.engine.maxEligibleAny(lane)
+				considerRetired(lane, retired)
+				n.engine.walkDesc(lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+					if !slot.eligible() {
+						return true
+					}
+					ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+					considerRecord(ref, n.instances[ref])
+					return true
+				})
+				return true
+			})
+		} else {
+			n.engine.keyLaneSet(m.Ref.Conf, candidate.Command.ConflictKeys, func(lane instanceLane) bool {
+				for _, key := range candidate.Command.ConflictKeys {
+					resident, retired := n.engine.keyMax(m.Ref.Conf, key, lane)
+					considerRetired(lane, retired)
+					n.engine.walkKeyDesc(m.Ref.Conf, key, lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+						if !slot.eligible() {
+							return true
+						}
+						ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+						considerRecord(ref, n.instances[ref])
+						return true
+					})
+				}
+				return true
+			})
+			n.engine.lanes(m.Ref.Conf, func(lane instanceLane) bool {
+				resident, retired := n.engine.globalMax(lane)
+				considerRetired(lane, retired)
+				n.engine.walkGlobalDesc(lane, resident, func(instance InstanceNum, _ laneSlot) bool {
+					ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+					considerRecord(ref, n.instances[ref])
+					return true
+				})
+				return true
+			})
+		}
+	}
+	return conflictRef, conflictStatus, !conflictRef.IsZero()
 }
+
 
 func (n *RawNode) attrsDependsOn(attrs Attributes, dep InstanceRef, confID ConfID) bool {
 	if dep.Conf != confID || dep.Replica == 0 {
@@ -3924,18 +3984,21 @@ func (n *RawNode) startPrepareFrom(inst *instance, base Ballot) error {
 	inst.generation++
 	n.enqueueRecord(inst.rec)
 	if n.slowQuorumForConf(inst.rec.Ref.Conf) == 1 {
+		next := inst.rec.Clone()
 		if _, _, isControl := n.findBootstrapControl(inst.rec.Ref); isControl {
 			command, ok := n.membershipAllNoneCommand(inst.rec.Ref)
 			if !ok {
 				return ErrBootstrapControl
 			}
-			inst.rec.Command = command
+			next.Command = command
 		} else {
-			inst.rec.Command = Command{Kind: CommandNoop}
+			next.Command = Command{Kind: CommandNoop}
 		}
-		inst.rec.ProcessAt = 0
-		inst.rec.TimingDomain = TimingDomainUntimed
-		inst.rec.TOQPending = false
+		next.ProcessAt = 0
+		next.TimingDomain = TimingDomainUntimed
+		next.TOQPending = false
+		next.Checksum = ChecksumRecord(next)
+		n.setInstanceRecord(inst, next)
 		inst.processAt = 0
 		n.startAccept(inst, Attributes{Seq: 1, Deps: n.depsForConf(inst.rec.Ref.Conf)})
 		return nil
@@ -4136,16 +4199,17 @@ func (n *RawNode) commit(inst *instance, attrs Attributes) {
 	if inst.rec.Seq != attrs.Seq || !instanceNumsEqual(inst.rec.Deps, attrs.Deps) {
 		clearRecordAcceptEvidence(&inst.rec)
 	}
+	next := inst.rec.Clone()
+	next.Status = StatusCommitted
+	next.Seq = attrs.Seq
+	next.Deps = append([]InstanceNum(nil), attrs.Deps...)
+	next.FastPathEligible = false
+	next.TOQPending = false
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
 	inst.phase = phaseCommitted
-	inst.rec.Status = StatusCommitted
 	n.noteCommitted(inst.rec.Ref)
-	inst.rec.Seq = attrs.Seq
-	inst.rec.Deps = append([]InstanceNum(nil), attrs.Deps...)
-	inst.rec.FastPathEligible = false
-	inst.rec.TOQPending = false
-	inst.rec.Checksum = ChecksumRecord(inst.rec)
 	inst.generation++
-	n.indexConflicts(inst.rec)
 	n.enqueueRecord(inst.rec)
 	n.broadcast(MsgCommit, inst.rec)
 	releaseInstanceVolatile(inst)
@@ -4404,6 +4468,12 @@ func (n *RawNode) readyRecord(rec InstanceRecord) InstanceRecord {
 
 func inboundCommand(cmd Command) Command { return cmd.Clone() }
 
+func (n *RawNode) setInstanceRecord(inst *instance, rec InstanceRecord) {
+	previous := inst.rec.Clone()
+	n.engine.apply(&previous, rec)
+	inst.rec = rec
+}
+
 func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 	return n.computeAttrsAt(cmd, exclude, 0, false)
 }
@@ -4411,10 +4481,10 @@ func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uint64, timedPreAccept bool) Attributes {
 	conf := n.confFor(exclude.Conf)
 	deps := make([]InstanceNum, len(conf.Voters))
-	seq := uint64(1)
-	if len(n.instances) == 0 {
-		return Attributes{Seq: seq, Deps: deps}
+	if cmd.Kind == CommandNoop {
+		return Attributes{Seq: 1, Deps: deps}
 	}
+
 	addRef := func(ref InstanceRef, rec InstanceRecord) bool {
 		if ref == exclude || rec.TOQPending || rec.Status == StatusNone || rec.Command.Kind == CommandNoop || ref.Conf != exclude.Conf {
 			return false
@@ -4429,82 +4499,102 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 		if !ok {
 			return false
 		}
-		if ref.Instance > deps[idx] {
-			deps[idx] = ref.Instance
-		}
-		if rec.Seq >= seq {
-			seq = saturatingSeqIncrement(rec.Seq)
-		}
+		deps[idx] = max(deps[idx], ref.Instance)
 		return true
 	}
-	addFallbackLane := func(lane instanceLane) {
-		var bestRef InstanceRef
-		var bestRec InstanceRecord
-		for ref, inst := range n.instances {
-			if inst == nil || laneFor(ref) != lane || ref == exclude || ref.Conf != exclude.Conf ||
-				inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop ||
-				!commandsConflict(cmd, inst.rec.Command) {
-				continue
-			}
-			if bestRef.IsZero() || lessRef(bestRef, ref) {
-				bestRef = ref
-				bestRec = inst.rec
-			}
+	addRetired := func(lane instanceLane, instance InstanceNum) {
+		if instance == 0 || lane.conf != exclude.Conf {
+			return
 		}
-		if !bestRef.IsZero() {
-			addRef(bestRef, bestRec)
+		idx, ok := conf.Index(lane.replica)
+		if ok {
+			deps[idx] = max(deps[idx], instance)
 		}
 	}
-	addIndexedLanes := func(index map[instanceLane]InstanceRef) {
-		for lane, ref := range index {
-			if lane.conf != exclude.Conf {
-				continue
+	// Key-scoped: walk only that key's postings descending from its resident max.
+	walkKey := func(lane instanceLane, key []byte, from InstanceNum) {
+		if from == 0 || lane.conf != exclude.Conf {
+			return
+		}
+		n.engine.walkKeyDesc(exclude.Conf, key, lane, from, func(instance InstanceNum, slot laneSlot) bool {
+			if !slot.eligible() {
+				return true
 			}
+			ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
 			inst := n.instances[ref]
-			if inst != nil && addRef(ref, inst.rec) {
-				continue
+			if inst == nil {
+				return true
 			}
-			addFallbackLane(lane)
-		}
+			_ = addRef(ref, inst.rec)
+			// continue: need max across candidates; do not stop at first
+			return true
+		})
 	}
-	if cmd.Kind == CommandNoop {
-		return Attributes{Seq: seq, Deps: deps}
+	walkGlobal := func(lane instanceLane, from InstanceNum) {
+		if from == 0 || lane.conf != exclude.Conf {
+			return
+		}
+		n.engine.walkGlobalDesc(lane, from, func(instance InstanceNum, _ laneSlot) bool {
+			ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+			inst := n.instances[ref]
+			if inst == nil {
+				addRetired(lane, instance)
+				return true
+			}
+			_ = addRef(ref, inst.rec)
+			return true
+		})
 	}
-	if commandHasGlobalConflictScope(cmd.Kind) { //nolint:gocritic // ifElseChain: attrs path keeps explicit ordering
-		addIndexedLanes(n.allConflicts)
-		if len(n.allConflicts) == 0 {
-			for ref, inst := range n.instances {
-				if inst != nil {
-					addRef(ref, inst.rec)
-				}
+
+	if commandHasGlobalConflictScope(cmd.Kind) {
+		n.engine.lanes(exclude.Conf, func(lane instanceLane) bool {
+			resident, retired := n.engine.maxEligibleAny(lane)
+			// Global-scope commands depend on any eligible conflict, not only global-flagged records.
+			if resident != 0 {
+				n.engine.walkDesc(lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+					if !slot.eligible() {
+						return true
+					}
+					ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+					inst := n.instances[ref]
+					if inst == nil {
+						return true
+					}
+					_ = addRef(ref, inst.rec)
+					return true
+				})
 			}
-		}
-	} else if timedPreAccept {
-		for ref, inst := range n.instances {
-			if inst != nil {
-				addRef(ref, inst.rec)
-			}
-		}
+			addRetired(lane, retired)
+			return true
+		})
 	} else {
-		for _, key := range cmd.ConflictKeys {
-			addIndexedLanes(n.conflicts[conflictIndexKey{conf: exclude.Conf, key: string(key)}])
-		}
-		addIndexedLanes(n.globalConflicts)
+		n.engine.keyLaneSet(exclude.Conf, cmd.ConflictKeys, func(lane instanceLane) bool {
+			for _, key := range cmd.ConflictKeys {
+				resident, retired := n.engine.keyMax(exclude.Conf, key, lane)
+				walkKey(lane, key, resident)
+				addRetired(lane, retired)
+			}
+			return true
+		})
+		n.engine.lanes(exclude.Conf, func(lane instanceLane) bool {
+			resident, retired := n.engine.globalMax(lane)
+			walkGlobal(lane, resident)
+			addRetired(lane, retired)
+			return true
+		})
 	}
-	for ref, inst := range n.instances {
-		if inst == nil || ref == exclude || ref.Conf != exclude.Conf || inst.rec.TOQPending || inst.rec.Status == StatusNone || inst.rec.Command.Kind == CommandNoop {
+
+	seq := uint64(1)
+	for idx, through := range deps {
+		if through == 0 {
 			continue
 		}
-		idx, ok := conf.Index(ref.Replica)
-		if !ok || ref.Instance > deps[idx] {
-			continue
-		}
-		if inst.rec.Seq >= seq {
-			seq = saturatingSeqIncrement(inst.rec.Seq)
-		}
+		lane := instanceLane{conf: exclude.Conf, replica: conf.Voters[idx]}
+		seq = max(seq, saturatingSeqIncrement(n.engine.prefixMaxSeq(lane, through)))
 	}
 	return Attributes{Seq: seq, Deps: deps}
 }
+
 
 func (n *RawNode) skipTimedConflict(cmd Command, candidate InstanceRef, processAt uint64, timedPreAccept bool, ref InstanceRef, rec InstanceRecord) bool {
 	if !timedPreAccept || cmd.Kind != CommandUser || rec.Command.Kind != CommandUser {
@@ -4621,70 +4711,6 @@ func addTryCandidate(candidates []tryCandidate, conf ConfState, rec InstanceReco
 	candidate := tryCandidate{rec: rec.Clone()}
 	candidate.voters.add(conf, voter)
 	return append(candidates, candidate)
-}
-
-func (n *RawNode) ensureConflictIndexes() {
-	if n.conflicts == nil {
-		n.conflicts = make(map[conflictIndexKey]map[instanceLane]InstanceRef)
-	}
-	if n.allConflicts == nil {
-		n.allConflicts = make(map[instanceLane]InstanceRef)
-	}
-	if n.globalConflicts == nil {
-		n.globalConflicts = make(map[instanceLane]InstanceRef)
-	}
-}
-func (n *RawNode) conflictIndex(conf ConfID, key []byte) map[instanceLane]InstanceRef {
-	return n.conflicts[conflictIndexKey{conf: conf, key: string(key)}]
-}
-
-func updateConflictMaximum(index map[instanceLane]InstanceRef, ref InstanceRef) {
-	lane := laneFor(ref)
-	if old, ok := index[lane]; !ok || old.Instance < ref.Instance {
-		index[lane] = ref
-	}
-}
-
-func (n *RawNode) indexConflictRecord(rec InstanceRecord) {
-	if rec.Status < StatusPreAccepted || rec.TOQPending || rec.Command.Kind == CommandNoop {
-		return
-	}
-	n.ensureConflictIndexes()
-	updateConflictMaximum(n.allConflicts, rec.Ref)
-	if commandHasGlobalConflictScope(rec.Command.Kind) {
-		updateConflictMaximum(n.globalConflicts, rec.Ref)
-		return
-	}
-	for _, key := range rec.Command.ConflictKeys {
-		indexKey := conflictIndexKey{conf: rec.Ref.Conf, key: string(key)}
-		byLane := n.conflicts[indexKey]
-		if byLane == nil {
-			byLane = make(map[instanceLane]InstanceRef)
-			n.conflicts[indexKey] = byLane
-		}
-		updateConflictMaximum(byLane, rec.Ref)
-	}
-}
-
-func (n *RawNode) rebuildConflictLane(lane instanceLane) {
-	n.ensureConflictIndexes()
-	for key, byLane := range n.conflicts {
-		delete(byLane, lane)
-		if len(byLane) == 0 {
-			delete(n.conflicts, key)
-		}
-	}
-	delete(n.allConflicts, lane)
-	delete(n.globalConflicts, lane)
-	for ref, inst := range n.instances {
-		if inst != nil && laneFor(ref) == lane {
-			n.indexConflictRecord(inst.rec)
-		}
-	}
-}
-
-func (n *RawNode) indexConflicts(rec InstanceRecord) {
-	n.indexConflictRecord(rec)
 }
 
 func attrsFromVotes(conf ConfState, votes *attrVoteSet) Attributes {

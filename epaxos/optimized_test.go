@@ -46,9 +46,6 @@ func optimizedSeedRecord(t *testing.T, rn *RawNode, rec InstanceRecord) {
 	}
 	rec.Checksum = ChecksumRecord(rec)
 	rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status), processAt: rec.ProcessAt})
-	if rec.Status >= StatusPreAccepted {
-		rn.indexConflicts(rec)
-	}
 }
 
 func optimizedRequireRecord(t *testing.T, rd Ready, ref InstanceRef) InstanceRecord {

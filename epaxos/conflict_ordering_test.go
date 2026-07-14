@@ -98,13 +98,15 @@ func TestConflictIndexScopesConfigurationsAndExcludedLaneMaximum(t *testing.T) {
 	}
 	for _, rec := range records {
 		rn.instances[rec.Ref] = &instance{rec: rec, phase: phasePreAccept}
-		rn.indexConflicts(rec)
+		rn.engine.apply(nil, rec)
 	}
-	if got := rn.conflictIndex(1, key)[instanceLane{conf: 1, replica: 2}]; got != records[0].Ref {
-		t.Fatalf("configuration 1 index=%s, want %s", got, records[0].Ref)
+	lane2c1 := instanceLane{conf: 1, replica: 2}
+	if resident, _ := rn.engine.keyMax(1, key, lane2c1); resident != records[0].Ref.Instance {
+		t.Fatalf("configuration 1 index=%d, want %s", resident, records[0].Ref)
 	}
-	if got := rn.conflictIndex(2, key)[instanceLane{conf: 2, replica: 2}]; got != records[2].Ref {
-		t.Fatalf("configuration 2 index=%s, want latest %s", got, records[2].Ref)
+	lane2c2 := instanceLane{conf: 2, replica: 2}
+	if resident, _ := rn.engine.keyMax(2, key, lane2c2); resident != records[2].Ref.Instance {
+		t.Fatalf("configuration 2 index=%d, want latest %s", resident, records[2].Ref)
 	}
 
 	newCommand := Command{Payload: []byte("new"), ConflictKeys: [][]byte{key}}

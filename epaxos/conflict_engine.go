@@ -641,6 +641,50 @@ func (e *conflictEngine) keyMax(conf ConfID, key []byte, lane instanceLane) (res
 	return entry.postings.max(), entry.retiredFloor
 }
 
+// walkKeyDesc yields resident instances for one (conf,key,lane) in descending Instance order,
+// only visiting that key's posting tree (not unrelated lane residents).
+func (e *conflictEngine) walkKeyDesc(conf ConfID, key []byte, lane instanceLane, from InstanceNum, yield func(InstanceNum, laneSlot) bool) {
+	keys := e.byKey[conf]
+	if keys == nil {
+		return
+	}
+	lanes := keys[string(key)]
+	if lanes == nil {
+		return
+	}
+	entry := (*lanes)[lane]
+	if entry == nil || entry.postings.root == nil {
+		return
+	}
+	index := e.laneIndex[lane]
+	if index == nil {
+		return
+	}
+	if from == 0 {
+		from = entry.postings.max()
+	}
+	if from == 0 {
+		return
+	}
+	walkPostingDesc(entry.postings.root, 0, from, true, func(instance InstanceNum) bool {
+		slot, ok := index.resident.slot(instance)
+		if !ok {
+			return true
+		}
+		return yield(instance, slot)
+	})
+}
+
+// walkGlobalDesc yields global-scope eligible residents for a lane descending from from.
+func (e *conflictEngine) walkGlobalDesc(lane instanceLane, from InstanceNum, yield func(InstanceNum, laneSlot) bool) {
+	e.walkDesc(lane, from, func(instance InstanceNum, slot laneSlot) bool {
+		if !slot.global() || !slot.eligible() {
+			return true
+		}
+		return yield(instance, slot)
+	})
+}
+
 func (e *conflictEngine) keyLaneSet(conf ConfID, keys [][]byte, yield func(instanceLane) bool) {
 	for lane := range e.laneIndex {
 		if lane.conf != conf {
@@ -671,28 +715,26 @@ func (e *conflictEngine) lanes(conf ConfID, yield func(instanceLane) bool) {
 	}
 }
 
-func (e *conflictEngine) maxEligibleAny(lane instanceLane) InstanceNum {
+func (e *conflictEngine) maxEligibleAny(lane instanceLane) (resident, retired InstanceNum) {
 	index := e.laneIndex[lane]
 	if index == nil {
-		return 0
+		return 0, 0
 	}
-	resident := InstanceNum(0)
 	if index.resident.root != nil {
 		resident = index.resident.root.maxEligibleAny
 	}
-	return max(resident, index.retiredEligibleAny)
+	return resident, index.retiredEligibleAny
 }
 
-func (e *conflictEngine) globalMax(lane instanceLane) InstanceNum {
+func (e *conflictEngine) globalMax(lane instanceLane) (resident, retired InstanceNum) {
 	index := e.laneIndex[lane]
 	if index == nil {
-		return 0
+		return 0, 0
 	}
-	resident := InstanceNum(0)
 	if index.resident.root != nil {
 		resident = index.resident.root.globalMax
 	}
-	return max(resident, index.retiredGlobal)
+	return resident, index.retiredGlobal
 }
 
 func (e *conflictEngine) foldRecord(rec InstanceRecord) {

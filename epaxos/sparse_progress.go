@@ -200,10 +200,12 @@ func (n *RawNode) installInstance(inst *instance) {
 		releaseInstanceVolatile(replaced)
 	}
 	n.dropTryEvidenceChecksForTarget(inst.rec.Ref)
-	n.instances[inst.rec.Ref] = inst
-	if replaced != nil && replaced != inst {
-		n.rebuildConflictLane(laneFor(inst.rec.Ref))
+	var previous *InstanceRecord
+	if replaced != nil {
+		previous = &replaced.rec
 	}
+	n.engine.apply(previous, inst.rec)
+	n.instances[inst.rec.Ref] = inst
 	if inst.rec.Status >= StatusCommitted {
 		n.noteCommitted(inst.rec.Ref)
 		releaseInstanceVolatile(inst)
@@ -557,6 +559,7 @@ func (n *RawNode) ensureDependencyRecovery(ref InstanceRef, mayStart bool) recov
 	}
 	if err := n.startPrepare(inst); err != nil {
 		if created {
+			n.engine.remove(ref, inst.rec)
 			delete(n.instances, ref)
 		}
 		return recoveryDeferred
@@ -660,24 +663,29 @@ func (n *RawNode) tryExecute() {
 					continue
 				}
 				n.executed.add(ref)
-				inst.rec.Status = StatusExecuted
-				switch inst.rec.Command.Kind {
+				rec := inst.rec
+				rec.Status = StatusExecuted
+				switch rec.Command.Kind {
 				case CommandUser:
-					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					n.enqueueCommitted(CommittedCommand{Ref: ref, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), Command: inst.rec.Command.Clone()})
+					rec.Checksum = ChecksumRecord(rec)
+					n.setInstanceRecord(inst, rec)
+					n.enqueueCommitted(CommittedCommand{Ref: ref, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: rec.Command.Clone()})
 				case CommandConfChange:
-					inst.rec.ConfChangeResult = n.applyConfChange(ref, inst.rec.Command)
-					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					n.enqueueRecord(inst.rec)
+					rec.ConfChangeResult = n.applyConfChange(ref, rec.Command)
+					rec.Checksum = ChecksumRecord(rec)
+					n.setInstanceRecord(inst, rec)
+					n.enqueueRecord(rec)
 				case CommandMembership:
-					inst.rec.MembershipResult, inst.rec.ConfChangeResult = n.applyMembershipControl(ref, inst.rec.Command)
-					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					n.enqueueRecord(inst.rec)
+					rec.MembershipResult, rec.ConfChangeResult = n.applyMembershipControl(ref, rec.Command)
+					rec.Checksum = ChecksumRecord(rec)
+					n.setInstanceRecord(inst, rec)
+					n.enqueueRecord(rec)
 				case CommandNoop:
 					fallthrough
 				default:
-					inst.rec.Checksum = ChecksumRecord(inst.rec)
-					n.enqueueRecord(inst.rec)
+					rec.Checksum = ChecksumRecord(rec)
+					n.setInstanceRecord(inst, rec)
+					n.enqueueRecord(rec)
 				}
 				releaseInstanceVolatile(inst)
 				progress = true
