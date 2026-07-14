@@ -1,0 +1,26 @@
+version: "2"
+
+run:
+  go: "1.26"
+
+linters:
+  enable:
+    - errcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+    - unused
+    - wastedassign
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: false
+    govet:
+      enable-all: true
+    staticcheck:
+      checks:
+        - all
