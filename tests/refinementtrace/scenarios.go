@@ -138,10 +138,6 @@ func persistInitial(node *nodeHarness) error {
 	return nil
 }
 
-func eventSnapshots(node *nodeHarness) (snapshotView, snapshotView, error) {
-	pre, err := snapshot(node.node, node.store)
-	return pre, pre, err
-}
 
 func addAPICall(b *traceBuilder, action, kind string, node *nodeHarness, input *inputView, pre snapshotView, callErr error, admission, drop, boundary string) error {
 	post, err := snapshot(node.node, node.store)
@@ -563,7 +559,10 @@ func captureNormalScenario() (semanticTrace, error) {
 	}
 	stepErr := target.node.Step(wrongDecoded)
 	if !errors.Is(stepErr, epaxos.ErrMessageRejected) {
-		return semanticTrace{}, fmt.Errorf("wrong-target normal probe err=%v, want message rejected", stepErr)
+		if stepErr != nil {
+			return semanticTrace{}, fmt.Errorf("wrong-target normal probe: %w, want message rejected", stepErr)
+		}
+		return semanticTrace{}, errors.New("wrong-target normal probe: nil error, want message rejected")
 	}
 	if err := addAPICall(b, "NormalValidationDrop", "wrong-target-step", target, &inputView{Operation: "RawNode.Step", Message: &wrongSemantic}, beforeWrong, stepErr, "rejected", "wrong-target", ""); err != nil {
 		return semanticTrace{}, err
@@ -1001,8 +1000,11 @@ func captureTOQScenario() (semanticTrace, error) {
 	if err := addAPICall(b, "TOQBuildAllowReady", "process-toq-due", node, &inputView{Operation: "RawNode.ProcessTOQ", TOQClock: &clock, Ref: &refSemantic}, duePre, dueErr, "due-admitted", "", ""); err != nil {
 		return semanticTrace{}, err
 	}
-	if dueErr != nil || !node.node.HasReady() {
-		return semanticTrace{}, fmt.Errorf("due ProcessTOQ err=%v ready=%v", dueErr, node.node.HasReady())
+	if dueErr != nil {
+		return semanticTrace{}, fmt.Errorf("due ProcessTOQ: %w", dueErr)
+	}
+	if !node.node.HasReady() {
+		return semanticTrace{}, errors.New("due ProcessTOQ: node has no ready work")
 	}
 	allowActions := phaseActions{ready: "TOQBuildAllowReady", persist: "TOQPersistAllow", advance: "TOQAdvanceAllow", apply: "TOQApply", codec: "TOQBuildAllowReady", step: "TOQBuildAllowReady", drop: "TOQMaxTickDrop", frozen: "TOQFrozenReadyProbe"}
 	if _, err := consumeReady(b, node, allowActions, false, nil); err != nil {
@@ -1032,8 +1034,11 @@ func captureTOQScenario() (semanticTrace, error) {
 	if err != nil {
 		return semanticTrace{}, err
 	}
-	if maxErr != nil || !snapshotEqual(maxPre, maxPost) {
-		return semanticTrace{}, fmt.Errorf("closed TOQ bucket did not stutter: err=%v", maxErr)
+	if maxErr != nil {
+		return semanticTrace{}, fmt.Errorf("closed TOQ bucket: %w", maxErr)
+	}
+	if !snapshotEqual(maxPre, maxPost) {
+		return semanticTrace{}, errors.New("closed TOQ bucket did not stutter")
 	}
 	return b.finish(), nil
 }
