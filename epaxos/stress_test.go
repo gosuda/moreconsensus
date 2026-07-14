@@ -295,17 +295,25 @@ func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals 
 		if base == nil || base.rec.Status != StatusExecuted {
 			t.Fatalf("base node did not execute proposed instance %s: %#v", proposal.ref, base)
 		}
+		baseRecord, ok := s.stores[s.ids[0]].Instance(proposal.ref)
+		if !ok || baseRecord.Status < StatusCommitted {
+			t.Fatalf("base node lacks durable committed record %s: %#v", proposal.ref, baseRecord)
+		}
 		for _, id := range s.ids[1:] {
 			inst := s.nodes[id].instances[proposal.ref]
-			if inst == nil || inst.rec.Status != StatusExecuted || !sameValueTuple(inst.rec, base.rec) {
-				t.Fatalf("node %d decided %#v for %s, want base tuple %#v", id, inst, proposal.ref, base.rec)
+			if inst == nil || inst.rec.Status != StatusExecuted {
+				t.Fatalf("node %d did not execute %s: %#v", id, proposal.ref, inst)
+			}
+			record, found := s.stores[id].Instance(proposal.ref)
+			if !found || record.Status < StatusCommitted || !sameValueTuple(record, baseRecord) {
+				t.Fatalf("node %d durable decision %#v for %s, want base tuple %#v", id, record, proposal.ref, baseRecord)
 			}
 		}
 		switch {
-		case commandEqual(base.rec.Command, proposal.cmd):
+		case commandEqual(baseRecord.Command, proposal.cmd):
 			chosen = append(chosen, proposal)
-		case base.rec.Command.Kind != CommandNoop:
-			t.Fatalf("proposed instance %s chose unexpected command %#v instead of %#v or no-op", proposal.ref, base.rec.Command, proposal.cmd)
+		case baseRecord.Command.Kind != CommandNoop:
+			t.Fatalf("proposed instance %s chose unexpected command %#v instead of %#v or no-op", proposal.ref, baseRecord.Command, proposal.cmd)
 		}
 	}
 	proposals = chosen

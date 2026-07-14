@@ -38,6 +38,10 @@ type failingReadyApplier struct{ err error }
 
 func (a failingReadyApplier) ApplyReady(epaxos.Ready) error { return a.err }
 
+func (a failingReadyApplier) LoadInstance(epaxos.InstanceRef) (epaxos.InstanceRecord, bool, error) {
+	return epaxos.InstanceRecord{}, false, a.err
+}
+
 func TestProtocolLoopConsumesManualLogicalPulses(t *testing.T) {
 	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2, 3})
 	source := newManualLogicalTickSource()

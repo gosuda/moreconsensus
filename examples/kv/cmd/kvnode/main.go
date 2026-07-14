@@ -38,6 +38,7 @@ import (
 
 type readyApplier interface {
 	ApplyReady(epaxos.Ready) error
+	LoadInstance(epaxos.InstanceRef) (epaxos.InstanceRecord, bool, error)
 }
 
 type logicalTickSource interface {
@@ -470,6 +471,7 @@ type service struct {
 	admissionBlocked       bool
 	blockedPeerIngress     map[epaxos.ReplicaID][][sha256.Size]byte
 	readyApplied           bool
+	readyLoadsApplied      int
 	frozenFrames           []*outboundFrame
 	singlePreparedFrame    [1]*outboundFrame
 	reusableReady          epaxos.Ready
@@ -2378,6 +2380,17 @@ func (s *service) drainLocked() error {
 			}
 			s.readyApplied = true
 		}
+		for s.readyLoadsApplied < len(s.reusableReady.RecordLoads) {
+			ref := s.reusableReady.RecordLoads[s.readyLoadsApplied]
+			rec, found, err := s.ready.LoadInstance(ref)
+			if err != nil {
+				return fmt.Errorf("load Ready record %s: %w", ref, err)
+			}
+			if err := s.node.ProvideRecordLoad(epaxos.RecordLoadResult{Ref: ref, Record: rec, Found: found}); err != nil {
+				return fmt.Errorf("provide Ready record %s: %w", ref, err)
+			}
+			s.readyLoadsApplied++
+		}
 		if s.frozenFrames == nil {
 			frames, err := s.prepareOutboundFrames(s.reusableReady.Messages)
 			if err != nil {
@@ -2405,6 +2418,7 @@ func (s *service) drainLocked() error {
 			return fmt.Errorf("advance Ready: %w", err)
 		}
 		s.readyApplied = false
+		s.readyLoadsApplied = 0
 		s.admissionBlocked = false
 		s.blockedPeerIngress = nil
 		s.completeExecutedWaitersLocked()

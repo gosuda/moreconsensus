@@ -77,6 +77,26 @@ func (s *PebbleStorage) LoadInstances(fn func(epaxos.InstanceRecord) error) erro
 	return iter.Error()
 }
 
+// LoadInstance returns one persisted EPaxos record for a Ready.RecordLoads request.
+func (s *PebbleStorage) LoadInstance(ref epaxos.InstanceRef) (epaxos.InstanceRecord, bool, error) {
+	value, closer, err := s.pebble.Get(epaxosRecordKey(ref))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return epaxos.InstanceRecord{}, false, nil
+	}
+	if err != nil {
+		return epaxos.InstanceRecord{}, false, err
+	}
+	defer func() { _ = closer.Close() }()
+	rec, err := decodeEPaxosRecord(value)
+	if err != nil {
+		return epaxos.InstanceRecord{}, false, err
+	}
+	if rec.Ref != ref {
+		return epaxos.InstanceRecord{}, false, fmt.Errorf("kv: epaxos record key/value ref mismatch")
+	}
+	return rec, true, nil
+}
+
 // NextCommandSequence returns one greater than the largest durable sequence for client.
 func (db *DB) NextCommandSequence(client uint64) (uint64, error) {
 	next := uint64(1)
@@ -171,6 +191,11 @@ func (db *DB) ApplyReady(rd epaxos.Ready) error {
 	db.nextTime = next
 	db.durableRecords.Add(newRecords)
 	return nil
+}
+
+// LoadInstance returns one persisted EPaxos record for a Ready.RecordLoads request.
+func (db *DB) LoadInstance(ref epaxos.InstanceRef) (epaxos.InstanceRecord, bool, error) {
+	return db.EPaxosStorage().LoadInstance(ref)
 }
 
 func prepareEPaxosHardState(pebbleDB *pebble.DB, next epaxos.HardState) ([]byte, error) {

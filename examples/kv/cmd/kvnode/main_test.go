@@ -2452,6 +2452,10 @@ func (a *recordingReadyApplier) ApplyReady(ready epaxos.Ready) error {
 	return nil
 }
 
+func (a *recordingReadyApplier) LoadInstance(ref epaxos.InstanceRef) (epaxos.InstanceRecord, bool, error) {
+	return a.inner.LoadInstance(ref)
+}
+
 func transportTestMessage(payload []byte) epaxos.Message {
 	return epaxos.Message{
 		Type:         epaxos.MsgCommit,

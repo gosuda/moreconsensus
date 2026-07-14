@@ -329,7 +329,6 @@ func residentInstanceBytes(inst *instance) uintptr {
 	return bytes
 }
 
-
 func growResidentNode(b *testing.B, n int) *RawNode {
 	b.Helper()
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
@@ -403,6 +402,7 @@ func BenchmarkRetireExecuted(b *testing.B) {
 			rec.Checksum = ChecksumRecord(rec)
 			rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 			rn.executed.add(ref)
+			rn.durableExecuted.add(ref)
 		}
 		b.StartTimer()
 		rn.retireExecuted()

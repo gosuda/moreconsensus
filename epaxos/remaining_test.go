@@ -2517,7 +2517,20 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
 	}
+	var fullRecord InstanceRecord
+	for _, record := range executedReady.Records {
+		if record.Ref == ref && record.Status == StatusExecuted {
+			fullRecord = record.Clone()
+			break
+		}
+	}
+	if fullRecord.Ref.IsZero() {
+		t.Fatalf("executed ready lacks full record for %s: %#v", ref, executedReady.Records)
+	}
 	advanceOK(t, rn, executedReady)
+	if inst := rn.instances[ref]; inst == nil || !inst.payloadAbsent {
+		t.Fatalf("executed resident=%#v, want payload stub", inst)
+	}
 
 	retry := Message{
 		Type:    MsgAccept,
@@ -2532,6 +2545,14 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 	if err := rn.Step(retry); err != nil {
 		t.Fatal(err)
 	}
+	loadReady := rn.Ready()
+	if len(loadReady.RecordLoads) != 1 || loadReady.RecordLoads[0] != ref || len(loadReady.Messages) != 0 {
+		t.Fatalf("accept retry ready=%#v, want one record load and no message before restore", loadReady)
+	}
+	if err := rn.ProvideRecordLoad(RecordLoadResult{Ref: ref, Record: fullRecord, Found: true}); err != nil {
+		t.Fatal(err)
+	}
+	advanceOK(t, rn, loadReady)
 	rd = rn.Ready()
 	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
 		t.Fatalf("accept retry changed committed state: records=%#v committed=%#v", rd.Records, rd.Committed)

@@ -139,6 +139,9 @@ func (s *simCluster) drain() {
 			if err := s.stores[id].ApplyReady(rd); err != nil {
 				s.t.Fatalf("apply ready %d: %v", id, err)
 			}
+			if err := provideRecordLoadsFromStore(rn, s.stores[id], rd); err != nil {
+				s.t.Fatalf("provide record loads %d: %v", id, err)
+			}
 			s.committedCommands += uint64(len(rd.Committed))
 			s.apps[id] = append(s.apps[id], rd.Committed...)
 			for _, m := range rd.Messages {

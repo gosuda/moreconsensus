@@ -37,6 +37,7 @@ func TestRetireFoldsBeyondRetention(t *testing.T) {
 		})
 		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 		rn.executed.add(ref)
+		rn.durableExecuted.add(ref)
 	}
 	rn.retireExecuted()
 	// retain 1 => fold through 4
@@ -70,3 +71,81 @@ func TestProposeBackpressureMaxResident(t *testing.T) {
 	}
 }
 
+func TestRetirePayloadDropPreservesChecksum(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), RetainExecutedPerLane: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
+	rec := checkedRecord(InstanceRecord{
+		Ref: ref, Status: StatusExecuted, Seq: 1, Ballot: Ballot{Replica: 1},
+		Deps: rn.q.deps(), Command: Command{Payload: []byte("my-payload"), ConflictKeys: [][]byte{[]byte("k")}},
+	})
+	rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
+	rn.executed.add(ref)
+	rn.durableExecuted.add(ref)
+
+	origChecksum := rec.Checksum
+	if origChecksum == ([32]byte{}) {
+		t.Fatal("expected non-zero original checksum")
+	}
+
+	rn.retireExecuted()
+
+	inst := rn.instances[ref]
+	if inst == nil {
+		t.Fatal("expected instance to remain resident")
+	}
+	if !inst.payloadAbsent {
+		t.Fatal("expected payload to be dropped")
+	}
+	if inst.rec.Command.Payload != nil {
+		t.Fatal("expected Command.Payload to be nil")
+	}
+	if !VerifyRecordChecksum(inst.rec) {
+		t.Fatalf("resident payload stub has invalid checksum: %#v", inst.rec)
+	}
+	if inst.payloadChecksum != origChecksum {
+		t.Fatalf("full checksum authority mutated: got %x, want %x", inst.payloadChecksum, origChecksum)
+	}
+}
+
+func TestRetirePayloadStubGaugeAndEmptyCapacity(t *testing.T) {
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), RetainExecutedPerLane: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 0, 1024)
+	for i, commandPayload := range [][]byte{[]byte("full"), payload} {
+		ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(i + 1)}
+		rec := checkedRecord(InstanceRecord{
+			Ref: ref, Status: StatusExecuted, Seq: uint64(i + 1), Ballot: Ballot{Replica: 1},
+			Deps: rn.q.deps(), Command: Command{Payload: commandPayload, ConflictKeys: [][]byte{[]byte("k")}},
+		})
+		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
+		rn.executed.add(ref)
+		rn.durableExecuted.add(ref)
+	}
+
+	rn.retireExecuted()
+	full := rn.instances[InstanceRef{Conf: 1, Replica: 1, Instance: 1}]
+	empty := rn.instances[InstanceRef{Conf: 1, Replica: 1, Instance: 2}]
+	if full == nil || !full.payloadAbsent {
+		t.Fatalf("full payload resident=%#v, want stub", full)
+	}
+	if empty == nil || empty.payloadAbsent || empty.rec.Command.Payload != nil {
+		t.Fatalf("empty payload resident=%#v, want nil non-stub payload", empty)
+	}
+	if got := rn.RuntimeStats().PayloadStubInstances; got != 1 {
+		t.Fatalf("payload stub gauge=%d, want 1", got)
+	}
+
+	rn.retainExecutedPerLane = 0
+	rn.retireExecuted()
+	if got := rn.RuntimeStats().PayloadStubInstances; got != 0 {
+		t.Fatalf("payload stub gauge after fold=%d, want 0", got)
+	}
+	if len(rn.instances) != 0 {
+		t.Fatalf("resident instances after fold=%#v, want none", rn.instances)
+	}
+}

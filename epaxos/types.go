@@ -682,7 +682,7 @@ func (r Ready) Empty() bool {
 	return r.HardState.Empty() && len(r.ConfigHistory) == 0 && len(r.Records) == 0 &&
 		len(r.BootstrapRecords) == 0 && r.LocalVoterState == nil && len(r.FrontierUpdates) == 0 &&
 		r.AllocatorFloor == 0 && len(r.Messages) == 0 && len(r.BootstrapMessages) == 0 &&
-		len(r.Committed) == 0 && !r.MustSync
+		len(r.Committed) == 0 && len(r.RecordLoads) == 0 && !r.MustSync
 }
 
 // CloneInto deep-copies r into dst while reusing destination capacity.
@@ -923,6 +923,8 @@ type RuntimeStats struct {
 }
 
 // StatusSnapshot is a copy-only view of node state for diagnostics and tests.
+// Executed instance records omit Command.Payload; durable storage remains the
+// authority for full executed commands.
 type StatusSnapshot struct {
 	ID        ReplicaID
 	Tick      uint64

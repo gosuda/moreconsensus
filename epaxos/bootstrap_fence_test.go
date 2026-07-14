@@ -1,8 +1,8 @@
 package epaxos
 
 import (
-	"encoding/binary"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"reflect"
 	"testing"
@@ -149,14 +149,38 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
-	stored := f.node.instances[userRef].rec.Clone()
+	stored, ok := f.store.Instance(userRef)
+	if !ok {
+		t.Fatalf("durable pre-fence record %s not found", userRef)
+	}
 	retry := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: userRef, Ballot: stored.Ballot, Seq: stored.Seq, Deps: stored.Deps, Command: stored.Command}
 	if err := f.node.Step(retry); err != nil {
 		t.Fatalf("matching pre-fence retry: %v", err)
 	}
+	loadReady := f.node.Ready()
+	if len(loadReady.RecordLoads) != 1 || loadReady.RecordLoads[0] != userRef {
+		t.Fatalf("matching retry Ready=%#v, want one record load", loadReady)
+	}
+	if err := provideRecordLoadsFromStore(f.node, f.store, loadReady); err != nil {
+		t.Fatalf("matching retry restore: %v", err)
+	}
+	if err := f.node.Advance(loadReady); err != nil {
+		t.Fatal(err)
+	}
+	for f.node.HasReady() {
+		persistBootstrapReady(t, f)
+	}
+
 	retry.Command.Payload = []byte("different")
-	if err := f.node.Step(retry); !errors.Is(err, ErrBootstrapFenced) {
-		t.Fatalf("different retry err=%v", err)
+	if err := f.node.Step(retry); err != nil {
+		t.Fatalf("different retry deferred error=%v, want asynchronous validation", err)
+	}
+	loadReady = f.node.Ready()
+	if err := provideRecordLoadsFromStore(f.node, f.store, loadReady); !errors.Is(err, ErrBootstrapFenced) {
+		t.Fatalf("different retry replay err=%v, want ErrBootstrapFenced", err)
+	}
+	if err := f.node.Advance(loadReady); err != nil {
+		t.Fatal(err)
 	}
 	recovery := Message{Type: MsgPrepare, From: 1, To: 1, Ref: userRef, Ballot: Ballot{Epoch: 1, Replica: 1}}
 	if err := f.node.Step(recovery); err != nil {
@@ -436,7 +460,6 @@ func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *t
 		t.Fatalf("same-index total conflict err=%v", err)
 	}
 }
-
 
 func TestDecodeBootstrapMessageRejectsOversizedType(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)

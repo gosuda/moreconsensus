@@ -659,6 +659,11 @@ func (h *faultSimHarness) executePump(receipt *faultActionReceipt) {
 			receipt.Affected++
 			continue
 		}
+		if err := provideRecordLoadsFromStore(r.node, r.store, rd); err != nil {
+			rejected = append(rejected, fmt.Sprintf("node %d record load: %v", id, err))
+			receipt.Affected++
+			continue
+		}
 		events, err := r.app.apply(rd.Committed)
 		if err != nil {
 			rejected = append(rejected, fmt.Sprintf("node %d application: %v", id, err))
@@ -1025,6 +1030,9 @@ func (h *faultSimHarness) executeCrash(action faultSimAction, receipt *faultActi
 			if action.Cut == faultCrashAfterPersistence {
 				break
 			}
+			if err := provideRecordLoadsFromStore(r.node, r.store, rd); err != nil {
+				return err
+			}
 			events, err := r.app.apply(rd.Committed)
 			if err != nil {
 				return err
@@ -1051,6 +1059,9 @@ func (h *faultSimHarness) executeCrash(action faultSimAction, receipt *faultActi
 					return errFaultSimBackpressure
 				}
 				if err := r.store.ApplyReady(executed); err != nil {
+					return err
+				}
+				if err := provideRecordLoadsFromStore(r.node, r.store, executed); err != nil {
 					return err
 				}
 				events, err := r.app.apply(executed.Committed)

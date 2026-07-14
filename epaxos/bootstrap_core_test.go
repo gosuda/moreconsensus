@@ -60,6 +60,9 @@ func persistBootstrapReady(t *testing.T, f bootstrapTestFixture) Ready {
 	if err := f.store.ApplyReady(rd); err != nil {
 		t.Fatalf("ApplyReady: %v", err)
 	}
+	if err := provideRecordLoadsFromStore(f.node, f.store, rd); err != nil {
+		t.Fatalf("ProvideRecordLoad: %v", err)
+	}
 	if err := f.node.Advance(rd); err != nil {
 		t.Fatalf("Advance: %v", err)
 	}

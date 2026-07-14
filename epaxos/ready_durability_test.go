@@ -372,7 +372,7 @@ func TestAdvanceAcceptsRecordOnlyAcknowledgementWithoutExecution(t *testing.T) {
 	advanceOK(t, rn, committedOnly)
 	next := rn.Ready()
 	if len(next.Committed) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
-		t.Fatalf("ready after committed acknowledgement for %s = %#v", ref, next)
+		t.Fatalf("ready after committed acknowledgement for %s = %#v; instance=%#v pending=%#v next=%#v durable=%v", ref, next, rn.instances[ref], rn.pendingReady, rn.nextReady, rn.durableExecuted.contains(ref))
 	}
 }
 

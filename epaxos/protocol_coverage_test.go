@@ -1476,6 +1476,7 @@ func TestEvidenceDependencyAndBroadcastHelperBranches(t *testing.T) {
 		{Replica: 3, Instance: 1, Conf: 1}: {},
 		{Replica: 2, Instance: 9, Conf: 1}: {},
 	}
+	rn.installInstance(inst)
 	rn.broadcastTryPreAccept(inst)
 	rd := rn.Ready()
 	first := optimizedRequireMessage(t, rd.Messages, MsgTryPreAccept, 2)

@@ -45,6 +45,8 @@ type instance struct {
 	waitDeadline    uint64
 	processAt       uint64
 	generation      uint64
+	payloadAbsent   bool
+	payloadChecksum [32]byte
 }
 
 type timerKind uint8
@@ -83,6 +85,16 @@ type recordLoadWait struct {
 	messages []Message
 	// requested is true once the ref has been placed into a Ready.RecordLoads batch.
 	requested bool
+	required  bool
+	// needReadyRecord means enqueueRecord should re-emit Ready.Records after restore.
+	needReadyRecord bool
+	exports         []recordLoadExport
+}
+
+type recordLoadExport struct {
+	messageType MessageType
+	// to==0 means broadcast to all remote voters for the record's conf.
+	to ReplicaID
 }
 
 type deferredPreAccept struct {
@@ -206,23 +218,24 @@ type RawNode struct {
 	maxDeferredPreAccepts int
 	maxReadyMessages      int
 
-	tick                            uint64
-	currentHardState                HardState
-	acknowledgedHardState           HardState
-	nextInstance                    InstanceNum
-	instances                       map[InstanceRef]*instance
-	engine                          conflictEngine
-	executed                        executedTracker
-	pendingConf                     bool
-	appliedConfByBase               map[ConfID]InstanceRef
-	timers                          timerHeap
-	pendingReady                    Ready
-	nextReady                       Ready
-	frozenReady                     Ready
-	awaitAdvance                    bool
-	logicalPreAccepts               deferredPreAcceptHeap
-	toqPreAccepts                   deferredPreAcceptHeap
-	deferredIndex                   map[deferredPreAcceptKey]*deferredPreAccept
+	tick                  uint64
+	currentHardState      HardState
+	acknowledgedHardState HardState
+	nextInstance          InstanceNum
+	instances             map[InstanceRef]*instance
+	engine                conflictEngine
+	executed              executedTracker
+	durableExecuted       executedTracker
+	pendingConf           bool
+	appliedConfByBase     map[ConfID]InstanceRef
+	timers                timerHeap
+	pendingReady          Ready
+	nextReady             Ready
+	frozenReady           Ready
+	awaitAdvance          bool
+	logicalPreAccepts     deferredPreAcceptHeap
+	toqPreAccepts         deferredPreAcceptHeap
+	deferredIndex         map[deferredPreAcceptKey]*deferredPreAccept
 	// pendingRecordLoads defers inbound messages until ProvideRecordLoad for a folded ref.
 	pendingRecordLoads              map[InstanceRef]*recordLoadWait
 	pendingRecordLoadMessages       int
@@ -284,6 +297,18 @@ func messageCarriesValue(message Message) bool {
 	default:
 		return false
 	}
+}
+
+// messageNeedsPayload reports value-carrying inbound types that may compare
+// against a resident stub via commandEqual / phaseMessage* helpers.
+func messageNeedsPayload(message Message) bool {
+	switch message.Type {
+	case MsgPreAccept, MsgAccept, MsgTryPreAccept:
+		return true
+	case MsgCommit, MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+		return false
+	}
+	return false
 }
 
 func (n *RawNode) messageTimingDomainEnabled(message Message) bool {
@@ -722,6 +747,7 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		nextInstance:                    1,
 		instances:                       make(map[InstanceRef]*instance),
 		executed:                        newExecutedTracker(),
+		durableExecuted:                 newExecutedTracker(),
 		committedThrough:                make(map[instanceLane]InstanceNum),
 		appliedConfByBase:               make(map[ConfID]InstanceRef),
 		confHistory:                     make(map[ConfID]ConfState),
@@ -937,6 +963,9 @@ func NewRawNode(cfg Config) (*RawNode, error) {
 		inst := &instance{rec: rec.Clone(), phase: phase, processAt: rec.ProcessAt}
 		n.seedLocalRestartVote(inst)
 		n.installInstance(inst)
+		if rec.Status == StatusExecuted {
+			n.durableExecuted.add(rec.Ref)
+		}
 		n.observeInstanceRef(rec.Ref)
 		if rec.Ref.Replica == n.id && rec.Ref.Instance >= n.nextInstance {
 			n.observeInstanceRef(rec.Ref)
@@ -1681,6 +1710,12 @@ func (n *RawNode) deferredPreAcceptStateError(m Message) error {
 		return nil
 	}
 	if inst.rec.Status >= StatusCommitted {
+		if ok, err := n.requirePayload(inst.rec.Ref, m); err != nil {
+			return err
+		} else if !ok {
+			// requirePayload already deferred the message for restore.
+			return nil
+		}
 		if recordTupleBallot(inst.rec) == m.Ballot &&
 			(!commandEqual(inst.rec.Command, m.Command) || inst.rec.ProcessAt != m.ProcessAt || inst.rec.TimingDomain != timingDomainFromMessage(m)) {
 			return fmt.Errorf("%w: conflicting committed PreAccept retry for %s", ErrInvalidMessage, m.Ref)
@@ -2048,6 +2083,9 @@ func (n *RawNode) Step(m Message) error {
 	if err := n.requireLocalVoterForConf(conf); err != nil {
 		return err
 	}
+	if inst := n.instances[m.Ref]; inst != nil && inst.payloadAbsent && messageNeedsPayload(m) {
+		return n.deferRecordLoadRequired(m.Ref, m)
+	}
 	if err := n.admitWhileFenced(m); err != nil {
 		return err
 	}
@@ -2249,6 +2287,11 @@ func (n *RawNode) Advance(rd Ready) error {
 	n.frozenReady.RecordLoads = consumeReadyPrefix(n.frozenReady.RecordLoads, len(rd.RecordLoads))
 	n.frozenReady.MustSync = readyHasDurableUpdate(n.frozenReady)
 
+	for _, rec := range rd.Records {
+		if rec.Status == StatusExecuted {
+			n.durableExecuted.add(rec.Ref)
+		}
+	}
 	n.enqueueExecutedRecords(rd.Committed[:ackedCommitted])
 	n.applyBootstrapDurability(rd.BootstrapRecords)
 	n.retireExecuted()
@@ -2267,7 +2310,7 @@ func (n *RawNode) validateReadyAck(rd Ready) error {
 	}
 	hasPayload := len(rd.ConfigHistory) > 0 || len(rd.Records) > 0 || len(rd.BootstrapRecords) > 0 ||
 		rd.LocalVoterState != nil || len(rd.FrontierUpdates) > 0 || rd.AllocatorFloor != 0 ||
-		len(rd.Messages) > 0 || len(rd.BootstrapMessages) > 0 || len(rd.Committed) > 0
+		len(rd.Messages) > 0 || len(rd.BootstrapMessages) > 0 || len(rd.Committed) > 0 || len(rd.RecordLoads) > 0
 	if !rd.HardState.Empty() {
 		if n.frozenReady.HardState.Empty() || !rd.HardState.Equal(n.frozenReady.HardState) {
 			return ErrInvalidReady
@@ -2472,7 +2515,12 @@ func (n *RawNode) Status() StatusSnapshot {
 	}
 	sortRefs(refs)
 	for _, ref := range refs {
-		s.Instances = append(s.Instances, n.instances[ref].rec.Clone())
+		rec := n.instances[ref].rec.Clone()
+		if rec.Status == StatusExecuted {
+			rec.Command.Payload = nil
+			rec.Checksum = ChecksumRecord(rec)
+		}
+		s.Instances = append(s.Instances, rec)
 		if n.executed.contains(ref) {
 			s.Executed = append(s.Executed, ref)
 		}
@@ -2509,6 +2557,11 @@ func (n *RawNode) handlePreAccept(m Message, ordered bool) error {
 	old := n.instances[m.Ref]
 	if old != nil {
 		if old.rec.Status >= StatusCommitted {
+			if ok, err := n.requirePayload(old.rec.Ref, m); err != nil {
+				return err
+			} else if !ok {
+				return nil
+			}
 			if recordTupleBallot(old.rec) == m.Ballot && (!commandEqual(old.rec.Command, m.Command) || old.rec.ProcessAt != m.ProcessAt || old.rec.TimingDomain != timingDomainFromMessage(m)) {
 				return fmt.Errorf("%w: conflicting committed PreAccept retry for %s", ErrInvalidMessage, m.Ref)
 			}
@@ -2681,6 +2734,13 @@ func phaseMessageTupleEqual(rec InstanceRecord, m Message) bool {
 		phaseMessageTimingEqual(rec, m)
 }
 
+func payloadStubMessageTupleEqual(inst *instance, m Message) bool {
+	rec := inst.rec
+	rec.Command = m.Command
+	rec.Checksum = inst.payloadChecksum
+	return VerifyRecordChecksum(rec) && phaseMessageTupleEqual(rec, m)
+}
+
 func phaseMessageValueEqual(rec InstanceRecord, m Message) bool {
 	return commandEqual(rec.Command, m.Command) && phaseMessageTimingEqual(rec, m)
 }
@@ -2713,6 +2773,11 @@ func (n *RawNode) handleAccept(m Message) error {
 	old := n.instances[m.Ref]
 	if old != nil {
 		if old.rec.Status >= StatusCommitted {
+			if ok, err := n.requirePayload(old.rec.Ref, m); err != nil {
+				return err
+			} else if !ok {
+				return nil
+			}
 			if recordTupleBallot(old.rec) == m.Ballot && !phaseMessageTupleEqual(old.rec, m) {
 				return fmt.Errorf("%w: conflicting committed Accept retry for %s", ErrInvalidMessage, m.Ref)
 			}
@@ -2796,6 +2861,17 @@ func (n *RawNode) handleAcceptResp(m Message) error {
 func (n *RawNode) handleCommit(m Message) error {
 	old := n.instances[m.Ref]
 	if old != nil && old.rec.Status >= StatusCommitted {
+		if old.payloadAbsent {
+			if recordTupleBallot(old.rec) == m.RecordBallot && !payloadStubMessageTupleEqual(old, m) {
+				return fmt.Errorf("%w: conflicting committed Commit retry for %s", ErrInvalidMessage, m.Ref)
+			}
+			return nil
+		}
+		if ok, err := n.requirePayload(old.rec.Ref, m); err != nil {
+			return err
+		} else if !ok {
+			return nil
+		}
 		if recordTupleBallot(old.rec) == m.RecordBallot && !phaseMessageTupleEqual(old.rec, m) {
 			return fmt.Errorf("%w: conflicting committed Commit retry for %s", ErrInvalidMessage, m.Ref)
 		}
@@ -2869,6 +2945,13 @@ func (n *RawNode) handlePrepare(m Message) error {
 		n.sendReject(MsgPrepareResp, m.From, m.Ref, inst.rec.Ballot)
 		return nil
 	}
+	if inst != nil {
+		if ok, err := n.requirePayload(inst.rec.Ref, m); err != nil {
+			return err
+		} else if !ok {
+			return nil
+		}
+	}
 	n.removeDeferredPreAccepts(m.Ref)
 	deadline := uint64(0)
 	needsWait := m.Ballot.IsRecovery() && m.Ballot.Replica != n.id &&
@@ -2937,6 +3020,11 @@ func (n *RawNode) handlePrepare(m Message) error {
 func (n *RawNode) handleEvidence(m Message) error {
 	if n.needsRecordLoad(m.Ref) {
 		return n.deferRecordLoad(m.Ref, m)
+	}
+	if ok, err := n.requirePayload(m.Ref, m); err != nil {
+		return err
+	} else if !ok {
+		return nil
 	}
 	resp := Message{Type: MsgEvidenceResp, From: n.id, To: m.From, Ref: m.Ref, ConflictRef: m.ConflictRef, Ballot: m.Ballot, Deps: n.depsForConf(m.Ref.Conf), RecordStatus: StatusNone}
 	inst := n.instances[m.Ref]
@@ -3317,6 +3405,11 @@ func (n *RawNode) handleTryPreAccept(m Message) error {
 	old := n.instances[m.Ref]
 	if old != nil {
 		if old.rec.Status >= StatusCommitted {
+			if ok, err := n.requirePayload(old.rec.Ref, m); err != nil {
+				return err
+			} else if !ok {
+				return nil
+			}
 			if recordTupleBallot(old.rec) == m.Ballot && !phaseMessageTupleEqual(old.rec, m) {
 				return fmt.Errorf("%w: conflicting committed TryPreAccept retry for %s", ErrInvalidMessage, m.Ref)
 			}
@@ -3856,7 +3949,6 @@ func (n *RawNode) tryPreAcceptConflict(m Message) (InstanceRef, Status, bool) {
 	return conflictRef, conflictStatus, !conflictRef.IsZero()
 }
 
-
 func (n *RawNode) attrsDependsOn(attrs Attributes, dep InstanceRef, confID ConfID) bool {
 	if dep.Conf != confID || dep.Replica == 0 {
 		return false
@@ -4346,13 +4438,18 @@ func (n *RawNode) schedule(inst *instance, kind timerKind, after uint64) error {
 }
 
 func (n *RawNode) broadcastPreAccept(inst *instance) {
+	rec, ok := n.exportRecord(inst.rec.Ref)
+	if !ok {
+		n.deferRecordLoadExport(inst.rec.Ref, MsgPreAccept, 0)
+		return
+	}
 	processAt := inst.processAt
-	toq := recordUsesTOQ(inst.rec) && inst.rec.Ref.Replica == n.id && inst.rec.Ballot.IsInitialFor(inst.rec.Ref.Replica)
-	for _, to := range n.votersForConf(inst.rec.Ref.Conf) {
+	toq := recordUsesTOQ(rec) && rec.Ref.Replica == n.id && rec.Ballot.IsInitialFor(rec.Ref.Replica)
+	for _, to := range n.votersForConf(rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: MsgPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, Command: inst.rec.Command.Borrow(), ProcessAt: processAt, TOQ: recordUsesTOQ(inst.rec)}
+		m := Message{Type: MsgPreAccept, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command.Borrow(), ProcessAt: processAt, TOQ: recordUsesTOQ(rec)}
 		if toq {
 			m.TOQ = true
 			m.Seq = 0
@@ -4387,16 +4484,27 @@ func (n *RawNode) broadcastTryPreAccept(inst *instance) {
 }
 
 func (n *RawNode) broadcastTryPreAcceptIgnore(inst *instance, ignore InstanceRef) {
-	for _, to := range n.votersForConf(inst.rec.Ref.Conf) {
+	rec, ok := n.exportRecord(inst.rec.Ref)
+	if !ok {
+		n.deferRecordLoadExport(inst.rec.Ref, MsgTryPreAccept, 0)
+		return
+	}
+	for _, to := range n.votersForConf(rec.Ref.Conf) {
 		if to == n.id {
 			continue
 		}
-		m := Message{Type: MsgTryPreAccept, From: n.id, To: to, Ref: inst.rec.Ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, IgnoreDependency: TryPreAcceptIgnore{Ref: ignore}, Command: inst.rec.Command.Borrow(), ProcessAt: inst.rec.ProcessAt, TOQ: recordUsesTOQ(inst.rec)}
+		m := Message{Type: MsgTryPreAccept, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, IgnoreDependency: TryPreAcceptIgnore{Ref: ignore}, Command: rec.Command.Borrow(), ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
 		n.enqueueMessage(m)
 	}
 }
 
 func (n *RawNode) broadcast(t MessageType, rec InstanceRecord) {
+	exported, ok := n.exportRecord(rec.Ref)
+	if !ok {
+		n.deferRecordLoadExport(rec.Ref, t, 0)
+		return
+	}
+	rec = exported
 	for _, to := range n.votersForConf(rec.Ref.Conf) {
 		if to == n.id {
 			continue
@@ -4424,6 +4532,12 @@ func (n *RawNode) sendReject(t MessageType, to ReplicaID, ref InstanceRef, hint 
 }
 
 func (n *RawNode) sendCommitTo(to ReplicaID, rec InstanceRecord) {
+	exported, ok := n.exportRecord(rec.Ref)
+	if !ok {
+		n.deferRecordLoadExport(rec.Ref, MsgCommit, to)
+		return
+	}
+	rec = exported
 	m := Message{Type: MsgCommit, From: n.id, To: to, Ref: rec.Ref, Ballot: rec.Ballot, RecordBallot: recordTupleBallot(rec), Seq: rec.Seq, Deps: rec.Deps, AcceptSeq: rec.AcceptSeq, AcceptDeps: rec.AcceptDeps, AcceptEvidence: rec.AcceptEvidence, Command: rec.Command.Borrow(), ProcessAt: rec.ProcessAt, TOQ: recordUsesTOQ(rec)}
 	n.enqueueMessage(m)
 }
@@ -4482,6 +4596,12 @@ func (n *RawNode) mergeNextReady() {
 }
 
 func (n *RawNode) enqueueRecord(rec InstanceRecord) {
+	if inst := n.instances[rec.Ref]; inst != nil && inst.payloadAbsent {
+		if n.deferRecordLoadRequiredWithoutMessage(rec.Ref) == nil {
+			n.pendingRecordLoads[rec.Ref].needReadyRecord = true
+		}
+		return
+	}
 	if rec.Checksum == ([32]byte{}) {
 		rec.Checksum = ChecksumRecord(rec)
 	}
@@ -4521,7 +4641,6 @@ func (n *RawNode) readyRecord(rec InstanceRecord) InstanceRecord {
 
 func inboundCommand(cmd Command) Command { return cmd.Clone() }
 
-
 func (n *RawNode) needsRecordLoad(ref InstanceRef) bool {
 	if ref.IsZero() || ref.Instance == 0 {
 		return false
@@ -4533,34 +4652,79 @@ func (n *RawNode) needsRecordLoad(ref InstanceRef) bool {
 	return ref.Instance <= n.engine.foldedThrough(lane)
 }
 
-// deferRecordLoad queues m until ProvideRecordLoad(ref). Returns false if capacity exceeded.
+func (n *RawNode) requirePayload(ref InstanceRef, m Message) (bool, error) {
+	inst := n.instances[ref]
+	if inst == nil || !inst.payloadAbsent {
+		return true, nil
+	}
+	return false, n.deferRecordLoadRequired(ref, m)
+}
+
+func (n *RawNode) exportRecord(ref InstanceRef) (InstanceRecord, bool) {
+	inst := n.instances[ref]
+	if inst == nil {
+		return InstanceRecord{}, false
+	}
+	if !inst.payloadAbsent {
+		return inst.rec, true
+	}
+	_ = n.deferRecordLoadRequiredWithoutMessage(ref)
+	return InstanceRecord{}, false
+}
+
+func (n *RawNode) deferRecordLoadExport(ref InstanceRef, messageType MessageType, to ReplicaID) {
+	if n.deferRecordLoadRequiredWithoutMessage(ref) != nil {
+		return
+	}
+	wait := n.pendingRecordLoads[ref]
+	for _, export := range wait.exports {
+		if export.messageType == messageType && export.to == to {
+			return
+		}
+	}
+	wait.exports = append(wait.exports, recordLoadExport{messageType: messageType, to: to})
+}
+
 func (n *RawNode) deferRecordLoad(ref InstanceRef, m Message) error {
+	return n.deferRecordLoadWith(ref, m, false, true)
+}
+
+func (n *RawNode) deferRecordLoadRequired(ref InstanceRef, m Message) error {
+	return n.deferRecordLoadWith(ref, m, true, true)
+}
+
+func (n *RawNode) deferRecordLoadRequiredWithoutMessage(ref InstanceRef) error {
+	return n.deferRecordLoadWith(ref, Message{}, true, false)
+}
+
+func (n *RawNode) deferRecordLoadWith(ref InstanceRef, m Message, required, keepMessage bool) error {
 	if n.pendingRecordLoads == nil {
 		n.pendingRecordLoads = make(map[InstanceRef]*recordLoadWait)
 	}
 	wait := n.pendingRecordLoads[ref]
 	if wait == nil {
-		if n.pendingRecordLoadMessages >= n.maxDeferredRecordLoads {
+		if keepMessage && n.pendingRecordLoadMessages >= n.maxDeferredRecordLoads {
 			return fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredRecordLoadFull)
 		}
 		wait = &recordLoadWait{}
 		n.pendingRecordLoads[ref] = wait
-		// enqueue request into next Ready batch
 		target := n.readyTarget()
 		target.RecordLoads = append(target.RecordLoads, ref)
-		// keep sorted unique later at Ready() freeze; also sort now for stability
 		sortRefs(target.RecordLoads)
-		// dedup adjacent
 		out := target.RecordLoads[:0]
 		var last InstanceRef
-		for i, r := range target.RecordLoads {
-			if i == 0 || r != last {
-				out = append(out, r)
-				last = r
+		for i, recordRef := range target.RecordLoads {
+			if i == 0 || recordRef != last {
+				out = append(out, recordRef)
+				last = recordRef
 			}
 		}
 		target.RecordLoads = out
 		wait.requested = true
+	}
+	wait.required = wait.required || required
+	if !keepMessage {
+		return nil
 	}
 	if n.pendingRecordLoadMessages >= n.maxDeferredRecordLoads {
 		return fmt.Errorf("%w: %w", ErrMessageRejected, ErrDeferredRecordLoadFull)
@@ -4577,39 +4741,89 @@ func (n *RawNode) ProvideRecordLoad(res RecordLoadResult) error {
 		return ErrUnrequestedRecordLoad
 	}
 	if !res.Found {
+		if wait.required {
+			return ErrInvalidRecord
+		}
 		n.recordLoadMisses++
 		n.pendingRecordLoadMessages -= len(wait.messages)
 		delete(n.pendingRecordLoads, res.Ref)
 		return nil
 	}
 	rec := res.Record
-	if rec.Ref != res.Ref && !res.Ref.IsZero() {
-		// allow Ref on result to define
-		if rec.Ref.IsZero() {
-			rec.Ref = res.Ref
-		}
+	if rec.Ref != res.Ref {
+		return ErrInvalidRecord
 	}
 	if err := validateRecordChecksum(rec); err != nil {
 		return err
 	}
-	// install through chokepoint
 	inst := n.instances[rec.Ref]
+	wasStub := inst != nil && inst.payloadAbsent
+	if wasStub && rec.Checksum != inst.payloadChecksum {
+		return ErrInvalidRecord
+	}
 	if inst == nil {
 		inst = &instance{rec: rec, phase: phaseFromStatus(rec.Status)}
 		n.installInstance(inst)
 	} else {
 		n.setInstanceRecord(inst, rec)
 	}
+	if wasStub {
+		inst.payloadAbsent = false
+		inst.payloadChecksum = [32]byte{}
+		n.payloadStubInstances--
+	}
 	msgs := wait.messages
+	exports := append([]recordLoadExport(nil), wait.exports...)
+	needReadyRecord := wait.needReadyRecord
 	n.pendingRecordLoadMessages -= len(msgs)
 	delete(n.pendingRecordLoads, res.Ref)
 	for _, msg := range msgs {
 		if err := n.Step(msg); err != nil {
+			n.maybeRefoldLoaded(rec.Ref)
 			return err
 		}
 	}
+	// Execute deferred exports while payload is restored, before maybeRefoldLoaded re-stubs.
+	if needReadyRecord {
+		n.enqueueRecord(inst.rec)
+	}
+	for _, export := range exports {
+		if export.to == 0 {
+			n.broadcast(export.messageType, inst.rec)
+			continue
+		}
+		if export.messageType != MsgCommit {
+			panic(fmt.Sprintf("invalid targeted export message type: %s", export.messageType))
+		}
+		n.sendCommitTo(export.to, inst.rec)
+	}
 	n.maybeRefoldLoaded(rec.Ref)
 	return nil
+}
+
+func (n *RawNode) dropPayload(inst *instance) {
+	if inst == nil || inst.payloadAbsent || inst.rec.Status != StatusExecuted {
+		return
+	}
+	if len(inst.rec.Command.Payload) == 0 {
+		// nil high-cap empty slice only; not a stub
+		if cap(inst.rec.Command.Payload) > 0 {
+			next := inst.rec.Clone()
+			next.Command.Payload = nil
+			// do NOT recompute Checksum
+			n.setInstanceRecord(inst, next)
+		}
+		return
+	}
+	next := inst.rec.Clone()
+	fullChecksum := next.Checksum
+	next.Command.Payload = nil
+	// Keep the resident InstanceRecord canonical; preserve the durable full checksum privately.
+	next.Checksum = ChecksumRecord(next)
+	n.setInstanceRecord(inst, next)
+	inst.payloadAbsent = true
+	inst.payloadChecksum = fullChecksum
+	n.payloadStubInstances++
 }
 
 func (n *RawNode) maybeRefoldLoaded(ref InstanceRef) {
@@ -4618,10 +4832,14 @@ func (n *RawNode) maybeRefoldLoaded(ref InstanceRef) {
 		return
 	}
 	if ref.Instance > n.engine.foldedThrough(laneFor(ref)) {
+		n.dropPayload(inst)
 		return
 	}
 	rec := inst.rec.Clone()
 	n.engine.foldRecord(rec)
+	if inst.payloadAbsent {
+		n.payloadStubInstances--
+	}
 	delete(n.instances, ref)
 	n.foldedInstances++
 }
@@ -4846,7 +5064,6 @@ func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uin
 	}
 	return Attributes{Seq: seq, Deps: deps}
 }
-
 
 func (n *RawNode) skipTimedConflict(cmd Command, candidate InstanceRef, processAt uint64, timedPreAccept bool, ref InstanceRef, rec InstanceRecord) bool {
 	if !timedPreAccept || cmd.Kind != CommandUser || rec.Command.Kind != CommandUser {
