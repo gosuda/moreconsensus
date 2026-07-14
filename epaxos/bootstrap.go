@@ -2098,7 +2098,6 @@ func (n *RawNode) proposeMembershipAt(ref InstanceRef, command Command) error {
 		return ErrInvalidConfig
 	}
 	n.installInstance(inst)
-	n.indexConflicts(record)
 	n.enqueueRecord(record)
 	if n.slowQuorumForConf(ref.Conf) == 1 {
 		n.commit(inst, record.Attributes())

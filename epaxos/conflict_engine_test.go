@@ -191,11 +191,11 @@ func assertConflictEngineMatchesModel(t *testing.T, engine *conflictEngine, mode
 				wantGlobal = max(wantGlobal, ref.Instance)
 			}
 		}
-		if got := engine.maxEligibleAny(lane); got != wantMax {
-			t.Fatalf("step %d lane %v: max eligible=%d, want %d", step, lane, got, wantMax)
+		if resident, retired := engine.maxEligibleAny(lane); max(resident, retired) != wantMax {
+			t.Fatalf("step %d lane %v: max eligible=%d/%d, want %d", step, lane, resident, retired, wantMax)
 		}
-		if got := engine.globalMax(lane); got != wantGlobal {
-			t.Fatalf("step %d lane %v: global max=%d, want %d", step, lane, got, wantGlobal)
+		if resident, retired := engine.globalMax(lane); max(resident, retired) != wantGlobal {
+			t.Fatalf("step %d lane %v: global max=%d/%d, want %d", step, lane, resident, retired, wantGlobal)
 		}
 		for _, through := range []InstanceNum{0, 1, 63, 64, 4_096, InstanceNum(1)<<60 + 63, ^InstanceNum(0)} {
 			want := modelPrefixMaxSeq(model, lane, through)
@@ -265,9 +265,9 @@ func engineModelAttrs(engine *conflictEngine, conf ConfID, cmd Command) modelAtt
 	engine.lanes(conf, func(lane instanceLane) bool {
 		var dep InstanceNum
 		if commandHasGlobalConflictScope(cmd.Kind) {
-			dep = engine.maxEligibleAny(lane)
+			r, ret := engine.maxEligibleAny(lane); dep = max(r, ret)
 		} else {
-			dep = engine.globalMax(lane)
+			r, ret := engine.globalMax(lane); dep = max(r, ret)
 			for _, key := range cmd.ConflictKeys {
 				resident, retired := engine.keyMax(conf, key, lane)
 				dep = max(dep, resident, retired)
@@ -417,11 +417,11 @@ func TestConflictEnginePostFoldDomination(t *testing.T) {
 			t.Fatalf("query %+v decreased across fold: before=%+v after=%+v", query, beforeAttrs, afterAttrs)
 		}
 	}
-	if got := engine.globalMax(lane); got != 3 {
-		t.Fatalf("retired global max=%d, want 3", got)
+	if resident, retired := engine.globalMax(lane); max(resident, retired) != 3 {
+		t.Fatalf("retired global max=%d, want 3", max(resident, retired))
 	}
-	if got := engine.maxEligibleAny(lane); got != 4 {
-		t.Fatalf("retired eligible max=%d, want 4", got)
+	if resident, retired := engine.maxEligibleAny(lane); max(resident, retired) != 4 {
+		t.Fatalf("retired eligible max=%d, want 4", max(resident, retired))
 	}
 	if err := engine.verify(); err != nil {
 		t.Fatal(err)
@@ -471,8 +471,8 @@ func TestConflictEngineNoopMutationDropsMax(t *testing.T) {
 	if resident != lower.Ref.Instance || retired != 0 {
 		t.Fatalf("key max after noop mutation=(%d,%d), want (%d,0)", resident, retired, lower.Ref.Instance)
 	}
-	if got := engine.maxEligibleAny(lane); got != lower.Ref.Instance {
-		t.Fatalf("max eligible after noop mutation=%d, want %d", got, lower.Ref.Instance)
+	if resident, retired := engine.maxEligibleAny(lane); max(resident, retired) != lower.Ref.Instance {
+		t.Fatalf("max eligible after noop mutation=%d/%d, want %d", resident, retired, lower.Ref.Instance)
 	}
 	if err := engine.verify(); err != nil {
 		t.Fatal(err)
@@ -639,5 +639,40 @@ func assertExactKeyPostings(t *testing.T, e *conflictEngine, records map[Instanc
 				t.Fatalf("missing posting for %v key %q", ref, key)
 			}
 		}
+	}
+}
+
+
+func TestWalkGlobalDescSkipsUnrelatedResidents(t *testing.T) {
+	t.Parallel()
+	var engine conflictEngine
+	lane := instanceLane{conf: 1, replica: 1}
+	// One old global at instance 1, then many ordinary residents.
+	global := InstanceRecord{
+		Ref: InstanceRef{Conf: 1, Replica: 1, Instance: 1},
+		Status: StatusCommitted, Seq: 1,
+		Command: Command{Kind: CommandConfChange, Payload: []byte("cfg")},
+	}
+	engine.apply(nil, global)
+	for i := InstanceNum(2); i <= 200; i++ {
+		rec := InstanceRecord{
+			Ref: InstanceRef{Conf: 1, Replica: 1, Instance: i},
+			Status: StatusCommitted, Seq: uint64(i),
+			Command: Command{Kind: CommandUser, Payload: []byte("u"), ConflictKeys: [][]byte{[]byte("k")}},
+		}
+		engine.apply(nil, rec)
+	}
+	visits := 0
+	var seen []InstanceNum
+	engine.walkGlobalDesc(lane, 200, func(instance InstanceNum, slot laneSlot) bool {
+		visits++
+		seen = append(seen, instance)
+		if !slot.global() {
+			t.Fatalf("yielded non-global instance %d", instance)
+		}
+		return true
+	})
+	if visits != 1 || len(seen) != 1 || seen[0] != 1 {
+		t.Fatalf("walkGlobalDesc visits=%d seen=%v, want only global instance 1", visits, seen)
 	}
 }

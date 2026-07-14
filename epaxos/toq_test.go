@@ -126,8 +126,8 @@ func TestTOQImmediateProcessAtProposeAssignsLocalAttrsAndValidatesMessages(t *te
 	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.rec.ProcessAt != 0 || inst.preOK.len() != 1 {
 		t.Fatalf("local immediate TOQ instance = %#v, want assigned local preaccept vote at ProcessAt 0", inst)
 	}
-	if got := rn.conflictIndex(1, []byte("toq-immediate-key"))[instanceLane{conf: 1, replica: 1}]; got != ref {
-		t.Fatalf("immediate TOQ command conflict index = %s, want %s", got, ref)
+	if resident, _ := rn.engine.keyMax(1, []byte("toq-immediate-key"), instanceLane{conf: 1, replica: 1}); resident != ref.Instance {
+		t.Fatalf("immediate TOQ command conflict index = %d, want %s", resident, ref)
 	}
 
 	applyAndAdvanceTOQReady(t, store, rn, rd)
@@ -177,10 +177,11 @@ func TestTOQImmediateProcessAtSkipsLaterSameTimestampConflict(t *testing.T) {
 	if assigned.Seq != 1 || !instanceNumsEqual(assigned.Deps, []InstanceNum{0, 0, 0}) {
 		t.Fatalf("immediate TOQ zero-timestamp attrs = seq %d deps %v, want no dependency on later same-timestamp conflict %s", assigned.Seq, assigned.Deps, laterRef)
 	}
-	if byLane := rn.conflictIndex(ref.Conf, []byte("toq-zero-order-key")); len(byLane) != 2 ||
-		byLane[instanceLane{conf: ref.Conf, replica: ref.Replica}] != ref ||
-		byLane[instanceLane{conf: laterRef.Conf, replica: laterRef.Replica}] != laterRef {
-		t.Fatalf("TOQ zero-timestamp conflict index = %#v, want candidate %s and later conflict %s indexed after assignment", byLane, ref, laterRef)
+	if r1, _ := rn.engine.keyMax(ref.Conf, []byte("toq-zero-order-key"), instanceLane{conf: ref.Conf, replica: ref.Replica}); r1 != ref.Instance {
+		t.Fatalf("TOQ zero-timestamp conflict index missing candidate %s (got %d)", ref, r1)
+	}
+	if r2, _ := rn.engine.keyMax(laterRef.Conf, []byte("toq-zero-order-key"), instanceLane{conf: laterRef.Conf, replica: laterRef.Replica}); r2 != laterRef.Instance {
+		t.Fatalf("TOQ zero-timestamp conflict index missing later %s (got %d)", laterRef, r2)
 	}
 }
 
@@ -215,8 +216,8 @@ func TestTOQProposePersistsPendingAndSendsExplicitMessages(t *testing.T) {
 	if inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.preOK.len() != 0 {
 		t.Fatalf("local TOQ instance before ProcessAt = phase %d record %#v preOK %#v, want pending without local preaccept vote", inst.phase, inst.rec, inst.preOK)
 	}
-	if byLane := rn.conflictIndex(inst.rec.Ref.Conf, []byte("toq-pending-key")); len(byLane) != 0 {
-		t.Fatalf("TOQ pending command was indexed as an ordinary conflict before ProcessAt: %#v", byLane)
+	if resident, _ := rn.engine.keyMax(inst.rec.Ref.Conf, []byte("toq-pending-key"), instanceLane{conf: inst.rec.Ref.Conf, replica: inst.rec.Ref.Replica}); resident != 0 {
+		t.Fatalf("TOQ pending command was indexed as an ordinary conflict before ProcessAt: resident=%d", resident)
 	}
 
 	applyAndAdvanceTOQReady(t, store, rn, rd)
@@ -260,8 +261,8 @@ func TestTOQProcessAtAssignsLocalAttrsAndRetriesStayExplicit(t *testing.T) {
 	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.preOK.len() != 1 {
 		t.Fatalf("local TOQ instance after ProcessAt = %#v preOK %#v, want one local preaccept vote", inst, inst.preOK)
 	}
-	if got := rn.conflictIndex(1, []byte("toq-assign-key"))[instanceLane{conf: 1, replica: 1}]; got != ref {
-		t.Fatalf("TOQ command conflict index after ProcessAt = %s, want %s", got, ref)
+	if resident, _ := rn.engine.keyMax(1, []byte("toq-assign-key"), instanceLane{conf: 1, replica: 1}); resident != ref.Instance {
+		t.Fatalf("TOQ command conflict index after ProcessAt = %d, want %s", resident, ref)
 	}
 	applyAndAdvanceTOQReady(t, store, rn, assignedReady)
 
@@ -377,9 +378,11 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 	if inst.phase != phasePreAccept || inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.rec.ProcessAt != processAt || !commandEqual(inst.rec.Command, cmd) || inst.preOK.len() != 0 {
 		t.Fatalf("restarted local TOQ instance before ProcessAt = %#v preOK %#v, want pending command without local preaccept vote", inst, inst.preOK)
 	}
-	if byLane := restarted.conflictIndex(ref.Conf, []byte("toq-restart-key")); len(byLane) != 1 ||
-		byLane[instanceLane{conf: conflictRef.Conf, replica: conflictRef.Replica}] != conflictRef {
-		t.Fatalf("restart conflict index before ProcessAt = %#v, want only preexisting conflict %s", byLane, conflictRef)
+	if r, _ := restarted.engine.keyMax(conflictRef.Conf, []byte("toq-restart-key"), instanceLane{conf: conflictRef.Conf, replica: conflictRef.Replica}); r != conflictRef.Instance {
+		t.Fatalf("restart conflict index before ProcessAt missing preexisting %s (got %d)", conflictRef, r)
+	}
+	if r, _ := restarted.engine.keyMax(ref.Conf, []byte("toq-restart-key"), instanceLane{conf: ref.Conf, replica: ref.Replica}); r != 0 {
+		t.Fatalf("restart conflict index before ProcessAt indexed pending command: resident=%d", r)
 	}
 
 	if err := restarted.Tick(); err != nil {
@@ -397,9 +400,8 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 	if inst.rec.Status != StatusNone || !inst.rec.TOQPending {
 		t.Fatalf("TOQ retry before ProcessAt mutated pending record to %#v", inst.rec)
 	}
-	if byLane := restarted.conflictIndex(ref.Conf, []byte("toq-restart-key")); len(byLane) != 1 ||
-		byLane[instanceLane{conf: conflictRef.Conf, replica: conflictRef.Replica}] != conflictRef {
-		t.Fatalf("retry before ProcessAt indexed pending command: %#v", byLane)
+	if r, _ := restarted.engine.keyMax(ref.Conf, []byte("toq-restart-key"), instanceLane{conf: ref.Conf, replica: ref.Replica}); r != 0 {
+		t.Fatalf("retry before ProcessAt indexed pending command: resident=%d", r)
 	}
 	applyAndAdvanceTOQReady(t, store, restarted, beforeProcessAtRetry)
 
@@ -419,10 +421,11 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 	if !commandEqual(assigned.Command, cmd) {
 		t.Fatalf("restarted TOQ assignment command = %#v, want original %#v", assigned.Command, cmd)
 	}
-	if byLane := restarted.conflictIndex(ref.Conf, []byte("toq-restart-key")); len(byLane) != 2 ||
-		byLane[instanceLane{conf: ref.Conf, replica: ref.Replica}] != ref ||
-		byLane[instanceLane{conf: conflictRef.Conf, replica: conflictRef.Replica}] != conflictRef {
-		t.Fatalf("conflict index after restarted TOQ assignment = %#v, want local %s plus preexisting %s", byLane, ref, conflictRef)
+	if r1, _ := restarted.engine.keyMax(ref.Conf, []byte("toq-restart-key"), instanceLane{conf: ref.Conf, replica: ref.Replica}); r1 != ref.Instance {
+		t.Fatalf("conflict index after restarted TOQ assignment missing local %s (got %d)", ref, r1)
+	}
+	if r2, _ := restarted.engine.keyMax(conflictRef.Conf, []byte("toq-restart-key"), instanceLane{conf: conflictRef.Conf, replica: conflictRef.Replica}); r2 != conflictRef.Instance {
+		t.Fatalf("conflict index after restarted TOQ assignment missing preexisting %s (got %d)", conflictRef, r2)
 	}
 	applyAndAdvanceTOQReady(t, store, restarted, assignedReady)
 	stored, ok := store.Instance(ref)

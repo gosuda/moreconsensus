@@ -66,7 +66,7 @@ func snapshotRemainingNodeProtocol(rn *RawNode) remainingNodeProtocolSnapshot {
 		toqClosed:             rn.toqClosed,
 		toqClosedThrough:      rn.toqClosedThrough,
 		instances:             len(rn.instances),
-		conflicts:             len(rn.conflicts),
+		conflicts:             rn.engine.residentCount(),
 		executed:              len(rn.executed.exact),
 		appliedConfByBase:     len(rn.appliedConfByBase),
 		confHistory:           len(rn.confHistory),
@@ -1970,8 +1970,7 @@ func TestConflictIndexIncludesKnownInstancesFromEveryReplica(t *testing.T) {
 	}
 	for _, rec := range priors {
 		rec = checkedRecord(rec)
-		rn.instances[rec.Ref] = &instance{rec: rec, phase: phaseCommitted}
-		rn.indexConflicts(rec)
+		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 	}
 
 	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("next"), ConflictKeys: [][]byte{key}})
@@ -1993,9 +1992,13 @@ func TestRemainingDependencyAndStorageBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := Command{Kind: CommandConfChange}
-	rn.instances[InstanceRef{Replica: 1, Instance: 1, Conf: 1}] = &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusNone, Command: Command{Payload: []byte("skip")}}}
-	rn.instances[InstanceRef{Replica: 2, Instance: 1, Conf: 1}] = &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 4, Command: Command{Kind: CommandNoop}}}
-	rn.instances[InstanceRef{Replica: 3, Instance: 1, Conf: 1}] = &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 3, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 5, Command: Command{Payload: []byte("dep")}}}
+	for _, rec := range []InstanceRecord{
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusNone, Command: Command{Payload: []byte("skip")}}),
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 4, Command: Command{Kind: CommandNoop}}),
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 3, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 5, Command: Command{Payload: []byte("dep")}}),
+	} {
+		rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status)})
+	}
 	attrs := rn.computeAttrs(cmd, InstanceRef{Replica: 1, Instance: 99, Conf: 1})
 	if attrs.Seq != 6 || attrs.Deps[2] != 1 {
 		t.Fatalf("conf attrs=%#v", attrs)
@@ -2833,7 +2836,6 @@ func TestProcessedLogicalPreAcceptRetryReacksPinnedTupleAfterLaterConflict(t *te
 	conflictRef := InstanceRef{Conf: 1, Replica: 3, Instance: 1}
 	conflict := checkedRecord(InstanceRecord{Ref: conflictRef, Ballot: Ballot{Replica: 3}, RecordBallot: Ballot{Replica: 3}, Status: StatusCommitted, Seq: pinned.Seq + 10, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("later-conflict", "logical-retry-key"), ProcessAt: 3, TimingDomain: TimingDomainLogical})
 	rn.installInstance(&instance{rec: conflict, phase: phaseCommitted})
-	rn.indexConflicts(conflict)
 	if err := rn.Step(message); err != nil {
 		t.Fatal(err)
 	}

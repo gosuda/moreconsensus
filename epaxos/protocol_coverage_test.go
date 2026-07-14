@@ -274,7 +274,7 @@ func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
 	})
 	inst := &instance{rec: rec, phase: phasePreAccept, preOK: nil}
 	rn.instances[ref] = inst
-	rn.indexConflicts(rec)
+	rn.engine.apply(nil, rec)
 
 	respDeps := []InstanceNum{0, 1, 0}
 	const depsCommitted uint64 = 0b101

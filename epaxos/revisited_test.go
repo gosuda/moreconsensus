@@ -256,9 +256,6 @@ func revisitedRawNode(t *testing.T) *RawNode {
 func revisitedInstall(rn *RawNode, rec InstanceRecord) {
 	rec = checkedRecord(rec)
 	rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status)})
-	if rec.Status >= StatusPreAccepted {
-		rn.indexConflicts(rec)
-	}
 }
 
 func revisitedCommand(client uint64, payload string, key []byte) Command {
