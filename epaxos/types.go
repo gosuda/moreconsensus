@@ -442,6 +442,9 @@ type Config struct {
 	// MaxDeferredPreAccepts bounds retained future timed PreAccept messages
 	// across the logical and TOQ domains. Zero selects a conservative default.
 	MaxDeferredPreAccepts int
+	// MaxDeferredRecordLoads bounds deferred messages waiting on async record
+	// loads for folded instances. Zero selects the package default of 256.
+	MaxDeferredRecordLoads int
 	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
 	// slices instead of cloning them. When true, the caller transfers ownership
 	// of those slices and must not mutate or reuse them while they remain
@@ -641,6 +644,13 @@ func (c CommittedCommand) Clone() CommittedCommand {
 	return out
 }
 
+// RecordLoadResult is the embedding's response to a Ready.RecordLoads request.
+type RecordLoadResult struct {
+	Ref    InstanceRef
+	Record InstanceRecord
+	Found  bool
+}
+
 // Ready batches records to persist, messages to send, and commands to apply.
 // Committed is already dependency-ordered; callers must preserve its slice
 // order when applying commands.
@@ -655,7 +665,10 @@ type Ready struct {
 	Messages          []Message
 	BootstrapMessages []BootstrapMessage
 	Committed         []CommittedCommand
-	MustSync          bool
+	// RecordLoads requests durable InstanceRecords for folded refs referenced by
+	// inbound messages. Sorted and deduplicated; stable until Advance.
+	RecordLoads []InstanceRef
+	MustSync    bool
 }
 
 // Empty reports whether the ready batch contains no work.
@@ -804,6 +817,19 @@ func (r Ready) CloneInto(dst *Ready) {
 		fullCommitted[i] = CommittedCommand{}
 	}
 
+	sourceLoads := r.RecordLoads
+	if slicesPartiallyOverlap(dst.RecordLoads, sourceLoads) {
+		sourceLoads = append([]InstanceRef(nil), sourceLoads...)
+	}
+	recordLoads := dst.RecordLoads
+	if cap(recordLoads) < len(sourceLoads) {
+		recordLoads = make([]InstanceRef, len(sourceLoads))
+	} else {
+		recordLoads = recordLoads[:len(sourceLoads)]
+	}
+	copy(recordLoads, sourceLoads)
+	clear(recordLoads[len(recordLoads):cap(recordLoads)])
+
 	*dst = Ready{
 		HardState:         hardState,
 		ConfigHistory:     history,
@@ -815,6 +841,7 @@ func (r Ready) CloneInto(dst *Ready) {
 		Messages:          messages,
 		BootstrapMessages: bootstrapMessages,
 		Committed:         committed,
+		RecordLoads:       recordLoads,
 		MustSync:          r.MustSync,
 	}
 }
@@ -881,6 +908,8 @@ type RuntimeStats struct {
 	NextReadyRecords         int
 	NextReadyMessages        int
 	OldestUnexecutedAgeTicks uint64
+	// RecordLoadMisses counts ProvideRecordLoad results with Found=false.
+	RecordLoadMisses uint64
 }
 
 // StatusSnapshot is a copy-only view of node state for diagnostics and tests.
@@ -916,6 +945,12 @@ var (
 	ErrLogicalTimeExhausted = errors.New("epaxos: logical time exhausted")
 	// ErrDeferredQueueFull reports that the bounded timed PreAccept queue is full.
 	ErrDeferredQueueFull = errors.New("epaxos: deferred PreAccept queue full")
+	// ErrDeferredRecordLoadFull reports that the deferred record-load queue is full.
+	ErrDeferredRecordLoadFull = errors.New("epaxos: deferred record load queue full")
+	// ErrUnrequestedRecordLoad reports ProvideRecordLoad for a ref not pending.
+	ErrUnrequestedRecordLoad = errors.New("epaxos: unrequested record load")
+	// ErrInvalidRecord reports a record that fails checksum validation.
+	ErrInvalidRecord = errors.New("epaxos: invalid record")
 	// ErrBallotExhausted reports that no strictly greater ballot is representable.
 	ErrBallotExhausted = errors.New("epaxos: ballot exhausted")
 	// ErrInstanceExhausted reports that no further local instance number is representable.
