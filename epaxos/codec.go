@@ -254,9 +254,16 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 	for i := range m.AcceptEvidence {
 		m.AcceptEvidence[i].Sender = ReplicaID(p.uvarint())
 		m.AcceptEvidence[i].Seq = p.uvarint()
-		deps := int(p.uvarint()) //nolint:gosec // G115: conversion is bounded by protocol or test-fixture limits.
+		depsCount := p.uvarint()
+		if p.err || depsCount > maxWireDeps {
+			return decodeMessageError(m, scratch, ErrInvalidMessage)
+		}
+		deps := int(depsCount)
 		if scratch != nil {
 			end := evidenceOffset + deps
+			if end > len(evidenceArena) {
+				return decodeMessageError(m, scratch, ErrInvalidMessage)
+			}
 			m.AcceptEvidence[i].Deps = evidenceArena[evidenceOffset:end:end]
 			evidenceOffset = end
 		} else {
