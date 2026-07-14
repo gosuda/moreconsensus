@@ -134,14 +134,10 @@
                  cfg))
           (is (= "1=http://alpha:19091,2=http://bravo:19091"
                  (epaxos/peer-spec cfg)))
-          (is (= "alpha:19090"
-                 (epaxos/http-node cfg "alpha")))
           (is (= "alpha:19091"
                  (epaxos/peer-node cfg "alpha")))
           (is (= "alpha:19092"
-                 (epaxos/admin-node cfg "alpha")))
-          (is (= "bravo:7777"
-                 (epaxos/http-node cfg "bravo:7777"))))))))
+                 (epaxos/admin-node cfg "alpha"))))))))
 
 (deftest remote-config-requires-confirmation-for-remote-destructive-storage
   (let [nodes ["alpha"]

@@ -122,9 +122,6 @@
                        (str (node-id cfg node) "=" (endpoint cfg (peer-node cfg node))))
                      (:nodes cfg))))
 
-(defn http-node [cfg node]
-  (node-with-port node (node-client-port cfg node)))
-
 (defn local-fault-config [opts]
   (let [faults (fault-env "FAULTS")
         base-port (parse-env-long "BASE_PORT" 0)
