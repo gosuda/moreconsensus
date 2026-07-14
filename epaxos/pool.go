@@ -25,21 +25,6 @@ func resetSliceForPool[T any](items []T, maxCapacity int) []T {
 	return items[:0]
 }
 
-func resetNestedByteSlicesForPool(items [][]byte, maxOuterCapacity, maxInnerCapacity int) [][]byte {
-	full := items[:cap(items)]
-	if cap(items) > maxOuterCapacity {
-		for i := range full {
-			clear(full[i])
-			full[i] = nil
-		}
-		return nil
-	}
-	for i := range full {
-		full[i] = resetSliceForPool(full[i], maxInnerCapacity)
-	}
-	return full[:0]
-}
-
 func resetConflictKeysForPool(items [][]byte) [][]byte {
 	full := items[:cap(items)]
 	drop := cap(items) > maxPooledConflictKeys

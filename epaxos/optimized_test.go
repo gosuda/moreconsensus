@@ -713,9 +713,6 @@ func TestTryPreAcceptRecoveryStartsAcceptAfterWitnessQuorum(t *testing.T) {
 		rn, inst, ballot := optimizedStartRecovery(t, 5, ref)
 		cmd := optimizedTestCommand("recover", "recover-key")
 		attrs := Attributes{Seq: 1, Deps: rn.q.deps()}
-		if witness := rn.q.tryWitnessQuorum(); witness != 1 {
-			t.Fatalf("five-node optimized try witness quorum = %d, want 1", witness)
-		}
 
 		prepareResponses := []Message{
 			{Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: Ballot{Replica: ref.Replica}, RecordStatus: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd, FastPathEligible: true},

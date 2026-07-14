@@ -3106,7 +3106,3 @@ var (
 	// ErrInvalidBootstrapMessage reports a malformed or unauthenticated envelope.
 	ErrInvalidBootstrapMessage = errors.New("epaxos: invalid bootstrap message")
 )
-
-func bootstrapError(base error, format string, args ...any) error {
-	return fmt.Errorf("%w: %s", base, fmt.Sprintf(format, args...))
-}

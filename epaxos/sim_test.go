@@ -783,13 +783,9 @@ func TestQuorumTables(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			q, err := newQuorum(makeIDs(tt.n))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if slow != tt.slow || fast != tt.fast || tryWitness != tt.tryWitness || q.tryWitnessQuorum() != tt.tryWitness {
-				t.Fatalf("n=%d slow=%d fast=%d tryWitness=%d q.tryWitness=%d, want slow=%d fast=%d tryWitness=%d",
-					tt.n, slow, fast, tryWitness, q.tryWitnessQuorum(), tt.slow, tt.fast, tt.tryWitness)
+			if slow != tt.slow || fast != tt.fast || tryWitness != tt.tryWitness {
+				t.Fatalf("n=%d slow=%d fast=%d tryWitness=%d, want slow=%d fast=%d tryWitness=%d",
+					tt.n, slow, fast, tryWitness, tt.slow, tt.fast, tt.tryWitness)
 			}
 			if got := fast + slow - tt.n; got != tryWitness {
 				t.Fatalf("n=%d fast/slow intersection=%d, want try witness quorum %d", tt.n, got, tryWitness)

@@ -57,8 +57,6 @@ func (q quorum) slowQuorum() int { return q.slow }
 
 func (q quorum) fastQuorum() int { return q.fast }
 
-func (q quorum) tryWitnessQuorum() int { return tryWitnessQuorumSize(len(q.conf.Voters)) }
-
 // SlowQuorum returns the majority quorum size for n voters.
 func SlowQuorum(n int) (int, error) {
 	if _, err := newQuorum(makeIDs(n)); err != nil {

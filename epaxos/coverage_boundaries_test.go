@@ -150,107 +150,6 @@ func TestStorageStateCloneDoesNotShareOwnedSlices(t *testing.T) {
 	}
 }
 
-func TestDeferredPreAcceptEntryRemovalCleansBothDomains(t *testing.T) {
-	node := &RawNode{
-		deferredIndex:         make(map[deferredPreAcceptKey]*deferredPreAccept),
-		maxDeferredPreAccepts: 4,
-	}
-	for i, domain := range []preAcceptDomain{preAcceptLogical, preAcceptTOQ} {
-		message := Message{
-			Type:   MsgPreAccept,
-			From:   1,
-			To:     2,
-			Ref:    InstanceRef{Replica: 1, Instance: InstanceNum(i + 1), Conf: 1},
-			Ballot: Ballot{Number: 0, Replica: 1},
-			Deps:   []InstanceNum{0, 0, 0},
-		}
-		admitted, err := node.admitDeferredPreAccept(domain, message)
-		if err != nil || !admitted {
-			t.Fatalf("admitDeferredPreAccept(%d): admitted=%v err=%v", domain, admitted, err)
-		}
-		key := deferredPreAcceptKey{domain: domain, ref: message.Ref, ballot: message.Ballot, from: message.From}
-		entry := node.deferredIndex[key]
-		if entry == nil {
-			t.Fatalf("missing deferred entry for domain %d", domain)
-		}
-		node.removeDeferredPreAcceptEntry(entry)
-		if _, ok := node.deferredIndex[key]; ok {
-			t.Fatalf("deferred index retained removed entry for domain %d", domain)
-		}
-		if len(node.logicalPreAccepts) != 0 || len(node.toqPreAccepts) != 0 {
-			t.Fatalf("deferred queue retained removed entry for domain %d", domain)
-		}
-		if entry.message.Type != 0 || entry.message.Deps != nil {
-			t.Fatalf("removed deferred message was not reset: %#v", entry.message)
-		}
-		node.removeDeferredPreAcceptEntry(entry)
-	}
-	node.removeDeferredPreAcceptEntry(nil)
-}
-
-func TestMatchingInitialLeaderTryRecordRequiresExactAttributes(t *testing.T) {
-	node, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf := node.Status().Conf
-	command := Command{ID: CommandID{Client: 44, Sequence: 1}, Payload: []byte("try")}
-	ref := InstanceRef{Replica: 2, Instance: 1, Conf: conf.ID}
-	record := InstanceRecord{
-		Ref:              ref,
-		Status:           StatusPreAccepted,
-		FastPathEligible: true,
-		Seq:              2,
-		Deps:             []InstanceNum{0, 1, 0},
-		Command:          command,
-	}
-	matching := func(candidate InstanceRecord, attrs Attributes) bool {
-		inst := &instance{rec: InstanceRecord{Ref: ref, Command: command}, prepareOK: &recordVoteSet{}}
-		if !inst.prepareOK.add(conf, 2, candidate) {
-			t.Fatal("recordVoteSet.add rejected test record")
-		}
-		return node.hasMatchingInitialLeaderTryRecord(inst, attrs)
-	}
-	if !matching(record, record.Attributes()) {
-		t.Fatal("matching initial leader TryPreAccept record was rejected")
-	}
-	if matching(record, Attributes{Seq: record.Seq + 1, Deps: record.Deps}) {
-		t.Fatal("attribute mismatch was accepted")
-	}
-	wrongStatus := record
-	wrongStatus.Status = StatusAccepted
-	if matching(wrongStatus, record.Attributes()) {
-		t.Fatal("non-preaccepted record was accepted")
-	}
-	wrongFastPath := record
-	wrongFastPath.FastPathEligible = false
-	if matching(wrongFastPath, record.Attributes()) {
-		t.Fatal("non-fast-path record was accepted")
-	}
-	if node.hasMatchingInitialLeaderTryRecord(nil, record.Attributes()) {
-		t.Fatal("nil instance was accepted")
-	}
-	if node.hasMatchingInitialLeaderTryRecord(&instance{rec: InstanceRecord{}}, record.Attributes()) {
-		t.Fatal("zero-reference instance was accepted")
-	}
-}
-
-func TestPoolNestedByteSliceResetHonorsCapacityBounds(t *testing.T) {
-	items := [][]byte{[]byte("one"), []byte("two")}
-	retained := resetNestedByteSlicesForPool(items, 2, 8)
-	smallBytes := []byte(items[0][:cap(items[0])])
-	secondBytes := []byte(items[1][:cap(items[1])])
-	if len(retained) != 0 || cap(retained) != cap(items) || smallBytes[0] != 0 || secondBytes[0] != 0 {
-		t.Fatalf("small nested reset did not clear and retain storage: len=%d cap=%d items=%q", len(retained), cap(retained), items)
-	}
-
-	large := make([][]byte, 1, 3)
-	large[0] = []byte("discard")
-	if retained := resetNestedByteSlicesForPool(large, 2, 8); retained != nil || large[0] != nil {
-		t.Fatalf("large nested reset retained storage: result=%#v large=%#v", retained, large)
-	}
-}
-
 func TestCommandResetReleasesOwnedReferences(t *testing.T) {
 	command := Command{
 		ID:           CommandID{Client: 7, Sequence: 8},
@@ -261,12 +160,5 @@ func TestCommandResetReleasesOwnedReferences(t *testing.T) {
 	command.Reset()
 	if command.ID != (CommandID{}) || command.Kind != CommandUser || command.Payload != nil || command.ConflictKeys != nil {
 		t.Fatalf("Command.Reset left owned state: %#v", command)
-	}
-}
-
-func TestBootstrapErrorWrapsBaseError(t *testing.T) {
-	err := bootstrapError(ErrBootstrapBounds, "field %s", "payload")
-	if !errors.Is(err, ErrBootstrapBounds) || err.Error() != "epaxos: bootstrap input exceeds bound: field payload" {
-		t.Fatalf("bootstrapError = %v", err)
 	}
 }

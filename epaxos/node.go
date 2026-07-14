@@ -1665,21 +1665,6 @@ func (n *RawNode) preflightDeferredPreAccepts(domain preAcceptDomain, now, logic
 	return nil
 }
 
-func (n *RawNode) removeDeferredPreAcceptEntry(entry *deferredPreAccept) {
-	if entry == nil || n.deferredIndex[entry.key] != entry {
-		return
-	}
-	queue := &n.logicalPreAccepts
-	if entry.key.domain == preAcceptTOQ {
-		queue = &n.toqPreAccepts
-	}
-	if entry.index >= 0 {
-		heap.Remove(queue, entry.index)
-	}
-	delete(n.deferredIndex, entry.key)
-	entry.message.Reset()
-}
-
 func (n *RawNode) detachDeferredPreAcceptEntry(entry *deferredPreAccept) (Message, bool) {
 	if entry == nil || n.deferredIndex[entry.key] != entry {
 		return Message{}, false
@@ -4013,18 +3998,6 @@ func (n *RawNode) attrsWithConflictDependencySeq(attrs Attributes, dep InstanceR
 		attrs.Seq = 1
 	}
 	return attrs
-}
-
-func (n *RawNode) hasMatchingInitialLeaderTryRecord(inst *instance, attrs Attributes) bool {
-	if inst == nil || inst.rec.Ref.Replica == 0 {
-		return false
-	}
-	rec, ok := inst.prepareOK.get(n.confFor(inst.rec.Ref.Conf), inst.rec.Ref.Replica)
-	return ok &&
-		rec.Status == StatusPreAccepted &&
-		rec.FastPathEligible &&
-		commandEqual(rec.Command, inst.rec.Command) &&
-		rec.Attributes().Equal(attrs)
 }
 
 func (n *RawNode) tryConflictForcesSlowAccept(inst *instance, conflictRef InstanceRef) bool {
