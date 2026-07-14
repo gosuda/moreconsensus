@@ -156,3 +156,6 @@ The core does not compact executed protocol history. Exact records remain requir
 
 ## Record load handshake
 When a message references a folded instance no longer resident in memory, Ready.RecordLoads lists the refs (sorted, deduplicated, frozen until Advance). The embedding loads durable records and calls ProvideRecordLoad. Capacity backpressure uses ErrDeferredRecordLoadFull wrapped with ErrMessageRejected.
+
+## Public conflict query
+`VisitConflicts` walks resident in-flight conflicts for a command without allocating in the steady state. Folded floors are dependency metadata only and are not enumerated.

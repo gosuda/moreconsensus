@@ -4647,6 +4647,89 @@ func (n *RawNode) computeAttrs(cmd Command, exclude InstanceRef) Attributes {
 	return n.computeAttrsAt(cmd, exclude, 0, false)
 }
 
+// VisitConflicts yields resident in-flight instances that conflict with cmd.
+// Folded history is not enumerated. yield returns false to stop early.
+// The walk is designed to avoid heap allocation in the steady state.
+func (n *RawNode) VisitConflicts(cmd Command, yield func(InstanceRef, Status) bool) {
+	if n == nil || yield == nil || cmd.Kind == CommandNoop {
+		return
+	}
+	confID := n.currentHardState.Conf.ID
+	stop := false
+	visit := func(ref InstanceRef, status Status) bool {
+		if !yield(ref, status) {
+			stop = true
+			return false
+		}
+		return true
+	}
+	if commandHasGlobalConflictScope(cmd.Kind) {
+		n.engine.lanes(confID, func(lane instanceLane) bool {
+			if stop {
+				return false
+			}
+			resident, _ := n.engine.maxEligibleAny(lane)
+			n.engine.walkDesc(lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+				if stop || !slot.eligible() {
+					return !stop
+				}
+				ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+				inst := n.instances[ref]
+				if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+					return true
+				}
+				return visit(ref, inst.rec.Status)
+			})
+			return !stop
+		})
+		return
+	}
+	n.engine.keyLaneSet(confID, cmd.ConflictKeys, func(lane instanceLane) bool {
+		if stop {
+			return false
+		}
+		for _, key := range cmd.ConflictKeys {
+			if stop {
+				break
+			}
+			resident, _ := n.engine.keyMax(confID, key, lane)
+			n.engine.walkKeyDesc(confID, key, lane, resident, func(instance InstanceNum, slot laneSlot) bool {
+				if stop || !slot.eligible() {
+					return !stop
+				}
+				ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+				inst := n.instances[ref]
+				if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+					return true
+				}
+				return visit(ref, inst.rec.Status)
+			})
+		}
+		return !stop
+	})
+	if stop {
+		return
+	}
+	n.engine.lanes(confID, func(lane instanceLane) bool {
+		if stop {
+			return false
+		}
+		resident, _ := n.engine.globalMax(lane)
+		n.engine.walkGlobalDesc(lane, resident, func(instance InstanceNum, _ laneSlot) bool {
+			if stop {
+				return false
+			}
+			ref := InstanceRef{Conf: lane.conf, Replica: lane.replica, Instance: instance}
+			inst := n.instances[ref]
+			if inst == nil || !commandsConflict(cmd, inst.rec.Command) {
+				return true
+			}
+			return visit(ref, inst.rec.Status)
+		})
+		return !stop
+	})
+}
+
 func (n *RawNode) computeAttrsAt(cmd Command, exclude InstanceRef, processAt uint64, timedPreAccept bool) Attributes {
 	conf := n.confFor(exclude.Conf)
 	deps := make([]InstanceNum, len(conf.Voters))

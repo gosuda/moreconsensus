@@ -48,3 +48,5 @@
 package epaxos
 
 // Ready.RecordLoads requests durable records for folded instance refs; embeddings respond via ProvideRecordLoad.
+
+// VisitConflicts enumerates resident conflicting instances for embeddings; folded history is omitted.
