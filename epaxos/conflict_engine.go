@@ -32,10 +32,10 @@ func slotForRecord(rec InstanceRecord) laneSlot {
 	if rec.TOQPending {
 		flags |= laneSlotTOQPending
 	}
-	if rec.Command.Kind == CommandNoop {
+	if rec.Kind == EntryNoop {
 		flags |= laneSlotNoop
 	}
-	if commandHasGlobalConflictScope(rec.Command.Kind) {
+	if recordHasGlobalConflictScope(rec) {
 		flags |= laneSlotGlobalScope
 	}
 	if rec.Status == StatusExecuted {
@@ -541,9 +541,11 @@ type keyLane struct {
 type keyLanes map[instanceLane]*keyLane
 
 type conflictEngine struct {
-	laneIndex map[instanceLane]*laneIndex
-	byKey     map[ConfID]map[string]*keyLanes
-	resident int
+	laneIndex        map[instanceLane]*laneIndex
+	points           map[ConfID]map[string]*resourceEntry
+	intervals        map[ConfID]*intervalNode
+	scratchResources map[*resourceEntry]struct{}
+	resident         int
 }
 
 func (e *conflictEngine) ensureLane(lane instanceLane) *laneIndex {
@@ -569,35 +571,51 @@ func (e *conflictEngine) apply(prev *InstanceRecord, rec InstanceRecord) {
 	if !existed {
 		e.resident++
 	}
-	if recordConflictEligible(rec) && !commandHasGlobalConflictScope(rec.Command.Kind) {
-		for _, key := range rec.Command.ConflictKeys {
-			e.ensureKeyLane(rec.Ref.Conf, key, lane).postings.insert(rec.Ref.Instance)
-		}
+	if !recordConflictEligible(rec) || recordHasGlobalConflictScope(rec) {
+		return
+	}
+	for _, point := range rec.Command.Footprint.Points {
+		e.ensureResource(rec.Ref.Conf, point, point, true, lane).postings.insert(rec.Ref.Instance)
+	}
+	for _, span := range rec.Command.Footprint.Spans {
+		e.ensureResource(rec.Ref.Conf, span.Start, span.End, false, lane).postings.insert(rec.Ref.Instance)
 	}
 }
 
 func recordConflictEligible(rec InstanceRecord) bool {
-	return rec.Status != StatusNone && !rec.TOQPending && rec.Command.Kind != CommandNoop
+	return rec.Status != StatusNone && !rec.TOQPending && rec.Kind != EntryNoop
 }
 
-func (e *conflictEngine) ensureKeyLane(conf ConfID, key []byte, lane instanceLane) *keyLane {
-	if e.byKey == nil {
-		e.byKey = make(map[ConfID]map[string]*keyLanes)
+func entryHasGlobalConflictScope(kind EntryKind) bool {
+	return kind == EntryConfChange || kind == EntryMembership || kind == EntryCheckpoint
+}
+
+func recordHasGlobalConflictScope(rec InstanceRecord) bool {
+	return entryHasGlobalConflictScope(rec.Kind) || rec.Kind == EntryCommand && rec.Command.Footprint.All
+}
+
+func (e *conflictEngine) ensureResource(conf ConfID, start, end []byte, point bool, lane instanceLane) *keyLane {
+	if e.intervals == nil {
+		e.intervals = make(map[ConfID]*intervalNode)
 	}
-	keys := e.byKey[conf]
-	if keys == nil {
-		keys = make(map[string]*keyLanes)
-		e.byKey[conf] = keys
+	resource := findInterval(e.intervals[conf], start, point, end)
+	if resource == nil {
+		resource = &resourceEntry{start: append([]byte(nil), start...), end: append([]byte(nil), end...), point: point, lanes: make(keyLanes)}
+		e.intervals[conf] = insertInterval(e.intervals[conf], resource)
+		if point {
+			if e.points == nil {
+				e.points = make(map[ConfID]map[string]*resourceEntry)
+			}
+			if e.points[conf] == nil {
+				e.points[conf] = make(map[string]*resourceEntry)
+			}
+			e.points[conf][string(start)] = resource
+		}
 	}
-	lanes := keys[string(key)]
-	if lanes == nil {
-		lanes = &keyLanes{}
-		keys[string(key)] = lanes
-	}
-	entry := (*lanes)[lane]
+	entry := resource.lanes[lane]
 	if entry == nil {
 		entry = &keyLane{}
-		(*lanes)[lane] = entry
+		resource.lanes[lane] = entry
 	}
 	return entry
 }
@@ -609,35 +627,42 @@ func (e *conflictEngine) remove(ref InstanceRef, rec InstanceRecord) {
 		return
 	}
 	e.resident--
-	if recordConflictEligible(rec) && !commandHasGlobalConflictScope(rec.Command.Kind) {
-		for _, key := range rec.Command.ConflictKeys {
-			e.removeKeyPosting(ref.Conf, key, lane, ref.Instance)
-		}
+	if !recordConflictEligible(rec) || recordHasGlobalConflictScope(rec) {
+		return
+	}
+	for _, point := range rec.Command.Footprint.Points {
+		e.removeResourcePosting(ref.Conf, point, point, true, lane, ref.Instance)
+	}
+	for _, span := range rec.Command.Footprint.Spans {
+		e.removeResourcePosting(ref.Conf, span.Start, span.End, false, lane, ref.Instance)
 	}
 }
 
-func (e *conflictEngine) removeKeyPosting(conf ConfID, key []byte, lane instanceLane, instance InstanceNum) {
-	keys := e.byKey[conf]
-	if keys == nil {
+func (e *conflictEngine) removeResourcePosting(conf ConfID, start, end []byte, point bool, lane instanceLane, instance InstanceNum) {
+	resource := findInterval(e.intervals[conf], start, point, end)
+	if resource == nil {
 		return
 	}
-	lanes := keys[string(key)]
-	if lanes == nil {
-		return
-	}
-	entry := (*lanes)[lane]
+	entry := resource.lanes[lane]
 	if entry == nil {
 		return
 	}
 	entry.postings.remove(instance)
 	if entry.postings.root == nil && entry.retiredFloor == 0 {
-		delete(*lanes, lane)
+		delete(resource.lanes, lane)
 	}
-	if len(*lanes) == 0 {
-		delete(keys, string(key))
+	if !resourceEntryEmpty(resource) {
+		return
 	}
-	if len(keys) == 0 {
-		delete(e.byKey, conf)
+	e.intervals[conf] = deleteInterval(e.intervals[conf], resource)
+	if e.intervals[conf] == nil {
+		delete(e.intervals, conf)
+	}
+	if point {
+		delete(e.points[conf], string(start))
+		if len(e.points[conf]) == 0 {
+			delete(e.points, conf)
+		}
 	}
 }
 
@@ -678,52 +703,72 @@ func (e *conflictEngine) walkDesc(lane instanceLane, from InstanceNum, yield fun
 }
 
 func (e *conflictEngine) keyMax(conf ConfID, key []byte, lane instanceLane) (resident, retired InstanceNum) {
-	keys := e.byKey[conf]
-	if keys == nil {
+	resource := e.points[conf][string(key)]
+	if resource == nil || resource.lanes[lane] == nil {
 		return 0, 0
 	}
-	lanes := keys[string(key)]
-	if lanes == nil {
-		return 0, 0
-	}
-	entry := (*lanes)[lane]
-	if entry == nil {
-		return 0, 0
-	}
+	entry := resource.lanes[lane]
 	return entry.postings.max(), entry.retiredFloor
 }
 
-// walkKeyDesc yields resident instances for one (conf,key,lane) in descending Instance order,
-// only visiting that key's posting tree (not unrelated lane residents).
-func (e *conflictEngine) walkKeyDesc(conf ConfID, key []byte, lane instanceLane, from InstanceNum, yield func(InstanceNum, laneSlot) bool) {
-	keys := e.byKey[conf]
-	if keys == nil {
-		return
+func (e *conflictEngine) eachFootprintResource(conf ConfID, footprint Footprint, yield func(*resourceEntry) bool) {
+	if e.scratchResources == nil {
+		e.scratchResources = make(map[*resourceEntry]struct{})
 	}
-	lanes := keys[string(key)]
-	if lanes == nil {
-		return
-	}
-	entry := (*lanes)[lane]
-	if entry == nil || entry.postings.root == nil {
-		return
-	}
-	index := e.laneIndex[lane]
-	if index == nil {
-		return
-	}
-	if from == 0 {
-		from = entry.postings.max()
-	}
-	if from == 0 {
-		return
-	}
-	walkPostingDesc(entry.postings.root, 0, from, true, func(instance InstanceNum) bool {
-		slot, ok := index.resident.slot(instance)
-		if !ok {
+	clear(e.scratchResources)
+	unique := func(resource *resourceEntry) bool {
+		if _, ok := e.scratchResources[resource]; ok {
 			return true
 		}
-		return yield(instance, slot)
+		e.scratchResources[resource] = struct{}{}
+		return yield(resource)
+	}
+	for _, point := range footprint.Points {
+		if resource := e.points[conf][string(point)]; resource != nil && !unique(resource) {
+			return
+		}
+		if !queryContainingSpans(e.intervals[conf], point, unique) {
+			return
+		}
+	}
+	for _, span := range footprint.Spans {
+		if !queryIntervalOverlap(e.intervals[conf], span.Start, span.End, unique) {
+			return
+		}
+	}
+}
+
+func (e *conflictEngine) footprintMax(conf ConfID, footprint Footprint, lane instanceLane) (resident, retired InstanceNum) {
+	e.eachFootprintResource(conf, footprint, func(resource *resourceEntry) bool {
+		if entry := resource.lanes[lane]; entry != nil {
+			resident = max(resident, entry.postings.max())
+			retired = max(retired, entry.retiredFloor)
+		}
+		return true
+	})
+	return resident, retired
+}
+
+func (e *conflictEngine) walkFootprintDesc(conf ConfID, footprint Footprint, lane instanceLane, from InstanceNum, yield func(InstanceNum, laneSlot) bool) {
+	seen := make(map[InstanceNum]struct{})
+	e.eachFootprintResource(conf, footprint, func(resource *resourceEntry) bool {
+		entry := resource.lanes[lane]
+		if entry == nil || entry.postings.root == nil {
+			return true
+		}
+		limit := from
+		if limit == 0 {
+			limit = entry.postings.max()
+		}
+		walkPostingDesc(entry.postings.root, 0, limit, true, func(instance InstanceNum) bool {
+			if _, ok := seen[instance]; ok {
+				return true
+			}
+			seen[instance] = struct{}{}
+			slot, ok := e.laneIndex[lane].resident.slot(instance)
+			return !ok || yield(instance, slot)
+		})
+		return true
 	})
 }
 
@@ -737,26 +782,24 @@ func (e *conflictEngine) walkGlobalDesc(lane instanceLane, from InstanceNum, yie
 	walkGlobalRadixDesc(index.resident.root, 0, from, radixLevel(from) <= index.resident.root.level, yield)
 }
 
-func (e *conflictEngine) keyLaneSet(conf ConfID, keys [][]byte, yield func(instanceLane) bool) {
-	for lane := range e.laneIndex {
-		if lane.conf != conf {
-			continue
-		}
-		for _, key := range keys {
-			byConf := e.byKey[conf]
-			if byConf == nil {
-				break
-			}
-			byLane := byConf[string(key)]
-			if byLane == nil || (*byLane)[lane] == nil {
+func (e *conflictEngine) footprintLaneSet(conf ConfID, footprint Footprint, yield func(instanceLane) bool) {
+	if footprint.All {
+		e.lanes(conf, yield)
+		return
+	}
+	seen := make(map[instanceLane]struct{})
+	e.eachFootprintResource(conf, footprint, func(resource *resourceEntry) bool {
+		for lane := range resource.lanes {
+			if _, ok := seen[lane]; ok {
 				continue
 			}
+			seen[lane] = struct{}{}
 			if !yield(lane) {
-				return
+				return false
 			}
-			break
 		}
-	}
+		return true
+	})
 }
 
 func (e *conflictEngine) lanes(conf ConfID, yield func(instanceLane) bool) {
@@ -801,11 +844,15 @@ func (e *conflictEngine) foldRecord(rec InstanceRecord) {
 		return
 	}
 	index.retiredEligibleAny = max(index.retiredEligibleAny, rec.Ref.Instance)
-	if commandHasGlobalConflictScope(rec.Command.Kind) {
+	if recordHasGlobalConflictScope(rec) {
 		index.retiredGlobal = max(index.retiredGlobal, rec.Ref.Instance)
 	} else {
-		for _, key := range rec.Command.ConflictKeys {
-			entry := e.ensureKeyLane(rec.Ref.Conf, key, lane)
+		for _, point := range rec.Command.Footprint.Points {
+			entry := e.ensureResource(rec.Ref.Conf, point, point, true, lane)
+			entry.retiredFloor = max(entry.retiredFloor, rec.Ref.Instance)
+		}
+		for _, span := range rec.Command.Footprint.Spans {
+			entry := e.ensureResource(rec.Ref.Conf, span.Start, span.End, false, lane)
 			entry.retiredFloor = max(entry.retiredFloor, rec.Ref.Instance)
 		}
 	}
@@ -919,29 +966,40 @@ func (e *conflictEngine) verify() error {
 	if resident != e.resident {
 		return fmt.Errorf("resident count: aggregate=%d tracked=%d", resident, e.resident)
 	}
-	// Forward: every posting entry must name an eligible non-global resident.
-	for conf, keys := range e.byKey {
-		for key, lanes := range keys {
-			for lane, entry := range *lanes {
-				if lane.conf != conf {
-					return fmt.Errorf("key %q: lane configuration mismatch", key)
-				}
-				if err := verifyPostingNode(entry.postings.root, 0); err != nil {
-					return fmt.Errorf("key %q lane %v: %w", key, lane, err)
-				}
-				valid := true
-				walkPostingDesc(entry.postings.root, 0, ^InstanceNum(0), false, func(instance InstanceNum) bool {
-					slot, ok := e.laneIndex[lane].resident.slot(instance)
-					if !ok || !slot.eligible() || slot.global() {
-						valid = false
-						return false
-					}
-					return true
-				})
-				if !valid {
-					return fmt.Errorf("key %q lane %v: posting lacks eligible resident slot", key, lane)
-				}
+	// Forward: every resource posting must name an eligible non-global resident.
+	var verifyResource func(ConfID, *intervalNode) error
+	verifyResource = func(conf ConfID, node *intervalNode) error {
+		if node == nil {
+			return nil
+		}
+		if err := verifyResource(conf, node.left); err != nil {
+			return err
+		}
+		for lane, entry := range node.resource.lanes {
+			if lane.conf != conf {
+				return fmt.Errorf("resource %q: lane configuration mismatch", node.resource.start)
 			}
+			if err := verifyPostingNode(entry.postings.root, 0); err != nil {
+				return fmt.Errorf("resource %q lane %v: %w", node.resource.start, lane, err)
+			}
+			valid := true
+			walkPostingDesc(entry.postings.root, 0, ^InstanceNum(0), false, func(instance InstanceNum) bool {
+				slot, ok := e.laneIndex[lane].resident.slot(instance)
+				if !ok || !slot.eligible() || slot.global() {
+					valid = false
+					return false
+				}
+				return true
+			})
+			if !valid {
+				return fmt.Errorf("resource %q lane %v: posting lacks eligible resident slot", node.resource.start, lane)
+			}
+		}
+		return verifyResource(conf, node.right)
+	}
+	for conf, root := range e.intervals {
+		if err := verifyResource(conf, root); err != nil {
+			return err
 		}
 	}
 	return nil

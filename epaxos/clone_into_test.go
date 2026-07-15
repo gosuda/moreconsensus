@@ -7,14 +7,14 @@ import (
 
 func TestCloneIntoReusesCapacityWithoutAliasing(t *testing.T) {
 	largeCommand := Command{
-		ID:           CommandID{Client: 601, Sequence: 1},
-		Payload:      []byte("large-command-payload"),
-		ConflictKeys: [][]byte{[]byte("large-key-one"), []byte("large-key-two")},
+		ID:        CommandID{Client: 601, Sequence: 1},
+		Payload:   []byte("large-command-payload"),
+		Footprint: Footprint{Points: [][]byte{[]byte("large-key-one"), []byte("large-key-two")}},
 	}
 	smallCommand := Command{
-		ID:           CommandID{Client: 601, Sequence: 2},
-		Payload:      []byte("small"),
-		ConflictKeys: [][]byte{[]byte("key")},
+		ID:        CommandID{Client: 601, Sequence: 2},
+		Payload:   []byte("small"),
+		Footprint: Footprint{Points: [][]byte{[]byte("key")}},
 	}
 	largeEvidence := []AcceptEvidence{
 		{Sender: 1, Seq: 7, Deps: []InstanceNum{1, 2, 3, 4, 5}},
@@ -41,8 +41,8 @@ func TestCloneIntoReusesCapacityWithoutAliasing(t *testing.T) {
 	}
 	var recordDst InstanceRecord
 	largeRecord.CloneInto(&recordDst)
-	var committedDst CommittedCommand
-	(CommittedCommand{Deps: []InstanceNum{1, 2, 3, 4, 5}, Command: largeCommand}).CloneInto(&committedDst)
+	var committedDst ApplyCommand
+	(ApplyCommand{Deps: []InstanceNum{1, 2, 3, 4, 5}, Command: largeCommand}).CloneInto(&committedDst)
 	var attrsDst Attributes
 	(Attributes{Seq: 9, Deps: []InstanceNum{1, 2, 3, 4, 5}}).CloneInto(&attrsDst)
 
@@ -59,7 +59,7 @@ func TestCloneIntoReusesCapacityWithoutAliasing(t *testing.T) {
 			Conf:    smallConf,
 		},
 	}
-	smallCommitted := CommittedCommand{Ref: smallRecord.Ref, Seq: 3, Deps: []InstanceNum{0, 1, 0}, Command: smallCommand}
+	smallCommitted := ApplyCommand{Ref: smallRecord.Ref, Seq: 3, Deps: []InstanceNum{0, 1, 0}, Command: smallCommand}
 	smallAttrs := Attributes{Seq: 3, Deps: []InstanceNum{0, 1, 0}}
 
 	allocs := testing.AllocsPerRun(1000, func() {
@@ -81,7 +81,7 @@ func TestCloneIntoReusesCapacityWithoutAliasing(t *testing.T) {
 		!reflect.DeepEqual(attrsDst, smallAttrs) {
 		t.Fatalf("CloneInto result mismatch: command=%#v conf=%#v message=%#v record=%#v committed=%#v attrs=%#v", commandDst, confDst, messageDst, recordDst, committedDst, attrsDst)
 	}
-	if commandDst.ConflictKeys[:cap(commandDst.ConflictKeys)][1] != nil {
+	if commandDst.Footprint.Points[:cap(commandDst.Footprint.Points)][1] != nil {
 		t.Fatal("Command.CloneInto retained an inactive conflict-key reference")
 	}
 	if !reflect.DeepEqual(messageDst.AcceptEvidence[:cap(messageDst.AcceptEvidence)][1], AcceptEvidence{}) ||
@@ -90,10 +90,10 @@ func TestCloneIntoReusesCapacityWithoutAliasing(t *testing.T) {
 	}
 
 	commandDst.Payload[0] = 'X'
-	commandDst.ConflictKeys[0][0] = 'Y'
+	commandDst.Footprint.Points[0][0] = 'Y'
 	messageDst.AcceptEvidence[0].Deps[0] = 99
 	recordDst.ConfChangeResult.Conf.Voters[0] = 99
-	if string(smallCommand.Payload) != "small" || string(smallCommand.ConflictKeys[0]) != "key" || smallEvidence[0].Deps[0] != 0 || smallConf.Voters[0] != 1 {
+	if string(smallCommand.Payload) != "small" || string(smallCommand.Footprint.Points[0]) != "key" || smallEvidence[0].Deps[0] != 0 || smallConf.Voters[0] != 1 {
 		t.Fatal("CloneInto destination mutation reached a source value")
 	}
 }

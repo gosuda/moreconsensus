@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -41,18 +41,18 @@ type TraceReceipt struct {
 }
 
 type FaultTrace struct {
-	Version         string            `json:"version"`
-	SourceRevision  string            `json:"source_revision"`
-	Size            int               `json:"size"`
-	Seed            uint64            `json:"seed"`
-	Profiles        []string          `json:"profiles"`
-	Operations      []TraceOperation  `json:"operations"`
-	Actions         []TraceAction     `json:"actions"`
-	Receipts        []TraceReceipt    `json:"receipts"`
-	TerminalHashes  map[string]string `json:"terminal_hashes"`
-	TerminalDigest  string            `json:"terminal_digest"`
-	OracleResult    string            `json:"oracle_result"`
-	Nondeterminism  string            `json:"nondeterminism,omitempty"`
+	Version        string            `json:"version"`
+	SourceRevision string            `json:"source_revision"`
+	Size           int               `json:"size"`
+	Seed           uint64            `json:"seed"`
+	Profiles       []string          `json:"profiles"`
+	Operations     []TraceOperation  `json:"operations"`
+	Actions        []TraceAction     `json:"actions"`
+	Receipts       []TraceReceipt    `json:"receipts"`
+	TerminalHashes map[string]string `json:"terminal_hashes"`
+	TerminalDigest string            `json:"terminal_digest"`
+	OracleResult   string            `json:"oracle_result"`
+	Nondeterminism string            `json:"nondeterminism,omitempty"`
 }
 
 func validateTrace(trace FaultTrace) error {

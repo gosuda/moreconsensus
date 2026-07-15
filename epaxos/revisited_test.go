@@ -43,7 +43,7 @@ func TestRevisitedChainPruningExecutesBaseBeforeLaterDependencyChain(t *testing.
 
 	rn.tryExecute()
 	rd := rn.Ready()
-	revisitedRequireCommittedRefs(t, rd.Committed, []InstanceRef{a})
+	revisitedRequireCommittedRefs(t, rd.Apply, []InstanceRef{a})
 	if rn.instances[a].rec.Status != StatusExecuted {
 		t.Fatalf("base %s status = %s, want executed", a, rn.instances[a].rec.Status)
 	}
@@ -84,7 +84,7 @@ func TestRevisitedChainPruningIgnoresKnownUncommittedConflictAfterBase(t *testin
 			}
 			rn.tryExecute()
 			rd := rn.Ready()
-			revisitedRequireCommittedRefs(t, rd.Committed, []InstanceRef{a})
+			revisitedRequireCommittedRefs(t, rd.Apply, []InstanceRef{a})
 			if rn.instances[b].rec.Status != status {
 				t.Fatalf("known uncommitted conflict %s status = %s, want %s", b, rn.instances[b].rec.Status, status)
 			}
@@ -168,7 +168,7 @@ func TestRevisitedChainPruningDoesNotIgnoreUnsafeKnownConflicts(t *testing.T) {
 
 			rn.tryExecute()
 			rd := rn.Ready()
-			if got := revisitedCommittedRefCount(rd.Committed, tt.baseRef); got != 0 {
+			if got := revisitedCommittedRefCount(rd.Apply, tt.baseRef); got != 0 {
 				t.Fatalf("unsafe conflict emitted %s %d times, want blocked; ready=%#v", tt.baseRef, got, rd)
 			}
 			if rn.instances[tt.baseRef].rec.Status == StatusExecuted {
@@ -208,7 +208,7 @@ func TestRevisitedChainPruningDoesNotBypassUnknownDependency(t *testing.T) {
 
 			rn.tryExecute()
 			rd := rn.Ready()
-			if got := revisitedCommittedRefCount(rd.Committed, a); got != 0 {
+			if got := revisitedCommittedRefCount(rd.Apply, a); got != 0 {
 				t.Fatalf("unknown dependency emitted %s %d times, want blocked; ready=%#v", a, got, rd)
 			}
 			if rn.instances[a].rec.Status == StatusExecuted {
@@ -224,8 +224,8 @@ func TestRevisitedSparseMaxPrefixPrunesOnlyExactWitness(t *testing.T) {
 	maxInstance := ^InstanceNum(0)
 	base := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	witness := InstanceRef{Conf: 1, Replica: 2, Instance: maxInstance}
-	revisitedInstall(rn, InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInstance, 0}, Command: Command{Kind: CommandNoop}})
-	revisitedInstall(rn, InstanceRecord{Ref: witness, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}})
+	revisitedInstall(rn, InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInstance, 0}, Kind: EntryNoop})
+	revisitedInstall(rn, InstanceRecord{Ref: witness, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{1, 0, 0}, Kind: EntryNoop})
 	view := rn.newExecutionView()
 	component := revisitedComponentContaining(rn.executionComponents(&view), base)
 	if len(component) != 1 || component[0] != base {
@@ -260,9 +260,9 @@ func revisitedInstall(rn *RawNode, rec InstanceRecord) {
 
 func revisitedCommand(client uint64, payload string, key []byte) Command {
 	return Command{
-		ID:           CommandID{Client: client, Sequence: 1},
-		Payload:      []byte(payload),
-		ConflictKeys: [][]byte{key},
+		ID:        CommandID{Client: client, Sequence: 1},
+		Payload:   []byte(payload),
+		Footprint: Footprint{Points: [][]byte{key}},
 	}
 }
 
@@ -277,7 +277,7 @@ func revisitedComponentContaining(comps [][]InstanceRef, target InstanceRef) []I
 	return nil
 }
 
-func revisitedRequireCommittedRefs(t *testing.T, got []CommittedCommand, want []InstanceRef) {
+func revisitedRequireCommittedRefs(t *testing.T, got []ApplyCommand, want []InstanceRef) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("committed refs = %v, want %v; committed=%#v", refs(got), want, got)
@@ -289,7 +289,7 @@ func revisitedRequireCommittedRefs(t *testing.T, got []CommittedCommand, want []
 	}
 }
 
-func revisitedCommittedRefCount(committed []CommittedCommand, ref InstanceRef) int {
+func revisitedCommittedRefCount(committed []ApplyCommand, ref InstanceRef) int {
 	var count int
 	for _, cmd := range committed {
 		if cmd.Ref == ref {

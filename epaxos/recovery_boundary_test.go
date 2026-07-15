@@ -131,7 +131,7 @@ func recoveryBoundaryRejectFixture(t *testing.T, typ MessageType, hint Ballot) (
 	t.Helper()
 	rn := recoveryBoundaryNode(t, 1, 3, nil)
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	cmd := Command{ID: CommandID{Client: 501, Sequence: 1}, Payload: []byte("reject-boundary"), ConflictKeys: [][]byte{[]byte("reject-boundary-key")}}
+	cmd := Command{ID: CommandID{Client: 501, Sequence: 1}, Payload: []byte("reject-boundary"), Footprint: Footprint{Points: [][]byte{[]byte("reject-boundary-key")}}}
 	rec := checkedRecord(InstanceRecord{
 		Ref:          ref,
 		Ballot:       Ballot{Number: 1, Replica: 1},
@@ -152,7 +152,8 @@ func recoveryBoundaryRejectFixture(t *testing.T, typ MessageType, hint Ballot) (
 	case MsgPrepareResp:
 		inst.phase = phasePrepare
 		inst.prepareOK = testRecordVoteSet(t, rn.q.conf, map[ReplicaID]InstanceRecord{1: inst.rec.Clone()})
-	case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+	case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp,
+		MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		fallthrough
 	default:
 		t.Fatalf("unsupported reject fixture %s", typ)
@@ -180,7 +181,7 @@ func TestRejectPathsIncrementObservedBallotExactlyOnce(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := rn.Step(msg); err != nil {
+			if err := rn.Step(canonicalTestMessage(msg)); err != nil {
 				t.Fatal(err)
 			}
 			if inst.phase != phasePrepare || inst.rec.Ballot != want {
@@ -196,7 +197,7 @@ func TestStepBallotExhaustionIsTypedAndHasNoEffect(t *testing.T) {
 		t.Run(typ.String(), func(t *testing.T) {
 			rn, inst, msg := recoveryBoundaryRejectFixture(t, typ, maxBallot)
 			before := snapshotRecoveryBoundary(rn, inst)
-			err := rn.Step(msg)
+			err := rn.Step(canonicalTestMessage(msg))
 			if !errors.Is(err, ErrBallotExhausted) {
 				t.Fatalf("Step error = %v, want %v", err, ErrBallotExhausted)
 			}
@@ -217,7 +218,7 @@ func TestStepBallotExhaustionIsTypedAndHasNoEffect(t *testing.T) {
 			Status:       StatusPreAccepted,
 			Seq:          1,
 			Deps:         rn.q.deps(),
-			Command:      Command{Kind: CommandNoop},
+			Kind:         EntryNoop,
 		}), phase: phaseTryPreAccept}
 		rn.instances[ref] = inst
 		msg := Message{
@@ -229,13 +230,13 @@ func TestStepBallotExhaustionIsTypedAndHasNoEffect(t *testing.T) {
 			RecordBallot: Ballot{Replica: ref.Replica},
 			Seq:          1,
 			Deps:         rn.q.deps(),
-			Command:      Command{Kind: CommandNoop},
+			Kind:         EntryNoop,
 			Reject:       true,
 			RejectReason: RejectAcceptedTarget,
 			RecordStatus: StatusAccepted,
 		}
 		before := snapshotRecoveryBoundary(rn, inst)
-		err := rn.Step(msg)
+		err := rn.Step(canonicalTestMessage(msg))
 		if !errors.Is(err, ErrBallotExhausted) {
 			t.Fatalf("Step error = %v, want %v", err, ErrBallotExhausted)
 		}
@@ -256,7 +257,7 @@ func TestTickBallotExhaustionStuttersWithoutEffects(t *testing.T) {
 		Status:       StatusPreAccepted,
 		Seq:          1,
 		Deps:         rn.q.deps(),
-		Command:      Command{Kind: CommandNoop},
+		Kind:         EntryNoop,
 	}), phase: phaseIdle}
 	rn.instances[ref] = inst
 	if err := rn.schedule(inst, timerPrepare, 1); err != nil {
@@ -294,7 +295,7 @@ func TestEpochCarryBallotIsRecoveryAcrossValidationRestartAndFastGuard(t *testin
 		Status:           StatusPreAccepted,
 		Seq:              1,
 		Deps:             make([]InstanceNum, 3),
-		Command:          Command{Kind: CommandNoop},
+		Kind:             EntryNoop,
 		FastPathEligible: true,
 	})
 	restarted := recoveryBoundaryNode(t, 1, 3, store)
@@ -308,16 +309,16 @@ func TestEpochCarryBallotIsRecoveryAcrossValidationRestartAndFastGuard(t *testin
 
 	follower := recoveryBoundaryNode(t, 3, 3, nil)
 	preAccept := Message{
-		Type:    MsgPreAccept,
-		From:    1,
-		To:      3,
-		Ref:     ref,
-		Ballot:  ballot,
-		Seq:     1,
-		Deps:    follower.q.deps(),
-		Command: Command{Kind: CommandNoop},
+		Type:   MsgPreAccept,
+		From:   1,
+		To:     3,
+		Ref:    ref,
+		Ballot: ballot,
+		Seq:    1,
+		Deps:   follower.q.deps(),
+		Kind:   EntryNoop,
 	}
-	if err := follower.Step(preAccept); err != nil {
+	if err := follower.Step(canonicalTestMessage(preAccept)); err != nil {
 		t.Fatalf("carried recovery PreAccept rejected: %v", err)
 	}
 	if got := follower.instances[ref].rec; got.FastPathEligible || got.Ballot != ballot {
@@ -331,7 +332,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 			store := NewMemoryStorage()
 			rn := recoveryBoundaryNode(t, 1, voters, store)
 			ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 600 + uint64(voters), Sequence: 1}, Payload: []byte("restart-prepare"), ConflictKeys: [][]byte{[]byte("restart-prepare-key")}} //nolint:gosec // G115: test harness converts bounded int index/count
+			cmd := Command{ID: CommandID{Client: 600 + uint64(voters), Sequence: 1}, Payload: []byte("restart-prepare"), Footprint: Footprint{Points: [][]byte{[]byte("restart-prepare-key")}}} //nolint:gosec // G115: test harness converts bounded int index/count
 			inst := &instance{rec: checkedRecord(InstanceRecord{
 				Ref:          ref,
 				Ballot:       Ballot{Replica: ref.Replica},
@@ -367,7 +368,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 			failures := (voters - 1) / 2
 			for offset := range failures {
 				from := ReplicaID(2 + offset)
-				if err := restarted.Step(Message{
+				if err := restarted.Step(canonicalTestMessage(Message{
 					Type:         MsgPrepareResp,
 					From:         from,
 					To:           1,
@@ -375,7 +376,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 					Ballot:       startedBallot,
 					Deps:         restarted.q.deps(),
 					RecordStatus: StatusNone,
-				}); err != nil {
+				})); err != nil {
 					t.Fatalf("Prepare response from %d: %v", from, err)
 				}
 			}
@@ -384,7 +385,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 			}
 			for offset := range failures {
 				from := ReplicaID(2 + offset)
-				if err := restarted.Step(Message{
+				if err := restarted.Step(canonicalTestMessage(Message{
 					Type:         MsgAcceptResp,
 					From:         from,
 					To:           1,
@@ -394,7 +395,7 @@ func TestRestartReconstructsDurablePrepareSelfVoteAtMaximumFailures(t *testing.T
 					Seq:          recovered.rec.Seq,
 					Deps:         append([]InstanceNum(nil), recovered.rec.Deps...),
 					RecordStatus: StatusAccepted,
-				}); err != nil {
+				})); err != nil {
 					t.Fatalf("Accept response from %d: %v", from, err)
 				}
 			}
@@ -428,10 +429,10 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 				follower := recoveryBoundaryNode(t, 2, voters, nil)
 				ref := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
 				tryBallot := Ballot{Number: 1, Replica: 1}
-				candidate := Command{ID: CommandID{Client: 701, Sequence: 1}, Payload: []byte("candidate"), ConflictKeys: [][]byte{[]byte("accepted-target-key")}}
+				candidate := Command{ID: CommandID{Client: 701, Sequence: 1}, Payload: []byte("candidate"), Footprint: Footprint{Points: [][]byte{[]byte("accepted-target-key")}}}
 				accepted := candidate.Clone()
 				if !same {
-					accepted = Command{ID: CommandID{Client: 702, Sequence: 1}, Payload: []byte("accepted"), ConflictKeys: [][]byte{[]byte("accepted-target-key")}}
+					accepted = Command{ID: CommandID{Client: 702, Sequence: 1}, Payload: []byte("accepted"), Footprint: Footprint{Points: [][]byte{[]byte("accepted-target-key")}}}
 				}
 				candidateDeps := coordinator.q.deps()
 				candidateInst := &instance{rec: checkedRecord(InstanceRecord{
@@ -464,7 +465,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 				acceptedInst := &instance{rec: acceptedRec, phase: phaseIdle}
 				follower.instances[ref] = acceptedInst
 
-				if err := follower.Step(Message{
+				if err := follower.Step(canonicalTestMessage(Message{
 					Type:    MsgTryPreAccept,
 					From:    1,
 					To:      2,
@@ -473,7 +474,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 					Seq:     candidateInst.rec.Seq,
 					Deps:    append([]InstanceNum(nil), candidateInst.rec.Deps...),
 					Command: candidate,
-				}); err != nil {
+				})); err != nil {
 					t.Fatal(err)
 				}
 				if acceptedInst.rec.Status != StatusAccepted ||
@@ -498,7 +499,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 					t.Fatalf("canonical Accepted-target rejection invalid: %v", err)
 				}
 
-				if err := coordinator.Step(resp); err != nil {
+				if err := coordinator.Step(canonicalTestMessage(resp)); err != nil {
 					t.Fatal(err)
 				}
 				wantPrepare, err := tryBallot.Next(1)
@@ -512,7 +513,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 					t.Fatalf("Accepted-target evidence not retained outside Prepare quorum: %#v", candidateInst.prepareEvidence)
 				}
 				beforeDuplicate := snapshotRecoveryBoundary(coordinator, candidateInst)
-				if err := coordinator.Step(resp); err != nil {
+				if err := coordinator.Step(canonicalTestMessage(resp)); err != nil {
 					t.Fatal(err)
 				}
 				if afterDuplicate := snapshotRecoveryBoundary(coordinator, candidateInst); !reflect.DeepEqual(afterDuplicate, beforeDuplicate) {
@@ -522,7 +523,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 				failures := (voters - 1) / 2
 				for offset := range failures {
 					from := ReplicaID(3 + offset)
-					if err := coordinator.Step(Message{
+					if err := coordinator.Step(canonicalTestMessage(Message{
 						Type:         MsgPrepareResp,
 						From:         from,
 						To:           1,
@@ -530,7 +531,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 						Ballot:       wantPrepare,
 						Deps:         coordinator.q.deps(),
 						RecordStatus: StatusNone,
-					}); err != nil {
+					})); err != nil {
 						t.Fatalf("Prepare response from surviving replica %d: %v", from, err)
 					}
 				}
@@ -541,7 +542,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 				}
 				for offset := range failures {
 					from := ReplicaID(3 + offset)
-					if err := coordinator.Step(Message{
+					if err := coordinator.Step(canonicalTestMessage(Message{
 						Type:         MsgAcceptResp,
 						From:         from,
 						To:           1,
@@ -551,7 +552,7 @@ func TestTryPreAcceptAcceptedTargetRestartsPrepareAndCompletes(t *testing.T) {
 						Seq:          candidateInst.rec.Seq,
 						Deps:         append([]InstanceNum(nil), candidateInst.rec.Deps...),
 						RecordStatus: StatusAccepted,
-					}); err != nil {
+					})); err != nil {
 						t.Fatalf("Accept response from surviving replica %d: %v", from, err)
 					}
 				}
@@ -579,7 +580,8 @@ func TestAcceptedTargetRejectValidationIsExact(t *testing.T) {
 		AcceptSeq:      4,
 		AcceptDeps:     []InstanceNum{0, 1, 0},
 		AcceptEvidence: []AcceptEvidence{{Sender: 2, Seq: 4, Deps: []InstanceNum{0, 1, 0}}},
-		Command:        Command{ID: CommandID{Client: 800, Sequence: 1}, Payload: []byte("accepted")},
+		Kind:           EntryCommand,
+		Command:        Command{ID: CommandID{Client: 800, Sequence: 1}, Payload: []byte("accepted"), Footprint: Footprint{All: true}},
 		Reject:         true,
 		RejectReason:   RejectAcceptedTarget,
 		RecordStatus:   StatusAccepted,

@@ -69,7 +69,7 @@ class TLAModelCheckRunnerTest(unittest.TestCase):
 
     def test_fast_profile_is_exact_and_full_is_nonempty(self):
         fast = select_profile("fast")
-        self.assertEqual(len(fast), 31)
+        self.assertEqual(len(fast), 32)
         self.assertEqual(
             tuple((job.module, job.config, job.expected_failure_marker) for job in fast),
             tuple(entry if len(entry) == 3 else (*entry, None) for entry in FAST_PROFILE),

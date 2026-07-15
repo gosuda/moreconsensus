@@ -47,12 +47,12 @@ func TestConflictEngineRandomFoldDomination(t *testing.T) {
 		iterations = 2_000
 	}
 	rng := rand.New(rand.NewPCG(0xa0761d6478bd642f, 0xe7037ed1a0b428db)) //nolint:gosec // G404: deterministic property-test RNG, not crypto
-	queries := []Command{
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("a")}},
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("b")}},
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("a"), []byte("c")}},
-		{Kind: CommandConfChange},
-		{Kind: CommandMembership},
+	queries := []InstanceRecord{
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("a")}}}},
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("b")}}}},
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("a"), []byte("c")}}}},
+		{Kind: EntryConfChange},
+		{Kind: EntryMembership},
 	}
 	for iteration := range iterations {
 		var engine conflictEngine
@@ -107,7 +107,7 @@ func TestConflictEngineRandomFoldDomination(t *testing.T) {
 
 func randomFoldRecord(rng *rand.Rand, lane instanceLane, instance InstanceNum) InstanceRecord {
 	statuses := [...]Status{StatusNone, StatusPreAccepted, StatusAccepted, StatusCommitted, StatusExecuted}
-	kinds := [...]CommandKind{CommandUser, CommandUser, CommandNoop, CommandConfChange, CommandMembership}
+	kinds := [...]EntryKind{EntryCommand, EntryCommand, EntryNoop, EntryConfChange, EntryMembership}
 	keys := [][][]byte{
 		{[]byte("a")},
 		{[]byte("b")},
@@ -115,11 +115,13 @@ func randomFoldRecord(rng *rand.Rand, lane instanceLane, instance InstanceNum) I
 		{[]byte("a"), []byte("b")},
 		nil,
 	}
+	kind := kinds[rng.IntN(len(kinds))]
 	return InstanceRecord{
 		Ref:        InstanceRef{Replica: lane.replica, Instance: instance, Conf: lane.conf},
 		Status:     statuses[rng.IntN(len(statuses))],
 		Seq:        rng.Uint64(),
-		Command:    Command{Kind: kinds[rng.IntN(len(kinds))], ConflictKeys: keys[rng.IntN(len(keys))]},
+		Kind:       kind,
+		Command:    Command{Footprint: Footprint{Points: keys[rng.IntN(len(keys))]}},
 		TOQPending: rng.IntN(5) == 0,
 	}
 }
@@ -140,7 +142,7 @@ func randomConflictRecord(rng *rand.Rand, step uint64) InstanceRecord {
 		1, 2, 3, 7, 63, 64, 65, 4_095, 4_096,
 		InstanceNum(1)<<60 + 1, InstanceNum(1)<<60 + 63,
 	}
-	kinds := [...]CommandKind{CommandUser, CommandUser, CommandUser, CommandNoop, CommandConfChange, CommandMembership}
+	kinds := [...]EntryKind{EntryCommand, EntryCommand, EntryCommand, EntryNoop, EntryConfChange, EntryMembership}
 	statuses := [...]Status{StatusNone, StatusPreAccepted, StatusAccepted, StatusCommitted, StatusExecuted}
 	keys := [][][]byte{
 		nil,
@@ -154,18 +156,17 @@ func randomConflictRecord(rng *rand.Rand, step uint64) InstanceRecord {
 	if step%37 == 0 {
 		instance = InstanceNum(1)<<60 + InstanceNum(step&63)
 	}
+	kind := kinds[rng.IntN(len(kinds))]
 	return InstanceRecord{
 		Ref: InstanceRef{
 			Replica:  ReplicaID(rng.Uint64()%3 + 1),
 			Instance: instance,
 			Conf:     ConfID(rng.Uint64()%2 + 1),
 		},
-		Status: statuses[rng.IntN(len(statuses))],
-		Seq:    rng.Uint64(),
-		Command: Command{
-			Kind:         kinds[rng.IntN(len(kinds))],
-			ConflictKeys: keys[rng.IntN(len(keys))],
-		},
+		Status:     statuses[rng.IntN(len(statuses))],
+		Seq:        rng.Uint64(),
+		Kind:       kind,
+		Command:    Command{Footprint: Footprint{Points: keys[rng.IntN(len(keys))]}},
 		TOQPending: rng.IntN(7) == 0,
 	}
 }
@@ -187,7 +188,7 @@ func assertConflictEngineMatchesModel(t *testing.T, engine *conflictEngine, mode
 				continue
 			}
 			wantMax = max(wantMax, ref.Instance)
-			if commandHasGlobalConflictScope(rec.Command.Kind) {
+			if entryHasGlobalConflictScope(rec.Kind) {
 				wantGlobal = max(wantGlobal, ref.Instance)
 			}
 		}
@@ -213,24 +214,24 @@ func assertConflictEngineMatchesModel(t *testing.T, engine *conflictEngine, mode
 		assertWalkMatchesModel(t, engine, model, lane, step)
 	}
 
-	queries := []Command{
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("a")}},
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("a"), []byte("b")}},
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("missing")}},
-		{Kind: CommandConfChange},
-		{Kind: CommandMembership},
-		{Kind: CommandNoop, ConflictKeys: [][]byte{[]byte("a")}},
+	queries := []InstanceRecord{
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("a")}}}},
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("a"), []byte("b")}}}},
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("missing")}}}},
+		{Kind: EntryConfChange},
+		{Kind: EntryMembership},
+		{Kind: EntryNoop},
 	}
 	for conf := ConfID(1); conf <= 2; conf++ {
 		wantKeyLanes := make(map[instanceLane]struct{})
 		for ref, rec := range model {
-			if ref.Conf == conf && modelEligible(rec) && !commandHasGlobalConflictScope(rec.Command.Kind) &&
+			if ref.Conf == conf && modelEligible(rec) && !entryHasGlobalConflictScope(rec.Kind) &&
 				(modelRecordHasKey(rec, []byte("a")) || modelRecordHasKey(rec, []byte("b"))) {
 				wantKeyLanes[laneFor(ref)] = struct{}{}
 			}
 		}
 		gotKeyLanes := make(map[instanceLane]struct{})
-		engine.keyLaneSet(conf, [][]byte{[]byte("a"), []byte("b")}, func(lane instanceLane) bool {
+		engine.footprintLaneSet(conf, Footprint{Points: [][]byte{[]byte("a"), []byte("b")}}, func(lane instanceLane) bool {
 			gotKeyLanes[lane] = struct{}{}
 			return true
 		})
@@ -257,21 +258,25 @@ type modelAttrs map[instanceLane]struct {
 	seq uint64
 }
 
-func engineModelAttrs(engine *conflictEngine, conf ConfID, cmd Command) modelAttrs {
+func engineModelAttrs(engine *conflictEngine, conf ConfID, query InstanceRecord) modelAttrs {
 	out := make(modelAttrs)
-	if cmd.Kind == CommandNoop {
+	if query.Kind == EntryNoop {
 		return out
 	}
 	engine.lanes(conf, func(lane instanceLane) bool {
 		var dep InstanceNum
-		if commandHasGlobalConflictScope(cmd.Kind) {
-			r, ret := engine.maxEligibleAny(lane); dep = max(r, ret)
+		if entryHasGlobalConflictScope(query.Kind) || query.Command.Footprint.All {
+			resident, retired := engine.maxEligibleAny(lane)
+			dep = max(resident, retired)
 		} else {
-			r, ret := engine.globalMax(lane); dep = max(r, ret)
-			for _, key := range cmd.ConflictKeys {
-				resident, retired := engine.keyMax(conf, key, lane)
-				dep = max(dep, resident, retired)
-			}
+			resident, retired := engine.globalMax(lane)
+			dep = max(resident, retired)
+			resident, retired = engine.footprintMax(conf, query.Command.Footprint, lane)
+			dep = max(dep, retired)
+			engine.walkFootprintDesc(conf, query.Command.Footprint, lane, resident, func(instance InstanceNum, _ laneSlot) bool {
+				dep = max(dep, instance)
+				return true
+			})
 		}
 		if dep != 0 {
 			out[lane] = struct {
@@ -284,13 +289,13 @@ func engineModelAttrs(engine *conflictEngine, conf ConfID, cmd Command) modelAtt
 	return out
 }
 
-func naiveModelAttrs(model map[InstanceRef]InstanceRecord, conf ConfID, cmd Command) modelAttrs {
+func naiveModelAttrs(model map[InstanceRef]InstanceRecord, conf ConfID, query InstanceRecord) modelAttrs {
 	out := make(modelAttrs)
-	if cmd.Kind == CommandNoop {
+	if query.Kind == EntryNoop {
 		return out
 	}
 	for ref, rec := range model {
-		if ref.Conf != conf || !modelEligible(rec) || !commandsConflict(cmd, rec.Command) {
+		if ref.Conf != conf || !modelEligible(rec) || !recordsConflict(query, rec) {
 			continue
 		}
 		lane := laneFor(ref)
@@ -306,7 +311,7 @@ func naiveModelAttrs(model map[InstanceRef]InstanceRecord, conf ConfID, cmd Comm
 }
 
 func modelEligible(rec InstanceRecord) bool {
-	return rec.Status != StatusNone && !rec.TOQPending && rec.Command.Kind != CommandNoop
+	return rec.Status != StatusNone && !rec.TOQPending && rec.Kind != EntryNoop
 }
 
 func modelLanes(model map[InstanceRef]InstanceRecord) map[instanceLane]struct{} {
@@ -330,10 +335,10 @@ func modelPrefixMaxSeq(model map[InstanceRef]InstanceRecord, lane instanceLane, 
 func modelKeyMax(model map[InstanceRef]InstanceRecord, conf ConfID, key []byte, lane instanceLane) InstanceNum {
 	var result InstanceNum
 	for ref, rec := range model {
-		if ref.Conf != conf || laneFor(ref) != lane || !modelEligible(rec) || commandHasGlobalConflictScope(rec.Command.Kind) {
+		if ref.Conf != conf || laneFor(ref) != lane || !modelEligible(rec) || entryHasGlobalConflictScope(rec.Kind) {
 			continue
 		}
-		for _, recordKey := range rec.Command.ConflictKeys {
+		for _, recordKey := range rec.Command.Footprint.Points {
 			if string(recordKey) == string(key) {
 				result = max(result, ref.Instance)
 				break
@@ -344,7 +349,7 @@ func modelKeyMax(model map[InstanceRef]InstanceRecord, conf ConfID, key []byte, 
 }
 
 func modelRecordHasKey(rec InstanceRecord, key []byte) bool {
-	for _, recordKey := range rec.Command.ConflictKeys {
+	for _, recordKey := range rec.Command.Footprint.Points {
 		if string(recordKey) == string(key) {
 			return true
 		}
@@ -386,18 +391,18 @@ func TestConflictEnginePostFoldDomination(t *testing.T) {
 	var engine conflictEngine
 	lane := instanceLane{conf: 7, replica: 2}
 	records := []InstanceRecord{
-		conflictRecord(lane, 1, 3, CommandUser, "a"),
-		conflictRecord(lane, 2, 9, CommandUser, "b"),
-		conflictRecord(lane, 3, 5, CommandConfChange),
-		conflictRecord(lane, 4, 11, CommandUser, "a"),
+		conflictRecord(lane, 1, 3, EntryCommand, "a"),
+		conflictRecord(lane, 2, 9, EntryCommand, "b"),
+		conflictRecord(lane, 3, 5, EntryConfChange),
+		conflictRecord(lane, 4, 11, EntryCommand, "a"),
 	}
 	for idx := range records {
 		engine.apply(nil, records[idx])
 	}
-	queries := []Command{
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("a")}},
-		{Kind: CommandUser, ConflictKeys: [][]byte{[]byte("b")}},
-		{Kind: CommandConfChange},
+	queries := []InstanceRecord{
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("a")}}}},
+		{Kind: EntryCommand, Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("b")}}}},
+		{Kind: EntryConfChange},
 	}
 	before := make([]modelAttrs, len(queries))
 	for idx, query := range queries {
@@ -433,7 +438,7 @@ func TestConflictEngineIdempotence(t *testing.T) {
 
 	var engine conflictEngine
 	lane := instanceLane{conf: 1, replica: 1}
-	rec := conflictRecord(lane, 1, 7, CommandUser, "a")
+	rec := conflictRecord(lane, 1, 7, EntryCommand, "a")
 	engine.apply(nil, rec)
 	engine.apply(&rec, rec)
 	if got := engine.residentCount(); got != 1 {
@@ -460,12 +465,12 @@ func TestConflictEngineNoopMutationDropsMax(t *testing.T) {
 
 	var engine conflictEngine
 	lane := instanceLane{conf: 4, replica: 3}
-	lower := conflictRecord(lane, 10, 2, CommandUser, "key")
-	higher := conflictRecord(lane, 20, 8, CommandUser, "key")
+	lower := conflictRecord(lane, 10, 2, EntryCommand, "key")
+	higher := conflictRecord(lane, 20, 8, EntryCommand, "key")
 	engine.apply(nil, lower)
 	engine.apply(nil, higher)
 	noop := higher
-	noop.Command.Kind = CommandNoop
+	noop.Kind = EntryNoop
 	engine.apply(&higher, noop)
 	resident, retired := engine.keyMax(lane.conf, []byte("key"), lane)
 	if resident != lower.Ref.Instance || retired != 0 {
@@ -485,7 +490,7 @@ func TestConflictEngineSparseOutlierDepth(t *testing.T) {
 	var engine conflictEngine
 	lane := instanceLane{conf: 1, replica: 1}
 	outlier := InstanceNum(1)<<60 + 17
-	rec := conflictRecord(lane, outlier, 99, CommandUser, "far")
+	rec := conflictRecord(lane, outlier, 99, EntryCommand, "far")
 	engine.apply(nil, rec)
 	index := engine.laneIndex[lane]
 	nodes, leaves := countRadixNodes(index.resident.root)
@@ -527,7 +532,7 @@ func TestConflictEngineBreakpointCapOvershootsSafely(t *testing.T) {
 	var engine conflictEngine
 	lane := instanceLane{conf: 8, replica: 1}
 	for instance := InstanceNum(1); instance <= 96; instance++ {
-		rec := conflictRecord(lane, instance, uint64(instance), CommandUser, "key")
+		rec := conflictRecord(lane, instance, uint64(instance), EntryCommand, "key")
 		engine.apply(nil, rec)
 		engine.foldRecord(rec)
 	}
@@ -557,21 +562,21 @@ func TestConflictEngineFoldTouchesOnlyRecordKeys(t *testing.T) {
 	lane := instanceLane{conf: 9, replica: 1}
 	const unrelatedKeys = 2_000
 	for instance := InstanceNum(2); instance < unrelatedKeys+2; instance++ {
-		rec := conflictRecord(lane, instance, uint64(instance), CommandUser, fmt.Sprintf("unrelated-%04d", instance-2))
+		rec := conflictRecord(lane, instance, uint64(instance), EntryCommand, fmt.Sprintf("unrelated-%04d", instance-2))
 		engine.apply(nil, rec)
 	}
-	target := conflictRecord(lane, 1, 1, CommandUser, "target")
+	target := conflictRecord(lane, 1, 1, EntryCommand, "target")
 	engine.apply(nil, target)
-	unrelated := engine.byKey[lane.conf]["unrelated-1000"]
-	unrelatedRoot := (*unrelated)[lane].postings.root
+	unrelated := engine.points[lane.conf]["unrelated-1000"]
+	unrelatedRoot := unrelated.lanes[lane].postings.root
 	engine.foldRecord(target)
-	if (*unrelated)[lane].postings.root != unrelatedRoot {
+	if unrelated.lanes[lane].postings.root != unrelatedRoot {
 		t.Fatal("fold rebuilt an unrelated posting tree")
 	}
-	if got := (*unrelated)[lane].postings.max(); got != 1_002 {
+	if got := unrelated.lanes[lane].postings.max(); got != 1_002 {
 		t.Fatalf("unrelated posting max=%d, want 1002", got)
 	}
-	if got := len(engine.byKey[lane.conf]); got != unrelatedKeys+1 {
+	if got := len(engine.points[lane.conf]); got != unrelatedKeys+1 {
 		t.Fatalf("key count=%d, want %d", got, unrelatedKeys+1)
 	}
 	if err := engine.verify(); err != nil {
@@ -584,7 +589,7 @@ func TestConflictEngineAdvanceRejectsNonContiguousFold(t *testing.T) {
 
 	var engine conflictEngine
 	lane := instanceLane{conf: 1, replica: 1}
-	rec := conflictRecord(lane, 2, 1, CommandUser, "a")
+	rec := conflictRecord(lane, 2, 1, EntryCommand, "a")
 	engine.apply(nil, rec)
 	engine.foldRecord(rec)
 	defer func() {
@@ -598,7 +603,7 @@ func TestConflictEngineAdvanceRejectsNonContiguousFold(t *testing.T) {
 	engine.advanceFold(lane, 2)
 }
 
-func conflictRecord(lane instanceLane, instance InstanceNum, seq uint64, kind CommandKind, keys ...string) InstanceRecord {
+func conflictRecord(lane instanceLane, instance InstanceNum, seq uint64, kind EntryKind, keys ...string) InstanceRecord {
 	conflictKeys := make([][]byte, len(keys))
 	for idx, key := range keys {
 		conflictKeys[idx] = []byte(key)
@@ -611,7 +616,8 @@ func conflictRecord(lane instanceLane, instance InstanceNum, seq uint64, kind Co
 		},
 		Status:  StatusCommitted,
 		Seq:     seq,
-		Command: Command{Kind: kind, ConflictKeys: conflictKeys},
+		Kind:    kind,
+		Command: Command{Footprint: Footprint{Points: conflictKeys}},
 	}
 }
 
@@ -621,20 +627,16 @@ func conflictRecord(lane instanceLane, instance InstanceNum, seq uint64, kind Co
 func assertExactKeyPostings(t *testing.T, e *conflictEngine, records map[InstanceRef]InstanceRecord) {
 	t.Helper()
 	for ref, rec := range records {
-		if !recordConflictEligible(rec) || commandHasGlobalConflictScope(rec.Command.Kind) {
+		if !recordConflictEligible(rec) || entryHasGlobalConflictScope(rec.Kind) {
 			continue
 		}
 		lane := laneFor(ref)
-		for _, key := range rec.Command.ConflictKeys {
-			keys := e.byKey[ref.Conf]
-			if keys == nil {
-				t.Fatalf("missing byKey conf for %v key %q", ref, key)
+		for _, key := range rec.Command.Footprint.Points {
+			resource := e.points[ref.Conf][string(key)]
+			if resource == nil {
+				t.Fatalf("missing point resource for %v key %q", ref, key)
 			}
-			lanes := keys[string(key)]
-			if lanes == nil {
-				t.Fatalf("missing byKey entry for %v key %q", ref, key)
-			}
-			entry := (*lanes)[lane]
+			entry := resource.lanes[lane]
 			if entry == nil || !entry.postings.contains(ref.Instance) {
 				t.Fatalf("missing posting for %v key %q", ref, key)
 			}
@@ -642,23 +644,22 @@ func assertExactKeyPostings(t *testing.T, e *conflictEngine, records map[Instanc
 	}
 }
 
-
 func TestWalkGlobalDescSkipsUnrelatedResidents(t *testing.T) {
 	t.Parallel()
 	var engine conflictEngine
 	lane := instanceLane{conf: 1, replica: 1}
 	// One old global at instance 1, then many ordinary residents.
 	global := InstanceRecord{
-		Ref: InstanceRef{Conf: 1, Replica: 1, Instance: 1},
+		Ref:    InstanceRef{Conf: 1, Replica: 1, Instance: 1},
 		Status: StatusCommitted, Seq: 1,
-		Command: Command{Kind: CommandConfChange, Payload: []byte("cfg")},
+		Kind: EntryConfChange,
 	}
 	engine.apply(nil, global)
 	for i := InstanceNum(2); i <= 200; i++ {
 		rec := InstanceRecord{
-			Ref: InstanceRef{Conf: 1, Replica: 1, Instance: i},
+			Ref:    InstanceRef{Conf: 1, Replica: 1, Instance: i},
 			Status: StatusCommitted, Seq: uint64(i),
-			Command: Command{Kind: CommandUser, Payload: []byte("u"), ConflictKeys: [][]byte{[]byte("k")}},
+			Kind: EntryCommand, Command: Command{Payload: []byte("u"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 		}
 		engine.apply(nil, rec)
 	}

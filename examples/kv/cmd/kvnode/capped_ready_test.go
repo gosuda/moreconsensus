@@ -39,7 +39,7 @@ func TestReadyLargerThanQueueAdvancesInCappedPrefixes(t *testing.T) {
 		waiters:       make(map[epaxos.InstanceRef]*proposalWaiter),
 	}
 	s.mu.Lock()
-	if _, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, ConflictKeys: [][]byte{[]byte("capped")}}); err != nil {
+	if _, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("capped")}}}); err != nil {
 		s.mu.Unlock()
 		t.Fatal(err)
 	}

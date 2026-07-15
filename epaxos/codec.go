@@ -5,39 +5,38 @@ import (
 	"encoding/binary"
 )
 
-var wireMagic = [...]byte{'M', 'E', 'P', '2'}
+var wireMagic = [...]byte{'M', 'E', 'P', '3'}
 
 const (
-	maxWireDeps           = 128
-	maxWireConflictKeys   = 128
-	maxWireAcceptEvidence = 128
-	maxWireCommandPayload = 1 << 20
-	maxWireConflictKey    = 1 << 16
+	maxWireDeps            = 128
+	maxWireAcceptEvidence  = 128
+	maxWireCommandPayload  = 1 << 20
+	maxWireProtocolControl = 1 << 20
 )
 
 // DecodeScratch owns reusable metadata buffers for DecodeMessageWithScratch.
-//
-// The decoded message's Deps, AcceptDeps, AcceptEvidence, and ConflictKeys
-// slice headers alias these buffers until the scratch is reused.
-// AcceptEvidence dependency slices partition AcceptEvidenceDeps. Command payload
-// and conflict-key bytes still alias the input buffer.
+// Decoded metadata slice headers alias these buffers until reuse; endpoint,
+// payload, cycle-key, and protocol-control bytes alias the input.
 type DecodeScratch struct {
 	Deps               []InstanceNum
 	AcceptDeps         []InstanceNum
 	AcceptEvidence     []AcceptEvidence
 	AcceptEvidenceDeps []InstanceNum
-	ConflictKeys       [][]byte
+	Points             [][]byte
+	Spans              []Span
 }
 
 // Reset clears references retained by the scratch while keeping buffer capacity.
 func (s *DecodeScratch) Reset() {
 	clear(s.AcceptEvidence[:cap(s.AcceptEvidence)])
-	clear(s.ConflictKeys[:cap(s.ConflictKeys)])
+	clear(s.Points[:cap(s.Points)])
+	clear(s.Spans[:cap(s.Spans)])
 	s.Deps = s.Deps[:0]
 	s.AcceptDeps = s.AcceptDeps[:0]
 	s.AcceptEvidence = s.AcceptEvidence[:0]
 	s.AcceptEvidenceDeps = s.AcceptEvidenceDeps[:0]
-	s.ConflictKeys = s.ConflictKeys[:0]
+	s.Points = s.Points[:0]
+	s.Spans = s.Spans[:0]
 }
 
 func (s *DecodeScratch) deps(n int) []InstanceNum {
@@ -78,31 +77,34 @@ func (s *DecodeScratch) acceptEvidenceDeps(n int) []InstanceNum {
 	return s.AcceptEvidenceDeps
 }
 
-func (s *DecodeScratch) conflictKeys(n int) [][]byte {
-	if cap(s.ConflictKeys) < n {
-		for i := range s.ConflictKeys {
-			s.ConflictKeys[i] = nil
-		}
-		s.ConflictKeys = make([][]byte, n)
+func (s *DecodeScratch) points(n int) [][]byte {
+	if cap(s.Points) < n {
+		clear(s.Points[:cap(s.Points)])
+		s.Points = make([][]byte, n)
 	} else {
-		for i := n; i < len(s.ConflictKeys); i++ {
-			s.ConflictKeys[i] = nil
-		}
-		s.ConflictKeys = s.ConflictKeys[:n]
+		clear(s.Points[n:cap(s.Points)])
+		s.Points = s.Points[:n]
 	}
-	return s.ConflictKeys
+	return s.Points
+}
+
+func (s *DecodeScratch) spans(n int) []Span {
+	if cap(s.Spans) < n {
+		clear(s.Spans[:cap(s.Spans)])
+		s.Spans = make([]Span, n)
+	} else {
+		clear(s.Spans[n:cap(s.Spans)])
+		s.Spans = s.Spans[:n]
+	}
+	return s.Spans
 }
 
 // EncodeMessage appends the canonical wire representation of m to dst.
 func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	if len(m.Deps) > maxWireDeps || len(m.AcceptDeps) > maxWireDeps || len(m.AcceptEvidence) > maxWireAcceptEvidence ||
-		len(m.Command.Payload) > maxWireCommandPayload || len(m.Command.ConflictKeys) > maxWireConflictKeys {
+		len(m.Command.Payload) > maxWireCommandPayload || len(m.Command.CycleKey) > maxWireCycleKeyBytes ||
+		len(m.ProtocolControl) > maxWireProtocolControl || !entryValueCanonical(m.Kind, m.Command, m.ConfChange, m.ProtocolControl) {
 		return dst, ErrInvalidMessage
-	}
-	for _, key := range m.Command.ConflictKeys {
-		if len(key) > maxWireConflictKey {
-			return dst, ErrInvalidMessage
-		}
 	}
 	for _, ev := range m.AcceptEvidence {
 		if len(ev.Deps) > maxWireDeps {
@@ -114,6 +116,8 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	dst = binary.AppendUvarint(dst, uint64(m.Type))
 	dst = binary.AppendUvarint(dst, uint64(m.From))
 	dst = binary.AppendUvarint(dst, uint64(m.To))
+	dst = binary.AppendUvarint(dst, m.FromIncarnation)
+	dst = binary.AppendUvarint(dst, m.ToIncarnation)
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Replica))
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Instance))
 	dst = binary.AppendUvarint(dst, uint64(m.Ref.Conf))
@@ -151,6 +155,11 @@ func EncodeMessage(dst []byte, m Message) ([]byte, error) {
 	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Replica))
 	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Instance))
 	dst = binary.AppendUvarint(dst, uint64(m.IgnoreDependency.Ref.Conf))
+	dst = binary.AppendUvarint(dst, uint64(m.Kind))
+	dst = binary.AppendUvarint(dst, uint64(m.ConfChange.Type))
+	dst = binary.AppendUvarint(dst, uint64(m.ConfChange.Replica))
+	dst = binary.AppendUvarint(dst, uint64(len(m.ProtocolControl)))
+	dst = append(dst, m.ProtocolControl...)
 	dst = appendCommand(dst, m.Command)
 	if m.Reject {
 		dst = append(dst, 1)
@@ -186,12 +195,22 @@ func DecodeMessage(src []byte, m *Message) error {
 // DecodeMessageWithScratch decodes a message using scratch-owned metadata buffers.
 //
 // A nil scratch behaves like DecodeMessage. With a non-nil scratch, decoded
-// Deps, AcceptDeps, AcceptEvidence, and ConflictKeys slice headers expire when
-// scratch is reset, returned to its pool, or reused. Command payload and
-// conflict-key bytes alias src and expire when src is mutated or released.
+// Deps, AcceptDeps, AcceptEvidence, and Footprint point/span slice headers expire
+// when scratch is reset, returned to its pool, or reused. Command payload and
+// footprint endpoint bytes alias src and expire when src is mutated or released.
 // Step copies any data retained beyond the synchronous call before returning.
 func DecodeMessageWithScratch(src []byte, m *Message, scratch *DecodeScratch) error {
-	return decodeMessage(src, m, scratch)
+	if scratch == nil {
+		return decodeMessage(src, m, nil)
+	}
+	original := *scratch
+	if err := decodeMessage(src, m, scratch); err != nil {
+		scratch.Reset()
+		*scratch = original
+		scratch.Reset()
+		return err
+	}
+	return nil
 }
 
 func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
@@ -200,9 +219,14 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 		return decodeMessageError(m, scratch, ErrInvalidMessage)
 	}
 	p := parser{b: src[len(wireMagic) : len(src)-32], scratch: scratch}
+	if scratch != nil && !scanMessageBody(p) {
+		return decodeMessageError(m, scratch, ErrInvalidMessage)
+	}
 	m.Type = MessageType(p.uvarint8())
 	m.From = ReplicaID(p.uvarint())
 	m.To = ReplicaID(p.uvarint())
+	m.FromIncarnation = p.uvarint()
+	m.ToIncarnation = p.uvarint()
 	m.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
 	m.ProcessAt = p.uvarint()
 	m.TOQ = p.byte() == 1
@@ -274,6 +298,9 @@ func decodeMessage(src []byte, m *Message, scratch *DecodeScratch) error {
 		}
 	}
 	m.IgnoreDependency.Ref = InstanceRef{Replica: ReplicaID(p.uvarint()), Instance: InstanceNum(p.uvarint()), Conf: ConfID(p.uvarint())}
+	m.Kind = EntryKind(p.uvarint8())
+	m.ConfChange = ConfChange{Type: ConfChangeType(p.uvarint8()), Replica: ReplicaID(p.uvarint())}
+	m.ProtocolControl = p.bytesBound(maxWireProtocolControl)
 	m.Command = p.command()
 	m.Reject = p.byte() == 1
 	m.RejectHint = Ballot{Epoch: p.uvarint(), Number: p.uvarint(), Replica: ReplicaID(p.uvarint())}
@@ -312,6 +339,112 @@ func scanAcceptEvidence(p parser, count int) (int, bool) {
 	}
 	return totalDeps, true
 }
+func scanMessageBody(p parser) bool {
+	p.scratch = nil
+	p.uvarint8()
+	p.uvarint()
+	p.uvarint()
+	p.uvarint()
+	p.uvarint()
+	for range 3 {
+		p.uvarint()
+	}
+	p.uvarint()
+	p.byte()
+	for range 7 {
+		p.uvarint()
+	}
+	deps := p.uvarint()
+	if deps > maxWireDeps {
+		return false
+	}
+	for range deps {
+		p.uvarint()
+	}
+	p.uvarint()
+	acceptDeps := p.uvarint()
+	if acceptDeps > maxWireDeps {
+		return false
+	}
+	for range acceptDeps {
+		p.uvarint()
+	}
+	evidence := p.uvarint()
+	if evidence > maxWireAcceptEvidence {
+		return false
+	}
+	for range evidence {
+		p.uvarint()
+		p.uvarint()
+		evidenceDeps := p.uvarint()
+		if evidenceDeps > maxWireDeps {
+			return false
+		}
+		for range evidenceDeps {
+			p.uvarint()
+		}
+	}
+	for range 3 {
+		p.uvarint()
+	}
+	p.uvarint8()
+	p.uvarint8()
+	p.uvarint()
+	p.bytesBound(maxWireProtocolControl)
+	if !scanCommand(&p) {
+		return false
+	}
+	p.byte()
+	for range 3 {
+		p.uvarint()
+	}
+	p.uvarint8()
+	for range 3 {
+		p.uvarint()
+	}
+	p.uvarint8()
+	p.byte()
+	p.uvarint()
+	p.uvarint8()
+	return !p.err && len(p.b) == 0
+}
+
+func scanCommand(p *parser) bool {
+	client := p.uvarint()
+	sequence := p.uvarint()
+	payload := p.bytesBound(maxWireCommandPayload)
+	all := p.byte() == 1
+	pointCount := p.uvarint()
+	if p.err || pointCount > maxWireFootprintPoints {
+		return false
+	}
+	var pointStorage [maxWireFootprintPoints][]byte
+	points := pointStorage[:int(pointCount)]
+	total := uint64(0)
+	for i := range points {
+		points[i] = p.bytesBound(maxWireFootprintBytes)
+		total += uint64(len(points[i]))
+	}
+	spanCount := p.uvarint()
+	if p.err || spanCount > maxWireFootprintSpans {
+		return false
+	}
+	var spanStorage [maxWireFootprintSpans]Span
+	spans := spanStorage[:int(spanCount)]
+	for i := range spans {
+		spans[i].Start = p.bytesBound(maxWireFootprintBytes)
+		spans[i].End = p.bytesBound(maxWireFootprintBytes)
+		total += uint64(len(spans[i].Start) + len(spans[i].End))
+	}
+	cycleKey := p.bytesBound(maxWireCycleKeyBytes)
+	if p.err || total > maxWireFootprintBytes {
+		return false
+	}
+	if client == 0 && sequence == 0 && len(payload) == 0 && !all && len(points) == 0 && len(spans) == 0 && len(cycleKey) == 0 {
+		return true
+	}
+	return footprintCanonical(Footprint{Points: points, Spans: spans, All: all})
+}
 
 func decodeMessageError(m *Message, scratch *DecodeScratch, err error) error {
 	m.Reset()
@@ -324,14 +457,27 @@ func decodeMessageError(m *Message, scratch *DecodeScratch, err error) error {
 func appendCommand(dst []byte, c Command) []byte {
 	dst = binary.AppendUvarint(dst, c.ID.Client)
 	dst = binary.AppendUvarint(dst, c.ID.Sequence)
-	dst = binary.AppendUvarint(dst, uint64(c.Kind))
 	dst = binary.AppendUvarint(dst, uint64(len(c.Payload)))
 	dst = append(dst, c.Payload...)
-	dst = binary.AppendUvarint(dst, uint64(len(c.ConflictKeys)))
-	for _, key := range c.ConflictKeys {
-		dst = binary.AppendUvarint(dst, uint64(len(key)))
-		dst = append(dst, key...)
+	if c.Footprint.All {
+		dst = append(dst, 1)
+	} else {
+		dst = append(dst, 0)
 	}
+	dst = binary.AppendUvarint(dst, uint64(len(c.Footprint.Points)))
+	for _, point := range c.Footprint.Points {
+		dst = binary.AppendUvarint(dst, uint64(len(point)))
+		dst = append(dst, point...)
+	}
+	dst = binary.AppendUvarint(dst, uint64(len(c.Footprint.Spans)))
+	for _, span := range c.Footprint.Spans {
+		dst = binary.AppendUvarint(dst, uint64(len(span.Start)))
+		dst = append(dst, span.Start...)
+		dst = binary.AppendUvarint(dst, uint64(len(span.End)))
+		dst = append(dst, span.End...)
+	}
+	dst = binary.AppendUvarint(dst, uint64(len(c.CycleKey)))
+	dst = append(dst, c.CycleKey...)
 	return dst
 }
 
@@ -379,6 +525,9 @@ func (p *parser) bytesBound(maxLen uint64) []byte {
 		p.err = true
 		return nil
 	}
+	if n == 0 {
+		return nil
+	}
 	out := p.b[:n]
 	p.b = p.b[n:]
 	return out
@@ -388,20 +537,49 @@ func (p *parser) bytes() []byte {
 }
 
 func (p *parser) command() Command {
-	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}, Kind: CommandKind(p.uvarint8())}
+	c := Command{ID: CommandID{Client: p.uvarint(), Sequence: p.uvarint()}}
 	c.Payload = p.bytesBound(maxWireCommandPayload)
-	keys := p.uvarint()
-	if keys > maxWireConflictKeys {
+	c.Footprint.All = p.byte() == 1
+	points := p.uvarint()
+	if points > maxWireFootprintPoints {
 		p.err = true
 		return c
 	}
-	if p.scratch != nil {
-		c.ConflictKeys = p.scratch.conflictKeys(int(keys))
-	} else {
-		c.ConflictKeys = make([][]byte, int(keys))
+	if points != 0 {
+		if p.scratch != nil {
+			c.Footprint.Points = p.scratch.points(int(points))
+		} else {
+			c.Footprint.Points = make([][]byte, int(points))
+		}
 	}
-	for i := range c.ConflictKeys {
-		c.ConflictKeys[i] = p.bytesBound(maxWireConflictKey)
+	total := uint64(0)
+	for i := range c.Footprint.Points {
+		c.Footprint.Points[i] = p.bytesBound(maxWireFootprintBytes)
+		total += uint64(len(c.Footprint.Points[i]))
+	}
+	spans := p.uvarint()
+	if spans > maxWireFootprintSpans {
+		p.err = true
+		return c
+	}
+	if spans != 0 {
+		if p.scratch != nil {
+			c.Footprint.Spans = p.scratch.spans(int(spans))
+		} else {
+			c.Footprint.Spans = make([]Span, int(spans))
+		}
+	}
+	for i := range c.Footprint.Spans {
+		c.Footprint.Spans[i].Start = p.bytesBound(maxWireFootprintBytes)
+		c.Footprint.Spans[i].End = p.bytesBound(maxWireFootprintBytes)
+		total += uint64(len(c.Footprint.Spans[i].Start) + len(c.Footprint.Spans[i].End))
+	}
+	if total > maxWireFootprintBytes {
+		p.err = true
+	}
+	c.CycleKey = p.bytesBound(maxWireCycleKeyBytes)
+	if !p.err && !commandEmpty(c) && !footprintCanonical(c.Footprint) {
+		p.err = true
 	}
 	return c
 }

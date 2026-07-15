@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -24,13 +25,13 @@ func TestKVErrorAndPrefixBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: epaxos.Command{Kind: epaxos.CommandNoop}}); err != nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Command: epaxos.Command{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: epaxos.Command{Payload: []byte{opPut, 9}}}); err == nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Command: epaxos.Command{Payload: []byte{opPut, 9}}}); err == nil {
 		t.Fatal("expected malformed command")
 	}
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: epaxos.Command{Payload: []byte{99, 0, 0}}}); err == nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Command: epaxos.Command{Payload: []byte{99, 0, 0}}}); err == nil {
 		t.Fatal("expected unknown operation")
 	}
 	if _, ok, err := db.Get([]byte("missing")); err != nil || ok {
@@ -121,8 +122,8 @@ func TestClusterErrorBranches(t *testing.T) {
 		Seq: 1, Deps: []epaxos.InstanceNum{0, 0, 0},
 		Command: epaxos.Command{Payload: []byte{opPut, 9}},
 	})
-	if !errors.Is(err, epaxos.ErrMessageRejected) {
-		t.Fatalf("malformed network command err=%v, want message rejection", err)
+	if !errors.Is(err, epaxos.ErrInvalidMessage) {
+		t.Fatalf("malformed network command err=%v, want invalid message", err)
 	}
 }
 
@@ -222,7 +223,7 @@ func TestOpenClusterReopensDurableReadyPathWithoutCommandReplay(t *testing.T) {
 	for id, apply := range cluster.readyAppliers {
 		id, apply := id, apply
 		cluster.readyAppliers[id] = func(rd epaxos.Ready) error {
-			restartedCommitted += len(rd.Committed)
+			restartedCommitted += len(rd.Apply)
 			return apply(rd)
 		}
 	}
@@ -260,7 +261,7 @@ func TestOpenClusterRejectsBitFlippedPersistedEPaxosRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded := 0
-	if err := db.EPaxosStorage().LoadInstances(func(got epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(got epaxos.InstanceRecord) error {
 		loaded++
 		if got.Ref != ref || !epaxos.VerifyRecordChecksum(got) {
 			return epaxos.ErrChecksumMismatch
@@ -285,17 +286,11 @@ func TestOpenClusterRejectsBitFlippedPersistedEPaxosRecord(t *testing.T) {
 		_ = pebbleDB.Close()
 		t.Fatal(err)
 	}
-	corrupted := append([]byte(nil), value...)
+	corrupted := corruptEncodedEPaxosRecord(t, value, []byte("corruption-value"))
 	if err := closer.Close(); err != nil {
 		_ = pebbleDB.Close()
 		t.Fatal(err)
 	}
-	payloadAt := bytes.Index(corrupted, []byte("corruption-value"))
-	if payloadAt < 0 {
-		_ = pebbleDB.Close()
-		t.Fatalf("persisted EPaxos record did not contain payload bytes: %x", corrupted)
-	}
-	corrupted[payloadAt] ^= 0x01
 	if err := pebbleDB.Set(epaxosRecordKey(ref), corrupted, pebble.Sync); err != nil {
 		_ = pebbleDB.Close()
 		t.Fatal(err)
@@ -314,7 +309,7 @@ func TestOpenClusterRejectsBitFlippedPersistedEPaxosRecord(t *testing.T) {
 		t.Fatalf("corrupt database remained locked after failed cluster open: %v", err)
 	}
 	defer func() { _ = db.Close() }()
-	err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error { return nil })
+	err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error { return nil })
 	if !errors.Is(err, epaxos.ErrChecksumMismatch) {
 		t.Fatalf("LoadInstances err=%v, want %v", err, epaxos.ErrChecksumMismatch)
 	}
@@ -601,7 +596,7 @@ func TestRecoverReplicaFromLiveCheckpointRejectsUnsupportedSource(t *testing.T) 
 	})
 	if err := cluster.DBs[1].ApplyReady(epaxos.Ready{
 		Records: []epaxos.InstanceRecord{unsupportedRecord},
-		Committed: []epaxos.CommittedCommand{{
+		Apply: []epaxos.ApplyCommand{{
 			Ref:     unsupportedRef,
 			Seq:     unsupportedRecord.Seq,
 			Deps:    append([]epaxos.InstanceNum(nil), unsupportedRecord.Deps...),
@@ -756,12 +751,12 @@ func TestVerifyCheckpointCrashWindowMarkerRules(t *testing.T) {
 	t.Run("executed noop missing applied marker", func(t *testing.T) {
 		checkpoint := filepath.Join(t.TempDir(), "checkpoint")
 		record := checkedKVRecord(epaxos.InstanceRecord{
-			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
-			Ballot:  epaxos.Ballot{Replica: 1},
-			Status:  epaxos.StatusExecuted,
-			Seq:     1,
-			Deps:    []epaxos.InstanceNum{0},
-			Command: epaxos.Command{Kind: epaxos.CommandNoop},
+			Ref:    epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+			Ballot: epaxos.Ballot{Replica: 1},
+			Status: epaxos.StatusExecuted,
+			Seq:    1,
+			Deps:   []epaxos.InstanceNum{0},
+			Kind:   epaxos.EntryNoop,
 		})
 		writeCheckpointRecordOnly(t, checkpoint, record)
 
@@ -938,7 +933,6 @@ func TestCheckpointCommandGroupClassifiesAndRejectsCommands(t *testing.T) {
 		wantGroup  string
 		wantErr    string
 	}{
-		{name: "noop has no writes", cmd: epaxos.Command{Kind: epaxos.CommandNoop}},
 		{name: "empty payload has no writes", cmd: epaxos.Command{}},
 		{name: "put", cmd: CommandForPut(110, 1, []byte("put-key"), []byte("put-value")), wantWrites: true, wantGroup: checkpointGroupKey([]string{checkpointAtomKey(valueRecord, []byte("put-key"), []byte("put-value"))})},
 		{name: "put malformed", cmd: epaxos.Command{Payload: []byte{opPut, 9}}, wantErr: "malformed command"},
@@ -1366,7 +1360,7 @@ func TestPebbleStorageLoadInstancesRejectsMalformedKeysAndRefMismatch(t *testing
 		defer func() { _ = db.Close() }()
 		setRawOpenPebbleKV(t, db.pebble, []byte{epaxosStorePrefix, epaxosRecordEntry, 0}, []byte{epaxosRecordCodec})
 
-		err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error {
+		err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error {
 			t.Fatal("callback must not run for malformed durable key")
 			return nil
 		})
@@ -1384,7 +1378,7 @@ func TestPebbleStorageLoadInstancesRejectsMalformedKeysAndRefMismatch(t *testing
 		record := checkpointPutRecord(epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1}, "load-mismatch", "value")
 		setRawOpenPebbleKV(t, db.pebble, epaxosRecordKey(epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}), encodeEPaxosRecord(record))
 
-		err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error {
+		err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error {
 			t.Fatal("callback must not run for mismatched durable record")
 			return nil
 		})
@@ -1407,7 +1401,7 @@ func TestVerifyCheckpointCoversOrderingAndIteratorErrorBranches(t *testing.T) {
 		}
 		err = db.ApplyReady(epaxos.Ready{
 			Records: []epaxos.InstanceRecord{record2, record1},
-			Committed: []epaxos.CommittedCommand{
+			Apply: []epaxos.ApplyCommand{
 				{Ref: ref2, Seq: record2.Seq, Deps: record2.Deps, Command: record2.Command},
 				{Ref: ref1, Seq: record1.Seq, Deps: record1.Deps, Command: record1.Command},
 			},
@@ -1437,7 +1431,7 @@ func TestVerifyCheckpointCoversOrderingAndIteratorErrorBranches(t *testing.T) {
 		}
 		err = db.ApplyReady(epaxos.Ready{
 			Records: []epaxos.InstanceRecord{dep, dependent},
-			Committed: []epaxos.CommittedCommand{
+			Apply: []epaxos.ApplyCommand{
 				{Ref: dependentRef, Seq: dependent.Seq, Deps: dependent.Deps, Command: dependent.Command},
 				{Ref: depRef, Seq: dep.Seq, Deps: dep.Deps, Command: dep.Command},
 			},
@@ -1845,7 +1839,7 @@ func TestDecodeEPaxosRecordRejectsZeroEvidenceSenderAndUpgradesLegacyChecksum(t 
 		AcceptEvidence: []epaxos.AcceptEvidence{{Sender: 0, Seq: 2, Deps: []epaxos.InstanceNum{0}}},
 		Command:        CommandForPut(150, 1, []byte("bad-sender"), []byte("value")),
 	})
-	if _, err := decodeEPaxosRecord(encodeEPaxosRecord(badSender)); err == nil || !strings.Contains(err.Error(), "bad epaxos accept evidence sender") {
+	if _, err := decodeEPaxosRecord(encodeHistoricalEPaxosRecordKV(badSender, 8)); err == nil || !strings.Contains(err.Error(), "bad epaxos accept evidence sender") {
 		t.Fatalf("decodeEPaxosRecord bad sender err=%v", err)
 	}
 
@@ -1895,7 +1889,8 @@ func TestEPaxosRecordCodecV8RoundTripsConfChangeResults(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := confChangeCodecRecordKV(tc.result)
-			encoded := encodeEPaxosRecord(rec)
+			rec.Checksum = epaxos.ChecksumRecordWithoutMembershipResult(rec)
+			encoded := encodeHistoricalEPaxosRecordKV(rec, 8)
 			if encoded[0] != 8 {
 				t.Fatalf("record codec version=%d, want 8", encoded[0])
 			}
@@ -1916,7 +1911,8 @@ func TestEPaxosRecordCodecV8RejectsMalformedConfChangeResult(t *testing.T) {
 		Outcome: epaxos.ConfChangeApplied,
 		Conf:    epaxos.ConfState{ID: 5, Voters: []epaxos.ReplicaID{1, 2, 3, 4}},
 	})
-	encoded := encodeEPaxosRecord(rec)
+	rec.Checksum = epaxos.ChecksumRecordWithoutMembershipResult(rec)
+	encoded := encodeHistoricalEPaxosRecordKV(rec, 8)
 	resultBytes := encodeConfChangeResultKV(rec.ConfChangeResult)
 	resultAt := len(encoded) - len(rec.Checksum) - len(resultBytes)
 	outcomeBytes := binary.AppendUvarint(nil, uint64(rec.ConfChangeResult.Outcome))
@@ -2007,6 +2003,7 @@ func TestEPaxosRecordCodecV6MigratesConfChangeChecksum(t *testing.T) {
 		AcceptSeq:        4,
 		AcceptDeps:       []epaxos.InstanceNum{0, 0, 0},
 		AcceptEvidence:   []epaxos.AcceptEvidence{{Sender: 2, Seq: 4, Deps: []epaxos.InstanceNum{0, 0, 0}}},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(151, 1, []byte("legacy-v6"), []byte("value")),
 		FastPathEligible: true,
 	}
@@ -2055,21 +2052,15 @@ func TestEPaxosRecordCodecV6MigratesConfChangeChecksum(t *testing.T) {
 }
 
 func confChangeCodecRecordKV(result epaxos.ConfChangeResult) epaxos.InstanceRecord {
-	payload := make([]byte, 9)
-	payload[0] = byte(epaxos.ConfChangeAddVoter)
-	binary.LittleEndian.PutUint64(payload[1:], 4)
 	rec := epaxos.InstanceRecord{
-		Ref:          epaxos.InstanceRef{Replica: 1, Instance: 9, Conf: 4},
-		Ballot:       epaxos.Ballot{Number: 1, Replica: 1},
-		RecordBallot: epaxos.Ballot{Number: 1, Replica: 1},
-		Status:       epaxos.StatusExecuted,
-		Seq:          9,
-		Deps:         []epaxos.InstanceNum{0, 0, 0},
-		Command: epaxos.Command{
-			Kind:         epaxos.CommandConfChange,
-			Payload:      payload,
-			ConflictKeys: [][]byte{[]byte("\xffconf")},
-		},
+		Ref:              epaxos.InstanceRef{Replica: 1, Instance: 9, Conf: 4},
+		Ballot:           epaxos.Ballot{Number: 1, Replica: 1},
+		RecordBallot:     epaxos.Ballot{Number: 1, Replica: 1},
+		Status:           epaxos.StatusExecuted,
+		Seq:              9,
+		Deps:             []epaxos.InstanceNum{0, 0, 0},
+		Kind:             epaxos.EntryConfChange,
+		ConfChange:       epaxos.ConfChange{Type: epaxos.ConfChangeAddVoter, Replica: 4},
 		ConfChangeResult: result,
 	}
 	rec.Checksum = epaxos.ChecksumRecord(rec)
@@ -2099,15 +2090,7 @@ func encodeConfChangeResultKV(result epaxos.ConfChangeResult) []byte {
 }
 
 func encodeEPaxosRecordV6KV(rec epaxos.InstanceRecord) []byte {
-	resultBytes := encodeConfChangeResultKV(rec.ConfChangeResult)
-	current := encodeEPaxosRecord(rec)
-	domainAt := len(current) - len(rec.Checksum) - len(resultBytes) - 3
-	withoutDomain := append([]byte(nil), current[:domainAt]...)
-	withoutDomain = append(withoutDomain, current[domainAt+1:]...)
-	legacyEnd := len(withoutDomain) - len(rec.Checksum) - len(resultBytes)
-	out := withoutDomain[:legacyEnd]
-	out[0] = 6
-	return append(out, rec.Checksum[:]...)
+	return encodeHistoricalEPaxosRecordKV(rec, 6)
 }
 
 func encodeEPaxosRecordV5KV(rec epaxos.InstanceRecord) []byte {
@@ -2132,13 +2115,14 @@ func encodeEPaxosRecordV5KV(rec epaxos.InstanceRecord) []byte {
 	for _, dep := range rec.AcceptDeps {
 		out = binary.AppendUvarint(out, uint64(dep))
 	}
-	out = binary.AppendUvarint(out, rec.Command.ID.Client)
-	out = binary.AppendUvarint(out, rec.Command.ID.Sequence)
-	out = binary.AppendUvarint(out, uint64(rec.Command.Kind))
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.Payload)))
-	out = append(out, rec.Command.Payload...)
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	out = binary.AppendUvarint(out, id.Client)
+	out = binary.AppendUvarint(out, id.Sequence)
+	out = binary.AppendUvarint(out, uint64(kind))
+	out = binary.AppendUvarint(out, uint64(len(payload)))
+	out = append(out, payload...)
+	out = binary.AppendUvarint(out, uint64(len(points)))
+	for _, key := range points {
 		out = binary.AppendUvarint(out, uint64(len(key)))
 		out = append(out, key...)
 	}
@@ -2201,12 +2185,13 @@ func checksumLegacyRecordKV(rec epaxos.InstanceRecord, includeSenderEvidence boo
 			}
 		}
 	}
-	writeUint64KV(rec.Command.ID.Client)
-	writeUint64KV(rec.Command.ID.Sequence)
-	writeByteKV(byte(rec.Command.Kind))
-	writeBytesKV(rec.Command.Payload)
-	writeUint64KV(uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	writeUint64KV(id.Client)
+	writeUint64KV(id.Sequence)
+	writeByteKV(kind)
+	writeBytesKV(payload)
+	writeUint64KV(uint64(len(points)))
+	for _, key := range points {
 		writeBytesKV(key)
 	}
 	if rec.FastPathEligible {
@@ -2262,16 +2247,29 @@ func corruptOpenDBEPaxosRecordValue(t *testing.T, db *DB, ref epaxos.InstanceRef
 	if err != nil {
 		t.Fatal(err)
 	}
-	corrupted := append([]byte(nil), value...)
+	corrupted := corruptEncodedEPaxosRecord(t, value, needle)
 	if err := closer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	payloadAt := bytes.Index(corrupted, needle)
-	if payloadAt < 0 {
-		t.Fatalf("persisted EPaxos record did not contain payload bytes %q: %x", needle, corrupted)
-	}
-	corrupted[payloadAt] ^= 0x01
 	setRawOpenPebbleKV(t, db.pebble, epaxosRecordKey(ref), corrupted)
+}
+
+func corruptEncodedEPaxosRecord(t *testing.T, encoded, needle []byte) []byte {
+	t.Helper()
+	record, err := decodeEPaxosRecord(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadAt := bytes.Index(record.Command.Payload, needle)
+	if payloadAt < 0 {
+		t.Fatalf("persisted EPaxos command did not contain payload bytes %q", needle)
+	}
+	record.Command.Payload[payloadAt] ^= 0x01
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte{epaxosRecordCodec}, payload...)
 }
 
 func assertReplicaValue(t *testing.T, cluster *Cluster, id epaxos.ReplicaID, key []byte, want string) {
@@ -2289,7 +2287,7 @@ func assertEPaxosChecksumMismatch(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error { return nil })
+	err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error { return nil })
 	if !errors.Is(err, epaxos.ErrChecksumMismatch) {
 		t.Fatalf("LoadInstances on %s err=%v, want %v", path, err, epaxos.ErrChecksumMismatch)
 	}
@@ -2318,7 +2316,7 @@ func writeAppliedCheckpointRecord(t *testing.T, path string, record epaxos.Insta
 	}
 	if err := db.ApplyReady(epaxos.Ready{
 		Records: []epaxos.InstanceRecord{record},
-		Committed: []epaxos.CommittedCommand{{
+		Apply: []epaxos.ApplyCommand{{
 			Ref:     record.Ref,
 			Seq:     record.Seq,
 			Deps:    append([]epaxos.InstanceNum(nil), record.Deps...),
@@ -2375,17 +2373,11 @@ func corruptPersistedEPaxosRecordValue(t *testing.T, path string, ref epaxos.Ins
 		_ = pebbleDB.Close()
 		t.Fatal(err)
 	}
-	corrupted := append([]byte(nil), value...)
+	corrupted := corruptEncodedEPaxosRecord(t, value, needle)
 	if err := closer.Close(); err != nil {
 		_ = pebbleDB.Close()
 		t.Fatal(err)
 	}
-	payloadAt := bytes.Index(corrupted, needle)
-	if payloadAt < 0 {
-		_ = pebbleDB.Close()
-		t.Fatalf("persisted EPaxos record did not contain payload bytes %q: %x", needle, corrupted)
-	}
-	corrupted[payloadAt] ^= 0x01
 	if err := pebbleDB.Set(epaxosRecordKey(ref), corrupted, pebble.Sync); err != nil {
 		_ = pebbleDB.Close()
 		t.Fatal(err)
@@ -2582,7 +2574,7 @@ func TestClusterProposalAndTransportErrorBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = cluster.Close() }()
-	if err := cluster.proposeAndDrain(epaxos.Command{Kind: epaxos.CommandConfChange}); !errors.Is(err, epaxos.ErrInvalidConfig) {
+	if err := cluster.proposeAndDrain(epaxos.Command{}); !errors.Is(err, epaxos.ErrInvalidFootprint) {
 		t.Fatalf("proposal err=%v", err)
 	}
 	if err := cluster.deliver(epaxos.Message{To: 99}); err != nil {
@@ -2624,7 +2616,7 @@ func TestCommandForTxnAppliesPutsThenDeleteAndPut(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	first := epaxos.CommittedCommand{
+	first := epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 10, Conf: 1},
 		Command: CommandForTxn(7, 1, []TxnOp{{Key: []byte("alpha"), Value: []byte("one")}, {Key: []byte("beta"), Value: []byte("two")}}),
 	}
@@ -2642,7 +2634,7 @@ func TestCommandForTxnAppliesPutsThenDeleteAndPut(t *testing.T) {
 		t.Fatalf("first transaction scan %#v", scan)
 	}
 
-	second := epaxos.CommittedCommand{
+	second := epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 11, Conf: 1},
 		Command: CommandForTxn(7, 2, []TxnOp{{Delete: true, Key: []byte("alpha")}, {Key: []byte("gamma"), Value: []byte("three")}}),
 	}
@@ -2680,7 +2672,7 @@ func TestTxnPayloadRejectsMalformedInputsAndKeepsBatchAtomic(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = db.Close() }()
-			err = db.ApplyCommitted(epaxos.CommittedCommand{
+			err = db.ApplyCommitted(epaxos.ApplyCommand{
 				Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 				Command: epaxos.Command{Payload: tt.payload},
 			})
@@ -2700,7 +2692,7 @@ func TestTxnPayloadRejectsMalformedInputsAndKeepsBatchAtomic(t *testing.T) {
 		payload = appendKVFields(payload, []byte("alpha"), []byte("one"))
 		payload = append(payload, 99)
 		payload = appendKVFields(payload, []byte("beta"), nil)
-		err = db.ApplyCommitted(epaxos.CommittedCommand{
+		err = db.ApplyCommitted(epaxos.ApplyCommand{
 			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
 			Command: epaxos.Command{Payload: payload},
 		})
@@ -2734,7 +2726,7 @@ func TestTxnBatchSetReturnsIndexErrorForPutAndDelete(t *testing.T) {
 				return txnBatchWithSetErr{err: setErr}
 			}
 
-			err = db.ApplyCommitted(epaxos.CommittedCommand{
+			err = db.ApplyCommitted(epaxos.ApplyCommand{
 				Ref:     epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1},
 				Command: CommandForTxn(7, 3, []TxnOp{tt.op}),
 			})
@@ -2757,7 +2749,7 @@ func TestTxnBatchCommitErrorIsReturned(t *testing.T) {
 		return txnBatchWithCommitErr{err: commitErr}
 	}
 
-	err = db.ApplyCommitted(epaxos.CommittedCommand{
+	err = db.ApplyCommitted(epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1},
 		Command: CommandForTxn(7, 4, []TxnOp{{Key: []byte("alpha"), Value: []byte("one")}}),
 	})
@@ -2781,8 +2773,8 @@ func TestApplyReadyPersistsExecutedRecordAndKVAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	rd := node.Ready()
-	if len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
-		t.Fatalf("ready committed = %#v, want one command for %s", rd.Committed, ref)
+	if len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
+		t.Fatalf("ready committed = %#v, want one command for %s", rd.Apply, ref)
 	}
 	if err := db.ApplyReady(rd); err != nil {
 		t.Fatal(err)
@@ -2791,8 +2783,8 @@ func TestApplyReadyPersistsExecutedRecordAndKVAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	executedReady := node.Ready()
-	if len(executedReady.Committed) != 0 {
-		t.Fatalf("post-advance ready committed = %#v, want no replayed command", executedReady.Committed)
+	if len(executedReady.Apply) != 0 {
+		t.Fatalf("post-advance ready committed = %#v, want no replayed command", executedReady.Apply)
 	}
 	if len(executedReady.Records) != 1 || executedReady.Records[0].Ref != ref || executedReady.Records[0].Status != epaxos.StatusExecuted {
 		t.Fatalf("post-advance ready records = %#v, want one executed record for %s", executedReady.Records, ref)
@@ -2849,7 +2841,7 @@ func TestApplyReadyDuplicateCommittedRefIsIdempotent(t *testing.T) {
 	})
 	rd := epaxos.Ready{
 		Records: []epaxos.InstanceRecord{rec},
-		Committed: []epaxos.CommittedCommand{{
+		Apply: []epaxos.ApplyCommand{{
 			Ref:     ref,
 			Seq:     rec.Seq,
 			Deps:    rec.Deps,
@@ -2973,7 +2965,7 @@ func TestPebbleStorageLoadInstancesDecodesDurableRecordOrder(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	var loaded []epaxos.InstanceRecord
-	if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 		loaded = append(loaded, rec)
 		return nil
 	}); err != nil {
@@ -2999,8 +2991,8 @@ func TestPebbleStorageLoadInstancesDecodesDurableRecordOrder(t *testing.T) {
 	if loaded[0].Status != epaxos.StatusPreAccepted || loaded[0].Seq != 5 || len(loaded[0].Deps) != 3 || loaded[0].Deps[0] != 4 {
 		t.Fatalf("first loaded record lost attributes: %#v", loaded[0])
 	}
-	if string(loaded[0].Command.ConflictKeys[0]) != "first" || string(loaded[0].Command.ConflictKeys[1]) != "gone" {
-		t.Fatalf("transaction conflict keys not decoded: %#v", loaded[0].Command.ConflictKeys)
+	if string(loaded[0].Command.Footprint.Points[0]) != "first" || string(loaded[0].Command.Footprint.Points[1]) != "gone" {
+		t.Fatalf("transaction conflict keys not decoded: %#v", loaded[0].Command.Footprint.Points)
 	}
 	if loaded[3].Ballot.Number != 5 || string(loaded[3].Command.Payload) != string(CommandForPut(20, 1, []byte("late"), []byte("value-late")).Payload) {
 		t.Fatalf("last loaded record lost ballot or payload: %#v", loaded[3])
@@ -3035,7 +3027,7 @@ func TestPebbleStorageRoundTripsFastPathEligibleRecord(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	var loaded []epaxos.InstanceRecord
-	if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 		loaded = append(loaded, rec)
 		return nil
 	}); err != nil {
@@ -3057,11 +3049,11 @@ func TestPebbleStorageRoundTripsFastPathEligibleRecord(t *testing.T) {
 	if len(got.Deps) != len(record.Deps) || got.Deps[1] != record.Deps[1] {
 		t.Fatalf("loaded deps = %#v, want %#v", got.Deps, record.Deps)
 	}
-	if got.Command.ID != record.Command.ID || got.Command.Kind != record.Command.Kind || string(got.Command.Payload) != string(record.Command.Payload) {
+	if got.Command.ID != record.Command.ID || got.Kind != record.Kind || string(got.Command.Payload) != string(record.Command.Payload) {
 		t.Fatalf("loaded command = %#v, want %#v", got.Command, record.Command)
 	}
-	if len(got.Command.ConflictKeys) != 1 || string(got.Command.ConflictKeys[0]) != "fast-path-key" {
-		t.Fatalf("loaded conflict keys = %#v", got.Command.ConflictKeys)
+	if len(got.Command.Footprint.Points) != 1 || string(got.Command.Footprint.Points[0]) != "fast-path-key" {
+		t.Fatalf("loaded conflict keys = %#v", got.Command.Footprint.Points)
 	}
 }
 
@@ -3299,6 +3291,7 @@ func TestDecodeEPaxosRecordMigratesVersion3ChecksumWithoutAcceptEvidence(t *test
 		Status:           epaxos.StatusAccepted,
 		Seq:              19,
 		Deps:             []epaxos.InstanceNum{12, 0, 13},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(50, 2, []byte("legacy-acceptless"), []byte("value")),
 		ProcessAt:        211,
 		TOQPending:       true,
@@ -3349,6 +3342,7 @@ func TestDecodeEPaxosRecordMigratesPreTOQChecksums(t *testing.T) {
 		Status:  epaxos.StatusAccepted,
 		Seq:     14,
 		Deps:    []epaxos.InstanceNum{0, 5, 0},
+		Kind:    epaxos.EntryCommand,
 		Command: CommandForPut(49, 1, []byte("v2-fast-false"), []byte("value-false")),
 	}
 	version2FastFalse.Checksum = legacyEPaxosChecksumWithoutTOQ(version2FastFalse)
@@ -3359,6 +3353,7 @@ func TestDecodeEPaxosRecordMigratesPreTOQChecksums(t *testing.T) {
 		Status:           epaxos.StatusPreAccepted,
 		Seq:              15,
 		Deps:             []epaxos.InstanceNum{6, 0, 0},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(49, 2, []byte("v2-fast-true"), []byte("value-true")),
 		FastPathEligible: true,
 	}
@@ -3370,6 +3365,7 @@ func TestDecodeEPaxosRecordMigratesPreTOQChecksums(t *testing.T) {
 		Status:           epaxos.StatusPreAccepted,
 		Seq:              16,
 		Deps:             []epaxos.InstanceNum{0, 0, 7},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(49, 3, []byte("v1-fast-true"), []byte("value-true")),
 		FastPathEligible: true,
 	}
@@ -3429,15 +3425,15 @@ func TestDecodeEPaxosRecordMigratesPreTOQChecksums(t *testing.T) {
 					t.Fatalf("decoded deps = %#v, want %#v", got.Deps, tt.record.Deps)
 				}
 			}
-			if got.Command.ID != tt.record.Command.ID || got.Command.Kind != tt.record.Command.Kind || string(got.Command.Payload) != string(tt.record.Command.Payload) {
+			if got.Command.ID != tt.record.Command.ID || got.Kind != tt.record.Kind || string(got.Command.Payload) != string(tt.record.Command.Payload) {
 				t.Fatalf("decoded command = %#v, want %#v", got.Command, tt.record.Command)
 			}
-			if len(got.Command.ConflictKeys) != len(tt.record.Command.ConflictKeys) {
-				t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.ConflictKeys, tt.record.Command.ConflictKeys)
+			if len(got.Command.Footprint.Points) != len(tt.record.Command.Footprint.Points) {
+				t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.Footprint.Points, tt.record.Command.Footprint.Points)
 			}
-			for i := range got.Command.ConflictKeys {
-				if string(got.Command.ConflictKeys[i]) != string(tt.record.Command.ConflictKeys[i]) {
-					t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.ConflictKeys, tt.record.Command.ConflictKeys)
+			for i := range got.Command.Footprint.Points {
+				if string(got.Command.Footprint.Points[i]) != string(tt.record.Command.Footprint.Points[i]) {
+					t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.Footprint.Points, tt.record.Command.Footprint.Points)
 				}
 			}
 		})
@@ -3451,7 +3447,8 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 		Status:     epaxos.StatusPreAccepted,
 		Seq:        12,
 		Deps:       []epaxos.InstanceNum{0, 4, 0},
-		Command:    epaxos.Command{ID: epaxos.CommandID{Client: 47, Sequence: 3}, Payload: []byte("legacy-multi-key-payload"), ConflictKeys: [][]byte{[]byte("legacy-key-a"), []byte("legacy-key-b")}},
+		Kind:       epaxos.EntryCommand,
+		Command:    epaxos.Command{ID: epaxos.CommandID{Client: 47, Sequence: 3}, Payload: []byte("legacy-multi-key-payload"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("legacy-key-a"), []byte("legacy-key-b")}}},
 		ProcessAt:  99,
 		TOQPending: true,
 		// This flag was not present in the legacy checksum layout; decoding must
@@ -3532,15 +3529,15 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 					t.Fatalf("decoded deps = %#v, want %#v", got.Deps, tt.record.Deps)
 				}
 			}
-			if got.Command.ID != tt.record.Command.ID || got.Command.Kind != tt.record.Command.Kind || string(got.Command.Payload) != string(tt.record.Command.Payload) {
+			if got.Command.ID != tt.record.Command.ID || got.Kind != tt.record.Kind || string(got.Command.Payload) != string(tt.record.Command.Payload) {
 				t.Fatalf("decoded command = %#v, want %#v", got.Command, tt.record.Command)
 			}
-			if len(got.Command.ConflictKeys) != len(tt.record.Command.ConflictKeys) {
-				t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.ConflictKeys, tt.record.Command.ConflictKeys)
+			if len(got.Command.Footprint.Points) != len(tt.record.Command.Footprint.Points) {
+				t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.Footprint.Points, tt.record.Command.Footprint.Points)
 			}
-			for i := range got.Command.ConflictKeys {
-				if string(got.Command.ConflictKeys[i]) != string(tt.record.Command.ConflictKeys[i]) {
-					t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.ConflictKeys, tt.record.Command.ConflictKeys)
+			for i := range got.Command.Footprint.Points {
+				if string(got.Command.Footprint.Points[i]) != string(tt.record.Command.Footprint.Points[i]) {
+					t.Fatalf("decoded conflict keys = %#v, want %#v", got.Command.Footprint.Points, tt.record.Command.Footprint.Points)
 				}
 			}
 		})
@@ -3557,7 +3554,7 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 		}
 
 		var loaded []epaxos.InstanceRecord
-		if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+		if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 			loaded = append(loaded, rec)
 			return nil
 		}); err != nil {
@@ -3580,18 +3577,18 @@ func TestDecodeEPaxosRecordAcceptsVersion1FastPathCompatibility(t *testing.T) {
 		if got.Ref != legacyNoFastPath.Ref || got.Ballot != legacyNoFastPath.Ballot || got.Status != legacyNoFastPath.Status || got.Seq != legacyNoFastPath.Seq {
 			t.Fatalf("loaded metadata = %#v, want %#v", got, legacyNoFastPath)
 		}
-		if len(got.Command.ConflictKeys) != len(legacyNoFastPath.Command.ConflictKeys) {
-			t.Fatalf("loaded conflict keys = %#v, want %#v", got.Command.ConflictKeys, legacyNoFastPath.Command.ConflictKeys)
+		if len(got.Command.Footprint.Points) != len(legacyNoFastPath.Command.Footprint.Points) {
+			t.Fatalf("loaded conflict keys = %#v, want %#v", got.Command.Footprint.Points, legacyNoFastPath.Command.Footprint.Points)
 		}
-		for i := range got.Command.ConflictKeys {
-			if string(got.Command.ConflictKeys[i]) != string(legacyNoFastPath.Command.ConflictKeys[i]) {
-				t.Fatalf("loaded conflict keys = %#v, want %#v", got.Command.ConflictKeys, legacyNoFastPath.Command.ConflictKeys)
+		for i := range got.Command.Footprint.Points {
+			if string(got.Command.Footprint.Points[i]) != string(legacyNoFastPath.Command.Footprint.Points[i]) {
+				t.Fatalf("loaded conflict keys = %#v, want %#v", got.Command.Footprint.Points, legacyNoFastPath.Command.Footprint.Points)
 			}
 		}
 	})
 }
 
-func TestApplyReadyDoesNotPersistExecutedRecordWhenKVStagingFails(t *testing.T) {
+func TestApplyReadyPersistsProtocolRecordBeforeKVStagingFailure(t *testing.T) {
 	path := t.TempDir()
 	db, err := Open(path)
 	if err != nil {
@@ -3612,8 +3609,8 @@ func TestApplyReadyDoesNotPersistExecutedRecordWhenKVStagingFails(t *testing.T) 
 		return &failOnSetBatch{inner: db.pebble.NewBatch(), failAt: 2, err: setErr}
 	}
 	err = db.ApplyReady(epaxos.Ready{
-		Records:   []epaxos.InstanceRecord{rec},
-		Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
+		Records: []epaxos.InstanceRecord{rec},
+		Apply:   []epaxos.ApplyCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
 	})
 	if !errors.Is(err, setErr) {
 		t.Fatalf("err=%v", err)
@@ -3628,14 +3625,14 @@ func TestApplyReadyDoesNotPersistExecutedRecordWhenKVStagingFails(t *testing.T) 
 	}
 	defer func() { _ = db.Close() }()
 	var loaded []epaxos.InstanceRecord
-	if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 		loaded = append(loaded, rec)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded) != 0 {
-		t.Fatalf("failed ApplyReady persisted consensus records: %#v", loaded)
+	if len(loaded) != 1 || loaded[0].Ref != ref || loaded[0].Status != epaxos.StatusExecuted {
+		t.Fatalf("failed application stage did not retain durable protocol record: %#v", loaded)
 	}
 	if value, ok, err := db.Get([]byte("atomic-key")); err != nil || ok {
 		t.Fatalf("failed ApplyReady value=%q ok=%v err=%v", value, ok, err)
@@ -3657,7 +3654,7 @@ func TestPebbleStorageLoadInstancesReturnsIteratorDecodeAndCallbackErrors(t *tes
 			return nil, sentinel
 		}
 		t.Cleanup(func() { newPebbleStorageIter = oldNewIter })
-		err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error {
+		err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error {
 			t.Fatal("callback must not run when iterator creation fails")
 			return nil
 		})
@@ -3679,7 +3676,7 @@ func TestPebbleStorageLoadInstancesReturnsIteratorDecodeAndCallbackErrors(t *tes
 		if err := db.pebble.Set(epaxosRecordKey(ref), []byte{epaxosRecordCodec + 1}, pebble.Sync); err != nil {
 			t.Fatal(err)
 		}
-		err = db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error {
+		err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error {
 			t.Fatal("callback must not run for a malformed durable record")
 			return nil
 		})
@@ -3707,7 +3704,7 @@ func TestPebbleStorageLoadInstancesReturnsIteratorDecodeAndCallbackErrors(t *tes
 		}
 		sentinel := errors.New("load callback")
 		var seen []epaxos.InstanceRef
-		err = db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+		err = db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 			seen = append(seen, rec.Ref)
 			return sentinel
 		})
@@ -3734,7 +3731,7 @@ func TestPebbleStorageApplyReadyRejectsBadRecordsAndLeavesStorageUnchanged(t *te
 		t.Fatalf("err=%v", err)
 	}
 	var loaded []epaxos.InstanceRecord
-	if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 		loaded = append(loaded, rec)
 		return nil
 	}); err != nil {
@@ -3745,7 +3742,7 @@ func TestPebbleStorageApplyReadyRejectsBadRecordsAndLeavesStorageUnchanged(t *te
 	}
 }
 
-func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
+func TestDBApplyReadyErrorPathsRespectDurabilityPhases(t *testing.T) {
 	t.Run("empty ready bypasses batch", func(t *testing.T) {
 		db, err := Open(t.TempDir())
 		if err != nil {
@@ -3775,8 +3772,8 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 		bad := epaxos.InstanceRecord{Ref: epaxos.InstanceRef{Replica: 1, Instance: 10, Conf: 1}, Checksum: [32]byte{1}}
 		cmd := CommandForPut(42, 1, []byte("bad-ready"), []byte("value"))
 		err = db.ApplyReady(epaxos.Ready{
-			Records:   []epaxos.InstanceRecord{bad},
-			Committed: []epaxos.CommittedCommand{{Ref: bad.Ref, Command: cmd}},
+			Records: []epaxos.InstanceRecord{bad},
+			Apply:   []epaxos.ApplyCommand{{Ref: bad.Ref, Command: cmd}},
 		})
 		if !errors.Is(err, epaxos.ErrChecksumMismatch) {
 			t.Fatalf("err=%v", err)
@@ -3802,7 +3799,7 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 		payload = append(payload, opPut)
 		payload = appendKVFields(payload, []byte("txn-ready"), []byte("value"))
 		payload = append(payload, opPut, 9)
-		cmd := epaxos.Command{Payload: payload, ConflictKeys: [][]byte{[]byte("txn-ready")}}
+		cmd := epaxos.Command{Payload: payload, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("txn-ready")}}}
 		rec := checkedKVRecord(epaxos.InstanceRecord{
 			Ref:     ref,
 			Ballot:  epaxos.Ballot{Number: 1, Replica: 1},
@@ -3812,13 +3809,15 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 			Command: cmd,
 		})
 		err = db.ApplyReady(epaxos.Ready{
-			Records:   []epaxos.InstanceRecord{rec},
-			Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
+			Records: []epaxos.InstanceRecord{rec},
+			Apply:   []epaxos.ApplyCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
 		})
-		if err == nil || !strings.Contains(err.Error(), "kv: malformed command") {
+		if err == nil || !strings.Contains(err.Error(), "applied command requires a nonzero command ID") {
 			t.Fatalf("err=%v", err)
 		}
-		assertNoEPaxosRecords(t, db)
+		if got, ok, err := db.EPaxosStorage().LoadInstance(ref); err != nil || !ok || got.Status != epaxos.StatusExecuted {
+			t.Fatalf("protocol record after rejected application command got=%#v ok=%v err=%v", got, ok, err)
+		}
 		if value, ok, err := db.Get([]byte("txn-ready")); err != nil || ok {
 			t.Fatalf("malformed command value=%q ok=%v err=%v", value, ok, err)
 		}
@@ -3844,7 +3843,7 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 		}
 		cmd := CommandForPut(42, 4, key, []byte("value"))
 		err = db.ApplyReady(epaxos.Ready{
-			Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: 1, Deps: []epaxos.InstanceNum{0}, Command: cmd}},
+			Apply: []epaxos.ApplyCommand{{Ref: ref, Seq: 1, Deps: []epaxos.InstanceNum{0}, Command: cmd}},
 		})
 		if !errors.Is(err, lookupErr) {
 			t.Fatalf("err=%v", err)
@@ -3884,13 +3883,15 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 			Command: cmd,
 		})
 		err = db.ApplyReady(epaxos.Ready{
-			Records:   []epaxos.InstanceRecord{rec},
-			Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
+			Records: []epaxos.InstanceRecord{rec},
+			Apply:   []epaxos.ApplyCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
 		})
 		if !errors.Is(err, markerErr) {
 			t.Fatalf("err=%v", err)
 		}
-		assertNoEPaxosRecords(t, db)
+		if got, ok, err := db.EPaxosStorage().LoadInstance(ref); err != nil || !ok || got.Status != epaxos.StatusExecuted {
+			t.Fatalf("protocol record after application marker failure got=%#v ok=%v err=%v", got, ok, err)
+		}
 		if value, ok, err := db.Get(key); err != nil || ok {
 			t.Fatalf("marker write failure value=%q ok=%v err=%v", value, ok, err)
 		}
@@ -3924,8 +3925,8 @@ func TestDBApplyReadyErrorPathsDoNotAdvanceDurableOrKVState(t *testing.T) {
 			Command: cmd,
 		})
 		err = db.ApplyReady(epaxos.Ready{
-			Records:   []epaxos.InstanceRecord{rec},
-			Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
+			Records: []epaxos.InstanceRecord{rec},
+			Apply:   []epaxos.ApplyCommand{{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: cmd}},
 		})
 		if !errors.Is(err, commitErr) {
 			t.Fatalf("err=%v", err)
@@ -3973,7 +3974,7 @@ func TestDecodeEPaxosRecordRejectsMalformedRecords(t *testing.T) {
 		Deps:    []epaxos.InstanceNum{0},
 		Command: CommandForPut(44, 1, []byte("decode"), []byte("value")),
 	})
-	corruptChecksum := encodeEPaxosRecord(valid)
+	corruptChecksum := encodeHistoricalEPaxosRecordKV(valid, 8)
 	corruptChecksum[len(corruptChecksum)-1] ^= 0x80
 	tests := []struct {
 		name    string
@@ -3985,7 +3986,7 @@ func TestDecodeEPaxosRecordRejectsMalformedRecords(t *testing.T) {
 		{name: "excessive dependency count", record: malformedEPaxosRecord(129, 0, true), wantErr: "kv: bad epaxos dependency count"},
 		{name: "excessive conflict key count", record: malformedEPaxosRecord(0, 129, true), wantErr: "kv: bad epaxos conflict-key count"},
 		{name: "short checksum", record: malformedEPaxosRecord(0, 0, false), wantErr: "kv: malformed epaxos record"},
-		{name: "extra bytes", record: append(encodeEPaxosRecord(valid), 1), wantErr: "kv: malformed epaxos record"},
+		{name: "extra bytes", record: append(encodeHistoricalEPaxosRecordKV(valid, 8), 1), wantErr: "kv: malformed epaxos record"},
 		{name: "checksum mismatch", record: corruptChecksum, wantIs: epaxos.ErrChecksumMismatch},
 	}
 	for _, tt := range tests {
@@ -4094,7 +4095,7 @@ func TestApplyCommittedEmptyTxnAndDeleteSetErrorDoNotAdvanceTimestamp(t *testing
 		db.newBatch = func() txnBatch {
 			return txnBatchWithCommitErr{err: commitErr}
 		}
-		if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: CommandForTxn(45, 1, nil)}); err != nil {
+		if err := db.ApplyCommitted(epaxos.ApplyCommand{Command: CommandForTxn(45, 1, nil)}); err != nil {
 			t.Fatalf("empty transaction err=%v", err)
 		}
 		if got := db.nextRecordTime(); got != 6 {
@@ -4113,7 +4114,7 @@ func TestApplyCommittedEmptyTxnAndDeleteSetErrorDoNotAdvanceTimestamp(t *testing
 		db.newBatch = func() txnBatch {
 			return txnBatchWithSetErr{err: setErr}
 		}
-		err = db.ApplyCommitted(epaxos.CommittedCommand{
+		err = db.ApplyCommitted(epaxos.ApplyCommand{
 			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 15, Conf: 1},
 			Command: CommandForDelete(45, 2, []byte("delete-set")),
 		})
@@ -4132,7 +4133,7 @@ func TestApplyCommittedEmptyTxnAndDeleteSetErrorDoNotAdvanceTimestamp(t *testing
 func assertNoEPaxosRecords(t *testing.T, db *DB) {
 	t.Helper()
 	var loaded []epaxos.InstanceRecord
-	if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 		loaded = append(loaded, rec)
 		return nil
 	}); err != nil {
@@ -4144,7 +4145,7 @@ func assertNoEPaxosRecords(t *testing.T, db *DB) {
 }
 
 func malformedEPaxosRecord(deps, keys uint64, withChecksum bool) []byte {
-	out := []byte{epaxosRecordCodec}
+	out := []byte{8}
 	for range 11 {
 		out = binary.AppendUvarint(out, 1)
 	}
@@ -4170,7 +4171,7 @@ func malformedEPaxosRecord(deps, keys uint64, withChecksum bool) []byte {
 }
 
 func malformedEPaxosRecordWithAcceptDeps(acceptDeps uint64) []byte {
-	out := []byte{epaxosRecordCodec}
+	out := []byte{8}
 	for range 11 {
 		out = binary.AppendUvarint(out, 1)
 	}
@@ -4181,7 +4182,7 @@ func malformedEPaxosRecordWithAcceptDeps(acceptDeps uint64) []byte {
 }
 
 func malformedEPaxosRecordWithAcceptEvidence(evidence uint64, fields ...uint64) []byte {
-	out := []byte{epaxosRecordCodec}
+	out := []byte{8}
 	for range 11 {
 		out = binary.AppendUvarint(out, 1)
 	}
@@ -4209,13 +4210,14 @@ func legacyEPaxosRecordV1(rec epaxos.InstanceRecord) []byte {
 	for _, dep := range rec.Deps {
 		out = binary.AppendUvarint(out, uint64(dep))
 	}
-	out = binary.AppendUvarint(out, rec.Command.ID.Client)
-	out = binary.AppendUvarint(out, rec.Command.ID.Sequence)
-	out = binary.AppendUvarint(out, uint64(rec.Command.Kind))
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.Payload)))
-	out = append(out, rec.Command.Payload...)
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	out = binary.AppendUvarint(out, id.Client)
+	out = binary.AppendUvarint(out, id.Sequence)
+	out = binary.AppendUvarint(out, uint64(kind))
+	out = binary.AppendUvarint(out, uint64(len(payload)))
+	out = append(out, payload...)
+	out = binary.AppendUvarint(out, uint64(len(points)))
+	for _, key := range points {
 		out = binary.AppendUvarint(out, uint64(len(key)))
 		out = append(out, key...)
 	}
@@ -4276,13 +4278,14 @@ func legacyEPaxosRecordV4WithoutRecordBallot(rec epaxos.InstanceRecord) []byte {
 	for _, dep := range rec.AcceptDeps {
 		out = binary.AppendUvarint(out, uint64(dep))
 	}
-	out = binary.AppendUvarint(out, rec.Command.ID.Client)
-	out = binary.AppendUvarint(out, rec.Command.ID.Sequence)
-	out = binary.AppendUvarint(out, uint64(rec.Command.Kind))
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.Payload)))
-	out = append(out, rec.Command.Payload...)
-	out = binary.AppendUvarint(out, uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	out = binary.AppendUvarint(out, id.Client)
+	out = binary.AppendUvarint(out, id.Sequence)
+	out = binary.AppendUvarint(out, uint64(kind))
+	out = binary.AppendUvarint(out, uint64(len(payload)))
+	out = append(out, payload...)
+	out = binary.AppendUvarint(out, uint64(len(points)))
+	for _, key := range points {
 		out = binary.AppendUvarint(out, uint64(len(key)))
 		out = append(out, key...)
 	}
@@ -4333,12 +4336,13 @@ func legacyEPaxosChecksumV4WithoutRecordBallot(rec epaxos.InstanceRecord) [32]by
 	for _, dep := range rec.AcceptDeps {
 		writeUint64(uint64(dep))
 	}
-	writeUint64(rec.Command.ID.Client)
-	writeUint64(rec.Command.ID.Sequence)
-	writeByte(byte(rec.Command.Kind))
-	writeBytes(rec.Command.Payload)
-	writeUint64(uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	writeUint64(id.Client)
+	writeUint64(id.Sequence)
+	writeByte(kind)
+	writeBytes(payload)
+	writeUint64(uint64(len(points)))
+	for _, key := range points {
 		writeBytes(key)
 	}
 	if rec.FastPathEligible {
@@ -4398,12 +4402,13 @@ func legacyEPaxosChecksum(rec epaxos.InstanceRecord, includeFastPath, includeTOQ
 	for _, dep := range rec.Deps {
 		writeUint64(uint64(dep))
 	}
-	writeUint64(rec.Command.ID.Client)
-	writeUint64(rec.Command.ID.Sequence)
-	writeByte(byte(rec.Command.Kind))
-	writeBytes(rec.Command.Payload)
-	writeUint64(uint64(len(rec.Command.ConflictKeys)))
-	for _, key := range rec.Command.ConflictKeys {
+	kind, id, payload, points := legacyEntryValueKV(rec)
+	writeUint64(id.Client)
+	writeUint64(id.Sequence)
+	writeByte(kind)
+	writeBytes(payload)
+	writeUint64(uint64(len(points)))
+	for _, key := range points {
 		writeBytes(key)
 	}
 	if includeFastPath {
@@ -4577,6 +4582,19 @@ func (b *failOnSetBatch) Close() error {
 }
 
 func checkedKVRecord(rec epaxos.InstanceRecord) epaxos.InstanceRecord {
+	if rec.Kind == 0 && rec.Status >= epaxos.StatusPreAccepted {
+		if rec.Command.ID != (epaxos.CommandID{}) || len(rec.Command.Payload) != 0 ||
+			rec.Command.Footprint.All || len(rec.Command.Footprint.Points) != 0 ||
+			len(rec.Command.Footprint.Spans) != 0 || len(rec.Command.CycleKey) != 0 {
+			rec.Kind = epaxos.EntryCommand
+		} else {
+			rec.Kind = epaxos.EntryNoop
+		}
+	}
+	if rec.Kind == epaxos.EntryCommand && !rec.Command.Footprint.All &&
+		len(rec.Command.Footprint.Points) == 0 && len(rec.Command.Footprint.Spans) == 0 {
+		rec.Command.Footprint.All = true
+	}
 	if rec.Status >= epaxos.StatusPreAccepted && rec.RecordBallot == (epaxos.Ballot{}) {
 		rec.RecordBallot = rec.Ballot
 	}
@@ -4671,7 +4689,7 @@ func TestApplyCommittedChangesPersistAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commands := []epaxos.CommittedCommand{
+	commands := []epaxos.ApplyCommand{
 		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: CommandForPut(7, 1, []byte("applied-put"), []byte("one"))},
 		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Command: CommandForPut(7, 2, []byte("applied-deleted"), []byte("before"))},
 		{Ref: epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1}, Command: CommandForDelete(7, 3, []byte("applied-deleted"))},
@@ -4718,10 +4736,10 @@ func TestApplyCommittedSameRefSameKeyKeepsLaterValue(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	ref := epaxos.InstanceRef{Replica: 1, Instance: 44, Conf: 1}
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: ref, Command: CommandForPut(7, 1, []byte("same-ref"), []byte("first"))}); err != nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Ref: ref, Command: CommandForPut(7, 1, []byte("same-ref"), []byte("first"))}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: ref, Command: CommandForPut(7, 2, []byte("same-ref"), []byte("second"))}); err != nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Ref: ref, Command: CommandForPut(7, 2, []byte("same-ref"), []byte("second"))}); err != nil {
 		t.Fatal(err)
 	}
 	value, ok, err := db.Get([]byte("same-ref"))

@@ -4,8 +4,10 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -20,6 +22,8 @@ const (
 	opPut        byte = 1
 	opDelete     byte = 2
 	opTxn        byte = 3
+	opGet        byte = 4
+	opScan       byte = 5
 )
 
 var (
@@ -360,7 +364,7 @@ func (db *DB) newWriteBatch() txnBatch {
 }
 
 // ApplyCommitted applies one committed EPaxOS command to the key-value store.
-func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
+func (db *DB) ApplyCommitted(cmd epaxos.ApplyCommand) error {
 	batch := db.newWriteBatch()
 	defer func() { _ = batch.Close() }()
 	next := db.nextRecordTime()
@@ -378,8 +382,8 @@ func (db *DB) ApplyCommitted(cmd epaxos.CommittedCommand) error {
 	return nil
 }
 
-func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.CommittedCommand, next *uint64) (bool, error) {
-	if cmd.Command.Kind == epaxos.CommandNoop || len(cmd.Command.Payload) == 0 {
+func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.ApplyCommand, next *uint64) (bool, error) {
+	if len(cmd.Command.Payload) == 0 {
 		return false, nil
 	}
 	op := cmd.Command.Payload[0]
@@ -420,6 +424,78 @@ func (db *DB) stageCommitted(batch txnBatch, cmd epaxos.CommittedCommand, next *
 	default:
 		return false, fmt.Errorf("kv: unknown op %d", op)
 	}
+}
+
+// OrderedGetResult is the durable response of an ordered point read.
+type OrderedGetResult struct {
+	Found bool   `json:"found"`
+	Value []byte `json:"value,omitempty"`
+}
+
+// OrderedScanResult is the durable response of an ordered range read.
+type OrderedScanResult struct {
+	Rows []KV `json:"rows"`
+}
+
+func (db *DB) executeOrderedRead(command epaxos.Command) ([]byte, bool, error) {
+	if len(command.Payload) == 0 {
+		return nil, false, nil
+	}
+	p := parser{b: command.Payload[1:]}
+	switch command.Payload[0] {
+	case opGet:
+		key := p.bytes()
+		_ = p.bytes()
+		if p.err || len(p.b) != 0 {
+			return nil, true, fmt.Errorf("kv: malformed ordered get")
+		}
+		if err := ValidateKey(key); err != nil {
+			return nil, true, err
+		}
+		value, found, err := db.Get(key)
+		if err != nil {
+			return nil, true, err
+		}
+		response, err := json.Marshal(OrderedGetResult{Found: found, Value: value})
+		return response, true, err
+	case opScan:
+		start := p.bytes()
+		end := p.bytes()
+		prefix := p.bytes()
+		limit := p.uvarint()
+		reverse := p.byte()
+		if p.err || len(p.b) != 0 || limit == 0 || limit > uint64(^uint(0)>>1) || reverse > 1 {
+			return nil, true, fmt.Errorf("kv: malformed ordered scan")
+		}
+		rows, err := db.Scan(ScanOptions{
+			Start: start, End: end, Prefix: prefix, Limit: int(limit), Reverse: reverse == 1,
+		})
+		if err != nil {
+			return nil, true, err
+		}
+		response, err := json.Marshal(OrderedScanResult{Rows: rows})
+		return response, true, err
+	default:
+		return nil, false, nil
+	}
+}
+
+// DecodeOrderedGetResult decodes a durable ordered point-read response.
+func DecodeOrderedGetResult(response []byte) (OrderedGetResult, error) {
+	var result OrderedGetResult
+	if err := json.Unmarshal(response, &result); err != nil {
+		return OrderedGetResult{}, fmt.Errorf("kv: malformed ordered get result: %w", err)
+	}
+	return result, nil
+}
+
+// DecodeOrderedScanResult decodes a durable ordered range-read response.
+func DecodeOrderedScanResult(response []byte) (OrderedScanResult, error) {
+	var result OrderedScanResult
+	if err := json.Unmarshal(response, &result); err != nil {
+		return OrderedScanResult{}, fmt.Errorf("kv: malformed ordered scan result: %w", err)
+	}
+	return result, nil
 }
 
 func (db *DB) stageTxn(batch txnBatch, p *parser, next *uint64) (bool, error) {
@@ -693,13 +769,13 @@ func (db *DB) Scan(opt ScanOptions) ([]KV, error) {
 // CommandForPut encodes a deterministic EPaxos command for a key update.
 func CommandForPut(client, seq uint64, key, value []byte) epaxos.Command {
 	payload := appendKVCommand(opPut, key, value)
-	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: [][]byte{append([]byte(nil), key...)}}
+	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, Footprint: epaxos.Footprint{Points: [][]byte{append([]byte(nil), key...)}}}
 }
 
 // CommandForDelete encodes a deterministic EPaxos command for a key delete.
 func CommandForDelete(client, seq uint64, key []byte) epaxos.Command {
 	payload := appendKVCommand(opDelete, key, nil)
-	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: [][]byte{append([]byte(nil), key...)}}
+	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, Footprint: epaxos.Footprint{Points: [][]byte{append([]byte(nil), key...)}}}
 }
 
 // CommandForTxn encodes an atomic multi-key transaction command.
@@ -707,19 +783,73 @@ func CommandForTxn(client, seq uint64, ops []TxnOp) epaxos.Command {
 	payload := appendKVTxn(ops)
 	keys := make([][]byte, 0, len(ops))
 	for _, op := range ops {
-		duplicate := false
-		for _, key := range keys {
-			if bytes.Equal(key, op.Key) {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
-			keys = append(keys, append([]byte(nil), op.Key...))
+		keys = append(keys, append([]byte(nil), op.Key...))
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
+	deduplicated := keys[:0]
+	for _, key := range keys {
+		if len(deduplicated) == 0 || !bytes.Equal(deduplicated[len(deduplicated)-1], key) {
+			deduplicated = append(deduplicated, key)
 		}
 	}
-	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, ConflictKeys: keys}
+	return epaxos.Command{ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, Footprint: epaxos.Footprint{Points: deduplicated}}
 }
+
+// CommandForGet encodes a latest-value point read ordered through EPaxos.
+func CommandForGet(client, seq uint64, key []byte) epaxos.Command {
+	payload := appendKVCommand(opGet, key, nil)
+	return epaxos.Command{
+		ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload,
+		Footprint: epaxos.Footprint{Points: [][]byte{append([]byte(nil), key...)}},
+	}
+}
+
+// CommandForScan encodes a latest-value range read ordered through EPaxos.
+func CommandForScan(client, seq uint64, options ScanOptions) (epaxos.Command, error) {
+	if options.Bounds.mode != timestampLatest || options.Limit <= 0 {
+		return epaxos.Command{}, fmt.Errorf("kv: ordered scan requires latest-value bounds and a positive limit")
+	}
+	var footprint epaxos.Footprint
+	switch {
+	case len(options.Prefix) != 0:
+		if len(options.Start) != 0 || len(options.End) != 0 {
+			return epaxos.Command{}, fmt.Errorf("kv: ambiguous ordered scan bounds")
+		}
+		if err := ValidateKey(options.Prefix); err != nil {
+			return epaxos.Command{}, err
+		}
+		end := prefixLimit(options.Prefix)
+		if end == nil {
+			footprint.All = true
+		} else {
+			footprint.Spans = []epaxos.Span{{Start: append([]byte(nil), options.Prefix...), End: end}}
+		}
+	case len(options.Start) != 0 && len(options.End) != 0 && bytes.Compare(options.Start, options.End) < 0:
+		if err := ValidateKey(options.Start); err != nil {
+			return epaxos.Command{}, err
+		}
+		if err := ValidateKey(options.End); err != nil {
+			return epaxos.Command{}, err
+		}
+		footprint.Spans = []epaxos.Span{{Start: append([]byte(nil), options.Start...), End: append([]byte(nil), options.End...)}}
+	default:
+		return epaxos.Command{}, fmt.Errorf("kv: invalid ordered scan bounds")
+	}
+	payload := []byte{opScan}
+	payload = appendLengthBytes(payload, options.Start)
+	payload = appendLengthBytes(payload, options.End)
+	payload = appendLengthBytes(payload, options.Prefix)
+	payload = binary.AppendUvarint(payload, uint64(options.Limit))
+	if options.Reverse {
+		payload = append(payload, 1)
+	} else {
+		payload = append(payload, 0)
+	}
+	return epaxos.Command{
+		ID: epaxos.CommandID{Client: client, Sequence: seq}, Payload: payload, Footprint: footprint,
+	}, nil
+}
+
 
 // EncodeDataKey appends a MyRocks-like data key to dst.
 func EncodeDataKey(dst []byte, cf uint32, user []byte, ts uint64) []byte {
@@ -751,6 +881,11 @@ func DecodeDataKey(k []byte, cf uint32) ([]byte, uint64, bool) {
 	user := k[5:sep]
 	ts := ^binary.BigEndian.Uint64(k[len(k)-8:])
 	return user, ts, true
+}
+
+func appendLengthBytes(out, value []byte) []byte {
+	out = binary.AppendUvarint(out, uint64(len(value)))
+	return append(out, value...)
 }
 
 func appendKVCommand(op byte, key, value []byte) []byte {

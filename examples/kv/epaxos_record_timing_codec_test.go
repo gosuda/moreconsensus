@@ -14,7 +14,7 @@ import (
 	"gosuda.org/moreconsensus/epaxos"
 )
 
-func TestEPaxosRecordCodecV8TimingDomainsRoundTrip(t *testing.T) {
+func TestEPaxosRecordCodecV9TimingDomainsRoundTrip(t *testing.T) {
 	tests := []struct {
 		name      string
 		domain    epaxos.TimingDomain
@@ -29,23 +29,8 @@ func TestEPaxosRecordCodecV8TimingDomainsRoundTrip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			record := timingCodecRecordKV(epaxos.InstanceNum(i+1), tc.domain, tc.processAt, tc.pending) //nolint:gosec // loop index is non-negative
 			encoded := encodeEPaxosRecord(record)
-			if encoded[0] != 8 {
-				t.Fatalf("codec version=%d, want 8", encoded[0])
-			}
-			domainAt := timingDomainOffsetKV(record, encoded)
-			if encoded[domainAt] != byte(tc.domain) {
-				t.Fatalf("encoded timing domain=%d, want %d", encoded[domainAt], tc.domain)
-			}
-			if encoded[domainAt+1] != boolByteKV(tc.pending) || encoded[domainAt+2] != boolByteKV(record.FastPathEligible) {
-				t.Fatalf("encoded timing suffix=%x, want domain/pending/fast=%d/%d/%d", encoded[domainAt:domainAt+3], tc.domain, boolByteKV(tc.pending), boolByteKV(record.FastPathEligible))
-			}
-
-			legacy := record
-			legacy.TimingDomain = epaxos.TimingDomainUntimed
-			legacy.Checksum = epaxos.ChecksumRecordWithoutTimingDomain(legacy)
-			legacyEncoded := encodeHistoricalEPaxosRecordKV(legacy, 7)
-			if len(encoded) != len(legacyEncoded)+1 {
-				t.Fatalf("v8 length=%d, v7 length=%d, want one added domain byte", len(encoded), len(legacyEncoded))
+			if encoded[0] != 9 {
+				t.Fatalf("codec version=%d, want 9", encoded[0])
 			}
 
 			decoded, err := decodeEPaxosRecord(encoded)
@@ -56,7 +41,7 @@ func TestEPaxosRecordCodecV8TimingDomainsRoundTrip(t *testing.T) {
 				t.Fatalf("decoded timing=(%d,%d,%t), want (%d,%d,%t)", decoded.TimingDomain, decoded.ProcessAt, decoded.TOQPending, tc.domain, tc.processAt, tc.pending)
 			}
 			if decoded.Checksum != record.Checksum || !epaxos.VerifyRecordChecksum(decoded) {
-				t.Fatalf("decoded v8 record has noncanonical checksum %x", decoded.Checksum)
+				t.Fatalf("decoded v9 record has noncanonical checksum %x", decoded.Checksum)
 			}
 		})
 	}
@@ -79,14 +64,14 @@ func TestEPaxosRecordCodecV8RejectsInvalidTimingAndShape(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			record := timingCodecRecordKV(epaxos.InstanceNum(i+20), tc.domain, tc.processAt, tc.pending) //nolint:gosec // loop index is non-negative
 			record.Checksum = epaxos.ChecksumRecord(record)
-			if got, err := decodeEPaxosRecord(encodeEPaxosRecord(record)); err == nil || !strings.Contains(err.Error(), tc.want) || !reflect.DeepEqual(got, epaxos.InstanceRecord{}) {
+			if got, err := decodeEPaxosRecord(encodeHistoricalEPaxosRecordKV(record, 8)); err == nil || !strings.Contains(err.Error(), tc.want) || !reflect.DeepEqual(got, epaxos.InstanceRecord{}) {
 				t.Fatalf("decode invalid timing got=%#v err=%v, want zero record and %q", got, err, tc.want)
 			}
 		})
 	}
 
 	valid := timingCodecRecordKV(40, epaxos.TimingDomainLogical, 91, false)
-	encoded := encodeEPaxosRecord(valid)
+	encoded := encodeHistoricalEPaxosRecordKV(valid, 8)
 	domainAt := timingDomainOffsetKV(valid, encoded)
 	for _, tc := range []struct {
 		name   string
@@ -111,16 +96,16 @@ func TestEPaxosRecordCodecV8RejectsInvalidTimingAndShape(t *testing.T) {
 		record := valid
 		record.Status = epaxos.StatusExecuted + 1
 		record.Checksum = epaxos.ChecksumRecord(record)
-		if _, err := decodeEPaxosRecord(encodeEPaxosRecord(record)); err == nil || !strings.Contains(err.Error(), "record status") {
+		if _, err := decodeEPaxosRecord(encodeHistoricalEPaxosRecordKV(record, 8)); err == nil || !strings.Contains(err.Error(), "record status") {
 			t.Fatalf("decode unknown status error=%v", err)
 		}
 	})
 
 	t.Run("unknown command kind", func(t *testing.T) {
 		record := valid
-		record.Command.Kind = epaxos.CommandConfChange + 1
+		record.Kind = epaxos.EntryKind(255)
 		record.Checksum = epaxos.ChecksumRecord(record)
-		if _, err := decodeEPaxosRecord(encodeEPaxosRecord(record)); err == nil || !strings.Contains(err.Error(), "command kind") {
+		if _, err := decodeEPaxosRecord(encodeHistoricalEPaxosRecordKV(record, 8)); err == nil || !strings.Contains(err.Error(), "command kind") {
 			t.Fatalf("decode unknown command error=%v", err)
 		}
 	})
@@ -210,7 +195,6 @@ func TestEPaxosRecordCodecV7PreservesAmbiguousTimingForCore(t *testing.T) {
 			if tc.pending {
 				inferred := baseConfig
 				inferred.TOQ = true
-				inferred.TOQClock = func() uint64 { return tc.processAt }
 				inferred.MaxDeferredPreAccepts = 1
 				inferred.TOQRuntime = &epaxos.TOQRuntimeConfig{
 					Conf:        epaxos.ConfState{ID: 1, Voters: []epaxos.ReplicaID{1}},
@@ -231,7 +215,6 @@ func TestEPaxosRecordCodecV7PreservesAmbiguousTimingForCore(t *testing.T) {
 				explicit.TimeOptimization = true
 			} else {
 				explicit.TOQ = true
-				explicit.TOQClock = func() uint64 { return tc.processAt }
 			}
 			if _, err := epaxos.NewRawNode(explicit); err != nil {
 				t.Fatalf("startup with explicit legacy domain %d: %v", tc.legacyDomain, err)
@@ -274,14 +257,13 @@ func TestEPaxosRecordCodecV7PreservesAmbiguousTimingForCore(t *testing.T) {
 		toqConfig := baseConfig
 		toqConfig.LegacyProcessAtDomain = &toq
 		toqConfig.TOQ = true
-		toqConfig.TOQClock = func() uint64 { return 0 }
 		if _, err := epaxos.NewRawNode(toqConfig); err != nil {
 			t.Fatalf("zero ProcessAt explicit TOQ migration: %v", err)
 		}
 	})
 }
 
-func TestEPaxosRecordCodecV1ThroughV7MigrateToNoDomainCanonical(t *testing.T) {
+func TestEPaxosRecordCodecV1ThroughV7PreservesAuthenticatedTimingMigrationState(t *testing.T) {
 	for version := byte(1); version <= 7; version++ {
 		t.Run("v"+string(rune('0'+version)), func(t *testing.T) {
 			record := historicalTimingRecordKV(version)
@@ -297,16 +279,7 @@ func TestEPaxosRecordCodecV1ThroughV7MigrateToNoDomainCanonical(t *testing.T) {
 			}
 			wantChecksum := epaxos.ChecksumRecordWithoutTimingDomain(decoded)
 			if decoded.Checksum != wantChecksum || !epaxos.VerifyRecordChecksumWithoutTimingDomain(decoded) {
-				t.Fatalf("decoded v%d checksum=%x, want no-domain canonical %x", version, decoded.Checksum, wantChecksum)
-			}
-			if version == 7 && decoded.Checksum != record.Checksum {
-				t.Fatalf("decoded v7 changed immediately previous checksum from %x to %x", record.Checksum, decoded.Checksum)
-			}
-			if version < 7 && decoded.Checksum == record.Checksum {
-				t.Fatalf("decoded v%d retained pre-v7 checksum %x", version, decoded.Checksum)
-			}
-			if epaxos.VerifyRecordChecksum(decoded) {
-				t.Fatalf("decoded v%d was silently promoted to a v8 checksum", version)
+				t.Fatalf("decoded v%d checksum=%x, want authenticated pre-domain checksum %x", version, decoded.Checksum, wantChecksum)
 			}
 
 			corrupt := append([]byte(nil), encoded...)
@@ -348,7 +321,7 @@ func TestTimingDomainReadyPersistenceReplayAndReopen(t *testing.T) {
 		if len(value) == 0 || value[0] != epaxosRecordCodec {
 			_ = closer.Close()
 			_ = db.Close()
-			t.Fatalf("persisted record %s codec=%x, want v8", record.Ref, value)
+			t.Fatalf("persisted record %s codec=%x, want v9", record.Ref, value)
 		}
 		_ = closer.Close()
 	}
@@ -369,7 +342,7 @@ func TestTimingDomainReadyPersistenceReplayAndReopen(t *testing.T) {
 		t.Fatalf("reopened hard state=%#v, want %#v", gotState.HardState, hardState)
 	}
 	loaded := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
-	if err := reopened.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := reopened.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		loaded[record.Ref] = record
 		return nil
 	}); err != nil {
@@ -409,7 +382,7 @@ func TestTimingDomainMalformedReadyDoesNotPartiallyWrite(t *testing.T) {
 		t.Fatalf("malformed replay partially persisted hard state %#v", gotState.HardState)
 	}
 	loaded := make(map[epaxos.InstanceRef]struct{})
-	if err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		loaded[record.Ref] = struct{}{}
 		return nil
 	}); err != nil {
@@ -465,7 +438,7 @@ func TestTimingDomainCheckpointDigestRestoreAndRepair(t *testing.T) {
 			}
 			defer func() { _ = restored.Close() }()
 			loaded := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
-			if err := restored.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+			if err := restored.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 				loaded[record.Ref] = record
 				return nil
 			}); err != nil {
@@ -490,6 +463,7 @@ func timingCodecRecordKV(instance epaxos.InstanceNum, domain epaxos.TimingDomain
 		Status:           epaxos.StatusPreAccepted,
 		Seq:              uint64(instance),
 		Deps:             []epaxos.InstanceNum{0},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(900, uint64(instance), []byte("timing-codec"), []byte{byte(instance)}), //nolint:gosec // test helper uses small instance numbers
 		FastPathEligible: true,
 		ProcessAt:        processAt,
@@ -526,6 +500,7 @@ func historicalTimingRecordKV(version byte) epaxos.InstanceRecord {
 		Status:           epaxos.StatusPreAccepted,
 		Seq:              uint64(100 + version),
 		Deps:             []epaxos.InstanceNum{0},
+		Kind:             epaxos.EntryCommand,
 		Command:          CommandForPut(901, uint64(version), []byte("historical-timing"), []byte{version}),
 		FastPathEligible: version >= 2,
 	}
@@ -543,7 +518,32 @@ func historicalTimingRecordKV(version byte) epaxos.InstanceRecord {
 	return record
 }
 
+func legacyEntryValueKV(record epaxos.InstanceRecord) (byte, epaxos.CommandID, []byte, [][]byte) {
+	if record.Kind == 0 && (record.Command.ID != (epaxos.CommandID{}) ||
+		len(record.Command.Payload) != 0 || len(record.Command.Footprint.Points) != 0) {
+		return 0, record.Command.ID, record.Command.Payload, record.Command.Footprint.Points
+	}
+	switch record.Kind {
+	case epaxos.EntryCommand:
+		return 0, record.Command.ID, record.Command.Payload, record.Command.Footprint.Points
+	case epaxos.EntryNoop:
+		return 1, epaxos.CommandID{}, nil, nil
+	case epaxos.EntryConfChange:
+		payload := make([]byte, 9)
+		payload[0] = byte(record.ConfChange.Type)
+		binary.LittleEndian.PutUint64(payload[1:], uint64(record.ConfChange.Replica))
+		return 2, epaxos.CommandID{}, payload, nil
+	case epaxos.EntryMembership:
+		return 3, epaxos.CommandID{}, record.ProtocolControl, nil
+	case epaxos.EntryCheckpoint:
+		return byte(record.Kind), epaxos.CommandID{}, record.ProtocolControl, nil
+	default:
+		return byte(record.Kind), epaxos.CommandID{}, nil, nil
+	}
+}
+
 func encodeHistoricalEPaxosRecordKV(record epaxos.InstanceRecord, version byte) []byte {
+	kind, id, payload, points := legacyEntryValueKV(record)
 	out := []byte{version}
 	out = binary.AppendUvarint(out, uint64(record.Ref.Replica))
 	out = binary.AppendUvarint(out, uint64(record.Ref.Instance))
@@ -580,18 +580,21 @@ func encodeHistoricalEPaxosRecordKV(record epaxos.InstanceRecord, version byte) 
 			}
 		}
 	}
-	out = binary.AppendUvarint(out, record.Command.ID.Client)
-	out = binary.AppendUvarint(out, record.Command.ID.Sequence)
-	out = binary.AppendUvarint(out, uint64(record.Command.Kind))
-	out = binary.AppendUvarint(out, uint64(len(record.Command.Payload)))
-	out = append(out, record.Command.Payload...)
-	out = binary.AppendUvarint(out, uint64(len(record.Command.ConflictKeys)))
-	for _, key := range record.Command.ConflictKeys {
+	out = binary.AppendUvarint(out, id.Client)
+	out = binary.AppendUvarint(out, id.Sequence)
+	out = binary.AppendUvarint(out, uint64(kind))
+	out = binary.AppendUvarint(out, uint64(len(payload)))
+	out = append(out, payload...)
+	out = binary.AppendUvarint(out, uint64(len(points)))
+	for _, key := range points {
 		out = binary.AppendUvarint(out, uint64(len(key)))
 		out = append(out, key...)
 	}
 	if version >= 3 {
 		out = binary.AppendUvarint(out, record.ProcessAt)
+		if version >= 8 {
+			out = append(out, byte(record.TimingDomain))
+		}
 		out = append(out, boolByteKV(record.TOQPending))
 	}
 	if version >= 2 {
@@ -604,6 +607,7 @@ func encodeHistoricalEPaxosRecordKV(record epaxos.InstanceRecord, version byte) 
 }
 
 func checksumHistoricalEPaxosRecordKV(record epaxos.InstanceRecord, version byte) [32]byte {
+	kind, id, payload, points := legacyEntryValueKV(record)
 	hasher := blake3.New()
 	writeUint64 := func(value uint64) {
 		var encoded [8]byte
@@ -654,12 +658,12 @@ func checksumHistoricalEPaxosRecordKV(record epaxos.InstanceRecord, version byte
 			}
 		}
 	}
-	writeUint64(record.Command.ID.Client)
-	writeUint64(record.Command.ID.Sequence)
-	writeByte(byte(record.Command.Kind))
-	writeBytes(record.Command.Payload)
-	writeUint64(uint64(len(record.Command.ConflictKeys)))
-	for _, key := range record.Command.ConflictKeys {
+	writeUint64(id.Client)
+	writeUint64(id.Sequence)
+	writeByte(kind)
+	writeBytes(payload)
+	writeUint64(uint64(len(points)))
+	for _, key := range points {
 		writeBytes(key)
 	}
 	if version >= 2 {

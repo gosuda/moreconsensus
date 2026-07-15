@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -257,7 +258,8 @@ func encodedMessageSizeWithin(message epaxos.Message, limit int64) (int, error) 
 	if len(message.Deps) > maxWireMessageCollectionEntries ||
 		len(message.AcceptDeps) > maxWireMessageCollectionEntries ||
 		len(message.AcceptEvidence) > maxWireMessageCollectionEntries ||
-		len(message.Command.ConflictKeys) > maxWireMessageCollectionEntries {
+		len(message.Command.Footprint.Points) > maxWireMessageCollectionEntries ||
+		len(message.Command.Footprint.Spans) > maxWireMessageCollectionEntries {
 		return 0, epaxos.ErrInvalidMessage
 	}
 	for _, evidence := range message.AcceptEvidence {
@@ -266,7 +268,7 @@ func encodedMessageSizeWithin(message epaxos.Message, limit int64) (int, error) 
 		}
 	}
 
-	size := int64(4 + 1 + 1 + 1 + 32) // Magic, three boolean flags, and checksum.
+	size := int64(4 + 1 + 1 + 1 + 1 + 32) // Magic, TOQ/All/Reject/FastPath flags, and checksum.
 	add := func(n int64) bool {
 		if n < 0 || size > limit || n > limit-size {
 			return false
@@ -285,6 +287,7 @@ func encodedMessageSizeWithin(message epaxos.Message, limit int64) (int, error) 
 
 	if !addUvarints(
 		uint64(message.Type), uint64(message.From), uint64(message.To),
+		message.FromIncarnation, message.ToIncarnation,
 		uint64(message.Ref.Replica), uint64(message.Ref.Instance), uint64(message.Ref.Conf),
 		message.ProcessAt,
 		message.Ballot.Epoch, message.Ballot.Number, uint64(message.Ballot.Replica),
@@ -323,18 +326,32 @@ func encodedMessageSizeWithin(message epaxos.Message, limit int64) (int, error) 
 		uint64(message.IgnoreDependency.Ref.Replica),
 		uint64(message.IgnoreDependency.Ref.Instance),
 		uint64(message.IgnoreDependency.Ref.Conf),
-		message.Command.ID.Client,
-		message.Command.ID.Sequence,
-		uint64(message.Command.Kind),
-		uint64(len(message.Command.Payload)),
-	) || !add(int64(len(message.Command.Payload))) ||
-		!add(uvarintSize(uint64(len(message.Command.ConflictKeys)))) {
+		uint64(message.Kind),
+		uint64(message.ConfChange.Type),
+		uint64(message.ConfChange.Replica),
+		uint64(len(message.ProtocolControl)),
+	) || !add(int64(len(message.ProtocolControl))) ||
+		!addUvarints(message.Command.ID.Client, message.Command.ID.Sequence, uint64(len(message.Command.Payload))) ||
+		!add(int64(len(message.Command.Payload))) ||
+		!add(uvarintSize(uint64(len(message.Command.Footprint.Points)))) {
 		return 0, errOutboundFrameTooLarge
 	}
-	for _, key := range message.Command.ConflictKeys {
-		if !add(uvarintSize(uint64(len(key)))) || !add(int64(len(key))) {
+	for _, point := range message.Command.Footprint.Points {
+		if !add(uvarintSize(uint64(len(point)))) || !add(int64(len(point))) {
 			return 0, errOutboundFrameTooLarge
 		}
+	}
+	if !add(uvarintSize(uint64(len(message.Command.Footprint.Spans)))) {
+		return 0, errOutboundFrameTooLarge
+	}
+	for _, span := range message.Command.Footprint.Spans {
+		if !add(uvarintSize(uint64(len(span.Start)))) || !add(int64(len(span.Start))) ||
+			!add(uvarintSize(uint64(len(span.End)))) || !add(int64(len(span.End))) {
+			return 0, errOutboundFrameTooLarge
+		}
+	}
+	if !add(uvarintSize(uint64(len(message.Command.CycleKey)))) || !add(int64(len(message.Command.CycleKey))) {
+		return 0, errOutboundFrameTooLarge
 	}
 	if !addUvarints(
 		message.RejectHint.Epoch,
@@ -471,6 +488,7 @@ type service struct {
 	admissionBlocked       bool
 	blockedPeerIngress     map[epaxos.ReplicaID][][sha256.Size]byte
 	readyApplied           bool
+	readyCheckpointApplied bool
 	readyLoadsApplied      int
 	frozenFrames           []*outboundFrame
 	singlePreparedFrame    [1]*outboundFrame
@@ -526,7 +544,6 @@ const (
 
 var (
 	errRequestBodyTooLarge = errors.New("request body too large")
-	scanBarrierConflictKey = []byte("\x00kvnode-scan-barrier")
 	errServiceShuttingDown = errors.New("kvnode service shutting down")
 	errRetentionLimit      = errors.New("configured retention limit reached")
 	errRetentionPressure   = errors.New("configured retention pressure threshold reached")
@@ -1020,6 +1037,7 @@ func (s *service) clientMux() *http.ServeMux {
 func (s *service) peerMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/epaxos/message", observeRequestDuration(&s.metrics.peerDuration, s.handleMessage))
+	mux.HandleFunc("/epaxos/snapshot/", observeRequestDuration(&s.metrics.peerDuration, s.handleSnapshotBundle))
 	return mux
 }
 
@@ -1672,11 +1690,19 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 		if hasBounds {
 			value, ok, err = s.db.GetWithBounds(key, bounds)
 		} else {
-			if err := s.waitForKeys(ctx, key); err != nil {
-				http.Error(w, err.Error(), http.StatusServiceUnavailable)
-				return
+			command := kv.CommandForGet(uint64(s.id), s.next(), key)
+			if err = s.proposeAndWait(ctx, command); err == nil {
+				var result kv.OrderedGetResult
+				var found bool
+				value, found, err = s.db.CommandResult(command.ID)
+				if err == nil && !found {
+					err = fmt.Errorf("ordered read completed without a durable result")
+				}
+				if err == nil {
+					result, err = kv.DecodeOrderedGetResult(value)
+					value, ok = result.Value, result.Found
+				}
 			}
-			value, ok, err = s.db.Get(key)
 		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1697,7 +1723,7 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 			writeBodyReadError(w, err)
 			return
 		}
-		if err := s.proposeAndWait(ctx, withScanBarrierConflict(kv.CommandForPut(uint64(s.id), s.next(), key, body))); err != nil {
+		if err := s.proposeAndWait(ctx, kv.CommandForPut(uint64(s.id), s.next(), key, body)); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -1707,7 +1733,7 @@ func (s *service) handleKV(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "storage fault active", http.StatusServiceUnavailable)
 			return
 		}
-		if err := s.proposeAndWait(ctx, withScanBarrierConflict(kv.CommandForDelete(uint64(s.id), s.next(), key))); err != nil {
+		if err := s.proposeAndWait(ctx, kv.CommandForDelete(uint64(s.id), s.next(), key)); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -1780,7 +1806,7 @@ func (s *service) handleTxn(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
 		return
 	}
-	if err := s.proposeAndWait(ctx, withScanBarrierConflict(kv.CommandForTxn(uint64(s.id), s.next(), ops))); err != nil {
+	if err := s.proposeAndWait(ctx, kv.CommandForTxn(uint64(s.id), s.next(), ops)); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -1860,8 +1886,7 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	barrier := q.Get("barrier")
-	if hasBounds && barrier != "" {
+	if hasBounds && q.Get("barrier") != "" {
 		http.Error(w, "bad timestamp selector", http.StatusBadRequest)
 		return
 	}
@@ -1871,35 +1896,35 @@ func (s *service) handleScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
 		return
 	}
-	if barrier != "" {
-		parts := strings.Split(barrier, ",")
-		keys := make([][]byte, 0, len(parts))
-		for _, part := range parts {
-			key := []byte(part)
-			if err := kv.ValidateKey(key); err != nil {
-				http.Error(w, "bad barrier key", http.StatusBadRequest)
+	options := kv.ScanOptions{
+		Start: start, End: end, Prefix: prefix, Limit: limit, Reverse: reverse, Bounds: bounds,
+	}
+	var rows []kv.KV
+	if hasBounds {
+		rows, err = s.db.Scan(options)
+	} else {
+		var command epaxos.Command
+		command, err = kv.CommandForScan(uint64(s.id), s.next(), options)
+		if err == nil {
+			if proposeErr := s.proposeAndWait(ctx, command); proposeErr != nil {
+				http.Error(w, proposeErr.Error(), http.StatusServiceUnavailable)
 				return
 			}
-			keys = append(keys, key)
 		}
-		if err := s.waitForKeys(ctx, keys...); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-	} else if !hasBounds {
-		if err := s.waitForScanBarrier(ctx); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
+		if err == nil {
+			var response []byte
+			var found bool
+			response, found, err = s.db.CommandResult(command.ID)
+			if err == nil && !found {
+				err = fmt.Errorf("ordered scan completed without a durable result")
+			}
+			if err == nil {
+				var result kv.OrderedScanResult
+				result, err = kv.DecodeOrderedScanResult(response)
+				rows = result.Rows
+			}
 		}
 	}
-	rows, err := s.db.Scan(kv.ScanOptions{
-		Start:   start,
-		End:     end,
-		Prefix:  prefix,
-		Limit:   limit,
-		Reverse: reverse,
-		Bounds:  bounds,
-	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2055,6 +2080,107 @@ func (s *service) validateInboundPeer(r *http.Request, message epaxos.Message) e
 	return nil
 }
 
+func (s *service) validateSnapshotPeer(r *http.Request) error {
+	if !s.production {
+		return nil
+	}
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return fmt.Errorf("verified peer client certificate is required")
+	}
+	replica, err := peerReplicaIDFromCertificate(r.TLS.PeerCertificates[0])
+	if err != nil {
+		return err
+	}
+	if _, configured := s.peers[replica]; !configured {
+		return fmt.Errorf("peer certificate replica %d is not configured", replica)
+	}
+	return nil
+}
+
+func (s *service) handleSnapshotBundle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.validateSnapshotPeer(r); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	encoded := strings.TrimPrefix(r.URL.Path, "/epaxos/snapshot/")
+	if len(encoded) != 80 {
+		http.Error(w, "bad application snapshot handle", http.StatusBadRequest)
+		return
+	}
+	handle, err := hex.DecodeString(encoded)
+	if err != nil {
+		http.Error(w, "bad application snapshot handle", http.StatusBadRequest)
+		return
+	}
+	bundle, err := s.db.ApplicationSnapshotBundle(handle)
+	if errors.Is(err, pebble.ErrNotFound) {
+		http.Error(w, "application snapshot not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(bundle)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(bundle)
+}
+
+func (s *service) materializeCheckpointOffer(ctx context.Context, message epaxos.Message) error {
+	checkpoint, offered, err := epaxos.CheckpointOffer(message)
+	if err != nil || !offered {
+		return err
+	}
+	handle := checkpoint.ApplicationSnapshot
+	size, err := kv.ApplicationSnapshotBundleSize(handle)
+	if err != nil {
+		return err
+	}
+	if size > uint64(s.peerBodyLimit()) {
+		return fmt.Errorf("application snapshot size %d exceeds peer body limit", size)
+	}
+	if _, err := s.db.ApplicationSnapshotBundle(handle); err == nil {
+		return nil
+	} else if !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+	endpoint := s.peers[message.From]
+	client := s.peerClients[message.From]
+	if endpoint == "" || client == nil {
+		return fmt.Errorf("checkpoint source replica %d has no peer transport", message.From)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		endpoint+"/epaxos/snapshot/"+hex.EncodeToString(handle), nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, transportReadChunkSize))
+		return fmt.Errorf("checkpoint source replica %d returned %s", message.From, response.Status)
+	}
+	if response.ContentLength >= 0 && uint64(response.ContentLength) != size {
+		return fmt.Errorf("application snapshot content length %d does not match advertised %d", response.ContentLength, size)
+	}
+	bundle, err := readLimitedBody(response.Body, int64(size))
+	if err != nil {
+		return err
+	}
+	if uint64(len(bundle)) != size {
+		return fmt.Errorf("application snapshot length %d does not match advertised %d", len(bundle), size)
+	}
+	return s.db.MaterializeApplicationSnapshot(handle, bundle)
+}
+
 func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2088,6 +2214,10 @@ func (s *service) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.storageFaultActive() {
 		http.Error(w, "storage fault active", http.StatusServiceUnavailable)
+		return
+	}
+	if err := s.materializeCheckpointOffer(r.Context(), msg); err != nil {
+		http.Error(w, fmt.Sprintf("materialize checkpoint offer: %v", err), http.StatusServiceUnavailable)
 		return
 	}
 	s.mu.Lock()
@@ -2148,37 +2278,6 @@ func (s *service) next() uint64 {
 	seq := s.nextSeq
 	s.nextSeq++
 	return seq
-}
-
-func withScanBarrierConflict(cmd epaxos.Command) epaxos.Command {
-	for _, key := range cmd.ConflictKeys {
-		if bytes.Equal(key, scanBarrierConflictKey) {
-			return cmd
-		}
-	}
-	cmd.ConflictKeys = append(cmd.ConflictKeys, append([]byte(nil), scanBarrierConflictKey...))
-	return cmd
-}
-
-func (s *service) waitForScanBarrier(ctx context.Context) error {
-	return s.proposeAndWait(ctx, epaxos.Command{
-		ID:           epaxos.CommandID{Client: uint64(s.id), Sequence: s.next()},
-		ConflictKeys: [][]byte{append([]byte(nil), scanBarrierConflictKey...)},
-	})
-}
-
-func (s *service) waitForKeys(ctx context.Context, keys ...[]byte) error {
-	conflicts := make([][]byte, 0, len(keys))
-	for _, key := range keys {
-		if len(key) == 0 {
-			continue
-		}
-		conflicts = append(conflicts, append([]byte(nil), key...))
-	}
-	if len(conflicts) == 0 {
-		return nil
-	}
-	return s.proposeAndWait(ctx, epaxos.Command{ID: epaxos.CommandID{Client: uint64(s.id), Sequence: s.next()}, ConflictKeys: conflicts})
 }
 
 func (s *service) proposeAndWait(ctx context.Context, cmd epaxos.Command) error {
@@ -2380,6 +2479,16 @@ func (s *service) drainLocked() error {
 			}
 			s.readyApplied = true
 		}
+		if !s.readyCheckpointApplied && s.reusableReady.Checkpoint != nil {
+			result, err := s.db.CreateApplicationCheckpoint(*s.reusableReady.Checkpoint)
+			if err != nil {
+				return fmt.Errorf("create Ready checkpoint: %w", err)
+			}
+			if err := s.node.ProvideCheckpoint(result); err != nil {
+				return fmt.Errorf("provide Ready checkpoint: %w", err)
+			}
+			s.readyCheckpointApplied = true
+		}
 		for s.readyLoadsApplied < len(s.reusableReady.RecordLoads) {
 			ref := s.reusableReady.RecordLoads[s.readyLoadsApplied]
 			rec, found, err := s.ready.LoadInstance(ref)
@@ -2418,6 +2527,7 @@ func (s *service) drainLocked() error {
 			return fmt.Errorf("advance Ready: %w", err)
 		}
 		s.readyApplied = false
+		s.readyCheckpointApplied = false
 		s.readyLoadsApplied = 0
 		s.admissionBlocked = false
 		s.blockedPeerIngress = nil

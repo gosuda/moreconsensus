@@ -20,7 +20,7 @@ func benchmarkPeerMessage(size int) epaxos.Message {
 		Ref:    epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: 1}, Seq: 1,
 		Deps:    []epaxos.InstanceNum{0, 0, 0},
-		Command: epaxos.Command{Kind: epaxos.CommandUser, Payload: make([]byte, size), ConflictKeys: [][]byte{[]byte("fixed-conflict-key")}},
+		Command: epaxos.Command{Payload: make([]byte, size), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("fixed-conflict-key")}}},
 	}
 }
 

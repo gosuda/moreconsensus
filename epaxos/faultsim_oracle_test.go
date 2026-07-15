@@ -430,7 +430,7 @@ func TestFaultSchedulerExplicitEncodedEnvelopeActions(t *testing.T) {
 	}
 	ref, _ := h.refFor(op.commandID())
 	if _, err := h.driveUntilApplied([]InstanceRef{ref}, h.ids, 80); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; counters=%v records=%v", err, h.counters, faultHarnessRecordStates(h))
 	}
 	result := faultCheckOracle(h, h.ids)
 	if !result.OK {

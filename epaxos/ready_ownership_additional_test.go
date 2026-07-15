@@ -27,9 +27,9 @@ func TestReadyDeepIsolationAndAllocationFreeAcknowledgement(t *testing.T) {
 			Deps:   []InstanceNum{0, 3, 0},
 		}},
 		Command: Command{
-			ID:           CommandID{Client: 501, Sequence: 1},
-			Payload:      []byte("ready-record-command"),
-			ConflictKeys: [][]byte{[]byte("ready-record-key")},
+			ID:        CommandID{Client: 501, Sequence: 1},
+			Payload:   []byte("ready-record-command"),
+			Footprint: Footprint{Points: [][]byte{[]byte("ready-record-key")}},
 		},
 		ConfChangeResult: ConfChangeResult{
 			Outcome: ConfChangeApplied,
@@ -54,7 +54,7 @@ func TestReadyDeepIsolationAndAllocationFreeAcknowledgement(t *testing.T) {
 			Deps:   []InstanceNum{0, 3, 0},
 		}},
 	})
-	rn.enqueueCommitted(CommittedCommand{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command})
+	rn.enqueueApply(ApplyCommand{Ref: ref, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command})
 
 	mutated := rn.Ready()
 	mutated.Records[0].Deps[0] = 99
@@ -64,8 +64,8 @@ func TestReadyDeepIsolationAndAllocationFreeAcknowledgement(t *testing.T) {
 	mutated.Records[0].Command.Payload[0] = 'X'
 	mutated.Messages[0].Deps[0] = 99
 	mutated.Messages[0].AcceptEvidence[0].Deps[0] = 99
-	mutated.Committed[0].Deps[0] = 99
-	mutated.Committed[0].Command.Payload[0] = 'Y'
+	mutated.Apply[0].Deps[0] = 99
+	mutated.Apply[0].Command.Payload[0] = 'Y'
 
 	frozenRecord := rn.frozenReady.Records[0]
 	if frozenRecord.Deps[0] != 0 ||
@@ -78,8 +78,8 @@ func TestReadyDeepIsolationAndAllocationFreeAcknowledgement(t *testing.T) {
 	if rn.frozenReady.Messages[0].Deps[0] != 0 || rn.frozenReady.Messages[0].AcceptEvidence[0].Deps[0] != 0 {
 		t.Fatalf("Ready message mutation reached frozen state: %#v", rn.frozenReady.Messages[0])
 	}
-	if rn.frozenReady.Committed[0].Deps[0] != 0 || string(rn.frozenReady.Committed[0].Command.Payload) != "ready-record-command" {
-		t.Fatalf("Ready committed mutation reached frozen state: %#v", rn.frozenReady.Committed[0])
+	if rn.frozenReady.Apply[0].Deps[0] != 0 || string(rn.frozenReady.Apply[0].Command.Payload) != "ready-record-command" {
+		t.Fatalf("Ready committed mutation reached frozen state: %#v", rn.frozenReady.Apply[0])
 	}
 	if err := rn.Advance(mutated); !errors.Is(err, ErrInvalidReady) {
 		t.Fatalf("Advance mutated Ready err=%v, want ErrInvalidReady", err)
@@ -98,19 +98,19 @@ func TestReadyDeepIsolationAndAllocationFreeAcknowledgement(t *testing.T) {
 	}
 	recordCap := cap(rn.frozenReady.Records)
 	messageCap := cap(rn.frozenReady.Messages)
-	committedCap := cap(rn.frozenReady.Committed)
+	committedCap := cap(rn.frozenReady.Apply)
 	if err := rn.Advance(canonical); err != nil {
 		t.Fatal(err)
 	}
-	if len(rn.pendingReady.Records) != 0 || len(rn.pendingReady.Messages) != 0 || len(rn.pendingReady.Committed) != 0 {
+	if len(rn.pendingReady.Records) != 0 || len(rn.pendingReady.Messages) != 0 || len(rn.pendingReady.Apply) != 0 {
 		t.Fatalf("Advance left acknowledged entries: %#v", rn.pendingReady)
 	}
-	if cap(rn.pendingReady.Records) != recordCap || cap(rn.pendingReady.Messages) != messageCap || cap(rn.pendingReady.Committed) != committedCap {
-		t.Fatalf("Advance discarded reusable queue capacity: records %d/%d messages %d/%d committed %d/%d", cap(rn.pendingReady.Records), recordCap, cap(rn.pendingReady.Messages), messageCap, cap(rn.pendingReady.Committed), committedCap)
+	if cap(rn.pendingReady.Records) != recordCap || cap(rn.pendingReady.Messages) != messageCap || cap(rn.pendingReady.Apply) != committedCap {
+		t.Fatalf("Advance discarded reusable queue capacity: records %d/%d messages %d/%d committed %d/%d", cap(rn.pendingReady.Records), recordCap, cap(rn.pendingReady.Messages), messageCap, cap(rn.pendingReady.Apply), committedCap)
 	}
 	if !reflect.DeepEqual(rn.pendingReady.Records[:cap(rn.pendingReady.Records)][0], InstanceRecord{}) ||
 		!reflect.DeepEqual(rn.pendingReady.Messages[:cap(rn.pendingReady.Messages)][0], Message{}) ||
-		!reflect.DeepEqual(rn.pendingReady.Committed[:cap(rn.pendingReady.Committed)][0], CommittedCommand{}) {
+		!reflect.DeepEqual(rn.pendingReady.Apply[:cap(rn.pendingReady.Apply)][0], ApplyCommand{}) {
 		t.Fatal("Advance retained acknowledged pointer-bearing queue entries")
 	}
 }
@@ -124,9 +124,9 @@ func TestReadyIntoOwnershipRetryAndInactiveClearing(t *testing.T) {
 		t.Fatalf("ReadyInto(nil) err=%v, want %v", err, ErrInvalidReady)
 	}
 	if _, err := rn.Propose(Command{
-		ID:           CommandID{Client: 900, Sequence: 1},
-		Payload:      []byte("ready-into"),
-		ConflictKeys: [][]byte{[]byte("ready-into-key")},
+		ID:        CommandID{Client: 900, Sequence: 1},
+		Payload:   []byte("ready-into"),
+		Footprint: Footprint{Points: [][]byte{[]byte("ready-into-key")}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -179,9 +179,9 @@ func TestReadyIntoCappedTailUsesDisjointWritableCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := rn.Propose(Command{
-		ID:           CommandID{Client: 901, Sequence: 1},
-		Payload:      []byte("ready-tail"),
-		ConflictKeys: [][]byte{[]byte("ready-tail-key")},
+		ID:        CommandID{Client: 901, Sequence: 1},
+		Payload:   []byte("ready-tail"),
+		Footprint: Footprint{Points: [][]byte{[]byte("ready-tail-key")}},
 	}); err != nil {
 		t.Fatal(err)
 	}

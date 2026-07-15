@@ -7,13 +7,13 @@ var commandPool = sync.Pool{New: func() any { return new(Command) }}
 var decodeScratchPool = sync.Pool{New: func() any { return new(DecodeScratch) }}
 
 const (
-	maxPooledDependencyWidth       = 7
-	maxPooledEvidenceEntries       = 7
-	maxPooledConflictKeys          = 128
-	maxPooledPayloadBytes          = 64 << 10
-	maxPooledConflictKeyBytes      = 64 << 10
-	maxPooledConflictKeyArenaBytes = 256 << 10
-	maxPooledEvidenceDeps          = maxPooledDependencyWidth * maxPooledEvidenceEntries
+	maxPooledDependencyWidth          = 7
+	maxPooledEvidenceEntries          = 7
+	maxPooledFootprintPoints          = 128
+	maxPooledPayloadBytes             = 64 << 10
+	maxPooledFootprintPointBytes      = 64 << 10
+	maxPooledFootprintPointArenaBytes = 256 << 10
+	maxPooledEvidenceDeps             = maxPooledDependencyWidth * maxPooledEvidenceEntries
 )
 
 func resetSliceForPool[T any](items []T, maxCapacity int) []T {
@@ -25,19 +25,19 @@ func resetSliceForPool[T any](items []T, maxCapacity int) []T {
 	return items[:0]
 }
 
-func resetConflictKeysForPool(items [][]byte) [][]byte {
+func resetFootprintPointsForPool(items [][]byte) [][]byte {
 	full := items[:cap(items)]
-	drop := cap(items) > maxPooledConflictKeys
+	drop := cap(items) > maxPooledFootprintPoints
 	aggregate := 0
 	for i := range full {
 		key := full[i]
 		clear(key[:cap(key)])
-		if cap(key) > maxPooledConflictKeyBytes || aggregate > maxPooledConflictKeyArenaBytes-cap(key) {
+		if cap(key) > maxPooledFootprintPointBytes || aggregate > maxPooledFootprintPointArenaBytes-cap(key) {
 			drop = true
 		}
 		aggregate += cap(key)
 	}
-	if aggregate > maxPooledConflictKeyArenaBytes {
+	if aggregate > maxPooledFootprintPointArenaBytes {
 		drop = true
 	}
 	if drop {
@@ -70,21 +70,32 @@ func resetAcceptEvidenceForPool(items []AcceptEvidence) []AcceptEvidence {
 
 func resetCommandForPool(c *Command) {
 	payload := resetSliceForPool(c.Payload, maxPooledPayloadBytes)
-	conflictKeys := resetConflictKeysForPool(c.ConflictKeys)
-	*c = Command{Payload: payload, ConflictKeys: conflictKeys}
+	points := resetFootprintPointsForPool(c.Footprint.Points)
+	spans := c.Footprint.Spans
+	for i := range spans[:cap(spans)] {
+		clear(spans[:cap(spans)][i].Start)
+		clear(spans[:cap(spans)][i].End)
+		spans[:cap(spans)][i] = Span{}
+	}
+	if cap(spans) > maxWireFootprintSpans {
+		spans = nil
+	} else {
+		spans = spans[:0]
+	}
+	cycleKey := resetSliceForPool(c.CycleKey, maxWireCycleKeyBytes)
+	*c = Command{Payload: payload, Footprint: Footprint{Points: points, Spans: spans}, CycleKey: cycleKey}
 }
 
 func resetMessageForPool(m *Message) {
 	deps := resetSliceForPool(m.Deps, maxPooledDependencyWidth)
 	acceptDeps := resetSliceForPool(m.AcceptDeps, maxPooledDependencyWidth)
 	acceptEvidence := resetAcceptEvidenceForPool(m.AcceptEvidence)
+	control := resetSliceForPool(m.ProtocolControl, maxWireProtocolControl)
 	command := m.Command
 	resetCommandForPool(&command)
 	*m = Message{
-		Deps:           deps,
-		AcceptDeps:     acceptDeps,
-		AcceptEvidence: acceptEvidence,
-		Command:        command,
+		Deps: deps, AcceptDeps: acceptDeps, AcceptEvidence: acceptEvidence,
+		ProtocolControl: control, Command: command,
 	}
 }
 
@@ -137,6 +148,7 @@ func PutDecodeScratch(s *DecodeScratch) {
 	s.AcceptDeps = resetSliceForPool(s.AcceptDeps, maxWireDeps)
 	s.AcceptEvidence = resetSliceForPool(s.AcceptEvidence, maxWireAcceptEvidence)
 	s.AcceptEvidenceDeps = resetSliceForPool(s.AcceptEvidenceDeps, maxPooledEvidenceDeps)
-	s.ConflictKeys = resetSliceForPool(s.ConflictKeys, maxWireConflictKeys)
+	s.Points = resetSliceForPool(s.Points, maxWireFootprintPoints)
+	s.Spans = resetSliceForPool(s.Spans, maxWireFootprintSpans)
 	decodeScratchPool.Put(s)
 }

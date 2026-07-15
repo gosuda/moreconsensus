@@ -20,7 +20,7 @@ func TestRetentionThresholdsPreserveSettlementAndFailClosedAtLimit(t *testing.T)
 	for sequence := uint64(1); sequence <= 8; sequence++ {
 		if err := s.proposeAndWait(context.Background(), epaxos.Command{
 			ID:           epaxos.CommandID{Client: 1, Sequence: sequence},
-			ConflictKeys: [][]byte{[]byte(fmt.Sprintf("retention-%d", sequence))},
+			Footprint: epaxos.Footprint{Points: [][]byte{[]byte(fmt.Sprintf("retention-%d", sequence))}},
 		}); err != nil {
 			t.Fatalf("proposal %d: %v", sequence, err)
 		}
@@ -39,7 +39,7 @@ func TestRetentionThresholdsPreserveSettlementAndFailClosedAtLimit(t *testing.T)
 
 	if err := s.proposeAndWait(context.Background(), epaxos.Command{
 		ID:           epaxos.CommandID{Client: 1, Sequence: 9},
-		ConflictKeys: [][]byte{[]byte("retention-9")},
+		Footprint: epaxos.Footprint{Points: [][]byte{[]byte("retention-9")}},
 	}); err != nil {
 		t.Fatalf("proposal crossing 90%% threshold did not settle: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestRetentionThresholdsPreserveSettlementAndFailClosedAtLimit(t *testing.T)
 	}
 	if err := s.proposeAndWait(context.Background(), epaxos.Command{
 		ID:           epaxos.CommandID{Client: 1, Sequence: 10},
-		ConflictKeys: [][]byte{[]byte("retention-10")},
+		Footprint: epaxos.Footprint{Points: [][]byte{[]byte("retention-10")}},
 	}); !errors.Is(err, errRetentionPressure) {
 		t.Fatalf("proposal above 90%% error=%v, want retention pressure", err)
 	}
@@ -86,7 +86,7 @@ func TestDurableRecordRetentionCountTriggersStartupEquivalentLimit(t *testing.T)
 	s := newTestService(t)
 	if err := s.proposeAndWait(context.Background(), epaxos.Command{
 		ID:           epaxos.CommandID{Client: 1, Sequence: 1},
-		ConflictKeys: [][]byte{[]byte("durable-limit")},
+		Footprint: epaxos.Footprint{Points: [][]byte{[]byte("durable-limit")}},
 	}); err != nil {
 		t.Fatal(err)
 	}

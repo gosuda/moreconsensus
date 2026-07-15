@@ -758,7 +758,7 @@ func (state *lifecycleState) verifyPeerRuntimeAuthorization() error {
 			Type: epaxos.MsgCommit, From: spoofID, To: epaxos.ReplicaID(destinationIndex + 1),
 			Ref:    epaxos.InstanceRef{Replica: spoofID, Instance: 1, Conf: 1},
 			Ballot: epaxos.Ballot{Replica: spoofID}, RecordBallot: epaxos.Ballot{Replica: spoofID},
-			Seq: 1, Deps: make([]epaxos.InstanceNum, 3), Command: epaxos.Command{Kind: epaxos.CommandNoop},
+			Seq: 1, Deps: make([]epaxos.InstanceNum, 3), Kind: epaxos.EntryNoop,
 		}
 		frame, err := epaxos.EncodeMessage(nil, message)
 		if err != nil {

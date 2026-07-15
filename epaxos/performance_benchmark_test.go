@@ -11,7 +11,7 @@ var benchmarkBytes []byte
 var benchmarkMessage Message
 
 func benchmarkCommand(size int) Command {
-	return Command{Kind: CommandUser, Payload: make([]byte, size), ConflictKeys: [][]byte{[]byte("fixed-conflict-key")}}
+	return Command{Payload: make([]byte, size), Footprint: Footprint{Points: [][]byte{[]byte("fixed-conflict-key")}}}
 }
 
 func BenchmarkProposeReadyAdvance(b *testing.B) {
@@ -132,11 +132,9 @@ func BenchmarkDeferredTOQ(b *testing.B) {
 	b.ReportAllocs()
 	b.StopTimer()
 	for range b.N {
-		clock := uint64(10)
 		conf := ConfState{ID: 1, Voters: makeIDs(3)}
 		n, err := NewRawNode(Config{
 			ID: 2, Voters: conf.Voters, TOQ: true,
-			TOQClock: func() uint64 { return clock },
 			TOQRuntime: &TOQRuntimeConfig{
 				Conf:        conf,
 				OneWayDelay: map[ReplicaID]uint64{1: 1, 2: 0, 3: 1},
@@ -154,9 +152,8 @@ func BenchmarkDeferredTOQ(b *testing.B) {
 		if err = n.Step(m); err != nil {
 			b.Fatal(err)
 		}
-		clock = 11
 		b.StartTimer()
-		err = n.ProcessTOQ()
+		err = n.ProcessTOQ(11)
 		b.StopTimer()
 		if err != nil {
 			b.Fatal(err)
@@ -193,7 +190,7 @@ func BenchmarkOptimizedRecovery(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if inst.phase != phaseAccept || inst.rec.Command.Kind != CommandNoop {
+		if inst.phase != phaseAccept || inst.rec.Kind != EntryNoop {
 			b.Fatal("optimized recovery decision did not enter no-op accept")
 		}
 	}
@@ -294,10 +291,10 @@ func BenchmarkLiveInstanceRetention(b *testing.B) {
 					Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1},
 					Status: StatusExecuted, Seq: uint64(i + 1),
 					Deps: make([]InstanceNum, voters),
+					Kind: EntryCommand,
 					Command: Command{
-						Kind:         CommandUser,
-						Payload:      make([]byte, 64),
-						ConflictKeys: [][]byte{make([]byte, len("fixed-conflict-key"))},
+						Payload:   make([]byte, 64),
+						Footprint: Footprint{Points: [][]byte{make([]byte, len("fixed-conflict-key"))}},
 					},
 				}
 				corpus[i] = instance{rec: rec, phase: phaseCommitted}
@@ -322,8 +319,8 @@ func residentInstanceBytes(inst *instance) uintptr {
 	bytes := unsafe.Sizeof(*inst)
 	bytes += uintptr(cap(inst.rec.Deps)) * unsafe.Sizeof(InstanceNum(0))
 	bytes += uintptr(cap(inst.rec.Command.Payload))
-	bytes += uintptr(cap(inst.rec.Command.ConflictKeys)) * unsafe.Sizeof([]byte(nil))
-	for _, key := range inst.rec.Command.ConflictKeys {
+	bytes += uintptr(cap(inst.rec.Command.Footprint.Points)) * unsafe.Sizeof([]byte(nil))
+	for _, key := range inst.rec.Command.Footprint.Points {
 		bytes += uintptr(cap(key))
 	}
 	return bytes
@@ -340,7 +337,7 @@ func growResidentNode(b *testing.B, n int) *RawNode {
 		ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(i)}
 		rec := InstanceRecord{
 			Ref: ref, Status: StatusCommitted, Seq: uint64(i), Ballot: Ballot{Replica: 1},
-			Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{key}},
+			Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{key}}},
 		}
 		rec.Checksum = ChecksumRecord(rec)
 		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
@@ -350,7 +347,7 @@ func growResidentNode(b *testing.B, n int) *RawNode {
 
 func BenchmarkComputeAttrsResident1k(b *testing.B) {
 	rn := growResidentNode(b, 1000)
-	cmd := Command{Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+	cmd := Command{Payload: []byte("y"), Footprint: Footprint{Points: [][]byte{[]byte("bench-key")}}}
 	exclude := InstanceRef{Conf: 1, Replica: 1, Instance: 1001}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -364,7 +361,7 @@ func BenchmarkComputeAttrsResident100k(b *testing.B) {
 		b.Skip("100k resident bench")
 	}
 	rn := growResidentNode(b, 100000)
-	cmd := Command{Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+	cmd := Command{Payload: []byte("y"), Footprint: Footprint{Points: [][]byte{[]byte("bench-key")}}}
 	exclude := InstanceRef{Conf: 1, Replica: 1, Instance: 100001}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -379,7 +376,7 @@ func BenchmarkStepPreAcceptGrown(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(i + 1)}
-		cmd := Command{ID: CommandID{Client: 9, Sequence: uint64(i + 1)}, Payload: []byte("z"), ConflictKeys: [][]byte{[]byte("bench-key")}}
+		cmd := Command{ID: CommandID{Client: 9, Sequence: uint64(i + 1)}, Payload: []byte("z"), Footprint: Footprint{Points: [][]byte{[]byte("bench-key")}}}
 		msg := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 2}, Command: cmd}
 		_ = rn.Step(msg)
 	}
@@ -397,7 +394,7 @@ func BenchmarkRetireExecuted(b *testing.B) {
 			ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(j)}
 			rec := InstanceRecord{
 				Ref: ref, Status: StatusExecuted, Seq: uint64(j), Ballot: Ballot{Replica: 1},
-				Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("k")}},
+				Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 			}
 			rec.Checksum = ChecksumRecord(rec)
 			rn.installInstance(&instance{rec: rec, phase: phaseCommitted})

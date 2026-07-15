@@ -101,14 +101,16 @@ func orderedInvariantRecords(first, second string) []epaxos.InstanceRecord {
 		Ref:    epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: 1}, RecordBallot: epaxos.Ballot{Replica: 1},
 		Status: epaxos.StatusExecuted, Seq: 1, Deps: []epaxos.InstanceNum{0, 0},
-		Command: epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Payload: []byte(first), ConflictKeys: [][]byte{[]byte("shared")}},
+		Kind: epaxos.EntryCommand,
+		Command: epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Payload: []byte(first), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("shared")}}},
 	}
 	firstRecord.Checksum = epaxos.ChecksumRecord(firstRecord)
 	secondRecord := epaxos.InstanceRecord{
 		Ref:    epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: 2}, RecordBallot: epaxos.Ballot{Replica: 2},
 		Status: epaxos.StatusExecuted, Seq: 2, Deps: []epaxos.InstanceNum{1, 0},
-		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, Payload: []byte(second), ConflictKeys: [][]byte{[]byte("shared")}},
+		Kind: epaxos.EntryCommand,
+		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, Payload: []byte(second), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("shared")}}},
 	}
 	secondRecord.Checksum = epaxos.ChecksumRecord(secondRecord)
 	return []epaxos.InstanceRecord{firstRecord, secondRecord}

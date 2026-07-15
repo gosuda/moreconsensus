@@ -19,20 +19,19 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 	advanceOK(t, rn, initial)
 
 	conf1To2 := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type: MsgCommit, From: 1, To: 1, Ref: conf1To2,
 		Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1},
 		Seq: 1, Deps: []InstanceNum{0, 0, 0},
-		Command: confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
-	}); err != nil {
-		t.Fatal(err)
-	}
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
+	})); err != nil { t.Fatal(err)
+ }
 	conf2 := ConfState{ID: 2, Voters: []ReplicaID{1, 2}}
 	assertConfState(t, rn.Status().Conf, conf2)
 
 	userRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
 	userCommand := configOrderingUserCommand(80, "conf2-before-conf3")
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgCommit,
 		From:         userRef.Replica,
 		To:           1,
@@ -42,15 +41,14 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0},
 		Command:      userCommand,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	if got := rn.instances[userRef].rec.Status; got != StatusExecuted {
 		t.Fatalf("Conf2 user commit %s status=%s, want %s", userRef, got, StatusExecuted)
 	}
 
 	conf2To3 := InstanceRef{Replica: 2, Instance: 2, Conf: 2}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgCommit,
 		From:         conf2To3.Replica,
 		To:           1,
@@ -59,10 +57,9 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 		RecordBallot: Ballot{Replica: conf2To3.Replica},
 		Seq:          2,
 		Deps:         []InstanceNum{0, userRef.Instance},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 2}),
-	}); err != nil {
-		t.Fatal(err)
-	}
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 2},
+	})); err != nil { t.Fatal(err)
+ }
 	conf3 := ConfState{ID: 3, Voters: []ReplicaID{1}}
 	assertConfState(t, rn.Status().Conf, conf3)
 
@@ -72,7 +69,7 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 	}
 	applied := make([]int, 0, 2)
 	for i, rec := range frozen.Records {
-		if rec.Status == StatusExecuted && rec.Command.Kind == CommandConfChange &&
+		if rec.Status == StatusExecuted && rec.Kind == EntryConfChange &&
 			rec.ConfChangeResult.Outcome == ConfChangeApplied {
 			applied = append(applied, i)
 		}
@@ -98,14 +95,14 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 	short := frozen.Clone()
 	short.Records = short.Records[:lastCausal]
 	short.Messages = nil
-	short.Committed = nil
+	short.Apply = nil
 	short.MustSync = true
 	assertRejectedStutter("short-record-prefix", short)
 
 	causal := frozen.Clone()
 	causal.Records = causal.Records[:lastCausal+1]
 	causal.Messages = nil
-	causal.Committed = nil
+	causal.Apply = nil
 	causal.MustSync = true
 	if err := store.ApplyReady(causal); err != nil {
 		t.Fatal(err)
@@ -133,8 +130,8 @@ func TestMultiTransitionHardStateRequiresCausalConfigRecordPrefix(t *testing.T) 
 	}
 	replay := restarted.Ready()
 	if !replay.HardState.Empty() || len(replay.Records) != 0 || len(replay.Messages) != 0 ||
-		len(replay.Committed) != 1 || replay.Committed[0].Ref != userRef ||
-		!commandEqual(replay.Committed[0].Command, userCommand) || replay.MustSync {
+		len(replay.Apply) != 1 || replay.Apply[0].Ref != userRef ||
+		!commandEqual(replay.Apply[0].Command, userCommand) || replay.MustSync {
 		t.Fatalf("restarted old-Conf2 application replay=%#v, want one committed command", replay)
 	}
 	advanceOK(t, restarted, replay)
@@ -170,7 +167,7 @@ func TestLegacyMigrationExplicitAppliedRemainsAuthoritative(t *testing.T) {
 		Status:       StatusExecuted,
 		Seq:          3,
 		Deps:         []InstanceNum{laterRef.Instance, earlierRef.Instance, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		ConfChangeResult: ConfChangeResult{
 			Outcome: ConfChangeApplied,
 			Conf:    conf2,
@@ -183,7 +180,7 @@ func TestLegacyMigrationExplicitAppliedRemainsAuthoritative(t *testing.T) {
 		Status:       StatusExecuted,
 		Seq:          2,
 		Deps:         []InstanceNum{0, earlierRef.Instance, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 5},
 	})
 	earlier := checkedRecord(InstanceRecord{
 		Ref:          earlierRef,
@@ -192,7 +189,7 @@ func TestLegacyMigrationExplicitAppliedRemainsAuthoritative(t *testing.T) {
 		Status:       StatusExecuted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 6}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 6},
 	})
 	records := []InstanceRecord{later, earlier, explicit}
 

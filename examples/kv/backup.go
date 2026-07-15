@@ -314,7 +314,7 @@ func verifyCheckpointDBMode(db *DB, requireHardState bool) (checkpointState, err
 		return checkpointState{}, err
 	}
 	for ref, rec := range state.records {
-		if rec.Status == epaxos.StatusExecuted && rec.Command.Kind == epaxos.CommandUser {
+		if rec.Status == epaxos.StatusExecuted && rec.Kind == epaxos.EntryCommand {
 			if _, ok := state.applied[ref]; !ok {
 				return checkpointState{}, fmt.Errorf("kv: executed user epaxos record %s missing applied marker", ref)
 			}
@@ -421,7 +421,7 @@ func loadCheckpointAppliedMarkers(pebbleDB *pebble.DB, state checkpointState, ex
 		if rec.Status < epaxos.StatusCommitted {
 			return fmt.Errorf("kv: applied marker %s references uncommitted epaxos record", ref)
 		}
-		if rec.Command.Kind != epaxos.CommandUser {
+		if rec.Kind != epaxos.EntryCommand {
 			return fmt.Errorf("kv: applied marker %s references a non-user epaxos record", ref)
 		}
 		state.applied[ref] = struct{}{}
@@ -502,7 +502,7 @@ func checkpointValueAtom(key, value []byte) (string, error) {
 }
 
 func checkpointCommandGroup(cmd epaxos.Command) (string, bool, error) {
-	if cmd.Kind == epaxos.CommandNoop || len(cmd.Payload) == 0 {
+	if len(cmd.Payload) == 0 {
 		return "", false, nil
 	}
 	p := parser{b: cmd.Payload[1:]}
@@ -822,7 +822,7 @@ func verifyCheckpointConfigurationHistory(state *checkpointState) error {
 	applied := make(map[epaxos.ConfID]epaxos.InstanceRecord)
 	for _, rec := range state.records {
 		result := rec.ConfChangeResult
-		if rec.Command.Kind != epaxos.CommandConfChange || rec.Status != epaxos.StatusExecuted {
+		if rec.Kind != epaxos.EntryConfChange || rec.Status != epaxos.StatusExecuted {
 			if result.Outcome != epaxos.ConfChangeOutcomeUnspecified || !checkpointConfStateZero(result.Conf) {
 				return fmt.Errorf("%w: durable record %s has a configuration outcome outside an executed configuration command", epaxos.ErrInvalidConfig, rec.Ref)
 			}
@@ -878,8 +878,8 @@ func verifyCheckpointConfigurationHistory(state *checkpointState) error {
 		if rec.Ref.Replica == 0 || rec.Ref.Instance == 0 || !conf.Contains(rec.Ref.Replica) {
 			return fmt.Errorf("%w: durable record %s is not owned by its pinned configuration", epaxos.ErrInvalidConfig, rec.Ref)
 		}
-		if rec.Command.Kind > epaxos.CommandConfChange {
-			return fmt.Errorf("%w: durable record %s has unknown command kind %d", epaxos.ErrInvalidConfig, rec.Ref, rec.Command.Kind)
+		if rec.Kind < epaxos.EntryCommand || rec.Kind > epaxos.EntryCheckpoint {
+			return fmt.Errorf("%w: durable record %s has unknown entry kind %d", epaxos.ErrInvalidConfig, rec.Ref, rec.Kind)
 		}
 		if len(rec.Deps) != len(conf.Voters) {
 			return fmt.Errorf("%w: durable record %s has dependency width %d for %d voters", epaxos.ErrInvalidConfig, rec.Ref, len(rec.Deps), len(conf.Voters))
@@ -920,10 +920,10 @@ func verifyCheckpointConfigurationHistory(state *checkpointState) error {
 }
 
 func verifyCheckpointConfigRecord(rec epaxos.InstanceRecord, base epaxos.ConfState, applied map[epaxos.ConfID]epaxos.InstanceRecord) error {
-	if rec.Command.Kind != epaxos.CommandConfChange {
+	if rec.Kind != epaxos.EntryConfChange {
 		return nil
 	}
-	successor, valid := checkpointConfigSuccessor(base, rec.Command)
+	successor, valid := checkpointConfigSuccessor(base, rec.ConfChange)
 	result := rec.ConfChangeResult
 	if rec.Status != epaxos.StatusExecuted {
 		if !valid {
@@ -954,7 +954,7 @@ func verifyCheckpointConfigRecord(rec epaxos.InstanceRecord, base epaxos.ConfSta
 }
 
 func checkpointAppliedPredecessor(rec epaxos.InstanceRecord, successor epaxos.ConfState) (epaxos.ConfState, bool) {
-	changeType, replica, ok := checkpointDecodeConfChange(rec.Command)
+	changeType, replica, ok := checkpointDecodeConfChange(rec.ConfChange)
 	if !ok {
 		return epaxos.ConfState{}, false
 	}
@@ -979,12 +979,12 @@ func checkpointAppliedPredecessor(rec epaxos.InstanceRecord, successor epaxos.Co
 	if err := validateEPaxosHardState(epaxos.HardState{Conf: base}); err != nil {
 		return epaxos.ConfState{}, false
 	}
-	replayed, valid := checkpointConfigSuccessor(base, rec.Command)
+	replayed, valid := checkpointConfigSuccessor(base, rec.ConfChange)
 	return base, valid && checkpointSameConf(replayed, successor)
 }
 
-func checkpointConfigSuccessor(base epaxos.ConfState, command epaxos.Command) (epaxos.ConfState, bool) {
-	changeType, replica, ok := checkpointDecodeConfChange(command)
+func checkpointConfigSuccessor(base epaxos.ConfState, change epaxos.ConfChange) (epaxos.ConfState, bool) {
+	changeType, replica, ok := checkpointDecodeConfChange(change)
 	if !ok || replica == 0 {
 		return epaxos.ConfState{}, false
 	}
@@ -1013,11 +1013,11 @@ func checkpointConfigSuccessor(base epaxos.ConfState, command epaxos.Command) (e
 	return successor, true
 }
 
-func checkpointDecodeConfChange(command epaxos.Command) (epaxos.ConfChangeType, epaxos.ReplicaID, bool) {
-	if command.Kind != epaxos.CommandConfChange || len(command.Payload) != 9 {
+func checkpointDecodeConfChange(change epaxos.ConfChange) (epaxos.ConfChangeType, epaxos.ReplicaID, bool) {
+	if change.Type != epaxos.ConfChangeAddVoter && change.Type != epaxos.ConfChangeRemoveVoter || change.Replica == 0 {
 		return 0, 0, false
 	}
-	return epaxos.ConfChangeType(command.Payload[0]), epaxos.ReplicaID(binary.LittleEndian.Uint64(command.Payload[1:])), true
+	return change.Type, change.Replica, true
 }
 
 func checkpointBallotCompatible(ballot epaxos.Ballot, conf epaxos.ConfState, allowZero bool) bool {

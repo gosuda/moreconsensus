@@ -14,9 +14,9 @@ func TestLocalInstanceNumberExhaustionNeverWraps(t *testing.T) {
 	rn.nextInstance = ^InstanceNum(0)
 
 	last, err := rn.Propose(Command{
-		ID:           CommandID{Client: 301, Sequence: 1},
-		Payload:      []byte("last-local-instance"),
-		ConflictKeys: [][]byte{[]byte("last-local-instance-key")},
+		ID:        CommandID{Client: 301, Sequence: 1},
+		Payload:   []byte("last-local-instance"),
+		Footprint: Footprint{Points: [][]byte{[]byte("last-local-instance-key")}},
 	})
 	if err != nil {
 		t.Fatalf("Propose final representable instance: %v", err)
@@ -28,9 +28,9 @@ func TestLocalInstanceNumberExhaustionNeverWraps(t *testing.T) {
 	readyBefore := rn.Ready()
 
 	got, err := rn.Propose(Command{
-		ID:           CommandID{Client: 301, Sequence: 2},
-		Payload:      []byte("must-not-wrap"),
-		ConflictKeys: [][]byte{[]byte("last-local-instance-key")},
+		ID:        CommandID{Client: 301, Sequence: 2},
+		Payload:   []byte("must-not-wrap"),
+		Footprint: Footprint{Points: [][]byte{[]byte("last-local-instance-key")}},
 	})
 	if !errors.Is(err, ErrInstanceExhausted) {
 		t.Fatalf("Propose after final instance err=%v, want ErrInstanceExhausted", err)
@@ -64,7 +64,8 @@ func TestRestartAtMaximumLocalInstanceRemainsExhausted(t *testing.T) {
 		Status:       StatusCommitted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      Command{Kind: CommandNoop},
+		Kind:         EntryNoop,
+		Command:      Command{},
 	}
 	rec.Checksum = ChecksumRecord(rec)
 	store.Records[ref] = rec
@@ -77,9 +78,9 @@ func TestRestartAtMaximumLocalInstanceRemainsExhausted(t *testing.T) {
 		t.Fatalf("restart next instance=%d, want exhausted sentinel 0", rn.nextInstance)
 	}
 	got, err := rn.Propose(Command{
-		ID:           CommandID{Client: 302, Sequence: 1},
-		Payload:      []byte("restart-must-not-wrap"),
-		ConflictKeys: [][]byte{[]byte("restart-must-not-wrap-key")},
+		ID:        CommandID{Client: 302, Sequence: 1},
+		Payload:   []byte("restart-must-not-wrap"),
+		Footprint: Footprint{Points: [][]byte{[]byte("restart-must-not-wrap-key")}},
 	})
 	if !errors.Is(err, ErrInstanceExhausted) || got != (InstanceRef{}) {
 		t.Fatalf("restart exhausted Propose ref/err=%s/%v, want zero/ErrInstanceExhausted", got, err)
@@ -122,7 +123,7 @@ func TestTimeOptimizationProcessAtCheckedBeforeMutation(t *testing.T) {
 	exact.tick = maxTick - 2
 	exact.currentHardState.Tick = exact.tick
 	exact.acknowledgedHardState = exact.currentHardState.Clone()
-	ref, err := exact.Propose(Command{ID: CommandID{Client: 303, Sequence: 1}, Payload: []byte("exact-max"), ConflictKeys: [][]byte{[]byte("exact-max-key")}})
+	ref, err := exact.Propose(Command{ID: CommandID{Client: 303, Sequence: 1}, Payload: []byte("exact-max"), Footprint: Footprint{Points: [][]byte{[]byte("exact-max-key")}}})
 	if err != nil {
 		t.Fatalf("exact-Max ProcessAt proposal: %v", err)
 	}
@@ -146,7 +147,7 @@ func TestTimeOptimizationProcessAtCheckedBeforeMutation(t *testing.T) {
 	overflow.currentHardState.Tick = overflow.tick
 	overflow.acknowledgedHardState = overflow.currentHardState.Clone()
 	before := snapshotRemainingNodeProtocol(overflow)
-	if _, err := overflow.Propose(Command{ID: CommandID{Client: 304, Sequence: 1}, Payload: []byte("overflow"), ConflictKeys: [][]byte{[]byte("overflow-key")}}); !errors.Is(err, ErrLogicalTimeExhausted) {
+	if _, err := overflow.Propose(Command{ID: CommandID{Client: 304, Sequence: 1}, Payload: []byte("overflow"), Footprint: Footprint{Points: [][]byte{[]byte("overflow-key")}}}); !errors.Is(err, ErrLogicalTimeExhausted) {
 		t.Fatalf("overflowing ProcessAt err=%v, want %v", err, ErrLogicalTimeExhausted)
 	}
 	requireRemainingNodeProtocolUnchanged(t, overflow, before)

@@ -533,6 +533,7 @@ func fileIdentity(info fs.FileInfo) (uint64, uint64) {
 	if !ok {
 		return 0, 0
 	}
+	//nolint:gosec // G115: Darwin's signed dev_t contains a kernel-issued nonnegative device identifier.
 	return uint64(stat.Dev), uint64(stat.Ino)
 }
 

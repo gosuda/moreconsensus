@@ -56,12 +56,12 @@ func TestOpenWithOptionsAndStorageStats(t *testing.T) {
 	if got := reopened.StorageStats().DurableInstanceRecords; got != 1 {
 		t.Fatalf("startup durable count=%d, want 1", got)
 	}
-	if next, err := reopened.NextCommandSequence(1); err != nil || next != 2 {
-		t.Fatalf("next durable command sequence=%d err=%v, want 2", next, err)
+	if next, err := reopened.NextCommandSequence(1); err != nil || next != 1 {
+		t.Fatalf("next durable command sequence=%d err=%v, want 1", next, err)
 	}
 }
 
-func TestNextCommandSequenceSurvivesReopenAndIncludesUncommittedRecords(t *testing.T) {
+func TestNextCommandSequenceSurvivesReopenAndExcludesUncommittedRecords(t *testing.T) {
 	path := t.TempDir()
 	db, err := Open(path)
 	if err != nil {
@@ -84,8 +84,8 @@ func TestNextCommandSequenceSurvivesReopenAndIncludesUncommittedRecords(t *testi
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
-	if next, err := reopened.NextCommandSequence(9); err != nil || next != 8 {
-		t.Fatalf("next durable command sequence=%d err=%v, want 8", next, err)
+	if next, err := reopened.NextCommandSequence(9); err != nil || next != 1 {
+		t.Fatalf("next durable command sequence=%d err=%v, want 1", next, err)
 	}
 	if next, err := reopened.NextCommandSequence(10); err != nil || next != 1 {
 		t.Fatalf("new client sequence=%d err=%v, want 1", next, err)

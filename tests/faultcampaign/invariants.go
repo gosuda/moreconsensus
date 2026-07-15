@@ -59,7 +59,7 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 		}
 		allConfigs[nodeIndex] = configs
 		records := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
-		err = database.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+		err = database.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 			if !epaxos.VerifyRecordChecksum(record) {
 				return fmt.Errorf("record %s checksum mismatch", record.Ref)
 			}
@@ -170,11 +170,16 @@ func inspectDurableCluster(nodes []*nodeProcess, expectedAcknowledgedMutations i
 }
 
 func isExecutedMutation(record epaxos.InstanceRecord) bool {
-	return record.Status == epaxos.StatusExecuted && record.Command.Kind == epaxos.CommandUser && len(record.Command.Payload) != 0
+	return record.Status == epaxos.StatusExecuted && record.Kind == epaxos.EntryCommand && len(record.Command.Payload) != 0
 }
 
 func sameChosenTuple(left, right chosenTuple) bool {
-	if left.Ref != right.Ref || left.Seq != right.Seq || len(left.Deps) != len(right.Deps) || left.Command.ID != right.Command.ID || left.Command.Kind != right.Command.Kind || !bytes.Equal(left.Command.Payload, right.Command.Payload) || len(left.Command.ConflictKeys) != len(right.Command.ConflictKeys) {
+	if left.Ref != right.Ref || left.Seq != right.Seq || len(left.Deps) != len(right.Deps) ||
+		left.Command.ID != right.Command.ID || !bytes.Equal(left.Command.Payload, right.Command.Payload) ||
+		!bytes.Equal(left.Command.CycleKey, right.Command.CycleKey) ||
+		left.Command.Footprint.All != right.Command.Footprint.All ||
+		len(left.Command.Footprint.Points) != len(right.Command.Footprint.Points) ||
+		len(left.Command.Footprint.Spans) != len(right.Command.Footprint.Spans) {
 		return false
 	}
 	for i := range left.Deps {
@@ -182,8 +187,14 @@ func sameChosenTuple(left, right chosenTuple) bool {
 			return false
 		}
 	}
-	for i := range left.Command.ConflictKeys {
-		if !bytes.Equal(left.Command.ConflictKeys[i], right.Command.ConflictKeys[i]) {
+	for i := range left.Command.Footprint.Points {
+		if !bytes.Equal(left.Command.Footprint.Points[i], right.Command.Footprint.Points[i]) {
+			return false
+		}
+	}
+	for i := range left.Command.Footprint.Spans {
+		if !bytes.Equal(left.Command.Footprint.Spans[i].Start, right.Command.Footprint.Spans[i].Start) ||
+			!bytes.Equal(left.Command.Footprint.Spans[i].End, right.Command.Footprint.Spans[i].End) {
 			return false
 		}
 	}
@@ -203,8 +214,8 @@ func sameRefSet(left, right map[epaxos.InstanceRef]struct{}) bool {
 }
 
 func commandsConflict(left, right epaxos.Command) bool {
-	for _, leftKey := range left.ConflictKeys {
-		for _, rightKey := range right.ConflictKeys {
+	for _, leftKey := range left.Footprint.Points {
+		for _, rightKey := range right.Footprint.Points {
 			if bytes.Equal(leftKey, rightKey) {
 				return true
 			}

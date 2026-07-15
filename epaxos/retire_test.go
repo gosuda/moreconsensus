@@ -33,7 +33,7 @@ func TestRetireFoldsBeyondRetention(t *testing.T) {
 		ref := InstanceRef{Conf: 1, Replica: 1, Instance: i}
 		rec := checkedRecord(InstanceRecord{
 			Ref: ref, Status: StatusExecuted, Seq: uint64(i), Ballot: Ballot{Replica: 1},
-			Deps: rn.q.deps(), Command: Command{Payload: []byte("p"), ConflictKeys: [][]byte{[]byte("k")}},
+			Deps: rn.q.deps(), Command: Command{Payload: []byte("p"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 		})
 		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 		rn.executed.add(ref)
@@ -63,10 +63,10 @@ func TestProposeBackpressureMaxResident(t *testing.T) {
 	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	rec := checkedRecord(InstanceRecord{
 		Ref: ref, Status: StatusCommitted, Seq: 1, Ballot: Ballot{Replica: 1},
-		Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("k")}},
+		Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	})
 	rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
-	if _, err := rn.Propose(Command{Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("k")}}); !errors.Is(err, ErrResidentInstancesExceeded) {
+	if _, err := rn.Propose(Command{Payload: []byte("y"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}}); !errors.Is(err, ErrResidentInstancesExceeded) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -79,7 +79,7 @@ func TestRetirePayloadDropPreservesChecksum(t *testing.T) {
 	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	rec := checkedRecord(InstanceRecord{
 		Ref: ref, Status: StatusExecuted, Seq: 1, Ballot: Ballot{Replica: 1},
-		Deps: rn.q.deps(), Command: Command{Payload: []byte("my-payload"), ConflictKeys: [][]byte{[]byte("k")}},
+		Deps: rn.q.deps(), Command: Command{Payload: []byte("my-payload"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	})
 	rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 	rn.executed.add(ref)
@@ -120,7 +120,7 @@ func TestRetirePayloadStubGaugeAndEmptyCapacity(t *testing.T) {
 		ref := InstanceRef{Conf: 1, Replica: 1, Instance: InstanceNum(i + 1)}
 		rec := checkedRecord(InstanceRecord{
 			Ref: ref, Status: StatusExecuted, Seq: uint64(i + 1), Ballot: Ballot{Replica: 1},
-			Deps: rn.q.deps(), Command: Command{Payload: commandPayload, ConflictKeys: [][]byte{[]byte("k")}},
+			Deps: rn.q.deps(), Command: Command{Payload: commandPayload, Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 		})
 		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 		rn.executed.add(ref)

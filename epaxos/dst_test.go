@@ -536,7 +536,7 @@ func TestDSTDataLifecycleCheckpointRestoreAndCorruptionRejection(t *testing.T) {
 	dstRequireProposalsExactlyOnceEverywhere(t, s, []dstProposal{firstProposal})
 
 	checkpointStore := cloneMemoryStorage(s.stores[3])
-	checkpointApp := cloneCommittedCommands(s.apps[3])
+	checkpointApp := cloneAppliedCommands(s.apps[3])
 	second := dstPut(2501, 2, "lifecycle-after", "restore")
 	secondRef, err := s.nodes[2].Propose(second)
 	if err != nil {
@@ -717,17 +717,17 @@ func dstPartition(s *simCluster, left, right []ReplicaID) {
 
 func dstPut(client, sequence uint64, key, value string) Command {
 	return Command{
-		ID:           CommandID{Client: client, Sequence: sequence},
-		Payload:      []byte("put:" + key + ":" + value),
-		ConflictKeys: [][]byte{[]byte(key)},
+		ID:        CommandID{Client: client, Sequence: sequence},
+		Payload:   []byte("put:" + key + ":" + value),
+		Footprint: Footprint{Points: [][]byte{[]byte(key)}},
 	}
 }
 
 func dstRead(client, sequence uint64, key, expected string) Command {
 	return Command{
-		ID:           CommandID{Client: client, Sequence: sequence},
-		Payload:      []byte("read:" + key + ":" + expected),
-		ConflictKeys: [][]byte{[]byte(key)},
+		ID:        CommandID{Client: client, Sequence: sequence},
+		Payload:   []byte("read:" + key + ":" + expected),
+		Footprint: Footprint{Points: [][]byte{[]byte(key)}},
 	}
 }
 
@@ -747,9 +747,9 @@ func dstTxn(client, sequence uint64, steps ...dstTxnStep) Command {
 		keys[i] = []byte(step.key)
 	}
 	return Command{
-		ID:           CommandID{Client: client, Sequence: sequence},
-		Payload:      []byte(payload.String()),
-		ConflictKeys: keys,
+		ID:        CommandID{Client: client, Sequence: sequence},
+		Payload:   []byte(payload.String()),
+		Footprint: Footprint{Points: keys},
 	}
 }
 
@@ -772,9 +772,6 @@ func dstAssertLinearizableApplications(t *testing.T, s *simCluster, commands []C
 		}
 		positions := make(map[CommandID]int, len(app))
 		for index, committed := range app {
-			if committed.Command.Kind != CommandUser {
-				t.Fatalf("node %d applied non-user command at %d: %#v", id, index, committed)
-			}
 			if _, ok := positions[committed.Command.ID]; ok {
 				t.Fatalf("node %d applied command id %#v more than once", id, committed.Command.ID)
 			}
@@ -814,7 +811,7 @@ func dstAssertLinearizableApplications(t *testing.T, s *simCluster, commands []C
 	}
 }
 
-func dstReplayApplication(t *testing.T, app []CommittedCommand) map[string]string {
+func dstReplayApplication(t *testing.T, app []ApplyCommand) map[string]string {
 	t.Helper()
 	state := make(map[string]string)
 	for index, committed := range app {
@@ -880,7 +877,7 @@ func dstDriveAllowingStorageFailures(t *testing.T, s *simCluster, rounds int) in
 				blockedWrites++
 				continue
 			}
-			s.apps[id] = append(s.apps[id], rd.Committed...)
+			s.apps[id] = append(s.apps[id], rd.Apply...)
 			for _, m := range rd.Messages {
 				if !s.deliver(m) {
 					s.delayed = append(s.delayed, m)
@@ -938,12 +935,12 @@ func dstRequireNoApplications(t *testing.T, s *simCluster) {
 	}
 }
 
-func dstRequireAppliedExactlyOnce(t *testing.T, app []CommittedCommand, id ReplicaID, proposal dstProposal) {
+func dstRequireAppliedExactlyOnce(t *testing.T, app []ApplyCommand, id ReplicaID, proposal dstProposal) {
 	t.Helper()
 	dstRequireAppliedCount(t, app, id, proposal, 1)
 }
 
-func dstRequireAppliedCount(t *testing.T, app []CommittedCommand, id ReplicaID, proposal dstProposal, want int) {
+func dstRequireAppliedCount(t *testing.T, app []ApplyCommand, id ReplicaID, proposal dstProposal, want int) {
 	t.Helper()
 	got := 0
 	for _, committed := range app {
@@ -960,11 +957,11 @@ func dstRequireAppliedCount(t *testing.T, app []CommittedCommand, id ReplicaID, 
 }
 
 func dstSameCommand(want, got Command) bool {
-	if want.ID != got.ID || got.Kind != CommandUser || !bytes.Equal(want.Payload, got.Payload) || len(want.ConflictKeys) != len(got.ConflictKeys) {
+	if want.ID != got.ID || !bytes.Equal(want.Payload, got.Payload) || len(want.Footprint.Points) != len(got.Footprint.Points) {
 		return false
 	}
-	wantKeys := dstSortedKeys(want.ConflictKeys)
-	gotKeys := dstSortedKeys(got.ConflictKeys)
+	wantKeys := dstSortedKeys(want.Footprint.Points)
+	gotKeys := dstSortedKeys(got.Footprint.Points)
 	for i := range wantKeys {
 		if wantKeys[i] != gotKeys[i] {
 			return false

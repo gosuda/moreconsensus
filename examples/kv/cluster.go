@@ -124,6 +124,15 @@ func openCluster(paths []string, newNode func(epaxos.Config) (*epaxos.RawNode, e
 			_ = c.Close()
 			return nil, err
 		}
+		next, err := db.NextCommandSequence(1)
+		if err != nil {
+			_ = db.Close()
+			_ = c.Close()
+			return nil, err
+		}
+		if next > c.next {
+			c.next = next
+		}
 		rn, err := newNode(epaxos.Config{ID: id, Voters: ids, Storage: db.EPaxosStorage(), RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: true, TimeOptimizationTicks: 1})
 		if err != nil {
 			_ = db.Close()
@@ -198,7 +207,7 @@ func (c *Cluster) firstLiveReplica() *epaxos.RawNode {
 	return nil
 }
 
-func (c *Cluster) allLiveReplicasExecuted(ref epaxos.InstanceRef) bool {
+func (c *Cluster) allLiveReplicasExecuted(want epaxos.InstanceRef) bool {
 	live := 0
 	for _, id := range c.ids {
 		node := c.Nodes[id]
@@ -206,14 +215,18 @@ func (c *Cluster) allLiveReplicasExecuted(ref epaxos.InstanceRef) bool {
 			continue
 		}
 		live++
-		found := false
-		for _, executed := range node.Status().Executed {
-			if executed == ref {
-				found = true
+		executed := false
+		for _, executedRef := range node.Status().Executed {
+			if executedRef == want {
+				executed = true
 				break
 			}
 		}
-		if !found {
+		if !executed {
+			checkpoint, err := c.DBs[id].EPaxosStorage().LoadCheckpoint()
+			executed = err == nil && executionFrontierCovers(checkpoint.CompactedThrough, want)
+		}
+		if !executed {
 			return false
 		}
 	}
@@ -279,7 +292,7 @@ func (c *Cluster) verifyCheckpointAgainstLiveQuorum(checkpointDir string, target
 			continue
 		}
 		records := make(map[epaxos.InstanceRef]epaxos.InstanceRecord)
-		if err := db.EPaxosStorage().LoadInstances(func(rec epaxos.InstanceRecord) error {
+		if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(rec epaxos.InstanceRecord) error {
 			records[rec.Ref] = rec
 			return nil
 		}); err != nil {
@@ -420,11 +433,20 @@ func instanceNumsEqualKV(left, right []epaxos.InstanceNum) bool {
 }
 
 func sameEPaxosCommand(left, right epaxos.Command) bool {
-	if left.ID != right.ID || left.Kind != right.Kind || !bytes.Equal(left.Payload, right.Payload) || len(left.ConflictKeys) != len(right.ConflictKeys) {
+	if left.ID != right.ID || !bytes.Equal(left.Payload, right.Payload) ||
+		!bytes.Equal(left.CycleKey, right.CycleKey) || left.Footprint.All != right.Footprint.All ||
+		len(left.Footprint.Points) != len(right.Footprint.Points) ||
+		len(left.Footprint.Spans) != len(right.Footprint.Spans) {
 		return false
 	}
-	for i := range left.ConflictKeys {
-		if !bytes.Equal(left.ConflictKeys[i], right.ConflictKeys[i]) {
+	for i := range left.Footprint.Points {
+		if !bytes.Equal(left.Footprint.Points[i], right.Footprint.Points[i]) {
+			return false
+		}
+	}
+	for i := range left.Footprint.Spans {
+		if !bytes.Equal(left.Footprint.Spans[i].Start, right.Footprint.Spans[i].Start) ||
+			!bytes.Equal(left.Footprint.Spans[i].End, right.Footprint.Spans[i].End) {
 			return false
 		}
 	}
@@ -460,25 +482,66 @@ func (c *Cluster) drainWithLimit(limit int) error {
 			progress = true
 			rd := rn.Ready()
 			if err := c.readyAppliers[id](rd); err != nil {
-				return err
+				return fmt.Errorf("kv: apply ready replica %d: %w", id, err)
+			}
+			if rd.Checkpoint != nil {
+				result, err := c.DBs[id].CreateApplicationCheckpoint(*rd.Checkpoint)
+				if err != nil {
+					return fmt.Errorf("kv: create checkpoint replica %d: %w", id, err)
+				}
+				if err := rn.ProvideCheckpoint(result); err != nil {
+					return fmt.Errorf("kv: provide checkpoint replica %d: %w", id, err)
+				}
+			}
+			for _, ref := range rd.RecordLoads {
+				record, found, err := c.DBs[id].LoadInstance(ref)
+				if err != nil {
+					return fmt.Errorf("kv: load record replica %d ref %s: %w", id, ref, err)
+				}
+				if err := rn.ProvideRecordLoad(epaxos.RecordLoadResult{Ref: ref, Record: record, Found: found}); err != nil {
+					return fmt.Errorf("kv: provide record replica %d ref %s: %w", id, ref, err)
+				}
 			}
 			for _, msg := range rd.Messages {
 				if err := c.deliverMessage(msg); err != nil {
-					return err
+					return fmt.Errorf("kv: deliver %s from replica %d: %w", msg.Type, id, err)
 				}
 			}
 			if err := rn.Advance(rd); err != nil {
-				return err
+				return fmt.Errorf("kv: advance replica %d: %w", id, err)
 			}
 		}
 		if !progress {
 			return nil
 		}
 	}
+	for _, id := range c.ids {
+		if rn := c.Nodes[id]; rn != nil && rn.HasReady() {
+			rd := rn.Ready()
+			return fmt.Errorf("kv: cluster did not quiesce; replica %d ready records=%d messages=%d apply=%d loads=%d checkpoint=%t snapshot=%t compact=%d",
+				id, len(rd.Records), len(rd.Messages), len(rd.Apply), len(rd.RecordLoads), rd.Checkpoint != nil, rd.Snapshot != nil, len(rd.Compact))
+		}
+	}
 	return fmt.Errorf("kv: cluster did not quiesce")
 }
 
 func (c *Cluster) deliver(msg epaxos.Message) error {
+	if checkpoint, offered, err := epaxos.CheckpointOffer(msg); err != nil {
+		return err
+	} else if offered {
+		source := c.DBs[msg.From]
+		target := c.DBs[msg.To]
+		if source == nil || target == nil {
+			return nil
+		}
+		bundle, err := source.ApplicationSnapshotBundle(checkpoint.ApplicationSnapshot)
+		if err != nil {
+			return err
+		}
+		if err := target.MaterializeApplicationSnapshot(checkpoint.ApplicationSnapshot, bundle); err != nil {
+			return err
+		}
+	}
 	to := c.Nodes[msg.To]
 	if to == nil {
 		return nil

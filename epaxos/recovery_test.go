@@ -35,7 +35,7 @@ func recoveryFinishPreAcceptedValidation(t *testing.T, store *MemoryStorage, rn 
 		if inst.phase == phaseAccept {
 			break
 		}
-		if err := rn.Step(Message{
+		if err := rn.Step(canonicalTestMessage(Message{
 			Type:         MsgTryPreAcceptResp,
 			From:         from,
 			To:           rn.id,
@@ -44,7 +44,7 @@ func recoveryFinishPreAcceptedValidation(t *testing.T, store *MemoryStorage, rn 
 			Seq:          inst.rec.Seq,
 			Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
 			RecordStatus: StatusPreAccepted,
-		}); err != nil {
+		})); err != nil {
 			t.Fatalf("step validated PreAccept response from %d: %v", from, err)
 		}
 	}
@@ -67,7 +67,7 @@ func TestDependencyClosureStartsPrefixRecoveryBeforeExecution(t *testing.T) {
 		{Replica: 2, Instance: 1, Conf: 1},
 		{Replica: 2, Instance: 2, Conf: 1},
 	}
-	dependent := Command{ID: CommandID{Client: 10, Sequence: 1}, Payload: []byte("dependent"), ConflictKeys: [][]byte{[]byte("k")}}
+	dependent := Command{ID: CommandID{Client: 10, Sequence: 1}, Payload: []byte("dependent"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}}
 	commit := Message{Type: MsgCommit, From: 2,
 		To:           1,
 		Ref:          dependentRef,
@@ -76,7 +76,7 @@ func TestDependencyClosureStartsPrefixRecoveryBeforeExecution(t *testing.T) {
 		Seq:          3,
 		Deps:         []InstanceNum{0, 2, 0},
 		Command:      dependent}
-	if err := rn.Step(commit); err != nil {
+	if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 		t.Fatal(err)
 	}
 	if got := rn.instances[dependentRef].rec.Deps[1]; got != 2 {
@@ -90,8 +90,8 @@ func TestDependencyClosureStartsPrefixRecoveryBeforeExecution(t *testing.T) {
 	}
 
 	rd := rn.Ready()
-	if got := recoveryCommittedPayloadCount(rd.Committed, dependentRef, dependent.Payload); got != 0 {
-		t.Fatalf("dependent command executed before dependency closure: count=%d committed=%#v", got, rd.Committed)
+	if got := recoveryCommittedPayloadCount(rd.Apply, dependentRef, dependent.Payload); got != 0 {
+		t.Fatalf("dependent command executed before dependency closure: count=%d committed=%#v", got, rd.Apply)
 	}
 	recoveryRequirePrepareRefs(t, rd.Messages, foreignPrefixRefs[:1])
 	recoveryRequireNoPrepareRefs(t, rd.Messages, []InstanceRef{
@@ -110,7 +110,7 @@ func TestForeignMissingDependencyRecoveryNoopsAndReleasesDependent(t *testing.T)
 
 	missingRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
 	dependentRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	dependent := Command{ID: CommandID{Client: 20, Sequence: 1}, Payload: []byte("after-noop"), ConflictKeys: [][]byte{[]byte("k")}}
+	dependent := Command{ID: CommandID{Client: 20, Sequence: 1}, Payload: []byte("after-noop"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}}
 	commit := Message{Type: MsgCommit, From: 3,
 		To:           1,
 		Ref:          dependentRef,
@@ -119,54 +119,54 @@ func TestForeignMissingDependencyRecoveryNoopsAndReleasesDependent(t *testing.T)
 		Seq:          2,
 		Deps:         []InstanceNum{0, 1, 0},
 		Command:      dependent}
-	if err := rn.Step(commit); err != nil {
+	if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
-	if got := recoveryCommittedPayloadCount(rd.Committed, dependentRef, dependent.Payload); got != 0 {
-		t.Fatalf("dependent command executed before missing dependency recovery: count=%d committed=%#v", got, rd.Committed)
+	if got := recoveryCommittedPayloadCount(rd.Apply, dependentRef, dependent.Payload); got != 0 {
+		t.Fatalf("dependent command executed before missing dependency recovery: count=%d committed=%#v", got, rd.Apply)
 	}
 	recoveryRequirePrepareRefs(t, rd.Messages, []InstanceRef{missingRef})
 	recoveryApplyReady(t, store, rn, rd)
 
 	ballot := Ballot{Number: 1, Replica: 1}
 	resp := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: missingRef, Ballot: ballot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0}}
-	if err := rn.Step(resp); err != nil {
+	if err := rn.Step(canonicalTestMessage(resp)); err != nil {
 		t.Fatal(err)
 	}
 	rd = rn.Ready()
-	recoveryRequireRecord(t, rd.Records, missingRef, StatusAccepted, CommandNoop)
-	recoveryRequireMessages(t, rd.Messages, MsgAccept, missingRef, CommandNoop)
-	if got := recoveryCommittedPayloadCount(rd.Committed, dependentRef, dependent.Payload); got != 0 {
-		t.Fatalf("dependent command executed before noop accept quorum: count=%d committed=%#v", got, rd.Committed)
+	recoveryRequireRecord(t, rd.Records, missingRef, StatusAccepted, EntryNoop)
+	recoveryRequireMessages(t, rd.Messages, MsgAccept, missingRef, EntryNoop)
+	if got := recoveryCommittedPayloadCount(rd.Apply, dependentRef, dependent.Payload); got != 0 {
+		t.Fatalf("dependent command executed before noop accept quorum: count=%d committed=%#v", got, rd.Apply)
 	}
 	recoveryApplyReady(t, store, rn, rd)
 
 	acceptResp := Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: missingRef, Ballot: ballot, RecordBallot: ballot, Seq: 1, Deps: []InstanceNum{0, 0, 0}, RecordStatus: StatusAccepted}
 	wrongAcceptResp := acceptResp
 	wrongAcceptResp.Seq++
-	if err := rn.Step(wrongAcceptResp); err != nil {
+	if err := rn.Step(canonicalTestMessage(wrongAcceptResp)); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, rn, "foreign missing-dependency recovery counted mismatched accept tuple")
-	if err := rn.Step(acceptResp); err != nil {
+	if err := rn.Step(canonicalTestMessage(acceptResp)); err != nil {
 		t.Fatal(err)
 	}
 	rd = rn.Ready()
-	recoveryRequireRecord(t, rd.Records, missingRef, StatusExecuted, CommandNoop)
-	if got := recoveryCommittedPayloadCount(rd.Committed, dependentRef, dependent.Payload); got != 1 {
-		t.Fatalf("dependent command release count=%d, want 1; committed=%#v", got, rd.Committed)
+	recoveryRequireRecord(t, rd.Records, missingRef, StatusExecuted, EntryNoop)
+	if got := recoveryCommittedPayloadCount(rd.Apply, dependentRef, dependent.Payload); got != 1 {
+		t.Fatalf("dependent command release count=%d, want 1; committed=%#v", got, rd.Apply)
 	}
-	for _, c := range rd.Committed {
-		if c.Ref == missingRef || c.Command.Kind == CommandNoop {
-			t.Fatalf("noop recovery emitted application command: %#v", rd.Committed)
+	for _, c := range rd.Apply {
+		if c.Ref == missingRef {
+			t.Fatalf("noop recovery emitted application command: %#v", rd.Apply)
 		}
 	}
 	recoveryApplyReady(t, store, rn, rd)
 
 	if rn.HasReady() {
 		rd = rn.Ready()
-		if got := recoveryCommittedPayloadCount(rd.Committed, dependentRef, dependent.Payload); got != 0 {
+		if got := recoveryCommittedPayloadCount(rd.Apply, dependentRef, dependent.Payload); got != 0 {
 			t.Fatalf("dependent command emitted again after recovery: count=%d ready=%#v", got, rd)
 		}
 		recoveryApplyReady(t, store, rn, rd)
@@ -178,10 +178,11 @@ func TestRestartResumesForeignRecoveryBallot(t *testing.T) {
 		name string
 		st   Status
 		seq  uint64
+		kind EntryKind
 		cmd  Command
 	}{
-		{name: "none", st: StatusNone, cmd: Command{}},
-		{name: "accepted", st: StatusAccepted, cmd: Command{Kind: CommandNoop}, seq: 1},
+		{name: "none", st: StatusNone},
+		{name: "accepted", st: StatusAccepted, kind: EntryNoop, seq: 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			store := NewMemoryStorage()
@@ -192,6 +193,7 @@ func TestRestartResumesForeignRecoveryBallot(t *testing.T) {
 				Status:  tt.st,
 				Seq:     tt.seq,
 				Deps:    []InstanceNum{0, 0, 0},
+				Kind:    tt.kind,
 				Command: tt.cmd,
 			})
 			restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store, RetryTicks: 2, RecoveryTicks: 5})
@@ -227,12 +229,12 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
@@ -258,24 +260,24 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery reached slow quorum without removed voter 4: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery counted duplicate voter 3 prepare response as removed voter 4: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargets(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4})
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
 	recoveryApplyReady(t, store, restarted, rd)
 
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
@@ -284,30 +286,30 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	}
 	wrongAcceptResp := acceptResp(3)
 	wrongAcceptResp.Seq++
-	if err := restarted.Step(wrongAcceptResp); err != nil {
+	if err := restarted.Step(canonicalTestMessage(wrongAcceptResp)); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "old-config recovery counted mismatched accept tuple")
-	if err := restarted.Step(acceptResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery committed without removed voter 4 accept response: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(acceptResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery counted duplicate voter 3 accept response as removed voter 4: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(acceptResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargets(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4})
-	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -320,12 +322,12 @@ func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.
 	}
 	ref := InstanceRef{Replica: 2, Instance: 7, Conf: 2}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 2},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 2},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	restarted, err := NewRawNode(Config{ID: 1, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
@@ -355,8 +357,8 @@ func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.
 			if rec.Ref != ref || rec.Status != status {
 				continue
 			}
-			if rec.Command.Kind != CommandNoop {
-				t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Command.Kind, CommandNoop, rec)
+			if rec.Kind != EntryNoop {
+				t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Kind, EntryNoop, rec)
 			}
 			if len(rec.Deps) != 4 {
 				t.Fatalf("record %s/%s deps width = %d, want pinned Conf2 width 4: %#v", ref, status, len(rec.Deps), rec)
@@ -369,20 +371,20 @@ func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 1, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("mid-chain old-config recovery counted local 1 plus current voter 4 as Conf2 prepare quorum: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(prepareResp(2)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(2))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{2, 3, 4}, 4)
 	requireNoopRecordWithDepsWidth(rd.Records, StatusAccepted)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("mid-chain old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("mid-chain old-config recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -390,20 +392,20 @@ func TestOldConfigRecoveryUsesPinnedMidChainVotersAfterAddThenRemove(t *testing.
 	acceptResp := func(from ReplicaID) Message {
 		return Message{Type: MsgAcceptResp, From: from, To: 1, Ref: ref, Ballot: acceptBallot, RecordBallot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
 	}
-	if err := restarted.Step(acceptResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("mid-chain old-config recovery counted local 1 plus current voter 4 as Conf2 accept quorum: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(acceptResp(2)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(2))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{2, 3, 4}, 4)
 	requireNoopRecordWithDepsWidth(rd.Records, StatusExecuted)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("mid-chain old-config noop recovery emitted application commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("mid-chain old-config noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -416,12 +418,12 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	}
 	ref := InstanceRef{Replica: 2, Instance: 7, Conf: 2}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 2},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 2},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	const retryTicks = 2
@@ -451,8 +453,8 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 			if rec.Ref != ref || rec.Status != status {
 				continue
 			}
-			if rec.Command.Kind != CommandNoop {
-				t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Command.Kind, CommandNoop, rec)
+			if rec.Kind != EntryNoop {
+				t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Kind, EntryNoop, rec)
 			}
 			if len(rec.Deps) != 4 {
 				t.Fatalf("record %s/%s deps width = %d, want pinned Conf2 width 4: %#v", ref, status, len(rec.Deps), rec)
@@ -465,7 +467,7 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 1, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "mid-chain recovery counted current quorum prepare response as old Conf2 quorum")
@@ -488,14 +490,14 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	recoveryRequireNoRecordOrApplicationEffects(t, restarted, retry, "mid-chain recovery prepare retry")
 	recoveryApplyReady(t, store, restarted, retry)
 
-	if err := restarted.Step(prepareResp(2)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(2))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{2, 3, 4}, 4)
 	requireNoopRecordWithDepsWidth(rd.Records, StatusAccepted)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("mid-chain recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("mid-chain recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -503,7 +505,7 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	acceptResp := func(from ReplicaID) Message {
 		return Message{Type: MsgAcceptResp, From: from, To: 1, Ref: ref, Ballot: acceptBallot, RecordBallot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
 	}
-	if err := restarted.Step(acceptResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "mid-chain recovery counted current quorum accept response as old Conf2 quorum")
@@ -530,14 +532,14 @@ func TestOldConfigChainRecoveryRetryCompletesAfterLostPreRetryResponses(t *testi
 	recoveryRequireNoRecordOrApplicationEffects(t, restarted, retry, "mid-chain recovery accept retry")
 	recoveryApplyReady(t, store, restarted, retry)
 
-	if err := restarted.Step(acceptResp(2)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(2))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{2, 3, 4}, 4)
 	requireNoopRecordWithDepsWidth(rd.Records, StatusExecuted)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("mid-chain noop recovery emitted application commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("mid-chain noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -547,12 +549,12 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	const retryTicks = 2
@@ -597,20 +599,20 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery reached accept before old prepare quorum: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -641,12 +643,12 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	const retryTicks = 2
@@ -672,18 +674,18 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "old-config recovery counted one prepare response as quorum")
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -691,7 +693,7 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 	acceptResp := func(from ReplicaID) Message {
 		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, RecordBallot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
 	}
-	if err := restarted.Step(acceptResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "old-config recovery counted one accept response as quorum")
@@ -718,14 +720,14 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryAcceptResponse(t *testi
 	recoveryRequireNoRecordOrApplicationEffects(t, restarted, retry, "old-config recovery accept retry")
 	recoveryApplyReady(t, store, restarted, retry)
 
-	if err := restarted.Step(acceptResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4}, 4)
-	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -735,12 +737,12 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	const retryTicks = 2
@@ -766,7 +768,7 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "old-config recovery counted one prepare response as quorum")
@@ -789,14 +791,14 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 	recoveryRequireNoRecordOrApplicationEffects(t, restarted, retry, "old-config recovery prepare retry")
 	recoveryApplyReady(t, store, restarted, retry)
 
-	if err := restarted.Step(prepareResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3, 4}, 4)
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 4)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -804,18 +806,18 @@ func TestOldConfigRecoveryRetryCompletesAfterLostPreRetryPrepareResponse(t *test
 	acceptResp := func(from ReplicaID) Message {
 		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, RecordBallot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
 	}
-	if err := restarted.Step(acceptResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	recoveryRequireNoReady(t, restarted, "old-config recovery counted one accept response as quorum")
-	if err := restarted.Step(acceptResp(4)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3, 4}, 4)
-	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -825,12 +827,12 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	const retryTicks = 2
@@ -876,14 +878,14 @@ func TestOldConfigRecoveryRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 	}
 
 	prepareResp := Message{Type: MsgPrepareResp, From: 3, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0}}
-	if err := restarted.Step(prepareResp); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp)); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3}, 3)
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config recovery accept emitted application commands before accept quorum: %#v", rd.Apply)
 	}
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
 	recoveryApplyReady(t, store, restarted, rd)
@@ -914,12 +916,12 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterAddition(t *testing.T) {
 	store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
 	store.Records[ref] = checkedRecord(InstanceRecord{
-		Ref:     ref,
-		Ballot:  Ballot{Replica: 1},
-		Status:  StatusAccepted,
-		Seq:     1,
-		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{Kind: CommandNoop},
+		Ref:    ref,
+		Ballot: Ballot{Replica: 1},
+		Status: StatusAccepted,
+		Seq:    1,
+		Deps:   []InstanceNum{0, 0, 0},
+		Kind:   EntryNoop,
 	})
 
 	restarted, err := NewRawNode(Config{ID: 2, Voters: []ReplicaID{1, 2, 3}, Storage: store, RetryTicks: 2, RecoveryTicks: 4})
@@ -945,38 +947,38 @@ func TestOldConfigRecoveryUsesPinnedVotersAfterAddition(t *testing.T) {
 	prepareResp := func(from ReplicaID) Message {
 		return Message{Type: MsgPrepareResp, From: from, To: 2, Ref: ref, Ballot: prepareBallot, RecordStatus: StatusNone, Deps: []InstanceNum{0, 0, 0}}
 	}
-	if err := restarted.Step(prepareResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery counted newly added voter 4 prepare response: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(prepareResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(prepareResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	acceptBallot := recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgAccept, ref, []ReplicaID{1, 3}, 3)
-	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, CommandNoop)
+	recoveryRequireRecord(t, rd.Records, ref, StatusAccepted, EntryNoop)
 	recoveryApplyReady(t, store, restarted, rd)
 
 	acceptMsg := optimizedRequireMessage(t, rd.Messages, MsgAccept, 3)
 	acceptResp := func(from ReplicaID) Message {
 		return Message{Type: MsgAcceptResp, From: from, To: 2, Ref: ref, Ballot: acceptBallot, RecordBallot: acceptBallot, Seq: acceptMsg.Seq, Deps: append([]InstanceNum(nil), acceptMsg.Deps...), RecordStatus: StatusAccepted}
 	}
-	if err := restarted.Step(acceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 		t.Fatal(err)
 	}
 	if restarted.HasReady() {
 		t.Fatalf("old-config recovery counted newly added voter 4 accept response: %#v", restarted.Ready())
 	}
-	if err := restarted.Step(acceptResp(3)); err != nil {
+	if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 		t.Fatal(err)
 	}
 	rd = restarted.Ready()
 	recoveryRequireMessageTargetsWithDepsWidth(t, rd.Messages, MsgCommit, ref, []ReplicaID{1, 3}, 3)
-	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
-	if len(rd.Committed) != 0 {
-		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Committed)
+	recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, EntryNoop)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("old-config noop recovery emitted application commands: %#v", rd.Apply)
 	}
 	recoveryApplyReady(t, store, restarted, rd)
 }
@@ -1018,7 +1020,7 @@ func TestOldConfigTransitionRetryUsesPinnedVotersAfterRemoval(t *testing.T) {
 			store := NewMemoryStorage()
 			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 			ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("old-config-transition-removal-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-removal-key")}}
+			cmd := Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("old-config-transition-removal-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-transition-removal-key")}}}
 			store.Records[ref] = checkedRecord(InstanceRecord{
 				Ref:              ref,
 				Ballot:           tt.ballot,
@@ -1105,7 +1107,7 @@ func TestOldConfigTransitionRetryUsesPinnedVotersAfterAddition(t *testing.T) {
 			store := NewMemoryStorage()
 			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
 			ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 92, Sequence: 1}, Payload: []byte("old-config-transition-addition-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-addition-key")}}
+			cmd := Command{ID: CommandID{Client: 92, Sequence: 1}, Payload: []byte("old-config-transition-addition-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-transition-addition-key")}}}
 			store.Records[ref] = checkedRecord(InstanceRecord{
 				Ref:              ref,
 				Ballot:           tt.ballot,
@@ -1220,7 +1222,7 @@ func TestOldConfigChainTransitionRetryUsesPinnedVotersAfterAddThenRemove(t *test
 				{ID: 3, Voters: []ReplicaID{1, 3, 4}},
 			}
 			ballot := Ballot{Replica: 1}
-			cmd := Command{ID: CommandID{Client: 98, Sequence: 1}, Payload: []byte("old-config-chain-transition-retry-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-chain-transition-retry-key")}}
+			cmd := Command{ID: CommandID{Client: 98, Sequence: 1}, Payload: []byte("old-config-chain-transition-retry-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-chain-transition-retry-key")}}}
 			store.Records[tt.ref] = checkedRecord(InstanceRecord{
 				Ref:              tt.ref,
 				Ballot:           ballot,
@@ -1359,7 +1361,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 			store := NewMemoryStorage()
 			store.Configs = append([]ConfState(nil), tt.storeConfigs...)
 			ballot := Ballot{Replica: 1}
-			cmd := Command{ID: CommandID{Client: 97, Sequence: 1}, Payload: []byte("old-config-transition-lost-pre-retry-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-lost-pre-retry-key")}}
+			cmd := Command{ID: CommandID{Client: 97, Sequence: 1}, Payload: []byte("old-config-transition-lost-pre-retry-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-transition-lost-pre-retry-key")}}}
 			store.Records[tt.ref] = checkedRecord(InstanceRecord{
 				Ref:              tt.ref,
 				Ballot:           ballot,
@@ -1394,7 +1396,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 			assertConfState(t, restarted.Status().Conf, tt.wantCurrentConf)
 			recoveryRequireNoReady(t, restarted, "restart before old-config transition lost-response retry deadline")
 
-			if err := restarted.Step(response(tt.preRetryFrom, ballot)); err != nil && (!tt.preRetryRejected || !errors.Is(err, ErrMessageRejected)) {
+			if err := restarted.Step(canonicalTestMessage(response(tt.preRetryFrom, ballot))); err != nil && (!tt.preRetryRejected || !errors.Is(err, ErrMessageRejected)) {
 				t.Fatal(err)
 			}
 			recoveryRequireNoReady(t, restarted, "old-config transition counted pre-retry response under current config")
@@ -1426,7 +1428,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 			recoveryRequireNoRecordOrApplicationEffects(t, restarted, rd, "old-config transition retry")
 			recoveryApplyReady(t, store, restarted, rd)
 
-			if err := restarted.Step(response(tt.lostFrom, retry.Ballot)); err != nil {
+			if err := restarted.Step(canonicalTestMessage(response(tt.lostFrom, retry.Ballot))); err != nil {
 				t.Fatal(err)
 			}
 			rd = restarted.Ready()
@@ -1438,8 +1440,8 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 					t.Fatalf("old-config transition preaccepted accept seq = %d, want %d: %#v", accept.Seq, tt.seq, accept)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusAccepted, cmd, tt.seq, tt.deps)
-				if len(rd.Committed) != 0 {
-					t.Fatalf("old-config transition preaccepted emitted application commands before accept quorum: %#v", rd.Committed)
+				if len(rd.Apply) != 0 {
+					t.Fatalf("old-config transition preaccepted emitted application commands before accept quorum: %#v", rd.Apply)
 				}
 			case StatusAccepted:
 				commit := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgCommit, tt.ref, tt.retryTargets, cmd, tt.deps)
@@ -1447,7 +1449,7 @@ func TestOldConfigTransitionRetryCompletesAfterLostPreRetryResponses(t *testing.
 					t.Fatalf("old-config transition accepted commit attrs = seq %d accept seq %d deps %v/%v, want seq %d accept seq %d deps %v/%v: %#v", commit.Seq, commit.AcceptSeq, commit.Deps, commit.AcceptDeps, tt.seq, tt.acceptSeq, tt.deps, tt.acceptDeps, commit)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusCommitted, cmd, tt.seq, tt.deps)
-				recoveryRequireCommittedCommand(t, rd.Committed, tt.ref, cmd, tt.seq, tt.deps)
+				recoveryRequireAppliedCommand(t, rd.Apply, tt.ref, cmd, tt.seq, tt.deps)
 			default:
 				t.Fatalf("unhandled status %s", tt.status)
 			}
@@ -1534,7 +1536,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 				{ID: 3, Voters: []ReplicaID{1, 3, 4}},
 			}
 			ballot := Ballot{Replica: 1}
-			cmd := Command{ID: CommandID{Client: 99, Sequence: 1}, Payload: []byte("old-config-chain-transition-lost-pre-retry-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-chain-transition-lost-pre-retry-key")}}
+			cmd := Command{ID: CommandID{Client: 99, Sequence: 1}, Payload: []byte("old-config-chain-transition-lost-pre-retry-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-chain-transition-lost-pre-retry-key")}}}
 			store.Records[tt.ref] = checkedRecord(InstanceRecord{
 				Ref:              tt.ref,
 				Ballot:           ballot,
@@ -1575,7 +1577,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 			if preRetryResponse.Type != tt.responseType || preRetryResponse.From != tt.preRetryFrom || preRetryResponse.To != 1 {
 				t.Fatalf("pre-retry response fixture = %#v", preRetryResponse)
 			}
-			err = restarted.Step(preRetryResponse)
+			err = restarted.Step(canonicalTestMessage(preRetryResponse))
 			if tt.preRetryErr == nil {
 				if err != nil {
 					t.Fatal(err)
@@ -1613,7 +1615,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 			recoveryApplyReady(t, store, restarted, rd)
 			recoveryRequireNoReady(t, restarted, "old-config chain transition retry left immediate work before replacement response")
 
-			if err := restarted.Step(response(tt.lostFrom, retry.Ballot)); err != nil {
+			if err := restarted.Step(canonicalTestMessage(response(tt.lostFrom, retry.Ballot))); err != nil {
 				t.Fatal(err)
 			}
 			rd = restarted.Ready()
@@ -1625,8 +1627,8 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 					t.Fatalf("old-config chain transition preaccepted accept seq = %d, want %d: %#v", accept.Seq, tt.seq, accept)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusAccepted, cmd, tt.seq, tt.deps)
-				if len(rd.Committed) != 0 {
-					t.Fatalf("old-config chain transition preaccepted emitted application commands before accept quorum: %#v", rd.Committed)
+				if len(rd.Apply) != 0 {
+					t.Fatalf("old-config chain transition preaccepted emitted application commands before accept quorum: %#v", rd.Apply)
 				}
 			case StatusAccepted:
 				commit := recoveryRequireMessageTargetsWithCommandAndDeps(t, rd.Messages, MsgCommit, tt.ref, tt.retryTargets, cmd, tt.deps)
@@ -1634,7 +1636,7 @@ func TestOldConfigChainTransitionRetryCompletesAfterLostPreRetryResponses(t *tes
 					t.Fatalf("old-config chain transition accepted commit attrs = seq %d accept seq %d deps %v/%v, want seq %d accept seq %d deps %v/%v: %#v", commit.Seq, commit.AcceptSeq, commit.Deps, commit.AcceptDeps, tt.seq, tt.acceptSeq, tt.deps, tt.acceptDeps, commit)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, tt.ref, StatusCommitted, cmd, tt.seq, tt.deps)
-				recoveryRequireCommittedCommand(t, rd.Committed, tt.ref, cmd, tt.seq, tt.deps)
+				recoveryRequireAppliedCommand(t, rd.Apply, tt.ref, cmd, tt.seq, tt.deps)
 			default:
 				t.Fatalf("unhandled status %s", tt.status)
 			}
@@ -1674,7 +1676,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 			store := NewMemoryStorage()
 			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3}}}
 			ref := InstanceRef{Replica: 1, Instance: 8, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 93, Sequence: 1}, Payload: []byte("old-config-transition-dedup-removal-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-dedup-removal-key")}}
+			cmd := Command{ID: CommandID{Client: 93, Sequence: 1}, Payload: []byte("old-config-transition-dedup-removal-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-transition-dedup-removal-key")}}}
 			store.Records[ref] = checkedRecord(InstanceRecord{
 				Ref:              ref,
 				Ballot:           Ballot{Replica: 1},
@@ -1719,15 +1721,15 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 				preAcceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), FastPathEligible: true}
 				}
-				if err := restarted.Step(preAcceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition removal preaccepted counted one remote old voter as quorum")
-				if err := restarted.Step(preAcceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition removal preaccepted counted duplicate voter 2 as voter 3")
-				if err := restarted.Step(preAcceptResp(3)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(3))); err != nil {
 					t.Fatal(err)
 				}
 				rd = restarted.Ready()
@@ -1737,22 +1739,22 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 					t.Fatalf("old-config transition removal preaccepted accept seq = %d, want %d: %#v", accept.Seq, tt.seq, accept)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, ref, StatusAccepted, cmd, tt.seq, tt.deps)
-				if len(rd.Committed) != 0 {
-					t.Fatalf("old-config transition removal preaccepted emitted application commands before accept quorum: %#v", rd.Committed)
+				if len(rd.Apply) != 0 {
+					t.Fatalf("old-config transition removal preaccepted emitted application commands before accept quorum: %#v", rd.Apply)
 				}
 			case StatusAccepted:
 				acceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, RecordBallot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), AcceptSeq: retry.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), retry.AcceptDeps...), RecordStatus: StatusAccepted}
 				}
-				if err := restarted.Step(acceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition removal accepted counted one remote old voter as quorum")
-				if err := restarted.Step(acceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition removal accepted counted duplicate voter 2 as voter 3")
-				if err := restarted.Step(acceptResp(3)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(3))); err != nil {
 					t.Fatal(err)
 				}
 				rd = restarted.Ready()
@@ -1761,7 +1763,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterRemoval(t *testing.T) {
 					t.Fatalf("old-config transition removal accepted commit attrs = seq %d accept seq %d deps %v/%v, want seq %d accept seq %d deps %v/%v: %#v", commit.Seq, commit.AcceptSeq, commit.Deps, commit.AcceptDeps, tt.seq, tt.acceptSeq, tt.deps, tt.acceptDeps, commit)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, ref, StatusCommitted, cmd, tt.seq, tt.deps)
-				recoveryRequireCommittedCommand(t, rd.Committed, ref, cmd, tt.seq, tt.deps)
+				recoveryRequireAppliedCommand(t, rd.Apply, ref, cmd, tt.seq, tt.deps)
 			default:
 				t.Fatalf("unhandled status %s", tt.status)
 			}
@@ -1800,7 +1802,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 			store := NewMemoryStorage()
 			store.Configs = []ConfState{{ID: 2, Voters: []ReplicaID{1, 2, 3, 4}}}
 			ref := InstanceRef{Replica: 1, Instance: 8, Conf: 1}
-			cmd := Command{ID: CommandID{Client: 94, Sequence: 1}, Payload: []byte("old-config-transition-dedup-addition-" + tt.name), ConflictKeys: [][]byte{[]byte("old-config-transition-dedup-addition-key")}}
+			cmd := Command{ID: CommandID{Client: 94, Sequence: 1}, Payload: []byte("old-config-transition-dedup-addition-" + tt.name), Footprint: Footprint{Points: [][]byte{[]byte("old-config-transition-dedup-addition-key")}}}
 			store.Records[ref] = checkedRecord(InstanceRecord{
 				Ref:              ref,
 				Ballot:           Ballot{Replica: 1},
@@ -1845,15 +1847,15 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 				preAcceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), FastPathEligible: true}
 				}
-				if err := restarted.Step(preAcceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition addition preaccepted counted added current voter 4")
-				if err := restarted.Step(preAcceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition addition preaccepted counted duplicate added current voter 4")
-				if err := restarted.Step(preAcceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(preAcceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				rd = restarted.Ready()
@@ -1863,22 +1865,22 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 					t.Fatalf("old-config transition addition preaccepted accept seq = %d, want %d: %#v", accept.Seq, tt.seq, accept)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, ref, StatusAccepted, cmd, tt.seq, tt.deps)
-				if len(rd.Committed) != 0 {
-					t.Fatalf("old-config transition addition preaccepted emitted application commands before accept quorum: %#v", rd.Committed)
+				if len(rd.Apply) != 0 {
+					t.Fatalf("old-config transition addition preaccepted emitted application commands before accept quorum: %#v", rd.Apply)
 				}
 			case StatusAccepted:
 				acceptResp := func(from ReplicaID) Message {
 					return Message{Type: MsgAcceptResp, From: from, To: 1, Ref: ref, Ballot: retry.Ballot, RecordBallot: retry.Ballot, Seq: retry.Seq, Deps: append([]InstanceNum(nil), retry.Deps...), AcceptSeq: retry.AcceptSeq, AcceptDeps: append([]InstanceNum(nil), retry.AcceptDeps...), RecordStatus: StatusAccepted}
 				}
-				if err := restarted.Step(acceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition addition accepted counted added current voter 4")
-				if err := restarted.Step(acceptResp(4)); err != nil && !errors.Is(err, ErrMessageRejected) {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(4))); err != nil && !errors.Is(err, ErrMessageRejected) {
 					t.Fatal(err)
 				}
 				recoveryRequireNoReady(t, restarted, "old-config transition addition accepted counted duplicate added current voter 4")
-				if err := restarted.Step(acceptResp(2)); err != nil {
+				if err := restarted.Step(canonicalTestMessage(acceptResp(2))); err != nil {
 					t.Fatal(err)
 				}
 				rd = restarted.Ready()
@@ -1887,7 +1889,7 @@ func TestOldConfigTransitionDedupUsesPinnedVotersAfterAddition(t *testing.T) {
 					t.Fatalf("old-config transition addition accepted commit attrs = seq %d accept seq %d deps %v/%v, want seq %d accept seq %d deps %v/%v: %#v", commit.Seq, commit.AcceptSeq, commit.Deps, commit.AcceptDeps, tt.seq, tt.acceptSeq, tt.deps, tt.acceptDeps, commit)
 				}
 				recoveryRequireRecordWithCommandAndDeps(t, rd.Records, ref, StatusCommitted, cmd, tt.seq, tt.deps)
-				recoveryRequireCommittedCommand(t, rd.Committed, ref, cmd, tt.seq, tt.deps)
+				recoveryRequireAppliedCommand(t, rd.Apply, ref, cmd, tt.seq, tt.deps)
 			default:
 				t.Fatalf("unhandled status %s", tt.status)
 			}
@@ -1901,7 +1903,7 @@ func TestRestartLocalVoteSeedGuardSkipsNonOwnerPreAcceptedBallot(t *testing.T) {
 	ballot := Ballot{Number: 2, Replica: 2}
 	seq := uint64(5)
 	deps := []InstanceNum{0, 0, 0}
-	cmd := Command{ID: CommandID{Client: 95, Sequence: 1}, Payload: []byte("restart-local-vote-preaccepted"), ConflictKeys: [][]byte{[]byte("restart-local-vote-key")}}
+	cmd := Command{ID: CommandID{Client: 95, Sequence: 1}, Payload: []byte("restart-local-vote-preaccepted"), Footprint: Footprint{Points: [][]byte{[]byte("restart-local-vote-key")}}}
 	store.Records[ref] = checkedRecord(InstanceRecord{
 		Ref:              ref,
 		Ballot:           ballot,
@@ -1940,7 +1942,7 @@ func TestRestartLocalVoteSeedGuardSkipsNonOwnerAcceptedBallot(t *testing.T) {
 	deps := []InstanceNum{0, 0, 0}
 	acceptSeq := uint64(7)
 	acceptDeps := []InstanceNum{0, 0, 0}
-	cmd := Command{ID: CommandID{Client: 96, Sequence: 1}, Payload: []byte("restart-local-vote-accepted"), ConflictKeys: [][]byte{[]byte("restart-local-vote-key")}}
+	cmd := Command{ID: CommandID{Client: 96, Sequence: 1}, Payload: []byte("restart-local-vote-accepted"), Footprint: Footprint{Points: [][]byte{[]byte("restart-local-vote-key")}}}
 	store.Records[ref] = checkedRecord(InstanceRecord{
 		Ref:          ref,
 		Ballot:       ballot,
@@ -1982,7 +1984,7 @@ func TestRestartLocalVoteSeedGuardSkipsNonOwnerAcceptedBallot(t *testing.T) {
 func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	s.drain()
-	first := Command{ID: CommandID{Client: 30, Sequence: 1}, Payload: []byte("owner-command"), ConflictKeys: [][]byte{[]byte("shared")}}
+	first := Command{ID: CommandID{Client: 30, Sequence: 1}, Payload: []byte("owner-command"), Footprint: Footprint{Points: [][]byte{[]byte("shared")}}}
 	firstRef, err := s.nodes[1].Propose(first)
 	if err != nil {
 		t.Fatal(err)
@@ -2001,7 +2003,7 @@ func TestSimulatorNonOwnerRecoversPreAcceptedDependency(t *testing.T) {
 	s.pause(1)
 	s.drain()
 
-	second := Command{ID: CommandID{Client: 31, Sequence: 1}, Payload: []byte("follower-command"), ConflictKeys: [][]byte{[]byte("shared")}}
+	second := Command{ID: CommandID{Client: 31, Sequence: 1}, Payload: []byte("follower-command"), Footprint: Footprint{Points: [][]byte{[]byte("shared")}}}
 	secondRef, err := s.nodes[2].Propose(second)
 	if err != nil {
 		t.Fatal(err)
@@ -2021,7 +2023,7 @@ func TestSimulatorIsolatedLocalTimeoutRecoversAfterConflictingQuorumCommit(t *te
 	key := []byte("current-canary-recovery")
 
 	s.omit(1)
-	isolated := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("isolated-local"), ConflictKeys: [][]byte{key}}
+	isolated := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("isolated-local"), Footprint: Footprint{Points: [][]byte{key}}}
 	isolatedRef, err := s.nodes[1].Propose(isolated)
 	if err != nil {
 		t.Fatal(err)
@@ -2032,7 +2034,7 @@ func TestSimulatorIsolatedLocalTimeoutRecoversAfterConflictingQuorumCommit(t *te
 		t.Fatalf("isolated replica applied %s without quorum before heal: %#v", isolatedRef, s.apps[1])
 	}
 
-	quorum := Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("quorum-commit"), ConflictKeys: [][]byte{key}}
+	quorum := Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("quorum-commit"), Footprint: Footprint{Points: [][]byte{key}}}
 	quorumRef, err := s.nodes[2].Propose(quorum)
 	if err != nil {
 		t.Fatal(err)
@@ -2050,7 +2052,7 @@ func TestSimulatorIsolatedLocalTimeoutRecoversAfterConflictingQuorumCommit(t *te
 	s.tickAll(20)
 	requireCommittedPayloadCount(t, s.apps[1], 1, quorumRef, quorum.Payload, 1)
 
-	barrier := Command{ID: CommandID{Client: 1, Sequence: 2}, ConflictKeys: [][]byte{key}}
+	barrier := Command{ID: CommandID{Client: 1, Sequence: 2}, Footprint: Footprint{Points: [][]byte{key}}}
 	barrierRef, err := s.nodes[1].Propose(barrier)
 	if err != nil {
 		t.Fatal(err)
@@ -2068,7 +2070,7 @@ func TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit(t *testing.
 	s.drain()
 	key := []byte("rollback-local-key")
 
-	beforeCheckpoint := Command{ID: CommandID{Client: 40, Sequence: 1}, Payload: []byte("before-checkpoint"), ConflictKeys: [][]byte{key}}
+	beforeCheckpoint := Command{ID: CommandID{Client: 40, Sequence: 1}, Payload: []byte("before-checkpoint"), Footprint: Footprint{Points: [][]byte{key}}}
 	beforeCheckpointRef, err := s.nodes[3].Propose(beforeCheckpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -2077,9 +2079,9 @@ func TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit(t *testing.
 	requireCommittedPayloadCount(t, s.apps[3], 3, beforeCheckpointRef, beforeCheckpoint.Payload, 1)
 
 	checkpointStore := cloneMemoryStorage(s.stores[3])
-	checkpointApp := cloneCommittedCommands(s.apps[3])
+	checkpointApp := cloneAppliedCommands(s.apps[3])
 
-	learned := Command{ID: CommandID{Client: 40, Sequence: 2}, Payload: []byte("learned-after-checkpoint"), ConflictKeys: [][]byte{key}}
+	learned := Command{ID: CommandID{Client: 40, Sequence: 2}, Payload: []byte("learned-after-checkpoint"), Footprint: Footprint{Points: [][]byte{key}}}
 	learnedRef, err := s.nodes[3].Propose(learned)
 	if err != nil {
 		t.Fatal(err)
@@ -2115,7 +2117,7 @@ func TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit(t *testing.
 	requireCommittedPayloadCount(t, s.apps[3], 3, learnedRef, learned.Payload, 1)
 	requireNoDuplicateCommittedRefs(t, s.apps[3], 3)
 
-	afterCatchUp := Command{ID: CommandID{Client: 40, Sequence: 3}, Payload: []byte("after-catch-up"), ConflictKeys: [][]byte{key}}
+	afterCatchUp := Command{ID: CommandID{Client: 40, Sequence: 3}, Payload: []byte("after-catch-up"), Footprint: Footprint{Points: [][]byte{key}}}
 	afterCatchUpRef, err := s.nodes[3].Propose(afterCatchUp)
 	if err != nil {
 		t.Fatal(err)
@@ -2145,7 +2147,7 @@ func recoveryCommitMessageFromRecord(from, to ReplicaID, rec InstanceRecord) Mes
 		Command:        rec.Command.Clone()}
 }
 
-func recoveryRequireAppliedOrder(t *testing.T, app []CommittedCommand, id ReplicaID, want ...InstanceRef) {
+func recoveryRequireAppliedOrder(t *testing.T, app []ApplyCommand, id ReplicaID, want ...InstanceRef) {
 	t.Helper()
 	positions := make(map[InstanceRef]int, len(app))
 	for i, c := range app {
@@ -2187,7 +2189,7 @@ func recoveryPersistInitialHardState(t *testing.T, store *MemoryStorage, rn *Raw
 	t.Helper()
 	rd := rn.Ready()
 	recoveryRequireCurrentTickHardState(t, rn, rd, "initial")
-	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("initial Ready carried protocol payload: %#v", rd)
 	}
 	recoveryApplyReady(t, store, rn, rd)
@@ -2200,7 +2202,7 @@ func recoveryPersistTickOnlyHardState(t *testing.T, store *MemoryStorage, rn *Ra
 	}
 	rd := rn.Ready()
 	recoveryRequireCurrentTickHardState(t, rn, rd, context)
-	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("%s produced protocol payload before deadline: %#v", context, rd)
 	}
 	recoveryApplyReady(t, store, rn, rd)
@@ -2209,7 +2211,7 @@ func recoveryPersistTickOnlyHardState(t *testing.T, store *MemoryStorage, rn *Ra
 func recoveryRequireNoRecordOrApplicationEffects(t *testing.T, rn *RawNode, rd Ready, context string) {
 	t.Helper()
 	recoveryRequireCurrentTickHardState(t, rn, rd, context)
-	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("%s emitted record/application effects: %#v", context, rd)
 	}
 }
@@ -2274,7 +2276,7 @@ func recoveryRequireMessageTargetsWithDepsWidth(t *testing.T, messages []Message
 				t.Fatalf("prepare for %s has non-minimal metadata: %#v", ref, m)
 			}
 		case MsgAccept:
-			if !commandEqual(m.Command, Command{Kind: CommandNoop}) {
+			if m.Kind != EntryNoop || !commandEqual(m.Command, Command{}) {
 				t.Fatalf("accept for %s command = %#v, want noop", ref, m.Command)
 			}
 			if len(m.Deps) != depsWidth {
@@ -2284,7 +2286,7 @@ func recoveryRequireMessageTargetsWithDepsWidth(t *testing.T, messages []Message
 				t.Fatalf("accept for %s exposed record metadata: %#v", ref, m)
 			}
 		case MsgCommit:
-			if !commandEqual(m.Command, Command{Kind: CommandNoop}) {
+			if m.Kind != EntryNoop || !commandEqual(m.Command, Command{}) {
 				t.Fatalf("commit for %s command = %#v, want noop", ref, m.Command)
 			}
 			if len(m.Deps) != depsWidth {
@@ -2383,7 +2385,7 @@ func recoveryRequireRecordWithCommandAndDeps(t *testing.T, records []InstanceRec
 		if !commandEqual(rec.Command, wantCommand) {
 			t.Fatalf("record %s/%s command = %#v, want %#v", ref, status, rec.Command, wantCommand)
 		}
-		if rec.Command.Kind == CommandNoop {
+		if rec.Kind == EntryNoop {
 			t.Fatalf("record %s/%s used noop command, want user command %#v", ref, status, wantCommand)
 		}
 		if rec.Seq != wantSeq || !instanceNumsEqual(rec.Deps, wantDeps) {
@@ -2395,7 +2397,7 @@ func recoveryRequireRecordWithCommandAndDeps(t *testing.T, records []InstanceRec
 	return InstanceRecord{}
 }
 
-func recoveryRequireCommittedCommand(t *testing.T, committed []CommittedCommand, ref InstanceRef, wantCommand Command, wantSeq uint64, wantDeps []InstanceNum) {
+func recoveryRequireAppliedCommand(t *testing.T, committed []ApplyCommand, ref InstanceRef, wantCommand Command, wantSeq uint64, wantDeps []InstanceNum) {
 	t.Helper()
 	count := 0
 	for _, c := range committed {
@@ -2405,9 +2407,6 @@ func recoveryRequireCommittedCommand(t *testing.T, committed []CommittedCommand,
 		count++
 		if !commandEqual(c.Command, wantCommand) {
 			t.Fatalf("committed %s command = %#v, want %#v", ref, c.Command, wantCommand)
-		}
-		if c.Command.Kind == CommandNoop {
-			t.Fatalf("committed %s used noop command, want user command %#v", ref, wantCommand)
 		}
 		if c.Seq != wantSeq || !instanceNumsEqual(c.Deps, wantDeps) {
 			t.Fatalf("committed %s attrs = seq %d deps %v, want seq %d deps %v: %#v", ref, c.Seq, c.Deps, wantSeq, wantDeps, c)
@@ -2431,7 +2430,6 @@ func messageTargets(messages map[ReplicaID]Message) []ReplicaID {
 	return targets
 }
 
-
 func recoveryRequireNoPrepareRefs(t *testing.T, messages []Message, refs []InstanceRef) {
 	t.Helper()
 	for _, ref := range refs {
@@ -2443,7 +2441,7 @@ func recoveryRequireNoPrepareRefs(t *testing.T, messages []Message, refs []Insta
 	}
 }
 
-func recoveryRequireMessages(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, kind CommandKind) {
+func recoveryRequireMessages(t *testing.T, messages []Message, typ MessageType, ref InstanceRef, kind EntryKind) {
 	t.Helper()
 	count := 0
 	for _, m := range messages {
@@ -2451,8 +2449,8 @@ func recoveryRequireMessages(t *testing.T, messages []Message, typ MessageType, 
 			continue
 		}
 		count++
-		if m.Command.Kind != kind {
-			t.Fatalf("%s message for %s command kind = %v, want %v: %#v", typ, ref, m.Command.Kind, kind, m)
+		if m.Kind != kind {
+			t.Fatalf("%s message for %s command kind = %v, want %v: %#v", typ, ref, m.Kind, kind, m)
 		}
 	}
 	if count != 2 {
@@ -2460,21 +2458,21 @@ func recoveryRequireMessages(t *testing.T, messages []Message, typ MessageType, 
 	}
 }
 
-func recoveryRequireRecord(t *testing.T, records []InstanceRecord, ref InstanceRef, status Status, kind CommandKind) {
+func recoveryRequireRecord(t *testing.T, records []InstanceRecord, ref InstanceRef, status Status, kind EntryKind) {
 	t.Helper()
 	for _, rec := range records {
 		if rec.Ref != ref || rec.Status != status {
 			continue
 		}
-		if rec.Command.Kind != kind {
-			t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Command.Kind, kind, rec)
+		if rec.Kind != kind {
+			t.Fatalf("record %s/%s command kind = %v, want %v: %#v", ref, status, rec.Kind, kind, rec)
 		}
 		return
 	}
 	t.Fatalf("missing %s record for %s with command kind %v: %#v", status, ref, kind, records)
 }
 
-func recoveryCommittedPayloadCount(committed []CommittedCommand, ref InstanceRef, payload []byte) int {
+func recoveryCommittedPayloadCount(committed []ApplyCommand, ref InstanceRef, payload []byte) int {
 	count := 0
 	for _, c := range committed {
 		if c.Ref == ref && bytes.Equal(c.Command.Payload, payload) {
@@ -2513,7 +2511,7 @@ func TestMaxUint64DependencyStartsBoundedExactRecovery(t *testing.T) {
 		Deps:         deps,
 		Command:      Command{ID: CommandID{Client: 700, Sequence: 1}, Payload: []byte("maxInst-dependent")},
 	}
-	if err := rn.Step(commit); err != nil {
+	if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 		t.Fatalf("MaxUint64 dependency commit failed: %v", err)
 	}
 	wantStarted := []InstanceRef{
@@ -2548,11 +2546,11 @@ func TestMaxUint64DependencyStartsBoundedExactRecovery(t *testing.T) {
 	if want := driveLimit * (len(deps) - 1); prepareCount != want {
 		t.Fatalf("Prepare messages = %d, want %d", prepareCount, want)
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("MaxUint64 dependent executed across absent prefix: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("MaxUint64 dependent executed across absent prefix: %#v", rd.Apply)
 	}
 	again := rn.Ready()
-	if len(again.Records) != len(rd.Records) || len(again.Messages) != len(rd.Messages) || len(again.Committed) != 0 {
+	if len(again.Records) != len(rd.Records) || len(again.Messages) != len(rd.Messages) || len(again.Apply) != 0 {
 		t.Fatalf("repeated Ready changed bounded output: first=%#v second=%#v", rd, again)
 	}
 }
@@ -2569,8 +2567,8 @@ func TestSparsePrefixRecoveryRoundRobinAndSharedDriveBudget(t *testing.T) {
 	}
 	baseA := InstanceRef{Conf: 1, Replica: 1, Instance: 10}
 	baseB := InstanceRef{Conf: 1, Replica: 1, Instance: 11}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: baseA, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 3, 0}, Command: Command{Kind: CommandNoop}}})
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: baseB, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 0, 3}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: baseA, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 3, 0}, Kind: EntryNoop}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: baseB, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 0, 3}, Kind: EntryNoop}})
 
 	first := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 	second := InstanceRef{Conf: 1, Replica: 3, Instance: 1}
@@ -2617,7 +2615,7 @@ func TestDependencyRecoveryBudgetZeroDoesNotMaterialize(t *testing.T) {
 	}
 	base := InstanceRef{Conf: 1, Replica: 1, Instance: 2}
 	missing := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Kind: EntryNoop}})
 	rn.beginDrive()
 	rn.dependencyRecoveryStartsLeft = 0
 	rn.tryExecute()
@@ -2630,7 +2628,7 @@ func TestDependencyRecoveryBudgetZeroDoesNotMaterialize(t *testing.T) {
 func TestRestartReconstructsSparsePrefixAndInFlightRecovery(t *testing.T) {
 	store := NewMemoryStorage()
 	conf := ConfState{ID: 1, Voters: makeIDs(3)}
-	record := func(ref InstanceRef, status Status, deps []InstanceNum, command Command) InstanceRecord {
+	record := func(ref InstanceRef, status Status, deps []InstanceNum, kind EntryKind, command Command) InstanceRecord {
 		rec := InstanceRecord{
 			Ref:          ref,
 			Ballot:       Ballot{Replica: ref.Replica},
@@ -2638,10 +2636,10 @@ func TestRestartReconstructsSparsePrefixAndInFlightRecovery(t *testing.T) {
 			Status:       status,
 			Seq:          1,
 			Deps:         deps,
+			Kind:         kind,
 			Command:      command,
 		}
-		rec.Checksum = ChecksumRecord(rec)
-		return rec
+		return checkedRecord(rec)
 	}
 	one := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 	two := InstanceRef{Conf: 1, Replica: 2, Instance: 2}
@@ -2649,9 +2647,9 @@ func TestRestartReconstructsSparsePrefixAndInFlightRecovery(t *testing.T) {
 	four := InstanceRef{Conf: 1, Replica: 2, Instance: 4}
 	dependent := InstanceRef{Conf: 1, Replica: 1, Instance: 9}
 	records := []InstanceRecord{
-		record(one, StatusExecuted, make([]InstanceNum, 3), Command{Kind: CommandNoop}),
-		record(three, StatusExecuted, make([]InstanceNum, 3), Command{Kind: CommandNoop}),
-		record(dependent, StatusCommitted, []InstanceNum{0, 4, 0}, Command{ID: CommandID{Client: 900, Sequence: 1}, Payload: []byte("sparse-restart")}),
+		record(one, StatusExecuted, make([]InstanceNum, 3), EntryNoop, Command{}),
+		record(three, StatusExecuted, make([]InstanceNum, 3), EntryNoop, Command{}),
+		record(dependent, StatusCommitted, []InstanceNum{0, 4, 0}, EntryCommand, Command{ID: CommandID{Client: 900, Sequence: 1}, Payload: []byte("sparse-restart")}),
 	}
 	if err := store.ApplyReady(Ready{HardState: HardState{Conf: conf}, Records: records}); err != nil {
 		t.Fatal(err)
@@ -2691,7 +2689,7 @@ func TestRestartReconstructsSparsePrefixAndInFlightRecovery(t *testing.T) {
 		t.Fatalf("restart duplicated in-flight recovery by materializing %s", four)
 	}
 
-	recovered := record(two, StatusExecuted, make([]InstanceNum, 3), Command{Kind: CommandNoop})
+	recovered := record(two, StatusExecuted, make([]InstanceNum, 3), EntryNoop, Command{})
 	recovered.Ballot = Ballot{Number: 1, Replica: 1}
 	recovered.RecordBallot = recovered.Ballot
 	recovered.Checksum = ChecksumRecord(recovered)
@@ -2720,7 +2718,8 @@ func TestLegacyTimeOptimizationRestartFloorsTickFromProcessAt(t *testing.T) {
 		Status:       StatusAccepted,
 		Seq:          1,
 		Deps:         make([]InstanceNum, 3),
-		Command:      Command{ID: CommandID{Client: 1000, Sequence: 1}, Payload: []byte("legacy"), ConflictKeys: [][]byte{[]byte("legacy-time-key")}},
+		Kind:         EntryCommand,
+		Command:      Command{ID: CommandID{Client: 1000, Sequence: 1}, Payload: []byte("legacy"), Footprint: Footprint{Points: [][]byte{[]byte("legacy-time-key")}}},
 		ProcessAt:    100,
 	}
 	prior.Checksum = ChecksumRecordWithoutTimingDomain(prior)
@@ -2739,7 +2738,7 @@ func TestLegacyTimeOptimizationRestartFloorsTickFromProcessAt(t *testing.T) {
 	if rn.tick != 100 {
 		t.Fatalf("legacy logical restart tick = %d, want ProcessAt floor 100", rn.tick)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1001, Sequence: 1}, Payload: []byte("after-restart"), ConflictKeys: [][]byte{[]byte("legacy-time-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1001, Sequence: 1}, Payload: []byte("after-restart"), Footprint: Footprint{Points: [][]byte{[]byte("legacy-time-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2765,12 +2764,11 @@ func TestRecoveryAdoptionPreservesProcessAtAcrossRestart(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := NewMemoryStorage()
-			clock := uint64(200)
 			runtime := &TOQRuntimeConfig{
 				Conf:        ConfState{ID: 1, Voters: makeIDs(3)},
 				OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0},
 			}
-			config := Config{ID: 1, Voters: makeIDs(3), Storage: store, TOQ: true, TOQClock: func() uint64 { return clock }, TOQRuntime: runtime}
+			config := Config{ID: 1, Voters: makeIDs(3), Storage: store, TOQ: true, TOQRuntime: runtime}
 			rn, err := NewRawNode(config)
 			if err != nil {
 				t.Fatal(err)
@@ -2807,7 +2805,7 @@ func TestRecoveryAdoptionPreservesProcessAtAcrossRestart(t *testing.T) {
 				ProcessAt:        100,
 				TOQ:              true,
 			}
-			if err := rn.Step(response); err != nil {
+			if err := rn.Step(canonicalTestMessage(response)); err != nil {
 				t.Fatal(err)
 			}
 			if inst.phase != test.wantPhase || inst.rec.ProcessAt != 100 || inst.processAt != 100 {
@@ -2858,7 +2856,8 @@ func TestLegacyZeroProcessAtDomainSelection(t *testing.T) {
 		Status:       StatusAccepted,
 		Seq:          1,
 		Deps:         make([]InstanceNum, 3),
-		Command:      Command{ID: CommandID{Client: 1200, Sequence: 1}, Payload: []byte("legacy-zero")},
+		Kind:         EntryCommand,
+		Command:      Command{ID: CommandID{Client: 1200, Sequence: 1}, Payload: []byte("legacy-zero"), Footprint: Footprint{All: true}},
 		ProcessAt:    0,
 	}
 	legacy.Checksum = ChecksumRecordWithoutTimingDomain(legacy)
@@ -2882,13 +2881,11 @@ func TestLegacyZeroProcessAtDomainSelection(t *testing.T) {
 	}
 
 	toq := TimingDomainTOQ
-	clock := uint64(0)
 	toqNode, err := NewRawNode(Config{
 		ID:                    1,
 		Voters:                makeIDs(3),
 		Storage:               store,
 		TOQ:                   true,
-		TOQClock:              func() uint64 { return clock },
 		TOQRuntime:            &TOQRuntimeConfig{Conf: ConfState{ID: 1, Voters: makeIDs(3)}, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0}},
 		LegacyProcessAtDomain: &toq,
 	})
@@ -2913,7 +2910,8 @@ func TestCanonicalLogicalTimingDomainHonorsAuthoritativeRestartTick(t *testing.T
 			Status:       StatusAccepted,
 			Seq:          1,
 			Deps:         make([]InstanceNum, 3),
-			Command:      Command{ID: CommandID{Client: 1201, Sequence: 1}, Payload: []byte("canonical-logical")},
+			Kind:         EntryCommand,
+			Command:      Command{ID: CommandID{Client: 1201, Sequence: 1}, Payload: []byte("canonical-logical"), Footprint: Footprint{All: true}},
 			ProcessAt:    processAt,
 			TimingDomain: TimingDomainLogical,
 		}
@@ -2945,7 +2943,7 @@ func TestCanonicalLogicalTimingDomainHonorsAuthoritativeRestartTick(t *testing.T
 	if maxNode.tick != ^uint64(0) {
 		t.Fatalf("legacy absent-HardState logical floor = %d, want MaxUint64", maxNode.tick)
 	}
-	if _, err := maxNode.Propose(Command{ID: CommandID{Client: 1202, Sequence: 1}, Payload: []byte("after-max")}); !errors.Is(err, ErrLogicalTimeExhausted) {
+	if _, err := maxNode.Propose(Command{ID: CommandID{Client: 1202, Sequence: 1}, Payload: []byte("after-max"), Footprint: Footprint{All: true}}); !errors.Is(err, ErrLogicalTimeExhausted) {
 		t.Fatalf("proposal after Max logical floor err=%v, want ErrLogicalTimeExhausted", err)
 	}
 	if err := maxNode.Tick(); !errors.Is(err, ErrLogicalTimeExhausted) {
@@ -2963,11 +2961,9 @@ func TestTerminalMessageReleasesDeferredPreAcceptCapacity(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			clock := uint64(0)
 			config := Config{ID: 1, Voters: makeIDs(3), MaxDeferredPreAccepts: 1, TimeOptimization: !test.toq}
 			if test.toq {
 				config.TOQ = true
-				config.TOQClock = func() uint64 { return clock }
 				config.TOQRuntime = &TOQRuntimeConfig{Conf: ConfState{ID: 1, Voters: makeIDs(3)}, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0}}
 			}
 			rn, err := NewRawNode(config)
@@ -2993,10 +2989,10 @@ func TestTerminalMessageReleasesDeferredPreAcceptCapacity(t *testing.T) {
 				return message
 			}
 			first := future(1, 10)
-			if err := rn.Step(first); err != nil {
+			if err := rn.Step(canonicalTestMessage(first)); err != nil {
 				t.Fatal(err)
 			}
-			if err := rn.Step(first.Clone()); err != nil {
+			if err := rn.Step(canonicalTestMessage(first.Clone())); err != nil {
 				t.Fatalf("duplicate future PreAccept: %v", err)
 			}
 			if len(rn.deferredIndex) != 1 {
@@ -3019,7 +3015,7 @@ func TestTerminalMessageReleasesDeferredPreAcceptCapacity(t *testing.T) {
 				ProcessAt:    first.ProcessAt,
 				TOQ:          test.toq,
 			}
-			if err := rn.Step(commit); err != nil {
+			if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 				t.Fatal(err)
 			}
 			if len(rn.deferredIndex) != 0 || rn.logicalPreAccepts.Len() != 0 || rn.toqPreAccepts.Len() != 0 {
@@ -3028,7 +3024,7 @@ func TestTerminalMessageReleasesDeferredPreAcceptCapacity(t *testing.T) {
 			if retained == nil || retained.index != -1 || retained.message.Type != 0 || retained.message.Command.Payload != nil || retained.message.Deps != nil {
 				t.Fatalf("removed deferred entry retained owned data: %#v", retained)
 			}
-			if err := rn.Step(future(2, 11)); err != nil {
+			if err := rn.Step(canonicalTestMessage(future(2, 11))); err != nil {
 				t.Fatalf("second future PreAccept was not admitted after terminal cleanup: %v", err)
 			}
 			if len(rn.deferredIndex) != 1 {
@@ -3047,7 +3043,7 @@ func TestEpochCarryRecoveryCountsAgainstConcurrentCap(t *testing.T) {
 	active := &instance{rec: InstanceRecord{Ref: activeRef, Ballot: Ballot{Epoch: 1, Number: 0, Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3)}, phase: phasePrepare}
 	rn.installInstance(active)
 	base := InstanceRef{Conf: 1, Replica: 1, Instance: 2}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Kind: EntryNoop}})
 	rn.tryExecute()
 	missing := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 	if rn.instances[missing] != nil {
@@ -3066,7 +3062,7 @@ func TestReplacementGenerationPreventsStaleRecoveryTimerAlias(t *testing.T) {
 	ref := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 	command := Command{ID: CommandID{Client: 1600, Sequence: 1}, Payload: []byte("generation-alias")}
 	preAccept := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 2}, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-	if err := rn.Step(preAccept); err != nil {
+	if err := rn.Step(canonicalTestMessage(preAccept)); err != nil {
 		t.Fatal(err)
 	}
 	if rn.instances[ref].generation != 0 {
@@ -3080,7 +3076,7 @@ func TestReplacementGenerationPreventsStaleRecoveryTimerAlias(t *testing.T) {
 		advanceOK(t, rn, rn.Ready())
 	}
 	accept := Message{Type: MsgAccept, From: 1, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-	if err := rn.Step(accept); err != nil {
+	if err := rn.Step(canonicalTestMessage(accept)); err != nil {
 		t.Fatal(err)
 	}
 	if rn.instances[ref].generation != 1 {
@@ -3142,14 +3138,14 @@ func TestReplacementGenerationOverflowRejectsWithoutMutation(t *testing.T) {
 	before := inst.rec.Clone()
 	readyBefore := cloneReady(rn.pendingReady)
 	message := Message{Type: MsgAccept, From: 1, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 2), Command: rec.Command.Clone()}
-	if err := rn.Step(message); !errors.Is(err, ErrLogicalTimeExhausted) {
+	if err := rn.Step(canonicalTestMessage(message)); !errors.Is(err, ErrLogicalTimeExhausted) {
 		t.Fatalf("generation overflow replacement err=%v, want ErrLogicalTimeExhausted", err)
 	}
 	if rn.instances[ref] != inst || inst.generation != ^uint64(0) || !instanceRecordEqual(inst.rec, before) {
 		t.Fatalf("generation overflow mutated instance: %#v before=%#v", inst, before)
 	}
 	if len(rn.pendingReady.Records) != len(readyBefore.Records) || len(rn.pendingReady.Messages) != len(readyBefore.Messages) ||
-		len(rn.pendingReady.Committed) != len(readyBefore.Committed) || !rn.pendingReady.HardState.Equal(readyBefore.HardState) {
+		len(rn.pendingReady.Apply) != len(readyBefore.Apply) || !rn.pendingReady.HardState.Equal(readyBefore.HardState) {
 		t.Fatalf("generation overflow mutated Ready: before=%#v after=%#v", readyBefore, rn.pendingReady)
 	}
 }
@@ -3164,18 +3160,18 @@ func TestMaxGenerationDuplicateRequestsAndCommitRemainTolerant(t *testing.T) {
 		return rn
 	}
 	ref := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
-	command := Command{ID: CommandID{Client: 1602, Sequence: 1}, Payload: []byte("generation-duplicate"), ConflictKeys: [][]byte{[]byte("generation-duplicate-key")}}
+	command := Command{ID: CommandID{Client: 1602, Sequence: 1}, Payload: []byte("generation-duplicate"), Footprint: Footprint{Points: [][]byte{[]byte("generation-duplicate-key")}}}
 
 	t.Run("PreAccept duplicate re-acks", func(t *testing.T) {
 		rn := newNode(t)
 		message := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 2}, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatal(err)
 		}
 		advanceOK(t, rn, rn.Ready())
 		inst := rn.instances[ref]
 		inst.generation = ^uint64(0)
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatalf("exact duplicate PreAccept at max generation: %v", err)
 		}
 		rd := rn.Ready()
@@ -3191,13 +3187,13 @@ func TestMaxGenerationDuplicateRequestsAndCommitRemainTolerant(t *testing.T) {
 		rn := newNode(t)
 		ballot := Ballot{Number: 1, Replica: 2}
 		message := Message{Type: MsgAccept, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatal(err)
 		}
 		advanceOK(t, rn, rn.Ready())
 		inst := rn.instances[ref]
 		inst.generation = ^uint64(0)
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatalf("exact duplicate Accept at max generation: %v", err)
 		}
 		rd := rn.Ready()
@@ -3213,14 +3209,14 @@ func TestMaxGenerationDuplicateRequestsAndCommitRemainTolerant(t *testing.T) {
 		rn := newNode(t)
 		ballot := Ballot{Number: 1, Replica: 2}
 		accept := Message{Type: MsgAccept, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-		if err := rn.Step(accept); err != nil {
+		if err := rn.Step(canonicalTestMessage(accept)); err != nil {
 			t.Fatal(err)
 		}
 		advanceOK(t, rn, rn.Ready())
 		old := rn.instances[ref]
 		old.generation = ^uint64(0)
 		commit := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, Seq: 1, Deps: make([]InstanceNum, 2), Command: command}
-		if err := rn.Step(commit); err != nil {
+		if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 			t.Fatalf("Commit over max-generation Accepted instance: %v", err)
 		}
 		if rn.instances[ref] == old || rn.instances[ref].rec.Status < StatusCommitted {
@@ -3239,7 +3235,7 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 	t.Run("logical nonpending", func(t *testing.T) {
 		ref := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 		ballot := Ballot{Replica: 2}
-		rec := InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}, ProcessAt: 12}
+		rec := InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Kind: EntryNoop, ProcessAt: 12}
 		rec.Checksum = ChecksumRecordWithoutTimingDomain(rec)
 		domain := TimingDomainLogical
 		store := makeStore(rec)
@@ -3249,7 +3245,7 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 		}
 		got := rn.instances[ref].rec
 		if got.Status != rec.Status || got.Ballot != rec.Ballot || got.RecordBallot != rec.RecordBallot || got.Seq != rec.Seq || !instanceNumsEqual(got.Deps, rec.Deps) ||
-			got.ProcessAt != 0 || got.TimingDomain != TimingDomainUntimed || got.TOQPending || got.Command.Kind != CommandNoop || !VerifyRecordChecksum(got) {
+			got.ProcessAt != 0 || got.TimingDomain != TimingDomainUntimed || got.TOQPending || got.Kind != EntryNoop || !VerifyRecordChecksum(got) {
 			t.Fatalf("logical legacy no-op migration = %#v, want preserved tuple with canonical untimed metadata", got)
 		}
 		rd := rn.Ready()
@@ -3271,12 +3267,12 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 
 	t.Run("TOQ pending", func(t *testing.T) {
 		ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
-		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}, ProcessAt: 20, TOQPending: true}
+		rec := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3), Kind: EntryNoop, ProcessAt: 20, TOQPending: true}
 		rec.Checksum = ChecksumRecordWithoutTimingDomain(rec)
 		domain := TimingDomainTOQ
 		store := makeStore(rec)
 		conf := ConfState{ID: 1, Voters: makeIDs(3)}
-		cfg := Config{ID: 1, Voters: conf.Voters, Storage: store, TOQ: true, TOQClock: func() uint64 { return 20 }, TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0}}, LegacyProcessAtDomain: &domain}
+		cfg := Config{ID: 1, Voters: conf.Voters, Storage: store, TOQ: true, TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0}}, LegacyProcessAtDomain: &domain}
 		rn, err := NewRawNode(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -3284,7 +3280,7 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 		got := rn.instances[ref]
 		if got == nil || got.rec.Status != StatusPreAccepted || got.rec.Ballot != rec.Ballot || got.rec.RecordBallot != rec.Ballot || got.phase != phasePreAccept ||
 			got.rec.Seq != 1 || len(got.rec.Deps) != 3 || got.rec.Deps[0] != 0 || got.rec.Deps[1] != 0 || got.rec.Deps[2] != 0 ||
-			got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending || got.rec.Command.Kind != CommandNoop || !got.rec.FastPathEligible || !VerifyRecordChecksum(got.rec) {
+			got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending || got.rec.Kind != EntryNoop || !got.rec.FastPathEligible || !VerifyRecordChecksum(got.rec) {
 			t.Fatalf("TOQ-pending legacy no-op migration = %#v, want complete canonical local PreAccepted vote", got)
 		}
 		if !got.preOK.has(rn.q.conf, rn.id) {
@@ -3311,10 +3307,10 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 			}
 			rd = rn.Ready()
 			if tick == rn.retryTicks {
-				recoveryRequireMessages(t, rd.Messages, MsgPreAccept, ref, CommandNoop)
+				recoveryRequireMessages(t, rd.Messages, MsgPreAccept, ref, EntryNoop)
 				for _, message := range rd.Messages {
 					if message.Ref == ref {
-						if message.ProcessAt != 0 || message.TOQ || message.Command.Kind != CommandNoop {
+						if message.ProcessAt != 0 || message.TOQ || message.Kind != EntryNoop {
 							t.Fatalf("migrated no-op retry is not canonical untimed: %#v", message)
 						}
 						if err := message.Validate(conf); err != nil {
@@ -3329,12 +3325,12 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 			advanceOK(t, rn, rd)
 		}
 		for _, from := range []ReplicaID{2, 3} {
-			if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: rec.Ballot, Seq: 1, Deps: make([]InstanceNum, 3), FastPathEligible: true}); err != nil {
+			if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from, To: 1, Ref: ref, Ballot: rec.Ballot, Seq: 1, Deps: make([]InstanceNum, 3), FastPathEligible: true})); err != nil {
 				t.Fatal(err)
 			}
 		}
 		rd = rn.Ready()
-		recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, CommandNoop)
+		recoveryRequireRecord(t, rd.Records, ref, StatusExecuted, EntryNoop)
 		if err := store.ApplyReady(rd); err != nil {
 			t.Fatal(err)
 		}
@@ -3350,12 +3346,12 @@ func TestLegacyTimedNoopMigrationIsAuthenticatedAndCanonical(t *testing.T) {
 		}
 
 		wrong := TimingDomainLogical
-		if _, err := NewRawNode(Config{ID: 1, Voters: conf.Voters, Storage: makeStore(rec), TOQ: true, TOQClock: func() uint64 { return 20 }, TOQRuntime: cfg.TOQRuntime, LegacyProcessAtDomain: &wrong}); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := NewRawNode(Config{ID: 1, Voters: conf.Voters, Storage: makeStore(rec), TOQ: true, TOQRuntime: cfg.TOQRuntime, LegacyProcessAtDomain: &wrong}); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("TOQ-pending legacy no-op wrong policy err=%v, want ErrInvalidConfig", err)
 		}
 		tampered := rec.Clone()
 		tampered.ProcessAt++
-		if _, err := NewRawNode(Config{ID: 1, Voters: conf.Voters, Storage: makeStore(tampered), TOQ: true, TOQClock: func() uint64 { return 20 }, TOQRuntime: cfg.TOQRuntime, LegacyProcessAtDomain: &domain}); !errors.Is(err, ErrChecksumMismatch) {
+		if _, err := NewRawNode(Config{ID: 1, Voters: conf.Voters, Storage: makeStore(tampered), TOQ: true, TOQRuntime: cfg.TOQRuntime, LegacyProcessAtDomain: &domain}); !errors.Is(err, ErrChecksumMismatch) {
 			t.Fatalf("tampered legacy no-op err=%v, want ErrChecksumMismatch", err)
 		}
 	})
@@ -3371,7 +3367,7 @@ func TestHigherBallotAcceptReplacesRecoveryTimerInPlace(t *testing.T) {
 	command := optimizedTestCommand("bounded-timer", "bounded-timer-key")
 	for number := uint64(1); number <= 128; number++ {
 		message := Message{Type: MsgAccept, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: number, Replica: 2}, Seq: 1, Deps: make([]InstanceNum, 3), Command: command}
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatal(err)
 		}
 		if len(rn.timers) != 1 {
@@ -3413,7 +3409,7 @@ func TestPrepareResponseGenerationDeltaPreflightIsAtomic(t *testing.T) {
 			message := Message{Type: MsgPrepareResp, From: 3, To: 1, Ref: ref, Ballot: ballot, RecordBallot: Ballot{Replica: ref.Replica}, RecordStatus: StatusPreAccepted, Seq: 1, Deps: rn.q.deps(), Command: command, FastPathEligible: true}
 			before := inst.rec.Clone()
 			readyBefore := cloneReady(rn.pendingReady)
-			err := rn.Step(message)
+			err := rn.Step(canonicalTestMessage(message))
 			if wantErr {
 				if !errors.Is(err, ErrLogicalTimeExhausted) {
 					t.Fatalf("Max-1 Try->Accept error = %v, want ErrLogicalTimeExhausted", err)
@@ -3450,7 +3446,7 @@ func TestPrepareResponseGenerationDeltaPreflightIsAtomic(t *testing.T) {
 			rn.installInstance(inst)
 			message := Message{Type: MsgPrepareResp, From: 1, To: 1, Ref: ref, Ballot: ballot, RecordStatus: StatusNone, Deps: make([]InstanceNum, 1)}
 			before := inst.rec.Clone()
-			err = rn.Step(message)
+			err = rn.Step(canonicalTestMessage(message))
 			if wantErr {
 				if !errors.Is(err, ErrLogicalTimeExhausted) {
 					t.Fatalf("single-voter Max-1 Accept->Commit error = %v, want ErrLogicalTimeExhausted", err)

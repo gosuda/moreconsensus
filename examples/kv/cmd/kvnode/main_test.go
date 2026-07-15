@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -116,9 +117,9 @@ func TestKVNodeTransportEmptyLegacyProcessAtDomainFailsClosed(t *testing.T) {
 		Seq:          1,
 		Deps:         make([]epaxos.InstanceNum, 3),
 		Command: epaxos.Command{
-			ID:           epaxos.CommandID{Client: 7, Sequence: 1},
-			Payload:      []byte("legacy"),
-			ConflictKeys: [][]byte{[]byte("legacy")},
+			ID:        epaxos.CommandID{Client: 7, Sequence: 1},
+			Payload:   []byte("legacy"),
+			Footprint: epaxos.Footprint{Points: [][]byte{[]byte("legacy")}},
 		},
 		ProcessAt: 17,
 	}
@@ -1109,7 +1110,7 @@ func TestLatestReadBarrierAfterFailedLocalProposalCurrentCluster(t *testing.T) {
 	}
 }
 
-func TestHandleScanLatestReadWithoutSelectorOrExplicitBarrierWaitsForScanBarrier(t *testing.T) {
+func TestHandleScanLatestReadUsesLogicalSpanCommand(t *testing.T) {
 	s := newTestService(t)
 
 	put := httptest.NewRecorder()
@@ -1132,17 +1133,17 @@ func TestHandleScanLatestReadWithoutSelectorOrExplicitBarrierWaitsForScanBarrier
 	}
 
 	writeRef := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	barrierRef := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
+	scanRef := epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}
 	write := requireInstanceRecord(t, s, writeRef)
 	requireCommandConflictKey(t, write.Command, []byte("scan-a"))
-	requireCommandConflictKey(t, write.Command, scanBarrierConflictKey)
-	barrier := requireInstanceRecord(t, s, barrierRef)
-	if len(barrier.Command.Payload) != 0 {
-		t.Fatalf("scan barrier payload=%q, want empty", barrier.Command.Payload)
+	scanRecord := requireInstanceRecord(t, s, scanRef)
+	if len(scanRecord.Command.Footprint.Points) != 0 || len(scanRecord.Command.Footprint.Spans) != 1 ||
+		!bytes.Equal(scanRecord.Command.Footprint.Spans[0].Start, []byte("scan-")) ||
+		!bytes.Equal(scanRecord.Command.Footprint.Spans[0].End, []byte("scan.")) {
+		t.Fatalf("ordered scan footprint=%#v, want [scan-,scan.)", scanRecord.Command.Footprint)
 	}
-	requireCommandConflictKey(t, barrier.Command, scanBarrierConflictKey)
-	if !hasExecutedRef(s.node.Status().Executed, barrierRef) {
-		t.Fatalf("executed refs=%v, want scan barrier %s", s.node.Status().Executed, barrierRef)
+	if !hasExecutedRef(s.node.Status().Executed, scanRef) {
+		t.Fatalf("executed refs=%v, want ordered scan %s", s.node.Status().Executed, scanRef)
 	}
 }
 
@@ -1311,17 +1312,58 @@ func TestHandleMessageRejectsNonPostBeforeReadingBody(t *testing.T) {
 	requireNoConsensusProgress(t, s)
 }
 
+func TestSnapshotBundleEndpointServesOnlyVerifiedContentAddressedHandle(t *testing.T) {
+	s := newTestService(t)
+	var checkpointID epaxos.CheckpointID
+	checkpointID[0] = 1
+	result, err := s.db.CreateApplicationCheckpoint(epaxos.CheckpointRequest{ID: checkpointID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := s.db.ApplicationSnapshotBundle(result.ApplicationSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/epaxos/snapshot/" + hex.EncodeToString(result.ApplicationSnapshot)
+	response := httptest.NewRecorder()
+	s.handleSnapshotBundle(response, httptest.NewRequest(http.MethodGet, path, nil))
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), want) {
+		t.Fatalf("snapshot status=%d body=%x want=%x", response.Code, response.Body.Bytes(), want)
+	}
+	if got := response.Header().Get("Content-Length"); got != fmt.Sprint(len(want)) {
+		t.Fatalf("content length=%q, want %d", got, len(want))
+	}
+
+	malformed := httptest.NewRecorder()
+	s.handleSnapshotBundle(malformed, httptest.NewRequest(http.MethodGet, "/epaxos/snapshot/not-a-handle", nil))
+	if malformed.Code != http.StatusBadRequest {
+		t.Fatalf("malformed status=%d body=%q", malformed.Code, malformed.Body.String())
+	}
+	missingHandle := append([]byte(nil), result.ApplicationSnapshot...)
+	missingHandle[0] ^= 0xff
+	missing := httptest.NewRecorder()
+	s.handleSnapshotBundle(missing, httptest.NewRequest(http.MethodGet,
+		"/epaxos/snapshot/"+hex.EncodeToString(missingHandle), nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%q", missing.Code, missing.Body.String())
+	}
+}
+
 func TestPeerBodyLimitAcceptsValidMessageAndRejectsOversizedWithoutSteppingNode(t *testing.T) {
 	msg := epaxos.Message{
-		Type:         epaxos.MsgCommit,
-		From:         2,
-		To:           1,
-		Ref:          epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
-		Ballot:       epaxos.Ballot{Replica: 2},
-		RecordBallot: epaxos.Ballot{Replica: 2},
-		Seq:          1,
-		Deps:         []epaxos.InstanceNum{0, 0},
-		Command:      kv.CommandForPut(2, 1, []byte("peer-limit"), []byte("ok")),
+		Type:            epaxos.MsgCommit,
+		From:            2,
+		To:              1,
+		FromIncarnation: 1,
+		ToIncarnation:   1,
+		Ref:             epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:          epaxos.Ballot{Replica: 2},
+		RecordBallot:    epaxos.Ballot{Replica: 2},
+		Seq:             1,
+		Deps:            []epaxos.InstanceNum{0, 0},
+		Kind:            epaxos.EntryCommand,
+		Command:         kv.CommandForPut(2, 1, []byte("peer-limit"), []byte("ok")),
 	}
 	body, err := epaxos.EncodeMessage(nil, msg)
 	if err != nil {
@@ -1460,15 +1502,18 @@ func TestBlockedPeerIngressAllowanceBoundsPendingReadyGrowth(t *testing.T) {
 
 	peerBody := func(from epaxos.ReplicaID, instance epaxos.InstanceNum) []byte {
 		message := epaxos.Message{
-			Type:         epaxos.MsgCommit,
-			From:         from,
-			To:           1,
-			Ref:          epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
-			Ballot:       epaxos.Ballot{Replica: from},
-			RecordBallot: epaxos.Ballot{Replica: from},
-			Seq:          uint64(instance),
-			Deps:         []epaxos.InstanceNum{0, 0, 0},
-			Command:      kv.CommandForPut(uint64(from), uint64(instance), []byte(fmt.Sprintf("remote-%d-%d", from, instance)), []byte("value")),
+			Type:            epaxos.MsgCommit,
+			From:            from,
+			To:              1,
+			FromIncarnation: 1,
+			ToIncarnation:   1,
+			Ref:             epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
+			Ballot:          epaxos.Ballot{Replica: from},
+			RecordBallot:    epaxos.Ballot{Replica: from},
+			Seq:             uint64(instance),
+			Deps:            []epaxos.InstanceNum{0, 0, 0},
+			Kind:            epaxos.EntryCommand,
+			Command:         kv.CommandForPut(uint64(from), uint64(instance), []byte(fmt.Sprintf("remote-%d-%d", from, instance)), []byte("value")),
 		}
 		body, err := epaxos.EncodeMessage(nil, message)
 		if err != nil {
@@ -1543,15 +1588,18 @@ func TestBlockedPeerIngressReleasesAtomicBatchCapacity(t *testing.T) {
 
 	peerBody := func(instance epaxos.InstanceNum) []byte {
 		message := epaxos.Message{
-			Type:         epaxos.MsgCommit,
-			From:         2,
-			To:           1,
-			Ref:          epaxos.InstanceRef{Replica: 2, Instance: instance, Conf: 1},
-			Ballot:       epaxos.Ballot{Replica: 2},
-			RecordBallot: epaxos.Ballot{Replica: 2},
-			Seq:          uint64(instance),
-			Deps:         []epaxos.InstanceNum{0, 0, 0},
-			Command:      kv.CommandForPut(2, uint64(instance), []byte(fmt.Sprintf("atomic-remote-%d", instance)), []byte("value")),
+			Type:            epaxos.MsgCommit,
+			From:            2,
+			To:              1,
+			FromIncarnation: 1,
+			ToIncarnation:   1,
+			Ref:             epaxos.InstanceRef{Replica: 2, Instance: instance, Conf: 1},
+			Ballot:          epaxos.Ballot{Replica: 2},
+			RecordBallot:    epaxos.Ballot{Replica: 2},
+			Seq:             uint64(instance),
+			Deps:            []epaxos.InstanceNum{0, 0, 0},
+			Kind:            epaxos.EntryCommand,
+			Command:         kv.CommandForPut(2, uint64(instance), []byte(fmt.Sprintf("atomic-remote-%d", instance)), []byte("value")),
 		}
 		body, err := epaxos.EncodeMessage(nil, message)
 		if err != nil {
@@ -1782,14 +1830,17 @@ func TestStorageFaultRejectsInboundMessageBeforeSteppingNode(t *testing.T) {
 	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
 	s.setStorageFault(true)
 	msg := epaxos.Message{
-		Type:    epaxos.MsgPreAccept,
-		From:    2,
-		To:      1,
-		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
-		Ballot:  epaxos.Ballot{Replica: 2},
-		Seq:     1,
-		Deps:    []epaxos.InstanceNum{0, 0},
-		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, ConflictKeys: [][]byte{[]byte("blocked")}},
+		Type:            epaxos.MsgPreAccept,
+		From:            2,
+		To:              1,
+		FromIncarnation: 1,
+		ToIncarnation:   1,
+		Ref:             epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:          epaxos.Ballot{Replica: 2},
+		Seq:             1,
+		Deps:            []epaxos.InstanceNum{0, 0},
+		Kind:            epaxos.EntryCommand,
+		Command:         epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("blocked")}}},
 	}
 	buf, err := epaxos.EncodeMessage(nil, msg)
 	if err != nil {
@@ -1884,7 +1935,7 @@ func TestTransportFrameConfiguredDropIsTerminalAndAccounted(t *testing.T) {
 	})}
 	s.setTransportDrop(1, 2, true)
 
-	frame := mustOutboundFrame(t, s, epaxos.Message{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}})
+	frame := mustOutboundFrame(t, s, transportTestMessage([]byte("configured-drop")))
 	s.deliverFrame(frame)
 
 	if posts != 0 {
@@ -1899,14 +1950,17 @@ func TestHandleMessageDropsConfiguredInboundTransportLinkBeforeSteppingNode(t *t
 	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
 	s.setTransportDrop(2, 1, true)
 	msg := epaxos.Message{
-		Type:    epaxos.MsgPreAccept,
-		From:    2,
-		To:      1,
-		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
-		Ballot:  epaxos.Ballot{Replica: 2},
-		Seq:     1,
-		Deps:    []epaxos.InstanceNum{0, 0},
-		Command: epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, ConflictKeys: [][]byte{[]byte("blocked")}},
+		Type:            epaxos.MsgPreAccept,
+		From:            2,
+		To:              1,
+		FromIncarnation: 1,
+		ToIncarnation:   1,
+		Ref:             epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:          epaxos.Ballot{Replica: 2},
+		Seq:             1,
+		Deps:            []epaxos.InstanceNum{0, 0},
+		Kind:            epaxos.EntryCommand,
+		Command:         epaxos.Command{ID: epaxos.CommandID{Client: 2, Sequence: 1}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("blocked")}}},
 	}
 	buf, err := epaxos.EncodeMessage(nil, msg)
 	if err != nil {
@@ -2058,12 +2112,12 @@ func requireInstanceRecord(t *testing.T, s *service, want epaxos.InstanceRef) ep
 
 func requireCommandConflictKey(t *testing.T, cmd epaxos.Command, want []byte) {
 	t.Helper()
-	for _, key := range cmd.ConflictKeys {
+	for _, key := range cmd.Footprint.Points {
 		if bytes.Equal(key, want) {
 			return
 		}
 	}
-	t.Fatalf("command conflict keys=%q, missing %q", cmd.ConflictKeys, want)
+	t.Fatalf("command conflict keys=%q, missing %q", cmd.Footprint.Points, want)
 }
 
 func hasExecutedRef(refs []epaxos.InstanceRef, want epaxos.InstanceRef) bool {
@@ -2358,7 +2412,7 @@ func (c *testKVNodeCluster) logStatus(label string) {
 		svc.mu.Unlock()
 		c.t.Logf("%s node=%d tick=%d executed=%v", label, id, status.Tick, status.Executed)
 		for _, rec := range status.Instances {
-			c.t.Logf("%s node=%d ref=%s status=%s seq=%d deps=%v keys=%q", label, id, rec.Ref, rec.Status, rec.Seq, rec.Deps, rec.Command.ConflictKeys)
+			c.t.Logf("%s node=%d ref=%s status=%s seq=%d deps=%v keys=%q", label, id, rec.Ref, rec.Status, rec.Seq, rec.Deps, rec.Command.Footprint.Points)
 		}
 	}
 }
@@ -2392,7 +2446,7 @@ func TestTransportFramePostsOnlyConfiguredRemotePeers(t *testing.T) {
 	})}
 	messages := []epaxos.Message{
 		{To: 1},
-		{Type: epaxos.MsgCommit, From: 1, To: 2, Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Deps: []epaxos.InstanceNum{0}},
+		transportTestMessage([]byte("configured-peer")),
 		{To: 3},
 	}
 	frames, err := s.prepareOutboundFrames(messages)
@@ -2458,18 +2512,21 @@ func (a *recordingReadyApplier) LoadInstance(ref epaxos.InstanceRef) (epaxos.Ins
 
 func transportTestMessage(payload []byte) epaxos.Message {
 	return epaxos.Message{
-		Type:         epaxos.MsgCommit,
-		From:         1,
-		To:           2,
-		Ref:          epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
-		Ballot:       epaxos.Ballot{Replica: 1},
-		RecordBallot: epaxos.Ballot{Replica: 1},
-		Seq:          1,
-		Deps:         []epaxos.InstanceNum{0, 0},
+		Type:            epaxos.MsgCommit,
+		From:            1,
+		To:              2,
+		FromIncarnation: 1,
+		ToIncarnation:   1,
+		Ref:             epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
+		Ballot:          epaxos.Ballot{Replica: 1},
+		RecordBallot:    epaxos.Ballot{Replica: 1},
+		Seq:             1,
+		Deps:            []epaxos.InstanceNum{0, 0},
+		Kind:            epaxos.EntryCommand,
 		Command: epaxos.Command{
-			ID:           epaxos.CommandID{Client: 1, Sequence: 1},
-			Payload:      payload,
-			ConflictKeys: [][]byte{[]byte("transport-key")},
+			ID:        epaxos.CommandID{Client: 1, Sequence: 1},
+			Payload:   payload,
+			Footprint: epaxos.Footprint{Points: [][]byte{[]byte("transport-key")}},
 		},
 	}
 }
@@ -2480,7 +2537,7 @@ func TestSendQueueAtomicFullBatchBackpressureLeavesReadyUnadvanced(t *testing.T)
 	s.ready = recorder
 
 	s.mu.Lock()
-	if _, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 44}, ConflictKeys: [][]byte{[]byte("atomic")}}); err != nil {
+	if _, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 44}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("atomic")}}}); err != nil {
 		s.mu.Unlock()
 		t.Fatal(err)
 	}
@@ -2908,15 +2965,18 @@ func TestTransportFrameLimitRejectsBeforeAllocation(t *testing.T) {
 func TestPeerDecodeScratchReuseMalformedSurvivalAndBodyBound(t *testing.T) {
 	s := newTestClusterService(t, []epaxos.ReplicaID{1, 2})
 	message := epaxos.Message{
-		Type:         epaxos.MsgCommit,
-		From:         2,
-		To:           1,
-		Ref:          epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
-		Ballot:       epaxos.Ballot{Replica: 2},
-		RecordBallot: epaxos.Ballot{Replica: 2},
-		Seq:          1,
-		Deps:         []epaxos.InstanceNum{0, 0},
-		Command:      kv.CommandForPut(2, 1, []byte("scratch-reuse"), []byte("survived")),
+		Type:            epaxos.MsgCommit,
+		From:            2,
+		To:              1,
+		FromIncarnation: 1,
+		ToIncarnation:   1,
+		Ref:             epaxos.InstanceRef{Replica: 2, Instance: 1, Conf: 1},
+		Ballot:          epaxos.Ballot{Replica: 2},
+		RecordBallot:    epaxos.Ballot{Replica: 2},
+		Seq:             1,
+		Deps:            []epaxos.InstanceNum{0, 0},
+		Kind:            epaxos.EntryCommand,
+		Command:         kv.CommandForPut(2, 1, []byte("scratch-reuse"), []byte("survived")),
 	}
 	valid, err := epaxos.EncodeMessage(nil, message)
 	if err != nil {
@@ -3221,13 +3281,7 @@ func TestApplicationCloseWaitsForTransportBeforeClosingPebbleAndIsIdempotent(t *
 		transportCancel: transportCancel,
 	}
 	s.startTransportWorkers(1)
-	admitOutboundFrameForTest(t, s, mustOutboundFrame(t, s, epaxos.Message{
-		Type: epaxos.MsgCommit,
-		From: 1,
-		To:   2,
-		Ref:  epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
-		Deps: []epaxos.InstanceNum{0},
-	}))
+	admitOutboundFrameForTest(t, s, mustOutboundFrame(t, s, transportTestMessage([]byte("shutdown"))))
 	receiveKVNodeTest(t, roundTripper.started)
 	pebbleCloser := &pebbleEventCloser{db: db, events: events}
 	app := &application{service: s, storage: pebbleCloser}

@@ -12,10 +12,10 @@ func validTestTrace(size int) FaultTrace {
 	state := map[string]string{"key": "value"}
 	trace := FaultTrace{
 		Version: traceVersion, SourceRevision: strings.Repeat("a", 40), Size: size, Seed: 0x5eed,
-		Profiles: []string{"duplicate"},
-		Operations: []TraceOperation{{ID: 1, Kind: string(OpPut), Node: 1, Key: "key", Value: "value"}, {ID: 2, Kind: string(OpGet), Node: 1, Key: "key"}},
-		Actions: []TraceAction{{ID: 1, Kind: "duplicate", Node: 1, From: 1, To: 2, Applicable: true}},
-		Receipts: []TraceReceipt{{ID: 1, ActionID: 1, Kind: "duplicate", Count: 1, Applicable: true}},
+		Profiles:       []string{"duplicate"},
+		Operations:     []TraceOperation{{ID: 1, Kind: string(OpPut), Node: 1, Key: "key", Value: "value"}, {ID: 2, Kind: string(OpGet), Node: 1, Key: "key"}},
+		Actions:        []TraceAction{{ID: 1, Kind: "duplicate", Node: 1, From: 1, To: 2, Applicable: true}},
+		Receipts:       []TraceReceipt{{ID: 1, ActionID: 1, Kind: "duplicate", Count: 1, Applicable: true}},
 		TerminalHashes: map[string]string{"node-1": "hash"}, TerminalDigest: terminalStateDigest(state), OracleResult: "pass",
 	}
 	if size == 1 {

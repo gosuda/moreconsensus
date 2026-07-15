@@ -33,8 +33,9 @@ The checked Go-trace-to-TLC replay proves sampled admission for four captured sc
 | `tla/EPaxosAcceptEvidenceMerge.tla` | Sender-zero skip, same-sender merge, distinct-sender append, identical duplicate acceptance, and conflicting duplicate rejection. | `TestSenderPreservingEvidenceValidationAndMergeContracts`, `TestCodecRejectsMalformedSenderEvidenceWireFrames`. |
 | `tla/EPaxosTryPreAcceptRetry.tla` | Logical retry checks for current, stale, and unrelated pending evidence. | `TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry`. |
 | `tla/EPaxosRevisited.tla` | TOQ envelopes, delayed assignment, pending decision blocking, receiver timing, and dependency chain pruning. | `epaxos/toq_test.go`, `epaxos/revisited_test.go`, `epaxos/node.go`. |
-| `tla/TOQClockDiscipline.tla` | Finite bounded-skew/bounded-delay contract for `ProcessAt`. | `Config.TOQClock`, `Config.TOQOneWayDelay`, `TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs`. |
+| `tla/TOQClockDiscipline.tla` | Finite bounded-skew/bounded-delay contract for externally sampled `ProcessAt`. | Explicit `ProcessTOQ(now)`, configured one-way bounds, and TOQ tests. |
 | `tla/ReadyAdvance.tla` | Durable Ready prefix acknowledgement and retry obligations. | `epaxos/ready_durability_test.go`, `tests/refinementtrace`. |
+| `tla/EPaxosCertifiedCompaction.tla` | Exact executed/applied checkpoint cut, prepared snapshot durability, quorum certification, atomic tombstone/delete, crash/restart snapshot-plus-delta replay, and stale-incarnation/late-compacted-message rejection. | `epaxos/checkpoint*.go`, Pebble checkpoint/snapshot code, focused lifecycle tests, and `TestCheckpointCompactionThreeReplicaRestartSmoke`. |
 | `tla/EPaxosRollbackAllocation.tla` | Learned local reference advances allocation after rollback and preserves learned-before-fresh apply order. | `TestSimulatorRestoredLocalStorageAdvancesPastLearnedLocalCommit`, rollback simulation tests. |
 | `tla/EPaxosConfigBarrier.tla` | Pending configuration barriers, dependency inclusion, sequence elevation, and barrier clearing. | `epaxos/config_change_ordering_test.go`. |
 | `tla/EPaxosConfigTransition.tla` | One add-voter transition with old and new pinned instance domains. | Configuration transition tests. |
@@ -59,7 +60,7 @@ The checked Go-trace-to-TLC replay proves sampled admission for four captured sc
 | `tla/EPaxosVoterBootstrap.tla` | Finite bootstrap fencing, target readiness, activation, abort, crash-prefix, race, and fairness obligations. | `tests/tla_model_check_fast.sh` runs base sizes 1–6 (successor sizes 2–7) plus crash-prefix, race, and fairness configurations; bootstrap is outside the sampled Go-to-TLC replay. |
 | `tla/KVTimestampStaleness.tla` and `tla/KVOmissionRecovery.tla` | Example KV timestamp and omission/recovery slices. | `examples/kv`, Jepsen checker tests. |
 
-The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 31 named finite jobs, including the positive compaction/fencing configuration, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
+The fast gate is executable through `bash tests/tla_model_check_fast.sh` (or `python3 tests/tla_model_check_runner.py --profile fast`) and covers 32 named finite jobs, including the certified-compaction configuration, the positive compaction/fencing configuration, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
 
 ## Paper-grounded claim map
 
@@ -70,6 +71,7 @@ The fast gate is executable through `bash tests/tla_model_check_fast.sh` and cov
 | Revisited TOQ | `Config.TOQ` persists `TOQPending` and `ProcessAt`, sends flagged attributes, delays originator assignment, and blocks decisions while pending. | Core behavior is implemented; clock synchronization, delay measurement, and sync-group operation remain embedder responsibilities. |
 | Accept-Deps evidence | `Message`, codec, checksum, storage, and node paths preserve chosen `Seq`/`Deps` separately from recovery-only aggregate and sender evidence. | Finite 3/5/7 optimized-recovery and sender-merge slices pass; arbitrary evidence histories remain outside the claim. |
 | Chain pruning | `sparse_progress.go` removes dependencies proven ordered by a higher-sequence dependency during SCC readiness. | Implemented and covered by Revisited tests and `tla/EPaxosRevisited.tla`. |
+| Certified compaction | Exact execution frontiers, incarnation-bound descriptors, durable quorum certificates, application digests, atomic compaction tombstones, and checkpoint-plus-delta restart are implemented across core and KV storage. | Focused Go, three-replica Pebble smoke, and finite TLC evidence pass; arbitrary Go histories and unbounded action correspondence remain open. |
 
 References: [EPaxos SOSP 2013](https://sigops.org/s/conferences/sosp/2013/papers/p358-moraru.pdf), [EPaxos technical report CMU-PDL-13-111](https://www.pdl.cmu.edu/PDL-FTP/associated/CMU-PDL-13-111.pdf), and [EPaxos Revisited NSDI 2021](https://www.usenix.org/system/files/nsdi21-tollman.pdf).
 
@@ -114,9 +116,9 @@ This replay proves sampled admission. Separately, the AST-checked inventory cove
 - `go test ./... -count=1` passes.
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
-- `bash tests/tla_model_check_fast.sh` passes all 31 configured jobs, including the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
+- `bash tests/tla_model_check_fast.sh` passes all 32 configured jobs, including the certified-compaction configuration, the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
 - `tests/trace_refinement_check.sh` accepts all four scenario traces and rejects all five negative controls.
-- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 89.7% against 85.0% minimum and `examples/kv` 92.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
+- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 87.6% against 85.0% minimum and `examples/kv` 90.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - TLAPS 1.6.0-pre at version `763bf3c`, from the newest prebuilt x86_64-linux release asset (no 1.6.0 final exists), reports 876 obligations for `tla/EPaxosInductiveProofs.tla`: 867 proved, 9 failed, and 0 omitted. `tests/tlaps_check.sh` exits 10, preserving that failure.
 - `tests/formal_closure_collect.sh` stages unsigned-local `rawArtifact` records and fails closed on component or bookkeeping errors; verifier enums cover the compaction/fencing area, and `tests/formal_closure_evidence_selftest.py` passes 82 synthetic cases.
 

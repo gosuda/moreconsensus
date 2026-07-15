@@ -10,12 +10,18 @@ type failingStorage struct{ err error }
 func (f failingStorage) InitialState() (StorageState, error) {
 	return StorageState{}, f.err
 }
-func (f failingStorage) LoadInstances(func(InstanceRecord) error) error { return nil }
+func (f failingStorage) LoadCheckpoint() (Checkpoint, error) { return Checkpoint{}, nil }
+func (f failingStorage) LoadInstances(ExecutionFrontier, func(InstanceRecord) error) error { return nil }
+func (f failingStorage) LoadInstance(InstanceRef) (InstanceRecord, bool, error) { return InstanceRecord{}, false, nil }
 
 type loadFailStorage struct{ rec InstanceRecord }
 
-func (l loadFailStorage) InitialState() (StorageState, error)               { return StorageState{}, nil }
-func (l loadFailStorage) LoadInstances(fn func(InstanceRecord) error) error { return fn(l.rec) }
+func (l loadFailStorage) InitialState() (StorageState, error) { return StorageState{}, nil }
+func (l loadFailStorage) LoadCheckpoint() (Checkpoint, error) { return Checkpoint{}, nil }
+func (l loadFailStorage) LoadInstances(_ ExecutionFrontier, fn func(InstanceRecord) error) error { return fn(l.rec) }
+func (l loadFailStorage) LoadInstance(ref InstanceRef) (InstanceRecord, bool, error) {
+	return l.rec.Clone(), l.rec.Ref == ref, nil
+}
 
 func TestConstructionAndReadyBranches(t *testing.T) {
 	sentinel := errors.New("boom")
@@ -34,7 +40,7 @@ func TestConstructionAndReadyBranches(t *testing.T) {
 	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: loadFailStorage{rec: badRec}}); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("load checksum err=%v", err)
 	}
-	executed := InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Status: StatusExecuted, Seq: 1, Deps: []InstanceNum{0}, Command: Command{Kind: CommandNoop}}
+	executed := InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Status: StatusExecuted, Seq: 1, Deps: []InstanceNum{0}, Kind: EntryNoop}
 	executed.Checksum = ChecksumRecord(executed)
 	loaded, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: loadFailStorage{rec: executed}})
 	if err != nil || len(loaded.Status().Executed) != 1 {
@@ -50,14 +56,14 @@ func TestConstructionAndReadyBranches(t *testing.T) {
 	initial := rn.Ready()
 	wantInitial := HardState{Conf: ConfState{ID: 1, Voters: []ReplicaID{1}}}
 	if !initial.HardState.Equal(wantInitial) || !initial.MustSync ||
-		len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Committed) != 0 {
+		len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Apply) != 0 {
 		t.Fatalf("initial Ready = %#v, want hard-state-only %#v", initial, wantInitial)
 	}
 	advanceOK(t, rn, initial)
-	if _, err := rn.Propose(Command{Kind: CommandConfChange}); err == nil {
-		t.Fatal("expected conf command rejection")
+	if _, err := rn.Propose(Command{}); err == nil {
+		t.Fatal("expected zero-footprint command rejection")
 	}
-	if _, err := rn.Propose(Command{Kind: CommandNoop}); err != nil {
+	if _, err := rn.Propose(Command{Footprint: Footprint{All: true}}); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -81,31 +87,29 @@ func TestConstructionAndReadyBranches(t *testing.T) {
 
 func TestDirectProtocolBranches(t *testing.T) {
 	s := newSimCluster(t, 3, false)
-	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.drain()
 	rec := s.nodes[2].instances[ref].rec
-	dup := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Command: rec.Command}
+	dup := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: rec.Ballot, Seq: rec.Seq, Deps: rec.Deps, Kind: rec.Kind, Command: rec.Command}
 	dup.Checksum = ChecksumMessage(dup)
-	if err := s.nodes[2].Step(dup); err != nil {
-		t.Fatal(err)
-	}
+	if err := s.nodes[2].Step(canonicalTestMessage(dup)); err != nil { t.Fatal(err)
+ }
 	pre := s.nodes[3]
-	pre.instances[ref] = &instance{rec: InstanceRecord{Ref: ref, Ballot: Ballot{Number: 7, Replica: 3}, Status: StatusPreAccepted, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: rec.Command}}
+	pre.instances[ref] = &instance{rec: InstanceRecord{Ref: ref, Ballot: Ballot{Number: 7, Replica: 3}, Status: StatusPreAccepted, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Kind: rec.Kind, Command: rec.Command}}
 	low := dup
 	low.To = 3
 	low.Ballot = Ballot{Replica: 1}
 	low.Checksum = ChecksumMessage(low)
-	if err := pre.Step(low); err != nil {
-		t.Fatal(err)
-	}
+	if err := pre.Step(canonicalTestMessage(low)); err != nil { t.Fatal(err)
+ }
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref2, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("y")}})
+	ref2, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("y"), Footprint: Footprint{Points: [][]byte{[]byte("y")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +138,7 @@ func TestAcceptResponseAndConfigBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,16 +157,16 @@ func TestAcceptResponseAndConfigBranches(t *testing.T) {
 	if err := rn.handleAcceptResp(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, RecordBallot: inst.rec.Ballot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: rn.q.deps()}); err != nil {
 		panic(err)
 	}
-	rn.enqueueRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 99, Conf: 1}, Deps: rn.q.deps(), Command: Command{Kind: CommandNoop}})
+	rn.enqueueRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 99, Conf: 1}, Deps: rn.q.deps(), Kind: EntryNoop})
 	rn.enqueueMessage(Message{Type: MsgPrepareResp, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}, Deps: rn.q.deps()})
 	if _, err := FastQuorum(0); err == nil {
 		t.Fatal("expected fast quorum error")
 	}
 	PutMessage(nil)
 	PutCommand(nil)
-	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 100, Conf: 1}, Command{Kind: CommandConfChange, Payload: []byte{99, 0}})
-	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 101, Conf: 1}, Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter), 0, 0, 0, 0, 0, 0, 0, 0}})
-	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 102, Conf: 1}, Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeRemoveVoter), 2, 0, 0, 0, 0, 0, 0, 0}})
+	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 100, Conf: 1}, ConfChange{Type: ConfChangeType(99)})
+	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 101, Conf: 1}, ConfChange{Type: ConfChangeAddVoter})
+	rn.applyConfChange(InstanceRef{Replica: 1, Instance: 102, Conf: 1}, ConfChange{Type: ConfChangeRemoveVoter, Replica: 2})
 }
 
 func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
@@ -174,7 +178,7 @@ func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
 		Status:  StatusAccepted,
 		Seq:     3,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{ID: CommandID{Client: 40, Sequence: 1}, Payload: []byte("foreign-accepted"), ConflictKeys: [][]byte{[]byte("foreign-accepted-key")}},
+		Command: Command{ID: CommandID{Client: 40, Sequence: 1}, Payload: []byte("foreign-accepted"), Footprint: Footprint{Points: [][]byte{[]byte("foreign-accepted-key")}}},
 	}
 	store.Records[ref] = checkedRecord(accepted)
 
@@ -189,7 +193,7 @@ func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
 	initial := rn.Ready()
 	wantInitial := HardState{Conf: ConfState{ID: 1, Voters: makeIDs(3)}}
 	if !initial.HardState.Equal(wantInitial) || !initial.MustSync ||
-		len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Committed) != 0 {
+		len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Apply) != 0 {
 		t.Fatalf("restart initial Ready = %#v, want hard-state-only %#v", initial, wantInitial)
 	}
 	if err := store.ApplyReady(initial); err != nil {
@@ -203,7 +207,7 @@ func TestRestartAcceptedForeignInstanceSchedulesPrepareRecovery(t *testing.T) {
 		tickReady := rn.Ready()
 		wantTick := HardState{Conf: wantInitial.Conf, Tick: tick}
 		if !tickReady.HardState.Equal(wantTick) || !tickReady.MustSync ||
-			len(tickReady.Records) != 0 || len(tickReady.Messages) != 0 || len(tickReady.Committed) != 0 {
+			len(tickReady.Records) != 0 || len(tickReady.Messages) != 0 || len(tickReady.Apply) != 0 {
 			t.Fatalf("foreign accepted recovery Ready after %d ticks = %#v, want hard-state-only %#v", tick, tickReady, wantTick)
 		}
 		if err := store.ApplyReady(tickReady); err != nil {
@@ -239,7 +243,7 @@ func TestAcceptResponseIgnoresNonHigherRejectHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 41, Sequence: 1}, Payload: []byte("accept-reject"), ConflictKeys: [][]byte{[]byte("accept-reject-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 41, Sequence: 1}, Payload: []byte("accept-reject"), Footprint: Footprint{Points: [][]byte{[]byte("accept-reject-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,9 +253,8 @@ func TestAcceptResponseIgnoresNonHigherRejectHint(t *testing.T) {
 	rn.startAccept(inst, inst.rec.Attributes())
 	current := inst.rec.Ballot
 	advanceOK(t, rn, rn.Ready())
-	if err := rn.Step(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: current, Reject: true, RejectHint: current, Deps: rn.q.deps()}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: current, Reject: true, RejectHint: current, Deps: rn.q.deps()})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phaseAccept || inst.rec.Ballot != current {
 		t.Fatalf("stale accept reject moved phase/ballot to %d/%v, want accept/%v", inst.phase, inst.rec.Ballot, current)
 	}
@@ -265,7 +268,7 @@ func TestAcceptRespIgnoresStaleBallotForCurrentAcceptRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 42, Sequence: 1}, Payload: []byte("accept-stale-ballot"), ConflictKeys: [][]byte{[]byte("accept-stale-ballot-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 42, Sequence: 1}, Payload: []byte("accept-stale-ballot"), Footprint: Footprint{Points: [][]byte{[]byte("accept-stale-ballot-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +290,7 @@ func TestAcceptRespIgnoresStaleBallotForCurrentAcceptRound(t *testing.T) {
 	advanceOK(t, rn, rn.Ready())
 
 	staleAcceptDeps := []InstanceNum{0, 7, 0}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgAcceptResp,
 		From:         2,
 		To:           1,
@@ -299,9 +302,8 @@ func TestAcceptRespIgnoresStaleBallotForCurrentAcceptRound(t *testing.T) {
 		Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
 		AcceptSeq:    currentAcceptSeq + 7,
 		AcceptDeps:   staleAcceptDeps,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("stale accept response committed instance at phase/status %d/%s, want accept/%s", inst.phase, inst.rec.Status, StatusAccepted)
 	}
@@ -312,9 +314,8 @@ func TestAcceptRespIgnoresStaleBallotForCurrentAcceptRound(t *testing.T) {
 		t.Fatalf("stale accept response produced ready work: %#v", rn.Ready())
 	}
 
-	if err := rn.Step(Message{Type: MsgAcceptResp, From: 3, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...)}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAcceptResp, From: 3, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...)})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phaseCommitted || inst.rec.Status < StatusCommitted {
 		t.Fatalf("current-ballot accept response left phase/status %d/%s, want committed or executed", inst.phase, inst.rec.Status)
 	}
@@ -326,7 +327,7 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 43, Sequence: 1}, Payload: []byte("accept-init"), ConflictKeys: [][]byte{[]byte("accept-init-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 43, Sequence: 1}, Payload: []byte("accept-init"), Footprint: Footprint{Points: [][]byte{[]byte("accept-init-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +340,7 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 	advanceOK(t, rn, rn.Ready())
 
 	inst.accOK = 0
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgAcceptResp,
 		From:         2,
 		To:           1,
@@ -349,9 +350,8 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 		RecordStatus: StatusAccepted,
 		Seq:          chosen.Seq + 1,
 		Deps:         append([]InstanceNum(nil), chosen.Deps...),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	if inst.accOK != 0 || inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("wrong-tuple accept response changed accept round: phase/status=%d/%s accOK=%#v", inst.phase, inst.rec.Status, inst.accOK)
 	}
@@ -359,9 +359,8 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 		t.Fatalf("wrong-tuple accept response emitted ready work: %#v", rn.Ready())
 	}
 
-	if err := rn.Step(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, Seq: chosen.Seq, Deps: append([]InstanceNum(nil), chosen.Deps...), RecordStatus: StatusAccepted}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, Seq: chosen.Seq, Deps: append([]InstanceNum(nil), chosen.Deps...), RecordStatus: StatusAccepted})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 		t.Fatalf("first current-ballot accept response committed at phase/status %d/%s, want accept/%s before slow quorum", inst.phase, inst.rec.Status, StatusAccepted)
 	}
@@ -369,9 +368,8 @@ func TestAcceptRespInitializesNilAccOKAndWaitsForSlowQuorum(t *testing.T) {
 		t.Fatalf("single accept response emitted ready before slow quorum: %#v", rn.Ready())
 	}
 
-	if err := rn.Step(Message{Type: MsgAcceptResp, From: 3, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, Seq: chosen.Seq, Deps: append([]InstanceNum(nil), chosen.Deps...), RecordStatus: StatusAccepted}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAcceptResp, From: 3, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, Seq: chosen.Seq, Deps: append([]InstanceNum(nil), chosen.Deps...), RecordStatus: StatusAccepted})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phaseCommitted || inst.rec.Status < StatusCommitted {
 		t.Fatalf("second current-ballot accept response left phase/status %d/%s, want committed after slow quorum", inst.phase, inst.rec.Status)
 	}
@@ -383,7 +381,7 @@ func TestAcceptRespDuplicateCurrentBallotResponseIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 44, Sequence: 1}, Payload: []byte("accept-duplicate"), ConflictKeys: [][]byte{[]byte("accept-duplicate-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 44, Sequence: 1}, Payload: []byte("accept-duplicate"), Footprint: Footprint{Points: [][]byte{[]byte("accept-duplicate-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +394,7 @@ func TestAcceptRespDuplicateCurrentBallotResponseIgnored(t *testing.T) {
 	advanceOK(t, rn, rn.Ready())
 
 	firstEvidence := Attributes{Seq: chosen.Seq + 2, Deps: []InstanceNum{0, 2, 0, 0, 0}}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgAcceptResp,
 		From:         2,
 		To:           1,
@@ -408,12 +406,11 @@ func TestAcceptRespDuplicateCurrentBallotResponseIgnored(t *testing.T) {
 		AcceptSeq:    firstEvidence.Seq,
 		AcceptDeps:   append([]InstanceNum(nil), firstEvidence.Deps...),
 		RecordStatus: StatusAccepted,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
-	if len(rd.Committed) != 0 {
-		t.Fatalf("first accept response committed before five-node slow quorum: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("first accept response committed before five-node slow quorum: %#v", rd.Apply)
 	}
 	rec := optimizedRequireRecord(t, rd, ref)
 	recEvidence, ok := rec.AcceptAttributes()
@@ -423,7 +420,7 @@ func TestAcceptRespDuplicateCurrentBallotResponseIgnored(t *testing.T) {
 	advanceOK(t, rn, rd)
 
 	secondEvidence := Attributes{Seq: firstEvidence.Seq + 5, Deps: []InstanceNum{0, 4, 0, 0, 0}}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgAcceptResp,
 		From:         2,
 		To:           1,
@@ -435,9 +432,8 @@ func TestAcceptRespDuplicateCurrentBallotResponseIgnored(t *testing.T) {
 		AcceptSeq:    secondEvidence.Seq,
 		AcceptDeps:   append([]InstanceNum(nil), secondEvidence.Deps...),
 		RecordStatus: StatusAccepted,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	gotEvidence, ok := inst.rec.AcceptAttributes()
 	if !ok || gotEvidence.Seq != firstEvidence.Seq || !instanceNumsEqual(gotEvidence.Deps, firstEvidence.Deps) {
 		t.Fatalf("duplicate accept response changed evidence to seq %d deps %v ok=%v, want first evidence seq %d deps %v", gotEvidence.Seq, gotEvidence.Deps, ok, firstEvidence.Seq, firstEvidence.Deps)
@@ -452,7 +448,7 @@ func TestAcceptRespZeroAcceptEvidenceIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("accept-zero-evidence"), ConflictKeys: [][]byte{[]byte("accept-zero-evidence-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("accept-zero-evidence"), Footprint: Footprint{Points: [][]byte{[]byte("accept-zero-evidence-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,9 +461,8 @@ func TestAcceptRespZeroAcceptEvidenceIgnored(t *testing.T) {
 	initialAcceptDeps := append([]InstanceNum(nil), inst.rec.AcceptDeps...)
 	advanceOK(t, rn, rn.Ready())
 
-	if err := rn.Step(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...)}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: currentBallot, RecordBallot: currentBallot, RecordStatus: StatusAccepted, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...)})); err != nil { t.Fatal(err)
+ }
 	if inst.rec.AcceptSeq != initialAcceptSeq || !instanceNumsEqual(inst.rec.AcceptDeps, initialAcceptDeps) {
 		t.Fatalf("zero accept evidence changed record evidence to seq=%d deps=%v, want seq=%d deps=%v", inst.rec.AcceptSeq, inst.rec.AcceptDeps, initialAcceptSeq, initialAcceptDeps)
 	}
@@ -496,7 +491,7 @@ func TestCanFastCommitPreAcceptAdoptsCoveringTupleAtDefaultBallot(t *testing.T) 
 				Status:           StatusPreAccepted,
 				Seq:              1,
 				Deps:             localDeps,
-				Command:          Command{ID: CommandID{Client: 42, Sequence: 1}, Payload: []byte("stale-originator"), ConflictKeys: [][]byte{[]byte("stale-originator-key")}},
+				Command:          Command{ID: CommandID{Client: 42, Sequence: 1}, Payload: []byte("stale-originator"), Footprint: Footprint{Points: [][]byte{[]byte("stale-originator-key")}}},
 				FastPathEligible: true,
 			},
 			phase:     phasePreAccept,
@@ -543,7 +538,7 @@ func TestCanFastCommitPreAcceptRejectsIneligibleLocalRecordDespiteMatchingVotes(
 			Status:           StatusPreAccepted,
 			Seq:              attrs.Seq,
 			Deps:             append([]InstanceNum(nil), attrs.Deps...),
-			Command:          Command{ID: CommandID{Client: 43, Sequence: 1}, Payload: []byte("local-ineligible"), ConflictKeys: [][]byte{[]byte("local-ineligible-key")}},
+			Command:          Command{ID: CommandID{Client: 43, Sequence: 1}, Payload: []byte("local-ineligible"), Footprint: Footprint{Points: [][]byte{[]byte("local-ineligible-key")}}},
 			FastPathEligible: false,
 		},
 		phase: phasePreAccept,
@@ -562,12 +557,10 @@ func TestCanFastCommitPreAcceptRejectsIneligibleLocalRecordDespiteMatchingVotes(
 }
 
 func TestTOQHigherAttrsFastCommitRejectsIneligibleLocalRecord(t *testing.T) {
-	clock := uint64(10)
 	rn, err := NewRawNode(Config{
 		ID:       1,
 		Voters:   makeIDs(3),
 		TOQ:      true,
-		TOQClock: func() uint64 { return clock },
 		TOQRuntime: &TOQRuntimeConfig{
 			Conf:        ConfState{ID: 1, Voters: makeIDs(3)},
 			OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 2, 3: 3},
@@ -585,9 +578,11 @@ func TestTOQHigherAttrsFastCommitRejectsIneligibleLocalRecord(t *testing.T) {
 			Status:           StatusPreAccepted,
 			Seq:              localAttrs.Seq,
 			Deps:             append([]InstanceNum(nil), localAttrs.Deps...),
-			Command:          Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("toq-higher-attrs"), ConflictKeys: [][]byte{[]byte("toq-higher-attrs-key")}},
+			Kind:             EntryCommand,
+			Command:          Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("toq-higher-attrs"), Footprint: Footprint{Points: [][]byte{[]byte("toq-higher-attrs-key")}}},
 			FastPathEligible: false,
 			ProcessAt:        15,
+			TimingDomain:     TimingDomainTOQ,
 		},
 		phase:     phasePreAccept,
 		processAt: 15,
@@ -618,7 +613,7 @@ func TestCanFastCommitPreAcceptRejectsIneligibleRemoteVoteDespiteMatchingAttrs(t
 			Status:           StatusPreAccepted,
 			Seq:              attrs.Seq,
 			Deps:             append([]InstanceNum(nil), attrs.Deps...),
-			Command:          Command{ID: CommandID{Client: 44, Sequence: 1}, Payload: []byte("remote-ineligible"), ConflictKeys: [][]byte{[]byte("remote-ineligible-key")}},
+			Command:          Command{ID: CommandID{Client: 44, Sequence: 1}, Payload: []byte("remote-ineligible"), Footprint: Footprint{Points: [][]byte{[]byte("remote-ineligible-key")}}},
 			FastPathEligible: true,
 		},
 		phase: phasePreAccept,

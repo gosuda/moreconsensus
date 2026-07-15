@@ -175,7 +175,7 @@ func TestPrepareVoterLeavesTargetNonVotingAndOldConfigAvailable(t *testing.T) {
 	if plan.Successor.Contains(f.target.Replica) == false || f.node.Status().Conf.Contains(f.target.Replica) {
 		t.Fatalf("prepare changed voting config: current=%#v successor=%#v", f.node.Status().Conf, plan.Successor)
 	}
-	if _, err := f.node.Propose(Command{Payload: []byte("old-config-live")}); err != nil {
+	if _, err := f.node.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("old-config-live"), Footprint: Footprint{Points: [][]byte{[]byte("old-config-live")}}}); err != nil {
 		t.Fatalf("old config unavailable while preparing: %v", err)
 	}
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -766,26 +765,22 @@ func TestInspectRestoreIntentRejectsAuthenticatedMetadataMismatchWithoutOutput(t
 }
 
 func TestInspectReconstructsFullConfigurationHistory(t *testing.T) {
-	configurationCommand := func(change epaxos.ConfChangeType, voter epaxos.ReplicaID) epaxos.Command {
-		payload := make([]byte, 9)
-		payload[0] = byte(change)
-		binary.LittleEndian.PutUint64(payload[1:], uint64(voter))
-		return epaxos.Command{Kind: epaxos.CommandConfChange, Payload: payload}
-	}
 	records := []epaxos.InstanceRecord{
 		{
-			Ref:     epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1},
-			Status:  epaxos.StatusExecuted,
-			Command: configurationCommand(epaxos.ConfChangeAddVoter, 3),
+			Ref:        epaxos.InstanceRef{Replica: 1, Instance: 4, Conf: 1},
+			Status:     epaxos.StatusExecuted,
+			Kind:       epaxos.EntryConfChange,
+			ConfChange: epaxos.ConfChange{Type: epaxos.ConfChangeAddVoter, Replica: 3},
 			ConfChangeResult: epaxos.ConfChangeResult{
 				Outcome: epaxos.ConfChangeApplied,
 				Conf:    epaxos.ConfState{ID: 2, Voters: []epaxos.ReplicaID{1, 2, 3}},
 			},
 		},
 		{
-			Ref:     epaxos.InstanceRef{Replica: 3, Instance: 7, Conf: 2},
-			Status:  epaxos.StatusExecuted,
-			Command: configurationCommand(epaxos.ConfChangeRemoveVoter, 2),
+			Ref:        epaxos.InstanceRef{Replica: 3, Instance: 7, Conf: 2},
+			Status:     epaxos.StatusExecuted,
+			Kind:       epaxos.EntryConfChange,
+			ConfChange: epaxos.ConfChange{Type: epaxos.ConfChangeRemoveVoter, Replica: 2},
 			ConfChangeResult: epaxos.ConfChangeResult{
 				Outcome: epaxos.ConfChangeApplied,
 				Conf:    epaxos.ConfState{ID: 3, Voters: []epaxos.ReplicaID{1, 3}},

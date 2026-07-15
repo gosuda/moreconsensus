@@ -152,13 +152,14 @@ func TestStorageStateCloneDoesNotShareOwnedSlices(t *testing.T) {
 
 func TestCommandResetReleasesOwnedReferences(t *testing.T) {
 	command := Command{
-		ID:           CommandID{Client: 7, Sequence: 8},
-		Kind:         CommandConfChange,
-		Payload:      []byte("payload"),
-		ConflictKeys: [][]byte{[]byte("key")},
+		ID:        CommandID{Client: 7, Sequence: 8},
+		Payload:   []byte("payload"),
+		Footprint: Footprint{Points: [][]byte{[]byte("key")}, Spans: []Span{{Start: []byte("a"), End: []byte("z")}}},
+		CycleKey: []byte("cycle"),
 	}
 	command.Reset()
-	if command.ID != (CommandID{}) || command.Kind != CommandUser || command.Payload != nil || command.ConflictKeys != nil {
+	if command.ID != (CommandID{}) || command.Payload != nil || command.Footprint.Points != nil ||
+		command.Footprint.Spans != nil || command.Footprint.All || command.CycleKey != nil {
 		t.Fatalf("Command.Reset left owned state: %#v", command)
 	}
 }

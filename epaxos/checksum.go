@@ -34,14 +34,68 @@ func writeBytes(h *blake3.Hasher, b []byte) {
 	_, _ = h.Write(b)
 }
 
+func writeFootprint(h *blake3.Hasher, f Footprint) {
+	if f.All {
+		writeByte(h, 1)
+	} else {
+		writeByte(h, 0)
+	}
+	writeUint64(h, uint64(len(f.Points)))
+	for _, point := range f.Points {
+		writeBytes(h, point)
+	}
+	writeUint64(h, uint64(len(f.Spans)))
+	for _, span := range f.Spans {
+		writeBytes(h, span.Start)
+		writeBytes(h, span.End)
+	}
+}
+
 func writeCommand(h *blake3.Hasher, c Command) {
 	writeUint64(h, c.ID.Client)
 	writeUint64(h, c.ID.Sequence)
-	writeByte(h, byte(c.Kind))
 	writeBytes(h, c.Payload)
-	writeUint64(h, uint64(len(c.ConflictKeys)))
-	for _, key := range c.ConflictKeys {
-		writeBytes(h, key)
+	writeFootprint(h, c.Footprint)
+	writeBytes(h, c.CycleKey)
+}
+
+func writeEntryValue(h *blake3.Hasher, kind EntryKind, command Command, change ConfChange, control []byte) {
+	writeByte(h, byte(kind))
+	writeByte(h, byte(change.Type))
+	writeUint64(h, uint64(change.Replica))
+	writeBytes(h, control)
+	writeCommand(h, command)
+}
+
+func writeLegacyCommand(h *blake3.Hasher, r InstanceRecord) {
+	var kind byte
+	var id CommandID
+	var payload []byte
+	var points [][]byte
+	switch r.Kind {
+	case EntryCommand:
+		kind, id, payload, points = 0, r.Command.ID, r.Command.Payload, r.Command.Footprint.Points
+	case EntryNoop:
+		kind = 1
+	case EntryConfChange:
+		kind = 2
+		payload = make([]byte, 9)
+		payload[0] = byte(r.ConfChange.Type)
+		binary.LittleEndian.PutUint64(payload[1:], uint64(r.ConfChange.Replica))
+	case EntryMembership:
+		kind, payload = 3, r.ProtocolControl
+	case EntryCheckpoint:
+		kind, payload = byte(EntryCheckpoint), r.ProtocolControl
+	default:
+		kind = byte(r.Kind)
+	}
+	writeUint64(h, id.Client)
+	writeUint64(h, id.Sequence)
+	writeByte(h, kind)
+	writeBytes(h, payload)
+	writeUint64(h, uint64(len(points)))
+	for _, point := range points {
+		writeBytes(h, point)
 	}
 }
 
@@ -72,19 +126,82 @@ func ChecksumRecord(r InstanceRecord) [32]byte {
 // ChecksumRecordWithoutMembershipResult returns the immediately previous
 // durable record layout. It is exposed only for exact storage migration.
 func ChecksumRecordWithoutMembershipResult(r InstanceRecord) [32]byte {
-	return checksumRecordLayout(r, true, true, true, true, true, true, true, false)
+	return checksumLegacyRecordLayout(r, true, true, true, true, true, true, true)
 }
 
 // ChecksumRecordWithoutTimingDomain returns the older pre-timing durable
 // record layout. It is exposed only for exact storage migration.
 func ChecksumRecordWithoutTimingDomain(r InstanceRecord) [32]byte {
-	return checksumRecord(r, true, true, true, true, true, true)
+	return checksumLegacyRecordLayout(r, true, true, true, true, true, true, false)
 }
 
 // checksumRecord retains the pre-TimingDomain durable checksum layout for
 // older exact-layout migration verifiers.
 func checksumRecord(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult bool) [32]byte {
-	return checksumRecordLayout(r, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, false, false)
+	return checksumLegacyRecordLayout(r, includeFastPath, includeTOQ, includeAcceptEvidence,
+		includeRecordBallot, includeSenderEvidence, includeConfChangeResult, false)
+}
+
+func checksumLegacyRecordLayout(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, includeTimingDomain bool) [32]byte {
+	h := getHash()
+	defer putHash(h)
+	writeRef(h, r.Ref)
+	writeBallot(h, r.Ballot)
+	if includeRecordBallot {
+		writeBallot(h, r.RecordBallot)
+	}
+	writeByte(h, byte(r.Status))
+	writeUint64(h, r.Seq)
+	writeUint64(h, uint64(len(r.Deps)))
+	for _, dep := range r.Deps {
+		writeUint64(h, uint64(dep))
+	}
+	if includeAcceptEvidence {
+		writeUint64(h, r.AcceptSeq)
+		writeUint64(h, uint64(len(r.AcceptDeps)))
+		for _, dep := range r.AcceptDeps {
+			writeUint64(h, uint64(dep))
+		}
+	}
+	if includeSenderEvidence {
+		writeUint64(h, uint64(len(r.AcceptEvidence)))
+		for _, evidence := range r.AcceptEvidence {
+			writeUint64(h, uint64(evidence.Sender))
+			writeUint64(h, evidence.Seq)
+			writeUint64(h, uint64(len(evidence.Deps)))
+			for _, dep := range evidence.Deps {
+				writeUint64(h, uint64(dep))
+			}
+		}
+	}
+	writeLegacyCommand(h, r)
+	if includeFastPath {
+		if r.FastPathEligible {
+			writeByte(h, 1)
+		} else {
+			writeByte(h, 0)
+		}
+	}
+	if includeTOQ {
+		writeUint64(h, r.ProcessAt)
+		if r.TOQPending {
+			writeByte(h, 1)
+		} else {
+			writeByte(h, 0)
+		}
+	}
+	if includeTimingDomain {
+		writeByte(h, byte(r.TimingDomain))
+	}
+	if includeConfChangeResult {
+		writeByte(h, byte(r.ConfChangeResult.Outcome))
+		writeUint64(h, uint64(r.ConfChangeResult.Conf.ID))
+		writeUint64(h, uint64(len(r.ConfChangeResult.Conf.Voters)))
+		for _, voter := range r.ConfChangeResult.Conf.Voters {
+			writeUint64(h, uint64(voter))
+		}
+	}
+	return sumHash(h)
 }
 
 func checksumRecordLayout(r InstanceRecord, includeFastPath, includeTOQ, includeAcceptEvidence, includeRecordBallot, includeSenderEvidence, includeConfChangeResult, includeTimingDomain, includeMembershipResult bool) [32]byte {
@@ -119,7 +236,7 @@ func checksumRecordLayout(r InstanceRecord, includeFastPath, includeTOQ, include
 			}
 		}
 	}
-	writeCommand(h, r.Command)
+	writeEntryValue(h, r.Kind, r.Command, r.ConfChange, r.ProtocolControl)
 	if includeFastPath {
 		if r.FastPathEligible {
 			writeByte(h, 1)
@@ -161,7 +278,7 @@ func checksumRecordLayout(r InstanceRecord, includeFastPath, includeTOQ, include
 }
 
 func recordTimingInvariant(r InstanceRecord) bool {
-	if r.Command.Kind == CommandNoop {
+	if r.Kind == EntryNoop {
 		return r.ProcessAt == 0 && r.TimingDomain == TimingDomainUntimed && !r.TOQPending
 	}
 	switch r.TimingDomain {
@@ -304,6 +421,8 @@ func ChecksumMessage(m Message) [32]byte {
 	writeByte(h, byte(m.Type))
 	writeUint64(h, uint64(m.From))
 	writeUint64(h, uint64(m.To))
+	writeUint64(h, m.FromIncarnation)
+	writeUint64(h, m.ToIncarnation)
 	writeRef(h, m.Ref)
 	writeUint64(h, m.ProcessAt)
 	if m.TOQ {
@@ -333,7 +452,7 @@ func ChecksumMessage(m Message) [32]byte {
 		}
 	}
 	writeRef(h, m.IgnoreDependency.Ref)
-	writeCommand(h, m.Command)
+	writeEntryValue(h, m.Kind, m.Command, m.ConfChange, m.ProtocolControl)
 	if m.Reject {
 		writeByte(h, 1)
 	} else {

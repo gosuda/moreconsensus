@@ -43,14 +43,15 @@ var rawNodeMethodContracts = map[string]rawNodeMethodContract{
 	"RecoverVoterControl":        {Mutates: true, Models: []string{"EPaxosVoterBootstrap.tla"}, Gap: "certified voter-bootstrap mutation is modeled separately and is not yet represented by the RawNode refinement trace"},
 	"StepBootstrapAuthenticated": {Mutates: true, Models: []string{"EPaxosVoterBootstrap.tla"}, Gap: "authenticated bootstrap messages are modeled separately and are not yet represented by the RawNode refinement trace"},
 
-	"HasReady":          {},
-	"IsExecuted":        {},
-	"RuntimeStats":      {},
-	"Status":            {},
-	"BootstrapClosure":  {},
-	"BootstrapStatus":   {},
-	"VisitConflicts":    {},
+	"HasReady":         {},
+	"IsExecuted":       {},
+	"RuntimeStats":     {},
+	"Status":           {},
+	"BootstrapClosure": {},
+	"BootstrapStatus":  {},
+
 	"ProvideRecordLoad": {Mutates: true, Models: []string{"ReadyAdvance.tla", "EPaxosRawNodeRefinement.tla"}, Gap: "async folded-record reload is covered by Go tests; no RawNode refinement-trace action yet"},
+	"ProvideCheckpoint": {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "application checkpoint materialization is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
 }
 
 func exportedRawNodeMethods(t *testing.T) map[string]struct{} {
@@ -188,9 +189,9 @@ var internalDispatchContracts = map[string]rawNodeMethodContract{
 	// handleCommit's volatile effect is checked by TraceCommitVolatile; the
 	// durable paper-visible effect (PaperChoose/PaperChooseAndExecute) is
 	// checked at the subsequent Ready persistence boundary.
-	"handleCommit":      {Mutates: true, Models: []string{"EPaxosPaperSafety.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
-	"handlePrepare":     {Mutates: true, Models: []string{"EPaxosRecoveryNetwork.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
-	"handlePrepareResp": {Mutates: true, Models: []string{"EPaxosRecoveryNetwork.tla", "EPaxosTraceCheck.tla"}, Gap: "sender admission is snapshot-invisible; observed record deltas are checked by TraceAcceptRecoveryTuple/TraceCommitVolatile, while PaperObserveRecovery remains an unchecked residual"},
+	"handleCommit":           {Mutates: true, Models: []string{"EPaxosPaperSafety.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
+	"handlePrepare":          {Mutates: true, Models: []string{"EPaxosRecoveryNetwork.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
+	"handlePrepareResp":      {Mutates: true, Models: []string{"EPaxosRecoveryNetwork.tla", "EPaxosTraceCheck.tla"}, Gap: "sender admission is snapshot-invisible; observed record deltas are checked by TraceAcceptRecoveryTuple/TraceCommitVolatile, while PaperObserveRecovery remains an unchecked residual"},
 	"handleTryPreAccept":     {Mutates: true, Models: []string{"EPaxosTryPreAcceptMessagePath.tla"}, Gap: "TryPreAccept traffic is not exercised by the captured finite scenarios"},
 	"handleTryPreAcceptResp": {Mutates: true, Models: []string{"EPaxosTryPreAcceptMessagePath.tla"}, Gap: "TryPreAccept traffic is not exercised by the captured finite scenarios"},
 	"handleEvidence":         {Mutates: true, Models: []string{"EPaxosEvidenceQuery.tla"}, Gap: "evidence-query traffic is not exercised by the captured finite scenarios"},
@@ -205,12 +206,22 @@ var internalDispatchContracts = map[string]rawNodeMethodContract{
 	"recycleFrozenReady":       {Mutates: true, Models: []string{"ReadyAdvance.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
 	"mergeNextReady":           {Mutates: true, Models: []string{"ReadyAdvance.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
 	"freezeReady":              {Mutates: true, Models: []string{"ReadyAdvance.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
+	"tryExecute":               {Mutates: true, Models: []string{"EPaxosRawNodeRefinement.tla", "EPaxosTraceCheck.tla"}, Stutter: true},
 
 	// Executed-prefix compaction call sites.
 	"retireExecuted": {Mutates: true, Models: []string{"EPaxosRetirePrefix.tla", "EPaxosCompactionFencing.tla"}, Gap: "resident-map retirement needs more executed instances than the captured finite scenarios produce; certified by the compaction models and epaxos/retire_test.go"},
 	"dropPayload":    {Mutates: true, Models: []string{"EPaxosCompactionFencing.tla"}, Gap: "payload compaction is below the durable tuple abstraction and is not exercised by the captured finite scenarios"},
 	"foldRecord":     {Mutates: true, Models: []string{"EPaxosRetirePrefix.tla", "EPaxosCompactionFencing.tla"}, Gap: "conflict-engine folding is resident-state only; certified by the compaction models"},
 	"advanceFold":    {Mutates: true, Models: []string{"EPaxosRetirePrefix.tla", "EPaxosCompactionFencing.tla"}, Gap: "conflict-engine fold watermark advance is resident-state only; certified by the compaction models"},
+
+	// Certified-checkpoint persistence and compaction paths.
+	"checkpointSnapshotAdvanced":         {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint durability acknowledgement is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"compactCheckpointMetadata":          {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "certified checkpoint metadata compaction is below the current RawNode trace abstraction"},
+	"retryCheckpointControl":             {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "periodic prepared-vote retry is covered by checkpoint partition-heal tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointCertificate": {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint certificate handoff is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointOffer":       {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint offer handoff is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointControl":     {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint certificate and offer enqueueing is covered by checkpoint partition-heal tests; no RawNode refinement-trace action yet"},
+	"handleCheckpointControl":            {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint vote, certificate, and handoff traffic is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
 
 	// Folded-record re-materialization path.
 	"needsRecordLoad":                       {},
@@ -241,6 +252,8 @@ var stepGuardHelpers = map[string]struct{}{
 	"validateReadyAck":           {},
 	"beginDrive":                 {},
 	"endDrive":                   {},
+	"readyTarget":                {},
+	"voterIncarnation":           {},
 }
 
 func rawNodeFuncDecls(t *testing.T) map[string]*ast.FuncDecl {
