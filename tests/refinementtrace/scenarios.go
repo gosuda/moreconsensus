@@ -45,7 +45,7 @@ type nodeHarness struct {
 	id    epaxos.ReplicaID
 	node  *epaxos.RawNode
 	store *epaxos.MemoryStorage
-	apps  []epaxos.CommittedCommand
+	apps  []epaxos.ApplyCommand
 	clock *uint64
 	cfg   epaxos.Config
 }
@@ -126,7 +126,7 @@ func persistInitial(node *nodeHarness) error {
 		return fmt.Errorf("fresh node %d omitted initial HardState Ready", node.id)
 	}
 	ready := node.node.Ready()
-	if ready.HardState.Empty() || !ready.MustSync || len(ready.Records) != 0 || len(ready.Messages) != 0 || len(ready.Committed) != 0 {
+	if ready.HardState.Empty() || !ready.MustSync || len(ready.Records) != 0 || len(ready.Messages) != 0 || len(ready.Apply) != 0 {
 		return fmt.Errorf("fresh node %d initial Ready is not exact HardState-only durability work", node.id)
 	}
 	if err := node.store.ApplyReady(ready); err != nil {
@@ -137,7 +137,6 @@ func persistInitial(node *nodeHarness) error {
 	}
 	return nil
 }
-
 
 func addAPICall(b *traceBuilder, action, kind string, node *nodeHarness, input *inputView, pre snapshotView, callErr error, admission, drop, boundary string) error {
 	post, err := snapshot(node.node, node.store)
@@ -234,13 +233,13 @@ func consumeReady(b *traceBuilder, node *nodeHarness, actions phaseActions, free
 			metrics.statuses[record.Ref][record.Status] = true
 		}
 	}
-	if len(ready.Committed) != 0 {
-		for _, committed := range ready.Committed {
+	if len(ready.Apply) != 0 {
+		for _, committed := range ready.Apply {
 			node.apps = append(node.apps, committed.Clone())
 		}
-		application := make([]committedView, len(ready.Committed))
-		for i := range ready.Committed {
-			application[i] = toCommitted(ready.Committed[i])
+		application := make([]committedView, len(ready.Apply))
+		for i := range ready.Apply {
+			application[i] = toCommitted(ready.Apply[i])
 		}
 		order := make([]refView, len(node.apps))
 		for i := range node.apps {
@@ -390,7 +389,7 @@ func instanceNumsEqual(a, b []epaxos.InstanceNum) bool {
 	return true
 }
 
-func applicationContains(apps []epaxos.CommittedCommand, ref epaxos.InstanceRef) bool {
+func applicationContains(apps []epaxos.ApplyCommand, ref epaxos.InstanceRef) bool {
 	for _, committed := range apps {
 		if committed.Ref == ref {
 			return true
@@ -444,7 +443,7 @@ func captureNormalScenario() (semanticTrace, error) {
 		codec: "NormalCodecOnly", step: "NormalRetrySend", drop: "NormalValidationDrop", frozen: "NormalFrozenReadyProbe",
 	}
 	metrics := &phaseMetrics{sawAccept: make(map[epaxos.InstanceRef]bool), statuses: make(map[epaxos.InstanceRef]map[epaxos.Status]bool)}
-	fastCommand := epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Payload: []byte("fast"), ConflictKeys: [][]byte{[]byte("fast-key")}}
+	fastCommand := epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Payload: []byte("fast"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("fast-key")}}}
 	fastNode := cluster.nodes[1]
 	pre, err := snapshot(fastNode.node, fastNode.store)
 	if err != nil {
@@ -452,7 +451,7 @@ func captureNormalScenario() (semanticTrace, error) {
 	}
 	fastRef, proposeErr := fastNode.node.Propose(fastCommand)
 	refSemantic := toRef(fastRef)
-	commandSemantic := toCommand(fastCommand)
+	commandSemantic := toCommand(epaxos.EntryCommand, fastCommand)
 	if err := addAPICall(b, "NormalPropose", "propose-fast", fastNode, &inputView{Operation: "RawNode.Propose", Ref: &refSemantic, Command: &commandSemantic}, pre, proposeErr, "", "", ""); err != nil {
 		return semanticTrace{}, err
 	}
@@ -473,14 +472,14 @@ func captureNormalScenario() (semanticTrace, error) {
 	var slowRefs []epaxos.InstanceRef
 	for _, id := range []epaxos.ReplicaID{2, 3} {
 		node := cluster.nodes[id]
-		command := epaxos.Command{ID: epaxos.CommandID{Client: uint64(id), Sequence: 2}, Payload: []byte(fmt.Sprintf("slow-%d", id)), ConflictKeys: [][]byte{[]byte("slow-key")}}
+		command := epaxos.Command{ID: epaxos.CommandID{Client: uint64(id), Sequence: 2}, Payload: []byte(fmt.Sprintf("slow-%d", id)), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("slow-key")}}}
 		pre, err := snapshot(node.node, node.store)
 		if err != nil {
 			return semanticTrace{}, err
 		}
 		ref, callErr := node.node.Propose(command)
 		refView := toRef(ref)
-		commandView := toCommand(command)
+		commandView := toCommand(epaxos.EntryCommand, command)
 		if err := addAPICall(b, "NormalPropose", "propose-conflicting", node, &inputView{Operation: "RawNode.Propose", Ref: &refView, Command: &commandView}, pre, callErr, "", "", ""); err != nil {
 			return semanticTrace{}, err
 		}
@@ -590,14 +589,14 @@ func captureRecoveryScenario() (semanticTrace, error) {
 	}
 	owner := cluster.nodes[1]
 	coordinator := cluster.nodes[2]
-	seedCommand := epaxos.Command{ID: epaxos.CommandID{Client: 91, Sequence: 1}, Payload: []byte("recover"), ConflictKeys: [][]byte{[]byte("recovery-key")}}
+	seedCommand := epaxos.Command{ID: epaxos.CommandID{Client: 91, Sequence: 1}, Payload: []byte("recover"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("recovery-key")}}}
 	pre, err := snapshot(owner.node, owner.store)
 	if err != nil {
 		return semanticTrace{}, err
 	}
 	ref, proposeErr := owner.node.Propose(seedCommand)
 	refSemantic := toRef(ref)
-	commandSemantic := toCommand(seedCommand)
+	commandSemantic := toCommand(epaxos.EntryCommand, seedCommand)
 	if err := addAPICall(b, "RecoverySeedAccepted", "seed-propose", owner, &inputView{Operation: "RawNode.Propose", Ref: &refSemantic, Command: &commandSemantic}, pre, proposeErr, "", "", ""); err != nil {
 		return semanticTrace{}, err
 	}
@@ -624,8 +623,11 @@ func captureRecoveryScenario() (semanticTrace, error) {
 		return semanticTrace{}, fmt.Errorf("seed record %s was not durable", ref)
 	}
 	accept := epaxos.Message{
-		Type: epaxos.MsgAccept, From: 3, To: 2, Ref: ref, Ballot: epaxos.Ballot{Number: 1, Replica: 3},
-		Seq: seedRecord.Seq, Deps: append([]epaxos.InstanceNum(nil), seedRecord.Deps...), Command: seedRecord.Command.Clone(),
+		Type: epaxos.MsgAccept, From: 3, To: 2, FromIncarnation: 1, ToIncarnation: 1,
+		Ref: ref, Ballot: epaxos.Ballot{Number: 1, Replica: 3},
+		Seq: seedRecord.Seq, Deps: append([]epaxos.InstanceNum(nil), seedRecord.Deps...),
+		Kind: seedRecord.Kind, ConfChange: seedRecord.ConfChange,
+		ProtocolControl: append([]byte(nil), seedRecord.ProtocolControl...), Command: seedRecord.Command.Clone(),
 	}
 	accept.Checksum = epaxos.ChecksumMessage(accept)
 	acceptActions := phaseActions{ready: "RecoveryBuildAcceptedReady", persist: "RecoveryPersistAccepted", advance: "RecoveryAdvanceAccepted", apply: "RecoveryApply", codec: "RecoveryBuildAcceptedReady", step: "RecoverySeedAccepted", drop: "RecoverySeedAccepted", frozen: "RecoveryFrozenReadyProbe"}
@@ -876,7 +878,7 @@ func captureRecoveryScenario() (semanticTrace, error) {
 	if prepareBallot != responses[1].Ballot || prepareBallot != responses[3].Ballot {
 		return semanticTrace{}, fmt.Errorf("recovery response ballots did not bind exact Prepare ballot")
 	}
-	if !semanticJSONEqual(toCommand(finalRecord.Command), toCommand(acceptedRecord.Command)) ||
+	if !semanticJSONEqual(toCommand(finalRecord.Kind, finalRecord.Command), toCommand(acceptedRecord.Kind, acceptedRecord.Command)) ||
 		finalRecord.Seq != acceptedRecord.Seq ||
 		!instanceNumsEqual(finalRecord.Deps, acceptedRecord.Deps) ||
 		finalRecord.Ballot != recoveryBallot ||
@@ -898,7 +900,7 @@ func captureTOQScenario() (semanticTrace, error) {
 	store := epaxos.NewMemoryStorage()
 	conf := epaxos.ConfState{ID: 1, Voters: []epaxos.ReplicaID{1}}
 	runtime := &epaxos.TOQRuntimeConfig{Conf: conf, OneWayDelay: map[epaxos.ReplicaID]uint64{1: 2}}
-	cfg := epaxos.Config{ID: 1, Voters: conf.Voters, Storage: store, RetryTicks: 3, RecoveryTicks: 9, TOQ: true, TOQClock: func() uint64 { return clock }, TOQRuntime: runtime}
+	cfg := epaxos.Config{ID: 1, Voters: conf.Voters, Storage: store, RetryTicks: 3, RecoveryTicks: 9, TOQ: true, TOQRuntime: runtime}
 	rawNode, err := epaxos.NewRawNode(cfg)
 	if err != nil {
 		return semanticTrace{}, err
@@ -907,14 +909,17 @@ func captureTOQScenario() (semanticTrace, error) {
 	if err := persistInitial(node); err != nil {
 		return semanticTrace{}, err
 	}
-	command := epaxos.Command{ID: epaxos.CommandID{Client: 220, Sequence: 1}, Payload: []byte("toq"), ConflictKeys: [][]byte{[]byte("toq-key")}}
+	command := epaxos.Command{ID: epaxos.CommandID{Client: 220, Sequence: 1}, Payload: []byte("toq"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("toq-key")}}}
 	pre, err := snapshot(node.node, node.store)
 	if err != nil {
 		return semanticTrace{}, err
 	}
+	if err := node.node.ProcessTOQ(clock); err != nil {
+		return semanticTrace{}, err
+	}
 	ref, proposeErr := node.node.Propose(command)
 	refSemantic := toRef(ref)
-	commandSemantic := toCommand(command)
+	commandSemantic := toCommand(epaxos.EntryCommand, command)
 	if err := addAPICall(b, "TOQPropose", "toq-propose", node, &inputView{Operation: "RawNode.Propose", Ref: &refSemantic, Command: &commandSemantic, TOQClock: &clock}, pre, proposeErr, "", "", ""); err != nil {
 		return semanticTrace{}, err
 	}
@@ -946,7 +951,7 @@ func captureTOQScenario() (semanticTrace, error) {
 		return semanticTrace{}, err
 	}
 	if err := b.add("TOQPendingApplyBlocked", semanticEvent{
-		Kind: "pending-application-blocked", Node: 1, Input: &inputView{Operation: "observe no Ready.Committed while durable TOQPending", Ref: &refSemantic, TOQClock: &clock},
+		Kind: "pending-application-blocked", Node: 1, Input: &inputView{Operation: "observe no Ready.Apply while durable TOQPending", Ref: &refSemantic, TOQClock: &clock},
 		Result: classifyError(nil), ResponseAdmission: "pending-blocked", Pre: &blockedSnapshot, Post: &blockedSnapshot,
 	}); err != nil {
 		return semanticTrace{}, err
@@ -996,7 +1001,7 @@ func captureTOQScenario() (semanticTrace, error) {
 	if err != nil {
 		return semanticTrace{}, err
 	}
-	dueErr := node.node.ProcessTOQ()
+	dueErr := node.node.ProcessTOQ(clock)
 	if err := addAPICall(b, "TOQBuildAllowReady", "process-toq-due", node, &inputView{Operation: "RawNode.ProcessTOQ", TOQClock: &clock, Ref: &refSemantic}, duePre, dueErr, "due-admitted", "", ""); err != nil {
 		return semanticTrace{}, err
 	}
@@ -1026,7 +1031,7 @@ func captureTOQScenario() (semanticTrace, error) {
 	if err != nil {
 		return semanticTrace{}, err
 	}
-	maxErr := node.node.ProcessTOQ()
+	maxErr := node.node.ProcessTOQ(clock)
 	if err := addAPICall(b, "TOQMaxTickDrop", "process-toq-closed-bucket", node, &inputView{Operation: "RawNode.ProcessTOQ", TOQClock: &clock, Ref: &refSemantic}, maxPre, maxErr, "closed-bucket-stutter", "already-processed-clock", ""); err != nil {
 		return semanticTrace{}, err
 	}
@@ -1057,9 +1062,9 @@ func captureConfigScenario() (semanticTrace, error) {
 	leader := cluster.nodes[1]
 	oldRef := epaxos.InstanceRef{Replica: 1, Instance: 50, Conf: 1}
 	oldAccept := epaxos.Message{
-		Type: epaxos.MsgAccept, From: 3, To: 2, Ref: oldRef,
+		Type: epaxos.MsgAccept, From: 3, To: 2, FromIncarnation: 1, ToIncarnation: 1, Ref: oldRef,
 		Ballot: epaxos.Ballot{Number: 1, Replica: 3}, Seq: 1,
-		Deps: []epaxos.InstanceNum{0, 0, 0}, Command: epaxos.Command{Kind: epaxos.CommandNoop},
+		Deps: []epaxos.InstanceNum{0, 0, 0}, Kind: epaxos.EntryNoop,
 	}
 	oldAccept.Checksum = epaxos.ChecksumMessage(oldAccept)
 	oldActions := phaseActions{
@@ -1274,14 +1279,14 @@ func captureConfigScenario() (semanticTrace, error) {
 		return semanticTrace{}, fmt.Errorf("old-config recovery result=%#v durable=%v, want executed config-1 Ref", recoveredOld, ok)
 	}
 
-	userCommand := epaxos.Command{ID: epaxos.CommandID{Client: 301, Sequence: 1}, Payload: []byte("new-config"), ConflictKeys: [][]byte{[]byte("config-order-key")}}
+	userCommand := epaxos.Command{ID: epaxos.CommandID{Client: 301, Sequence: 1}, Payload: []byte("new-config"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("config-order-key")}}}
 	userPre, err := snapshot(leader.node, leader.store)
 	if err != nil {
 		return semanticTrace{}, err
 	}
 	userRef, userErr := leader.node.Propose(userCommand)
 	userRefView := toRef(userRef)
-	userCommandView := toCommand(userCommand)
+	userCommandView := toCommand(epaxos.EntryCommand, userCommand)
 	if err := addAPICall(b, "ConfigProposeB", "propose-user-b", leader, &inputView{Operation: "RawNode.Propose", Ref: &userRefView, Command: &userCommandView}, userPre, userErr, "", "", ""); err != nil {
 		return semanticTrace{}, err
 	}

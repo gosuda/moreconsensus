@@ -33,11 +33,19 @@ type commandIDView struct {
 	Sequence uint64 `json:"sequence"`
 }
 
+type spanView struct {
+	Start string `json:"start_base64url"`
+	End   string `json:"end_base64url"`
+}
+
 type commandView struct {
-	ID           commandIDView `json:"id"`
-	Kind         string        `json:"kind"`
-	Payload      string        `json:"payload_base64url"`
-	ConflictKeys []string      `json:"conflict_keys_base64url"`
+	ID       commandIDView `json:"id"`
+	Kind     string        `json:"kind"`
+	Payload  string        `json:"payload_base64url"`
+	Points   []string      `json:"points_base64url"`
+	Spans    []spanView    `json:"spans"`
+	All      bool          `json:"all"`
+	CycleKey string        `json:"cycle_key_base64url"`
 }
 
 type acceptEvidenceView struct {
@@ -61,6 +69,7 @@ type recordView struct {
 	AcceptSeq        uint64               `json:"accept_seq"`
 	AcceptDeps       []uint64             `json:"accept_deps"`
 	AcceptEvidence   []acceptEvidenceView `json:"accept_evidence"`
+	Kind             string               `json:"kind"`
 	Command          commandView          `json:"command"`
 	FastPathEligible bool                 `json:"fast_path_eligible"`
 	ProcessAt        uint64               `json:"process_at"`
@@ -114,7 +123,7 @@ type readyView struct {
 	HardState hardStateView   `json:"hard_state"`
 	Records   []recordView    `json:"records"`
 	Messages  []messageView   `json:"messages"`
-	Committed []committedView `json:"committed"`
+	Apply     []committedView `json:"apply"`
 	MustSync  bool            `json:"must_sync"`
 }
 
@@ -208,29 +217,43 @@ func toConf(c epaxos.ConfState) confView {
 	return confView{ID: uint64(c.ID), Voters: voters}
 }
 
-func commandKindName(kind epaxos.CommandKind) string {
+func commandKindName(kind epaxos.EntryKind) string {
 	switch kind {
-	case epaxos.CommandUser:
+	case epaxos.EntryCommand:
 		return "user"
-	case epaxos.CommandNoop:
+	case epaxos.EntryNoop:
 		return "noop"
-	case epaxos.CommandConfChange:
+	case epaxos.EntryConfChange:
 		return "config-change"
-	case epaxos.CommandMembership:
+	case epaxos.EntryMembership:
 		return "membership"
+	case epaxos.EntryCheckpoint:
+		return "checkpoint"
 	default:
 		return "unknown-" + strconv.FormatUint(uint64(kind), 10)
 	}
 }
 
-func toCommand(c epaxos.Command) commandView {
-	keys := make([]string, len(c.ConflictKeys))
-	for i, key := range c.ConflictKeys {
-		keys[i] = base64.RawURLEncoding.EncodeToString(key)
+func toCommand(kind epaxos.EntryKind, c epaxos.Command) commandView {
+	points := make([]string, len(c.Footprint.Points))
+	for i, point := range c.Footprint.Points {
+		points[i] = base64.RawURLEncoding.EncodeToString(point)
+	}
+	spans := make([]spanView, len(c.Footprint.Spans))
+	for i, span := range c.Footprint.Spans {
+		spans[i] = spanView{
+			Start: base64.RawURLEncoding.EncodeToString(span.Start),
+			End:   base64.RawURLEncoding.EncodeToString(span.End),
+		}
 	}
 	return commandView{
-		ID:   commandIDView{Client: c.ID.Client, Sequence: c.ID.Sequence},
-		Kind: commandKindName(c.Kind), Payload: base64.RawURLEncoding.EncodeToString(c.Payload), ConflictKeys: keys,
+		ID:       commandIDView{Client: c.ID.Client, Sequence: c.ID.Sequence},
+		Kind:     commandKindName(kind),
+		Payload:  base64.RawURLEncoding.EncodeToString(c.Payload),
+		Points:   points,
+		Spans:    spans,
+		All:      c.Footprint.All,
+		CycleKey: base64.RawURLEncoding.EncodeToString(c.CycleKey),
 	}
 }
 
@@ -282,7 +305,7 @@ func toRecord(r epaxos.InstanceRecord) recordView {
 	return recordView{
 		Ref: toRef(r.Ref), Ballot: toBallot(r.Ballot), RecordBallot: toBallot(r.RecordBallot), Status: r.Status.String(),
 		Seq: r.Seq, Deps: toNums(r.Deps), AcceptSeq: r.AcceptSeq, AcceptDeps: toNums(r.AcceptDeps),
-		AcceptEvidence: toAcceptEvidence(r.AcceptEvidence), Command: toCommand(r.Command), FastPathEligible: r.FastPathEligible,
+		AcceptEvidence: toAcceptEvidence(r.AcceptEvidence), Kind: commandKindName(r.Kind), Command: toCommand(r.Kind, r.Command), FastPathEligible: r.FastPathEligible,
 		ProcessAt: r.ProcessAt, TimingDomain: timingDomainName(r.TimingDomain), TOQPending: r.TOQPending,
 		ConfChangeResult: confResultView{Outcome: confOutcomeName(r.ConfChangeResult.Outcome), Conf: toConf(r.ConfChangeResult.Conf)},
 		ChecksumValid:    epaxos.VerifyRecordChecksum(r),
@@ -312,15 +335,15 @@ func toMessage(m epaxos.Message) messageView {
 		Type: m.Type.String(), From: uint64(m.From), To: uint64(m.To), Ref: toRef(m.Ref), ProcessAt: m.ProcessAt, TOQ: m.TOQ,
 		Ballot: toBallot(m.Ballot), RecordBallot: toBallot(m.RecordBallot), Seq: m.Seq, Deps: toNums(m.Deps),
 		AcceptSeq: m.AcceptSeq, AcceptDeps: toNums(m.AcceptDeps), AcceptEvidence: toAcceptEvidence(m.AcceptEvidence),
-		IgnoreDependency: toRef(m.IgnoreDependency.Ref), Command: toCommand(m.Command), Reject: m.Reject,
+		IgnoreDependency: toRef(m.IgnoreDependency.Ref), Command: toCommand(m.Kind, m.Command), Reject: m.Reject,
 		RejectReason: rejectReasonName(m.RejectReason), RejectHint: toBallot(m.RejectHint), ConflictRef: toRef(m.ConflictRef),
 		ConflictStatus: m.ConflictStatus.String(), FastPathEligible: m.FastPathEligible, DepsCommitted: m.DepsCommitted,
 		RecordStatus: m.RecordStatus.String(), ChecksumValid: epaxos.VerifyMessageChecksum(m), CanonicalWireBytes: uint64(len(wire)),
 	}
 }
 
-func toCommitted(c epaxos.CommittedCommand) committedView {
-	return committedView{Ref: toRef(c.Ref), Seq: c.Seq, Deps: toNums(c.Deps), Command: toCommand(c.Command)}
+func toCommitted(c epaxos.ApplyCommand) committedView {
+	return committedView{Ref: toRef(c.Ref), Seq: c.Seq, Deps: toNums(c.Deps), Command: toCommand(epaxos.EntryCommand, c.Command)}
 }
 
 func toReady(r epaxos.Ready) readyView {
@@ -333,9 +356,9 @@ func toReady(r epaxos.Ready) readyView {
 	for i := range r.Messages {
 		out.Messages[i] = toMessage(r.Messages[i])
 	}
-	out.Committed = make([]committedView, len(r.Committed))
-	for i := range r.Committed {
-		out.Committed[i] = toCommitted(r.Committed[i])
+	out.Apply = make([]committedView, len(r.Apply))
+	for i := range r.Apply {
+		out.Apply[i] = toCommitted(r.Apply[i])
 	}
 	return out
 }
@@ -370,7 +393,7 @@ func snapshot(rn *epaxos.RawNode, store *epaxos.MemoryStorage) (snapshotView, er
 	hard := state.HardState
 	configs := state.ConfigHistory
 	records := make([]recordView, 0, len(store.Records))
-	if err := store.LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := store.LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		records = append(records, toRecord(record))
 		return nil
 	}); err != nil {

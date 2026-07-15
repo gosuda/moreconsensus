@@ -53,7 +53,7 @@ func TestProtocolLoopConsumesManualLogicalPulses(t *testing.T) {
 	}()
 
 	s.mu.Lock()
-	ref, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, ConflictKeys: [][]byte{[]byte("tick")}})
+	ref, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 1}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("tick")}}})
 	if err != nil {
 		s.mu.Unlock()
 		t.Fatal(err)
@@ -88,7 +88,7 @@ func TestProposalWaiterCancellationRemovesOnlyMatchingWaiter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- s.proposeAndWait(ctx, epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 2}, ConflictKeys: [][]byte{[]byte("cancel")}})
+		result <- s.proposeAndWait(ctx, epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 2}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("cancel")}}})
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -122,7 +122,7 @@ func TestProtocolTerminalErrorStopsTransitionsAndCompletesWaiters(t *testing.T) 
 	waiter := &proposalWaiter{result: make(chan error, 1)}
 
 	s.mu.Lock()
-	ref, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 3}, ConflictKeys: [][]byte{[]byte("terminal")}})
+	ref, err := s.node.Propose(epaxos.Command{ID: epaxos.CommandID{Client: 1, Sequence: 3}, Footprint: epaxos.Footprint{Points: [][]byte{[]byte("terminal")}}})
 	if err != nil {
 		s.mu.Unlock()
 		t.Fatal(err)

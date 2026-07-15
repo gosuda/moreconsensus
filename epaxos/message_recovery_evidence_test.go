@@ -18,6 +18,7 @@ func TestMessageValidateRejectsImpossiblePreAcceptedRecoveryEvidence(t *testing.
 		RecordStatus:     StatusPreAccepted,
 		Seq:              2,
 		Deps:             []InstanceNum{0, 1, 0},
+		Kind:             EntryCommand,
 		Command:          optimizedTestCommand("preaccepted-recovery-evidence", "preaccepted-recovery-evidence-key"),
 		FastPathEligible: true,
 	}

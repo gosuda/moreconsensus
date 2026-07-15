@@ -10,7 +10,7 @@ func TestLegacyRecordChecksumsRejectUnauthenticatedNewerFields(t *testing.T) {
 		Status:           StatusPreAccepted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0},
-		Command:          Command{ID: CommandID{Client: 401, Sequence: 1}, Payload: []byte("legacy-checksum"), ConflictKeys: [][]byte{[]byte("legacy-checksum-key")}},
+		Command:          Command{ID: CommandID{Client: 401, Sequence: 1}, Payload: []byte("legacy-checksum"), Footprint: Footprint{Points: [][]byte{[]byte("legacy-checksum-key")}}},
 		FastPathEligible: true,
 	}
 	tests := []struct {

@@ -32,7 +32,7 @@ func payloadStubTestNode(t *testing.T) (*RawNode, InstanceRef, InstanceRecord) {
 	rec := checkedRecord(InstanceRecord{
 		Ref: ref, Ballot: Ballot{Replica: 2}, RecordBallot: Ballot{Replica: 2},
 		Status: StatusExecuted, Seq: 3, Deps: rn.q.deps(),
-		Command: Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("chosen"), ConflictKeys: [][]byte{[]byte("k")}},
+		Command: Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("chosen"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	})
 	rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 	rn.executed.add(ref)
@@ -78,15 +78,14 @@ func TestRecordLoadFoundReplaysDeferred(t *testing.T) {
 	ref := InstanceRef{Conf: 1, Replica: 2, Instance: 5}
 	rec := checkedRecord(InstanceRecord{
 		Ref: ref, Status: StatusCommitted, Seq: 3, Ballot: Ballot{Replica: 2},
-		Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("k")}},
+		Deps: rn.q.deps(), Command: Command{Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	})
 	// Mark folded without resident.
 	foldTestRef(&rn.engine, rec)
 
 	prep := Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}}
-	if err := rn.Step(prep); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(prep)); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if len(rd.RecordLoads) != 1 || rd.RecordLoads[0] != ref {
 		t.Fatalf("RecordLoads=%v, want [%s]", rd.RecordLoads, ref)
@@ -118,9 +117,8 @@ func TestRecordLoadNotFoundIncrementsMisses(t *testing.T) {
 		Deps: rn.q.deps(), Command: Command{Payload: []byte("y")},
 	})
 	foldTestRef(&rn.engine, rec)
-	if err := rn.Step(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}})); err != nil { t.Fatal(err)
+ }
 	if err := rn.ProvideRecordLoad(RecordLoadResult{Ref: ref, Found: false}); err != nil {
 		t.Fatal(err)
 	}
@@ -143,9 +141,8 @@ func TestRecordLoadCorruptLeavesPending(t *testing.T) {
 		Deps: rn.q.deps(), Command: Command{Payload: []byte("z")},
 	})
 	foldTestRef(&rn.engine, rec)
-	if err := rn.Step(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}})); err != nil { t.Fatal(err)
+ }
 	bad := rec
 	bad.Checksum[0] ^= 0xff
 	if err := rn.ProvideRecordLoad(RecordLoadResult{Ref: ref, Record: bad, Found: true}); !errors.Is(err, ErrInvalidRecord) {
@@ -185,10 +182,9 @@ func TestRecordLoadCapacityRejectsStep(t *testing.T) {
 		})
 		foldTestRef(&rn.engine, rec)
 	}
-	if err := rn.Step(Message{Type: MsgPrepare, From: 2, To: 1, Ref: r1, Ballot: Ballot{Number: 1, Replica: 2}}); err != nil {
-		t.Fatal(err)
-	}
-	err = rn.Step(Message{Type: MsgPrepare, From: 2, To: 1, Ref: r2, Ballot: Ballot{Number: 1, Replica: 2}})
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 2, To: 1, Ref: r1, Ballot: Ballot{Number: 1, Replica: 2}})); err != nil { t.Fatal(err)
+ }
+	err = rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 2, To: 1, Ref: r2, Ballot: Ballot{Number: 1, Replica: 2}}))
 	if !errors.Is(err, ErrDeferredRecordLoadFull) || !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("err=%v, want capacity rejection", err)
 	}
@@ -206,9 +202,8 @@ func TestRecordLoadDedupSingleRequest(t *testing.T) {
 	})
 	foldTestRef(&rn.engine, rec)
 	for i := 0; i < 3; i++ {
-		if err := rn.Step(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: uint64(i + 1), Replica: 2}}); err != nil {
-			t.Fatal(err)
-		}
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: uint64(i + 1), Replica: 2}})); err != nil { t.Fatal(err)
+ }
 	}
 	rd := rn.Ready()
 	if len(rd.RecordLoads) != 1 {
@@ -221,9 +216,8 @@ func TestRecordLoadDedupSingleRequest(t *testing.T) {
 
 func TestPayloadStubRequiredLoadRejectsMismatchThenReplays(t *testing.T) {
 	rn, ref, rec := payloadStubTestNode(t)
-	if err := rn.Step(payloadStubAccept(rec)); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(payloadStubAccept(rec))); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if len(rd.RecordLoads) != 1 || rd.RecordLoads[0] != ref {
 		t.Fatalf("RecordLoads=%v, want [%s]", rd.RecordLoads, ref)
@@ -257,9 +251,8 @@ func TestPayloadStubRequiredLoadRejectsMismatchThenReplays(t *testing.T) {
 
 func TestPayloadStubRequiredMissKeepsWait(t *testing.T) {
 	rn, ref, rec := payloadStubTestNode(t)
-	if err := rn.Step(payloadStubAccept(rec)); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(payloadStubAccept(rec))); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if err := rn.ProvideRecordLoad(RecordLoadResult{Ref: ref, Found: false}); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("required miss error=%v, want ErrInvalidRecord", err)

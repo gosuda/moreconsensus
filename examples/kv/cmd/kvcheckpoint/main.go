@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -331,7 +330,7 @@ func inspectCheckpoint(checkpointDir string) (checkpointInspection, error) {
 	}
 	hardState := state.HardState
 	var records []epaxos.InstanceRecord
-	if err := storage.LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := storage.LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		records = append(records, record)
 		return nil
 	}); err != nil {
@@ -377,7 +376,7 @@ func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxo
 	}
 	applied := make(map[epaxos.ConfID]epaxos.InstanceRecord)
 	for _, record := range records {
-		if record.Command.Kind != epaxos.CommandConfChange || record.Status != epaxos.StatusExecuted ||
+		if record.Kind != epaxos.EntryConfChange || record.Status != epaxos.StatusExecuted ||
 			record.ConfChangeResult.Outcome != epaxos.ConfChangeApplied {
 			continue
 		}
@@ -403,7 +402,7 @@ func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxo
 			!sameCheckpointVoters(record.ConfChangeResult.Conf.Voters, currentVoters) {
 			return nil, fmt.Errorf("checkpoint configuration record %s conflicts with generation %d", record.Ref, generation)
 		}
-		change, voter, predecessor, err := configurationPredecessor(record.Command.Payload, currentVoters)
+		change, voter, predecessor, err := configurationPredecessor(record.ConfChange, currentVoters)
 		if err != nil {
 			return nil, fmt.Errorf("checkpoint configuration record %s: %w", record.Ref, err)
 		}
@@ -422,12 +421,9 @@ func reconstructConfigurationHistory(hardState epaxos.HardState, records []epaxo
 	return history, nil
 }
 
-func configurationPredecessor(payload []byte, successor []epaxos.ReplicaID) (string, epaxos.ReplicaID, []epaxos.ReplicaID, error) {
-	if len(payload) != 9 {
-		return "", 0, nil, fmt.Errorf("configuration command payload has length %d", len(payload))
-	}
-	changeType := epaxos.ConfChangeType(payload[0])
-	voter := epaxos.ReplicaID(binary.LittleEndian.Uint64(payload[1:]))
+func configurationPredecessor(change epaxos.ConfChange, successor []epaxos.ReplicaID) (string, epaxos.ReplicaID, []epaxos.ReplicaID, error) {
+	changeType := change.Type
+	voter := change.Replica
 	if voter == 0 {
 		return "", 0, nil, fmt.Errorf("configuration command voter is zero")
 	}

@@ -12,7 +12,7 @@ type simCluster struct {
 	t                 *testing.T
 	nodes             map[ReplicaID]*RawNode
 	stores            map[ReplicaID]*MemoryStorage
-	apps              map[ReplicaID][]CommittedCommand
+	apps              map[ReplicaID][]ApplyCommand
 	drop              map[[2]ReplicaID]bool
 	paused            map[ReplicaID]bool
 	delayed           []Message
@@ -28,7 +28,7 @@ type simCluster struct {
 func newSimCluster(t *testing.T, n int, opt bool) *simCluster {
 	t.Helper()
 	ids := makeIDs(n)
-	s := &simCluster{t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage), apps: make(map[ReplicaID][]CommittedCommand), drop: make(map[[2]ReplicaID]bool), paused: make(map[ReplicaID]bool), opt: opt}
+	s := &simCluster{t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage), apps: make(map[ReplicaID][]ApplyCommand), drop: make(map[[2]ReplicaID]bool), paused: make(map[ReplicaID]bool), opt: opt}
 	for _, id := range ids {
 		st := NewMemoryStorage()
 		rn, err := NewRawNode(Config{ID: id, Voters: ids, Storage: st, RetryTicks: 2, RecoveryTicks: 5, TimeOptimization: opt, TimeOptimizationTicks: 1})
@@ -51,7 +51,7 @@ func newCertifiedBootstrapSimCluster(t *testing.T, voters int) (*simCluster, Clu
 	}
 	s := &simCluster{
 		t: t, nodes: make(map[ReplicaID]*RawNode), stores: make(map[ReplicaID]*MemoryStorage),
-		apps: make(map[ReplicaID][]CommittedCommand), drop: make(map[[2]ReplicaID]bool),
+		apps: make(map[ReplicaID][]ApplyCommand), drop: make(map[[2]ReplicaID]bool),
 		paused: make(map[ReplicaID]bool),
 	}
 	base := ConfState{ID: 1, Voters: ids}
@@ -83,7 +83,7 @@ func persistBootstrapSimNode(t *testing.T, s *simCluster, id ReplicaID) []Bootst
 	var messages []BootstrapMessage
 	for attempts := 0; attempts < 16 && s.nodes[id].HasReady(); attempts++ {
 		rd := s.nodes[id].Ready()
-		if len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+		if len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 			t.Fatalf("bootstrap persistence for node %d unexpectedly contained EPaxos output: %#v", id, rd)
 		}
 		if err := s.stores[id].ApplyReady(rd); err != nil {
@@ -142,8 +142,8 @@ func (s *simCluster) drain() {
 			if err := provideRecordLoadsFromStore(rn, s.stores[id], rd); err != nil {
 				s.t.Fatalf("provide record loads %d: %v", id, err)
 			}
-			s.committedCommands += uint64(len(rd.Committed))
-			s.apps[id] = append(s.apps[id], rd.Committed...)
+			s.committedCommands += uint64(len(rd.Apply))
+			s.apps[id] = append(s.apps[id], rd.Apply...)
 			for _, m := range rd.Messages {
 				if !s.deliver(m) {
 					s.delayed = append(s.delayed, m)
@@ -172,7 +172,7 @@ func (s *simCluster) deliver(m Message) bool {
 	}
 	s.deliveredMessages++
 	if to := s.nodes[m.To]; to != nil {
-		if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
+		if err := to.Step(canonicalTestMessage(m)); err != nil && !errors.Is(err, ErrMessageRejected) {
 			s.t.Fatalf("step %s %d->%d: %v", m.Type, m.From, m.To, err)
 		}
 	}
@@ -270,8 +270,8 @@ func cloneMemoryStorage(st *MemoryStorage) *MemoryStorage {
 	return out
 }
 
-func cloneCommittedCommands(cmds []CommittedCommand) []CommittedCommand {
-	out := make([]CommittedCommand, len(cmds))
+func cloneAppliedCommands(cmds []ApplyCommand) []ApplyCommand {
+	out := make([]ApplyCommand, len(cmds))
 	for i := range cmds {
 		out[i] = cmds[i].Clone()
 	}
@@ -282,7 +282,7 @@ func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
 	for size := 1; size <= 7; size++ {
 		t.Run(fmt.Sprintf("n=%d", size), func(t *testing.T) {
 			s := newSimCluster(t, size, false)
-			_, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: uint64(size)}, Payload: []byte("set"), ConflictKeys: [][]byte{[]byte("k")}}) //nolint:gosec // G115: test harness converts bounded int index/count
+			_, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: uint64(size)}, Payload: []byte("set"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}}) //nolint:gosec // G115: test harness converts bounded int index/count
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -301,10 +301,10 @@ func TestClusterSizesOneThroughSevenCommit(t *testing.T) {
 
 func TestConflictingConcurrentCommandsConverge(t *testing.T) {
 	s := newSimCluster(t, 5, true)
-	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("a"), ConflictKeys: [][]byte{[]byte("same")}}); err != nil {
+	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("a"), Footprint: Footprint{Points: [][]byte{[]byte("same")}}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.nodes[2].Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("b"), ConflictKeys: [][]byte{[]byte("same")}}); err != nil {
+	if _, err := s.nodes[2].Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("b"), Footprint: Footprint{Points: [][]byte{[]byte("same")}}}); err != nil {
 		t.Fatal(err)
 	}
 	s.drain()
@@ -318,7 +318,7 @@ func TestConflictingConcurrentCommandsConverge(t *testing.T) {
 
 func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 	s := newSimCluster(t, 3, false)
-	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}}); err != nil {
+	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}); err != nil {
 		t.Fatal(err)
 	}
 	rd := s.nodes[1].Ready()
@@ -329,15 +329,15 @@ func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 		t.Fatal("expected messages")
 	}
 	m := rd.Messages[0]
-	if err := s.nodes[m.To].Step(m); err != nil {
+	if err := s.nodes[m.To].Step(canonicalTestMessage(m)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.nodes[m.To].Step(m); err != nil {
+	if err := s.nodes[m.To].Step(canonicalTestMessage(m)); err != nil {
 		t.Fatal(err)
 	}
 	bad := m
 	bad.To = 99
-	if err := s.nodes[m.To].Step(bad); !errors.Is(err, ErrMessageRejected) && !errors.Is(err, ErrChecksumMismatch) {
+	if err := s.nodes[m.To].Step(canonicalTestMessage(bad)); !errors.Is(err, ErrMessageRejected) && !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("bad target err=%v", err)
 	}
 	if err := s.nodes[1].Advance(rd); err != nil {
@@ -351,7 +351,7 @@ func TestDuplicateMessagesAndMalformedInput(t *testing.T) {
 
 func TestDuplicateInboundPreAcceptAndAcceptDoNotQueueDuplicateRecords(t *testing.T) {
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	command := Command{ID: CommandID{Client: 10, Sequence: 20}, Payload: []byte("duplicate-inbound"), ConflictKeys: [][]byte{[]byte("duplicate-key")}}
+	command := Command{ID: CommandID{Client: 10, Sequence: 20}, Payload: []byte("duplicate-inbound"), Footprint: Footprint{Points: [][]byte{[]byte("duplicate-key")}}}
 	tests := []struct {
 		name       string
 		msg        Message
@@ -395,7 +395,7 @@ func TestDuplicateInboundPreAcceptAndAcceptDoNotQueueDuplicateRecords(t *testing
 			}
 			tt.msg.Checksum = ChecksumMessage(tt.msg)
 
-			if err := rn.Step(tt.msg); err != nil {
+			if err := rn.Step(canonicalTestMessage(tt.msg)); err != nil {
 				t.Fatalf("first Step(%s) err=%v", tt.msg.Type, err)
 			}
 			first := rn.Ready()
@@ -407,7 +407,7 @@ func TestDuplicateInboundPreAcceptAndAcceptDoNotQueueDuplicateRecords(t *testing
 			}
 			advanceOK(t, rn, first)
 
-			if err := rn.Step(tt.msg); err != nil {
+			if err := rn.Step(canonicalTestMessage(tt.msg)); err != nil {
 				t.Fatalf("duplicate Step(%s) err=%v", tt.msg.Type, err)
 			}
 			duplicate := rn.Ready()
@@ -432,7 +432,8 @@ func TestCodecChecksumZeroCopy(t *testing.T) {
 		RecordBallot: Ballot{Replica: 1},
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), ConflictKeys: [][]byte{[]byte("conflict-key-beta")}}}
+		Kind:         EntryCommand,
+		Command:      Command{ID: CommandID{Client: 7, Sequence: 9}, Payload: []byte("payload-alpha"), Footprint: Footprint{Points: [][]byte{[]byte("conflict-key-beta")}}}}
 	buf, err := EncodeMessage(make([]byte, 0, 128), m)
 	if err != nil {
 		t.Fatal(err)
@@ -457,8 +458,8 @@ func TestCodecChecksumZeroCopy(t *testing.T) {
 	if !bytes.Equal(out.Command.Payload, []byte("Payload-alpha")) {
 		t.Fatalf("decoded payload does not alias encoded buffer: %q", out.Command.Payload)
 	}
-	if len(out.Command.ConflictKeys) != 1 || !bytes.Equal(out.Command.ConflictKeys[0], []byte("Conflict-key-beta")) {
-		t.Fatalf("decoded conflict key does not alias encoded buffer: %q", out.Command.ConflictKeys)
+	if len(out.Command.Footprint.Points) != 1 || !bytes.Equal(out.Command.Footprint.Points[0], []byte("Conflict-key-beta")) {
+		t.Fatalf("decoded conflict key does not alias encoded buffer: %q", out.Command.Footprint.Points)
 	}
 	buf[len(buf)-1] ^= 0xff
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrChecksumMismatch) {
@@ -468,7 +469,7 @@ func TestCodecChecksumZeroCopy(t *testing.T) {
 
 func TestRestartFromMemoryStorage(t *testing.T) {
 	s := newSimCluster(t, 3, false)
-	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}}); err != nil {
+	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}); err != nil {
 		t.Fatal(err)
 	}
 	s.drain()
@@ -484,8 +485,8 @@ func TestRestartFromMemoryStorage(t *testing.T) {
 func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T) {
 	ids := makeIDs(3)
 	s := newSimCluster(t, len(ids), false)
-	first := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("first"), ConflictKeys: [][]byte{[]byte("shared")}}
-	second := Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("second"), ConflictKeys: [][]byte{[]byte("shared")}}
+	first := Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("first"), Footprint: Footprint{Points: [][]byte{[]byte("shared")}}}
+	second := Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("second"), Footprint: Footprint{Points: [][]byte{[]byte("shared")}}}
 	if _, err := s.nodes[1].Propose(first); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +512,7 @@ func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T)
 		}
 		s.nodes[id] = rn
 	}
-	s.apps = make(map[ReplicaID][]CommittedCommand, len(ids))
+	s.apps = make(map[ReplicaID][]ApplyCommand, len(ids))
 
 	if _, err := s.nodes[2].Propose(second); err != nil {
 		t.Fatal(err)
@@ -526,8 +527,8 @@ func TestRestartAllRawNodesRetainsExecutedAndAppliesOnlyNewCommand(t *testing.T)
 		gotCmd := applied[0].Command
 		if gotCmd.ID != second.ID ||
 			!bytes.Equal(gotCmd.Payload, second.Payload) ||
-			len(gotCmd.ConflictKeys) != 1 ||
-			!bytes.Equal(gotCmd.ConflictKeys[0], second.ConflictKeys[0]) {
+			len(gotCmd.Footprint.Points) != 1 ||
+			!bytes.Equal(gotCmd.Footprint.Points[0], second.Footprint.Points[0]) {
 			t.Fatalf("node %d applied command = %#v, want %#v", id, gotCmd, second)
 		}
 		if applied[0].Ref == firstRef {
@@ -550,7 +551,7 @@ func TestLogicalTicksRecoveryAndStorageFailure(t *testing.T) {
 	s := newSimCluster(t, 3, true)
 	s.drop[[2]ReplicaID{1, 2}] = true
 	s.drop[[2]ReplicaID{2, 1}] = true
-	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}}); err != nil {
+	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}); err != nil {
 		t.Fatal(err)
 	}
 	s.drain()
@@ -561,7 +562,7 @@ func TestLogicalTicksRecoveryAndStorageFailure(t *testing.T) {
 		t.Fatalf("recovery did not apply everywhere: %#v", map[ReplicaID]int{1: len(s.apps[1]), 2: len(s.apps[2]), 3: len(s.apps[3])})
 	}
 	s.stores[1].FailWrites = true
-	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("y"), ConflictKeys: [][]byte{[]byte("y")}}); err != nil {
+	if _, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("y"), Footprint: Footprint{Points: [][]byte{[]byte("y")}}}); err != nil {
 		t.Fatal(err)
 	}
 	rd := s.nodes[1].Ready()
@@ -741,7 +742,7 @@ func TestConfChangeAndPools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start durably activated target: %v", err)
 	}
-	targetRef, err := targetNode.Propose(Command{Payload: []byte("target-after-activation"), ConflictKeys: [][]byte{[]byte("target")}})
+	targetRef, err := targetNode.Propose(Command{Payload: []byte("target-after-activation"), Footprint: Footprint{Points: [][]byte{[]byte("target")}}})
 	if err != nil || targetRef.Conf != plan.Successor.ID {
 		t.Fatalf("activated target proposal ref=%s err=%v", targetRef, err)
 	}
@@ -816,9 +817,9 @@ func TestExecutionEqualSeqTieBreaksByRef(t *testing.T) {
 	a := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
 	b := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	c := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: a, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{1, 0, 0}, Command: Command{Payload: []byte("a")}}})
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: b, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("b")}}})
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: c, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 0, 1}, Command: Command{Payload: []byte("c")}}})
+	rn.installInstance(&instance{rec: checkedRecord(InstanceRecord{Ref: a, Ballot: Ballot{Replica: 3}, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{1, 0, 0}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 1, Sequence: 3}, Payload: []byte("a"), Footprint: Footprint{All: true}}})})
+	rn.installInstance(&instance{rec: checkedRecord(InstanceRecord{Ref: b, Ballot: Ballot{Replica: 1}, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 1, 0}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("b"), Footprint: Footprint{All: true}}})})
+	rn.installInstance(&instance{rec: checkedRecord(InstanceRecord{Ref: c, Ballot: Ballot{Replica: 2}, Status: StatusCommitted, Seq: 7, Deps: []InstanceNum{0, 0, 1}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("c"), Footprint: Footprint{All: true}}})})
 
 	view := rn.newExecutionView()
 	comps := rn.executionComponents(&view)
@@ -832,10 +833,10 @@ func TestExecutionEqualSeqTieBreaksByRef(t *testing.T) {
 	rn.tryExecute()
 	rd := rn.Ready()
 	want := []InstanceRef{b, c, a}
-	if got := refs(rd.Committed); fmt.Sprint(got) != fmt.Sprint(want) {
+	if got := refs(rd.Apply); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("equal-seq execution order = %v, want %v", got, want)
 	}
-	for i, cmd := range rd.Committed {
+	for i, cmd := range rd.Apply {
 		if cmd.Seq != 7 {
 			t.Fatalf("committed[%d] seq = %d, want 7", i, cmd.Seq)
 		}
@@ -889,7 +890,7 @@ func TestRemoveVoterConfChangeAllowsLaterProgress(t *testing.T) {
 		}
 	}
 
-	cmd := Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("after-removal"), ConflictKeys: [][]byte{[]byte("after-removal")}}
+	cmd := Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("after-removal"), Footprint: Footprint{Points: [][]byte{[]byte("after-removal")}}}
 	ref, err := s.nodes[1].Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -910,7 +911,7 @@ func TestRemoveVoterConfChangeAllowsLaterProgress(t *testing.T) {
 
 func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 	s := newSimCluster(t, 4, false)
-	oldCmd := Command{ID: CommandID{Client: 70, Sequence: 1}, Payload: []byte("old-inflight-across-removal"), ConflictKeys: [][]byte{[]byte("old-inflight-across-removal")}}
+	oldCmd := Command{ID: CommandID{Client: 70, Sequence: 1}, Payload: []byte("old-inflight-across-removal"), Footprint: Footprint{Points: [][]byte{[]byte("old-inflight-across-removal")}}}
 	oldRef, err := s.nodes[1].Propose(oldCmd)
 	if err != nil {
 		t.Fatal(err)
@@ -919,8 +920,8 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 		t.Fatalf("old proposal used config %d, want 1", oldRef.Conf)
 	}
 	oldReady := s.nodes[1].Ready()
-	if len(oldReady.Committed) != 0 {
-		t.Fatalf("old proposal committed before any quorum response: %#v", oldReady.Committed)
+	if len(oldReady.Apply) != 0 {
+		t.Fatalf("old proposal committed before any quorum response: %#v", oldReady.Apply)
 	}
 	var oldPreAccepts []Message
 	foundOldRecord := false
@@ -1000,7 +1001,7 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 		requireCommittedPayloadCount(t, s.apps[id], id, oldRef, oldCmd.Payload, 1)
 	}
 
-	removedCmd := Command{ID: CommandID{Client: 70, Sequence: 3}, Payload: []byte("removed-node-proposal"), ConflictKeys: [][]byte{[]byte("removed-node-proposal")}}
+	removedCmd := Command{ID: CommandID{Client: 70, Sequence: 3}, Payload: []byte("removed-node-proposal"), Footprint: Footprint{Points: [][]byte{[]byte("removed-node-proposal")}}}
 	if _, err := s.nodes[4].Propose(removedCmd); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("removed voter Propose error = %v, want %v", err, ErrMessageRejected)
 	}
@@ -1011,7 +1012,7 @@ func TestRemoveVoterConfChangeKeepsOldInFlightInstancePinned(t *testing.T) {
 		t.Fatal("removed voter proposal rejection created Ready work")
 	}
 
-	newCmd := Command{ID: CommandID{Client: 70, Sequence: 2}, Payload: []byte("new-after-removal"), ConflictKeys: [][]byte{[]byte("new-after-removal")}}
+	newCmd := Command{ID: CommandID{Client: 70, Sequence: 2}, Payload: []byte("new-after-removal"), Footprint: Footprint{Points: [][]byte{[]byte("new-after-removal")}}}
 	newRef, err := s.nodes[2].Propose(newCmd)
 	if err != nil {
 		t.Fatal(err)
@@ -1042,12 +1043,12 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("durable"), ConflictKeys: [][]byte{[]byte("durable")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("durable"), Footprint: Footprint{Points: [][]byte{[]byte("durable")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
-	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+	if len(rd.Records) == 0 || len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
 		t.Fatalf("ready for %s = %#v", ref, rd)
 	}
 
@@ -1071,7 +1072,7 @@ func TestWriteErrorKeepsReadyForRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	executedReady := rn.Ready()
-	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+	if len(executedReady.Apply) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
 	}
 	if err := store.ApplyReady(executedReady); err != nil {
@@ -1107,7 +1108,7 @@ func TestPausedSlowNodeQueuesDeliveryAndReadyUntilResume(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	s.pause(3)
 
-	cmd := Command{ID: CommandID{Client: 10, Sequence: 1}, Payload: []byte("slow-node"), ConflictKeys: [][]byte{[]byte("slow-node")}}
+	cmd := Command{ID: CommandID{Client: 10, Sequence: 1}, Payload: []byte("slow-node"), Footprint: Footprint{Points: [][]byte{[]byte("slow-node")}}}
 	ref, err := s.nodes[1].Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -1134,7 +1135,7 @@ func TestSingleNodeOmissionDropsInboundOutboundThenHealConverges(t *testing.T) {
 	s := newSimCluster(t, 5, true)
 	s.omit(5)
 
-	cmd := Command{ID: CommandID{Client: 11, Sequence: 1}, Payload: []byte("omitted-node"), ConflictKeys: [][]byte{[]byte("omitted-node")}}
+	cmd := Command{ID: CommandID{Client: 11, Sequence: 1}, Payload: []byte("omitted-node"), Footprint: Footprint{Points: [][]byte{[]byte("omitted-node")}}}
 	ref, err := s.nodes[1].Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -1186,9 +1187,9 @@ func TestSustainedQuorumProgressWhileSingleNodeUnavailableThenCatchUp(t *testing
 			proposals := make([]proposal, 0, 4)
 			for i, proposer := range active {
 				cmd := Command{
-					ID:           CommandID{Client: uint64(proposer), Sequence: uint64(i + 1)},
-					Payload:      []byte(fmt.Sprintf("%s-progress-%d", tc.name, i+1)),
-					ConflictKeys: [][]byte{[]byte("sustained-progress")},
+					ID:        CommandID{Client: uint64(proposer), Sequence: uint64(i + 1)},
+					Payload:   []byte(fmt.Sprintf("%s-progress-%d", tc.name, i+1)),
+					Footprint: Footprint{Points: [][]byte{[]byte("sustained-progress")}},
 				}
 				ref, err := s.nodes[proposer].Propose(cmd)
 				if err != nil {
@@ -1223,7 +1224,7 @@ func TestPausedClockDoesNotTickOrProcessReadyUntilResume(t *testing.T) {
 	s.pause(2)
 	pausedTick := s.nodes[2].Status().Tick
 
-	cmd := Command{ID: CommandID{Client: 12, Sequence: 1}, Payload: []byte("clock-pause"), ConflictKeys: [][]byte{[]byte("clock-pause")}}
+	cmd := Command{ID: CommandID{Client: 12, Sequence: 1}, Payload: []byte("clock-pause"), Footprint: Footprint{Points: [][]byte{[]byte("clock-pause")}}}
 	ref, err := s.nodes[1].Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -1255,8 +1256,8 @@ func TestPausedClockDoesNotTickOrProcessReadyUntilResume(t *testing.T) {
 
 func TestUnevenLogicalTickSkewAndBurstConvergesWithoutDuplicates(t *testing.T) {
 	s := newSimCluster(t, 5, true)
-	first := Command{ID: CommandID{Client: 13, Sequence: 1}, Payload: []byte("skew-a"), ConflictKeys: [][]byte{[]byte("skew")}}
-	second := Command{ID: CommandID{Client: 14, Sequence: 1}, Payload: []byte("skew-b"), ConflictKeys: [][]byte{[]byte("skew")}}
+	first := Command{ID: CommandID{Client: 13, Sequence: 1}, Payload: []byte("skew-a"), Footprint: Footprint{Points: [][]byte{[]byte("skew")}}}
+	second := Command{ID: CommandID{Client: 14, Sequence: 1}, Payload: []byte("skew-b"), Footprint: Footprint{Points: [][]byte{[]byte("skew")}}}
 	firstRef, err := s.nodes[1].Propose(first)
 	if err != nil {
 		t.Fatal(err)
@@ -1280,7 +1281,7 @@ func TestUnevenLogicalTickSkewAndBurstConvergesWithoutDuplicates(t *testing.T) {
 
 func TestRolledBackNodeCatchesUpFromQuorumWithoutDuplicateApply(t *testing.T) {
 	s := newSimCluster(t, 3, false)
-	first := Command{ID: CommandID{Client: 15, Sequence: 1}, Payload: []byte("before-rollback"), ConflictKeys: [][]byte{[]byte("rollback")}}
+	first := Command{ID: CommandID{Client: 15, Sequence: 1}, Payload: []byte("before-rollback"), Footprint: Footprint{Points: [][]byte{[]byte("rollback")}}}
 	firstRef, err := s.nodes[1].Propose(first)
 	if err != nil {
 		t.Fatal(err)
@@ -1292,7 +1293,7 @@ func TestRolledBackNodeCatchesUpFromQuorumWithoutDuplicateApply(t *testing.T) {
 	rolledBackStore := cloneMemoryStorage(s.stores[3])
 
 	s.omit(3)
-	second := Command{ID: CommandID{Client: 15, Sequence: 2}, Payload: []byte("after-rollback"), ConflictKeys: [][]byte{[]byte("rollback")}}
+	second := Command{ID: CommandID{Client: 15, Sequence: 2}, Payload: []byte("after-rollback"), Footprint: Footprint{Points: [][]byte{[]byte("rollback")}}}
 	secondRef, err := s.nodes[1].Propose(second)
 	if err != nil {
 		t.Fatal(err)
@@ -1330,9 +1331,9 @@ func TestStorageWireRestartUpgradeRollbackSimulationConvergesWithoutDuplicateApp
 	proposeCanary := func(proposer ReplicaID, payload string) (InstanceRef, Command) {
 		s.t.Helper()
 		cmd := Command{
-			ID:           CommandID{Client: 210, Sequence: nextSequence},
-			Payload:      []byte(payload),
-			ConflictKeys: [][]byte{conflictKey},
+			ID:        CommandID{Client: 210, Sequence: nextSequence},
+			Payload:   []byte(payload),
+			Footprint: Footprint{Points: [][]byte{conflictKey}},
 		}
 		nextSequence++
 		ref, err := s.nodes[proposer].Propose(cmd)
@@ -1369,7 +1370,7 @@ func TestStorageWireRestartUpgradeRollbackSimulationConvergesWithoutDuplicateApp
 	remember(beforeRef, beforeCmd)
 	requireAllCanariesOnceEverywhere()
 	rollbackStoreCheckpoint := cloneMemoryStorage(s.stores[rollbackID])
-	rollbackAppCheckpoint := cloneCommittedCommands(s.apps[rollbackID])
+	rollbackAppCheckpoint := cloneAppliedCommands(s.apps[rollbackID])
 
 	for _, restarting := range s.ids() {
 		s.pause(restarting)
@@ -1397,7 +1398,7 @@ func TestStorageWireRestartUpgradeRollbackSimulationConvergesWithoutDuplicateApp
 
 	s.pause(rollbackID)
 	s.restart(rollbackID, cloneMemoryStorage(rollbackStoreCheckpoint))
-	s.apps[rollbackID] = cloneCommittedCommands(rollbackAppCheckpoint)
+	s.apps[rollbackID] = cloneAppliedCommands(rollbackAppCheckpoint)
 	rollbackWindowRef, rollbackWindowCmd := proposeCanary(1, "during-storage-rollback")
 	s.tickAll(30)
 	for _, id := range s.ids() {
@@ -1425,7 +1426,7 @@ func TestFiveNodePartitionHealConverges(t *testing.T) {
 		}
 	}
 
-	cmd := Command{ID: CommandID{Client: 9, Sequence: 1}, Payload: []byte("majority"), ConflictKeys: [][]byte{[]byte("majority")}}
+	cmd := Command{ID: CommandID{Client: 9, Sequence: 1}, Payload: []byte("majority"), Footprint: Footprint{Points: [][]byte{[]byte("majority")}}}
 	ref, err := s.nodes[1].Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -1466,14 +1467,14 @@ func requireConvergedRefs(t *testing.T, s *simCluster) {
 	}
 }
 
-func requireCommittedPayloadCount(t *testing.T, app []CommittedCommand, id ReplicaID, ref InstanceRef, payload []byte, want int) {
+func requireCommittedPayloadCount(t *testing.T, app []ApplyCommand, id ReplicaID, ref InstanceRef, payload []byte, want int) {
 	t.Helper()
 	if got := committedPayloadCount(app, ref, payload); got != want {
 		t.Fatalf("node %d applied %s with payload %q %d times, want %d: %#v", id, ref, payload, got, want, app)
 	}
 }
 
-func requireNoDuplicateCommittedRefs(t *testing.T, app []CommittedCommand, id ReplicaID) {
+func requireNoDuplicateCommittedRefs(t *testing.T, app []ApplyCommand, id ReplicaID) {
 	t.Helper()
 	seen := make(map[InstanceRef]struct{}, len(app))
 	for _, cmd := range app {
@@ -1484,7 +1485,7 @@ func requireNoDuplicateCommittedRefs(t *testing.T, app []CommittedCommand, id Re
 	}
 }
 
-func committedPayloadCount(app []CommittedCommand, ref InstanceRef, payload []byte) int {
+func committedPayloadCount(app []ApplyCommand, ref InstanceRef, payload []byte) int {
 	var count int
 	for _, c := range app {
 		if c.Ref == ref && bytes.Equal(c.Command.Payload, payload) {
@@ -1494,7 +1495,7 @@ func committedPayloadCount(app []CommittedCommand, ref InstanceRef, payload []by
 	return count
 }
 
-func committedPayload(app []CommittedCommand, ref InstanceRef, payload []byte) bool {
+func committedPayload(app []ApplyCommand, ref InstanceRef, payload []byte) bool {
 	for _, c := range app {
 		if c.Ref == ref && bytes.Equal(c.Command.Payload, payload) {
 			return true
@@ -1503,7 +1504,7 @@ func committedPayload(app []CommittedCommand, ref InstanceRef, payload []byte) b
 	return false
 }
 
-func refs(cmds []CommittedCommand) []InstanceRef {
+func refs(cmds []ApplyCommand) []InstanceRef {
 	out := make([]InstanceRef, len(cmds))
 	for i := range cmds {
 		out[i] = cmds[i].Ref
@@ -1529,7 +1530,7 @@ func TestIterativeExecutionComponentsMatchExplicitPrefixOracle(t *testing.T) {
 					deps[to] = 1
 				}
 			}
-			rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: deps, Command: Command{Kind: CommandNoop}}})
+			rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: deps, Kind: EntryNoop}})
 		}
 		view := rn.newExecutionView()
 		components := rn.executionComponents(&view)
@@ -1575,8 +1576,8 @@ func TestSparseMaxPrefixBuildsMaterializedSCCButBlocksOnFirstHole(t *testing.T) 
 	maxInst := ^InstanceNum(0)
 	left := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	right := InstanceRef{Conf: 1, Replica: 2, Instance: maxInst}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: left, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInst, 0}, Command: Command{Kind: CommandNoop}}})
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: right, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: left, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, maxInst, 0}, Kind: EntryNoop}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: right, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Kind: EntryNoop}})
 	view := rn.newExecutionView()
 	components := rn.executionComponents(&view)
 	if len(components) != 1 || len(components[0]) != 2 {

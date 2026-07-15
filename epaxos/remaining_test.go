@@ -10,6 +10,22 @@ import (
 )
 
 func checkedRecord(rec InstanceRecord) InstanceRecord {
+	if rec.Kind == 0 && rec.Status >= StatusPreAccepted {
+		switch {
+		case rec.ConfChange != (ConfChange{}):
+			rec.Kind = EntryConfChange
+		case len(rec.ProtocolControl) != 0:
+			rec.Kind = EntryMembership
+		case rec.Command.ID != (CommandID{}) || len(rec.Command.Payload) != 0 || len(rec.Command.CycleKey) != 0 ||
+			rec.Command.Footprint.All || len(rec.Command.Footprint.Points) != 0 || len(rec.Command.Footprint.Spans) != 0:
+			rec.Kind = EntryCommand
+		default:
+			rec.Kind = EntryNoop
+		}
+	}
+	if rec.Kind == EntryCommand && !rec.Command.Footprint.All && len(rec.Command.Footprint.Points) == 0 && len(rec.Command.Footprint.Spans) == 0 {
+		rec.Command.Footprint.All = true
+	}
 	if rec.Status >= StatusPreAccepted && rec.RecordBallot == (Ballot{}) {
 		rec.RecordBallot = rec.Ballot
 	}
@@ -18,6 +34,37 @@ func checkedRecord(rec InstanceRecord) InstanceRecord {
 	}
 	rec.Checksum = ChecksumRecord(rec)
 	return rec
+}
+
+func canonicalTestMessage(message Message) Message {
+	changed := false
+	if message.Kind == 0 {
+		switch {
+		case message.ConfChange != (ConfChange{}):
+			message.Kind = EntryConfChange
+			changed = true
+		case !commandEmpty(message.Command):
+			message.Kind = EntryCommand
+			changed = true
+		}
+	}
+	if message.Kind == EntryCommand && !message.Command.Footprint.All &&
+		len(message.Command.Footprint.Points) == 0 && len(message.Command.Footprint.Spans) == 0 {
+		message.Command.Footprint.All = true
+		changed = true
+	}
+	if message.FromIncarnation == 0 {
+		message.FromIncarnation = 1
+		changed = true
+	}
+	if message.ToIncarnation == 0 {
+		message.ToIncarnation = 1
+		changed = true
+	}
+	if changed && message.Checksum != ([32]byte{}) {
+		message.Checksum = ChecksumMessage(message)
+	}
+	return message
 }
 
 type remainingNodeProtocolSnapshot struct {
@@ -101,7 +148,7 @@ func remainingApplyHardStateOnly(t *testing.T, rn *RawNode, wantTick uint64) {
 	if rd.HardState.Empty() || !rd.HardState.Equal(rn.currentHardState) || rd.HardState.Tick != wantTick || !rd.MustSync {
 		t.Fatalf("hard-state-only Ready = %#v, want exact current hard state at tick %d", rd, wantTick)
 	}
-	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("hard-state-only Ready at tick %d carried protocol payload: %#v", wantTick, rd)
 	}
 	store, ok := rn.storage.(interface{ ApplyReady(Ready) error })
@@ -122,18 +169,21 @@ func (s duplicateRecordStorage) InitialState() (StorageState, error) {
 	return StorageState{}, nil
 }
 
-func (s duplicateRecordStorage) LoadInstances(fn func(InstanceRecord) error) error {
+func (s duplicateRecordStorage) LoadCheckpoint() (Checkpoint, error) { return Checkpoint{}, nil }
+
+func (s duplicateRecordStorage) LoadInstances(_ ExecutionFrontier, fn func(InstanceRecord) error) error {
 	if err := fn(s.rec.Clone()); err != nil {
 		return err
 	}
 	return fn(s.rec.Clone())
 }
 
-func confChangeCommand(cc ConfChange) Command {
-	var payload [9]byte
-	payload[0] = byte(cc.Type)
-	binary.LittleEndian.PutUint64(payload[1:], uint64(cc.Replica))
-	return Command{Kind: CommandConfChange, Payload: payload[:], ConflictKeys: [][]byte{[]byte("\xffconf")}}
+func (s duplicateRecordStorage) LoadInstance(ref InstanceRef) (InstanceRecord, bool, error) {
+	return s.rec.Clone(), s.rec.Ref == ref, nil
+}
+
+func confChangeCommand(cc ConfChange) ConfChange {
+	return cc
 }
 
 func assertConfState(t *testing.T, got, want ConfState) {
@@ -172,14 +222,14 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rn.pendingReady = Ready{Records: []InstanceRecord{{}, {}}, Messages: []Message{{}, {}}, Committed: []CommittedCommand{{}, {}}, MustSync: true}
+	rn.pendingReady = Ready{Records: []InstanceRecord{{}, {}}, Messages: []Message{{}, {}}, Apply: []ApplyCommand{{}, {}}, MustSync: true}
 	rd := rn.Ready()
-	advanceInvalid(t, rn, Ready{HardState: rd.HardState, Records: rd.Records[:1], Messages: rd.Messages[:1], Committed: rd.Committed[:1], MustSync: rd.MustSync})
-	if len(rn.frozenReady.Records) != 2 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Committed) != 2 {
+	advanceInvalid(t, rn, Ready{HardState: rd.HardState, Records: rd.Records[:1], Messages: rd.Messages[:1], Apply: rd.Apply[:1], MustSync: rd.MustSync})
+	if len(rn.frozenReady.Records) != 2 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Apply) != 2 {
 		t.Fatal("barrier rejection changed frozen ready")
 	}
 	advanceOK(t, rn, Ready{HardState: rd.HardState, Records: rd.Records[:1], MustSync: rd.MustSync})
-	if len(rn.frozenReady.Records) != 1 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Committed) != 2 {
+	if len(rn.frozenReady.Records) != 1 || len(rn.frozenReady.Messages) != 2 || len(rn.frozenReady.Apply) != 2 {
 		t.Fatal("partial record advance did not retain frozen work")
 	}
 	advanceOK(t, rn, rn.Ready())
@@ -193,7 +243,7 @@ func TestRemainingReadyAndProposalBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 9, Conf: 1}, Status: StatusCommitted, Deps: zr.q.deps(), Command: Command{Kind: CommandNoop}}, phase: phaseCommitted}
+	inst := &instance{rec: InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 9, Conf: 1}, Status: StatusCommitted, Deps: zr.q.deps(), Kind: EntryNoop}, phase: phaseCommitted}
 	zr.startAccept(inst, inst.rec.Attributes())
 	zr.commit(inst, inst.rec.Attributes())
 	if err := zr.schedule(inst, timerAccept, 0); err != nil {
@@ -206,9 +256,9 @@ func TestProposeRejectsNonEmptyNoopWithoutDurableMutation(t *testing.T) {
 		name string
 		cmd  Command
 	}{
-		{name: "id", cmd: Command{Kind: CommandNoop, ID: CommandID{Client: 1, Sequence: 1}}},
-		{name: "payload", cmd: Command{Kind: CommandNoop, Payload: []byte("not-empty")}},
-		{name: "conflict key", cmd: Command{Kind: CommandNoop, ConflictKeys: [][]byte{[]byte("not-empty")}}},
+		{name: "id", cmd: Command{ID: CommandID{Client: 1, Sequence: 1}}},
+		{name: "payload", cmd: Command{Payload: []byte("not-empty")}},
+		{name: "footprint", cmd: Command{Footprint: Footprint{Points: [][]byte{[]byte("not-empty")}}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -218,8 +268,8 @@ func TestProposeRejectsNonEmptyNoopWithoutDurableMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := snapshotRemainingNodeProtocol(rn)
-			if _, err := rn.Propose(tc.cmd); !errors.Is(err, ErrInvalidConfig) {
-				t.Fatalf("Propose(%#v) err=%v, want ErrInvalidConfig", tc.cmd, err)
+			if _, err := rn.proposeEntry(EntryNoop, tc.cmd, ConfChange{}, nil); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("proposeEntry(noop, %#v) err=%v, want ErrInvalidConfig", tc.cmd, err)
 			}
 			requireRemainingNodeProtocolUnchanged(t, rn, before)
 			if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store}); err != nil {
@@ -309,7 +359,7 @@ func TestValidProposeConfChangeSetsPending(t *testing.T) {
 		t.Fatal("valid ProposeConfChange produced no ready work")
 	}
 	rd := rn.Ready()
-	if len(rd.Records) == 0 || rd.Records[0].Ref != ref || rd.Records[0].Command.Kind != CommandConfChange {
+	if len(rd.Records) == 0 || rd.Records[0].Ref != ref || rd.Records[0].Kind != EntryConfChange {
 		t.Fatalf("valid ProposeConfChange ready records = %#v, want config change record for %s", rd.Records, ref)
 	}
 }
@@ -323,7 +373,7 @@ func TestProposeSkipsOccupiedLocalNextInstance(t *testing.T) {
 	occupied := InstanceRef{Replica: rn.id, Instance: rn.nextInstance, Conf: rn.q.conf.ID}
 	rn.instances[occupied] = &instance{rec: InstanceRecord{Ref: occupied}}
 
-	first, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 1}, Payload: []byte("after-occupied"), ConflictKeys: [][]byte{[]byte("skip-local-instance")}})
+	first, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 1}, Payload: []byte("after-occupied"), Footprint: Footprint{Points: [][]byte{[]byte("skip-local-instance")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +382,7 @@ func TestProposeSkipsOccupiedLocalNextInstance(t *testing.T) {
 		t.Fatalf("Propose with occupied local nextInstance returned %s, want %s", first, wantFirst)
 	}
 
-	second, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 2}, Payload: []byte("after-skip"), ConflictKeys: [][]byte{[]byte("skip-local-instance-2")}})
+	second, err := rn.Propose(Command{ID: CommandID{Client: 51, Sequence: 2}, Payload: []byte("after-skip"), Footprint: Footprint{Points: [][]byte{[]byte("skip-local-instance-2")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +400,7 @@ func TestProposalOwnershipCopiesCallerSlicesByDefault(t *testing.T) {
 	remainingApplyHardStateOnly(t, rn, 0)
 	payload := []byte("caller-payload")
 	key := []byte("caller-key")
-	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, ConflictKeys: [][]byte{key}}); err != nil {
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, Footprint: Footprint{Points: [][]byte{key}}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,8 +415,8 @@ func TestProposalOwnershipCopiesCallerSlicesByDefault(t *testing.T) {
 	if !bytes.Equal(got.Payload, []byte("caller-payload")) {
 		t.Fatalf("default proposal retained caller payload slice: got %q", got.Payload)
 	}
-	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], []byte("caller-key")) {
-		t.Fatalf("default proposal retained caller conflict key slice: got %q", got.ConflictKeys)
+	if len(got.Footprint.Points) != 1 || !bytes.Equal(got.Footprint.Points[0], []byte("caller-key")) {
+		t.Fatalf("default proposal retained caller conflict key slice: got %q", got.Footprint.Points)
 	}
 }
 
@@ -378,7 +428,7 @@ func TestProposalOwnershipZeroCopyRetainsCallerSlices(t *testing.T) {
 	remainingApplyHardStateOnly(t, rn, 0)
 	payload := []byte("caller-payload")
 	key := []byte("caller-key")
-	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, ConflictKeys: [][]byte{key}}); err != nil {
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, Footprint: Footprint{Points: [][]byte{key}}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -393,8 +443,8 @@ func TestProposalOwnershipZeroCopyRetainsCallerSlices(t *testing.T) {
 	if !bytes.Equal(got.Payload, []byte("Caller-payload")) {
 		t.Fatalf("zero-copy proposal copied caller payload slice: got %q", got.Payload)
 	}
-	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], []byte("Caller-key")) {
-		t.Fatalf("zero-copy proposal copied caller conflict key slice: got %q", got.ConflictKeys)
+	if len(got.Footprint.Points) != 1 || !bytes.Equal(got.Footprint.Points[0], []byte("Caller-key")) {
+		t.Fatalf("zero-copy proposal copied caller conflict key slice: got %q", got.Footprint.Points)
 	}
 }
 
@@ -414,7 +464,8 @@ func TestInboundStepCopiesDecodedCommandDespiteZeroCopyProposals(t *testing.T) {
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{ID: CommandID{Client: 7, Sequence: 11}, Payload: wantPayload, ConflictKeys: [][]byte{wantKey}},
+		Kind:    EntryCommand,
+		Command: Command{ID: CommandID{Client: 7, Sequence: 11}, Payload: wantPayload, Footprint: Footprint{Points: [][]byte{wantKey}}},
 	}
 	buf, err := EncodeMessage(make([]byte, 0, 128), msg)
 	if err != nil {
@@ -424,9 +475,8 @@ func TestInboundStepCopiesDecodedCommandDespiteZeroCopyProposals(t *testing.T) {
 	if err := DecodeMessage(buf, &inbound); err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.Step(inbound); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(inbound)); err != nil { t.Fatal(err)
+ }
 
 	payloadOffset := bytes.Index(buf, wantPayload)
 	if payloadOffset < 0 {
@@ -451,8 +501,8 @@ func TestInboundStepCopiesDecodedCommandDespiteZeroCopyProposals(t *testing.T) {
 	if !bytes.Equal(got.Payload, wantPayload) {
 		t.Fatalf("inbound step retained decoded payload buffer: got %q want %q", got.Payload, wantPayload)
 	}
-	if len(got.ConflictKeys) != 1 || !bytes.Equal(got.ConflictKeys[0], wantKey) {
-		t.Fatalf("inbound step retained decoded conflict key buffer: got %q want %q", got.ConflictKeys, wantKey)
+	if len(got.Footprint.Points) != 1 || !bytes.Equal(got.Footprint.Points[0], wantKey) {
+		t.Fatalf("inbound step retained decoded conflict key buffer: got %q want %q", got.Footprint.Points, wantKey)
 	}
 }
 
@@ -472,7 +522,7 @@ func TestMaxReadyMessagesCapsOnlyMessages(t *testing.T) {
 			{Type: MsgPreAccept, From: 1, To: 2, Ref: first, Deps: []InstanceNum{0, 0, 0}},
 			{Type: MsgPreAccept, From: 1, To: 3, Ref: second, Deps: []InstanceNum{0, 0, 0}},
 		},
-		Committed: []CommittedCommand{
+		Apply: []ApplyCommand{
 			{Ref: first, Command: Command{Payload: []byte("commit-1")}},
 			{Ref: second, Command: Command{Payload: []byte("commit-2")}},
 		},
@@ -486,14 +536,14 @@ func TestMaxReadyMessagesCapsOnlyMessages(t *testing.T) {
 	if len(rd.Records) != 2 || rd.Records[0].Ref != first || rd.Records[1].Ref != second {
 		t.Fatalf("records were capped with messages: %#v", rd.Records)
 	}
-	if len(rd.Committed) != 2 || rd.Committed[0].Ref != first || rd.Committed[1].Ref != second {
-		t.Fatalf("committed commands were capped with messages: %#v", rd.Committed)
+	if len(rd.Apply) != 2 || rd.Apply[0].Ref != first || rd.Apply[1].Ref != second {
+		t.Fatalf("committed commands were capped with messages: %#v", rd.Apply)
 	}
 
 	advanceOK(t, rn, rd)
 	tail := rn.Ready()
-	if len(tail.Records) != 0 || len(tail.Committed) != 0 {
-		t.Fatalf("advanced records/committed reappeared with message tail: records=%#v committed=%#v", tail.Records, tail.Committed)
+	if len(tail.Records) != 0 || len(tail.Apply) != 0 {
+		t.Fatalf("advanced records/committed reappeared with message tail: records=%#v committed=%#v", tail.Records, tail.Apply)
 	}
 	if len(tail.Messages) != 1 || tail.Messages[0].To != 3 || tail.Messages[0].Ref != second {
 		t.Fatalf("message tail ready = %#v, want the unsent second message", tail.Messages)
@@ -507,7 +557,7 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("value"), Footprint: Footprint{Points: [][]byte{[]byte("key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,9 +581,8 @@ func TestTimeOptimizationDelaysSlowAcceptUntilFastWaitTick(t *testing.T) {
 			Ballot: inst.rec.Ballot,
 			Seq:    inst.rec.Seq,
 			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}
-		if err := rn.Step(resp); err != nil {
-			t.Fatalf("step preaccept response from %d: %v", from, err)
-		}
+		if err := rn.Step(canonicalTestMessage(resp)); err != nil { t.Fatalf("step preaccept response from %d: %v", from, err)
+ }
 	}
 	if got, slow, fast := inst.preOK.len(), rn.q.slowQuorum(), rn.q.fastQuorum(); got != slow || got >= fast {
 		t.Fatalf("preaccept votes = %d, want slow quorum %d below fast quorum %d", got, slow, fast)
@@ -597,7 +646,7 @@ func TestTimeOptimizationRetryCannotBypassFastWaitDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 70, Sequence: 1}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("retry-fast-wait-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 70, Sequence: 1}, Payload: []byte("value"), Footprint: Footprint{Points: [][]byte{[]byte("retry-fast-wait-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,14 +658,13 @@ func TestTimeOptimizationRetryCannotBypassFastWaitDeadline(t *testing.T) {
 
 	inst := rn.instances[ref]
 	for _, from := range []ReplicaID{2, 3, 4} {
-		if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from,
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from,
 			To:     1,
 			Ref:    ref,
 			Ballot: inst.rec.Ballot,
 			Seq:    inst.rec.Seq,
-			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}); err != nil {
-			t.Fatalf("step preaccept response from %d: %v", from, err)
-		}
+			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true})); err != nil { t.Fatalf("step preaccept response from %d: %v", from, err)
+ }
 	}
 
 	for tick := uint64(1); tick < 3; tick++ {
@@ -664,7 +712,7 @@ func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	cmd := Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("late-fast-value"), ConflictKeys: [][]byte{[]byte("late-fast-key")}}
+	cmd := Command{ID: CommandID{Client: 8, Sequence: 1}, Payload: []byte("late-fast-value"), Footprint: Footprint{Points: [][]byte{[]byte("late-fast-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -690,9 +738,8 @@ func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
 			Ballot: inst.rec.Ballot,
 			Seq:    inst.rec.Seq,
 			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}
-		if err := rn.Step(resp); err != nil {
-			t.Fatalf("step matching preaccept response from %d: %v", from, err)
-		}
+		if err := rn.Step(canonicalTestMessage(resp)); err != nil { t.Fatalf("step matching preaccept response from %d: %v", from, err)
+ }
 	}
 
 	for _, from := range []ReplicaID{2, 3, 4} {
@@ -760,15 +807,15 @@ func TestTimeOptimizationLateFastQuorumCommitsWithoutAccept(t *testing.T) {
 			t.Fatalf("missing commit message to replica %d in %#v", to, rd.Messages)
 		}
 	}
-	if len(rd.Committed) != 1 {
-		t.Fatalf("late fast-quorum committed commands = %#v, want one command", rd.Committed)
+	if len(rd.Apply) != 1 {
+		t.Fatalf("late fast-quorum committed commands = %#v, want one command", rd.Apply)
 	}
 	committed := requireCommittedForRef(t, rd, ref)
-	if committed.Command.Kind != CommandUser || committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
 		t.Fatalf("committed command = %#v, want user command %#v", committed.Command, cmd)
 	}
-	if len(committed.Command.ConflictKeys) != 1 || !bytes.Equal(committed.Command.ConflictKeys[0], cmd.ConflictKeys[0]) {
-		t.Fatalf("committed conflict keys = %#v, want %#v", committed.Command.ConflictKeys, cmd.ConflictKeys)
+	if len(committed.Command.Footprint.Points) != 1 || !bytes.Equal(committed.Command.Footprint.Points[0], cmd.Footprint.Points[0]) {
+		t.Fatalf("committed conflict keys = %#v, want %#v", committed.Command.Footprint.Points, cmd.Footprint.Points)
 	}
 }
 
@@ -781,7 +828,7 @@ func TestFiveNodeOptimizedFastPathCommitsAtThreePreAcceptVotes(t *testing.T) {
 	if slow, fast := rn.q.slowQuorum(), rn.q.fastQuorum(); slow != 3 || fast != 3 {
 		t.Fatalf("five-node optimized quorum slow=%d fast=%d, want both 3", slow, fast)
 	}
-	cmd := Command{ID: CommandID{Client: 80, Sequence: 1}, Payload: []byte("optimized-five-fast"), ConflictKeys: [][]byte{[]byte("optimized-five-fast-key")}}
+	cmd := Command{ID: CommandID{Client: 80, Sequence: 1}, Payload: []byte("optimized-five-fast"), Footprint: Footprint{Points: [][]byte{[]byte("optimized-five-fast-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -801,14 +848,13 @@ func TestFiveNodeOptimizedFastPathCommitsAtThreePreAcceptVotes(t *testing.T) {
 	}
 	stepMatchingPreAcceptResp := func(from ReplicaID) {
 		t.Helper()
-		if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from,
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from,
 			To:     1,
 			Ref:    ref,
 			Ballot: inst.rec.Ballot,
 			Seq:    inst.rec.Seq,
-			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}); err != nil {
-			t.Fatalf("step matching five-node preaccept response from %d: %v", from, err)
-		}
+			Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true})); err != nil { t.Fatalf("step matching five-node preaccept response from %d: %v", from, err)
+ }
 	}
 
 	stepMatchingPreAcceptResp(2)
@@ -852,7 +898,7 @@ func TestFiveNodeOptimizedFastPathCommitsAtThreePreAcceptVotes(t *testing.T) {
 		}
 	}
 	committed := requireCommittedForRef(t, rd, ref)
-	if committed.Command.Kind != CommandUser || committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
 		t.Fatalf("optimized five-node committed command = %#v, want %#v", committed.Command, cmd)
 	}
 }
@@ -866,7 +912,7 @@ func TestFiveNodeOptimizedDivergentPreAcceptFallsBackToAcceptAtFastThreshold(t *
 	if slow, fast := rn.q.slowQuorum(), rn.q.fastQuorum(); slow != 3 || fast != 3 {
 		t.Fatalf("five-node optimized quorum slow=%d fast=%d, want both 3", slow, fast)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 81, Sequence: 1}, Payload: []byte("optimized-five-divergent"), ConflictKeys: [][]byte{[]byte("optimized-five-divergent-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 81, Sequence: 1}, Payload: []byte("optimized-five-divergent"), Footprint: Footprint{Points: [][]byte{[]byte("optimized-five-divergent-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,23 +926,21 @@ func TestFiveNodeOptimizedDivergentPreAcceptFallsBackToAcceptAtFastThreshold(t *
 	if inst == nil {
 		t.Fatalf("missing local instance %s", ref)
 	}
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 2,
 		To:     1,
 		Ref:    ref,
 		Ballot: inst.rec.Ballot,
 		Seq:    inst.rec.Seq,
-		Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}); err != nil {
-		t.Fatalf("step matching five-node preaccept response: %v", err)
-	}
+		Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true})); err != nil { t.Fatalf("step matching five-node preaccept response: %v", err)
+ }
 	divergentDeps := append([]InstanceNum(nil), inst.rec.Deps...)
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 3,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 3,
 		To:     1,
 		Ref:    ref,
 		Ballot: inst.rec.Ballot,
 		Seq:    inst.rec.Seq + 1,
-		Deps:   divergentDeps}); err != nil {
-		t.Fatalf("step divergent five-node preaccept response: %v", err)
-	}
+		Deps:   divergentDeps})); err != nil { t.Fatalf("step divergent five-node preaccept response: %v", err)
+ }
 
 	if inst.preOK != nil {
 		t.Fatalf("divergent optimized Accept retained PreAccept votes: %#v", inst.preOK)
@@ -923,8 +967,8 @@ func TestFiveNodeOptimizedDivergentPreAcceptFallsBackToAcceptAtFastThreshold(t *
 			t.Fatalf("divergent optimized quorum accept to %d = %#v, want canonical accepted tuple", to, msg)
 		}
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("divergent optimized quorum emitted committed commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("divergent optimized quorum emitted committed commands: %#v", rd.Apply)
 	}
 }
 
@@ -983,8 +1027,8 @@ func TestFiveNodeFastPathCommitsWithMatchingDepsCommittedEvidence(t *testing.T) 
 			t.Fatalf("evidence-gated commit message to %d = %#v, want canonical committed tuple deps %v", to, msg, rec.Deps)
 		}
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("fast commit with locally unresolved dependency emitted application commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("fast commit with locally unresolved dependency emitted application commands: %#v", rd.Apply)
 	}
 }
 
@@ -1018,7 +1062,7 @@ func TestDepsCommittedPrefixEvidenceRequiresContiguousCommittedPrefix(t *testing
 			seedDependencyRecord(t, follower, InstanceRef{Replica: 2, Instance: 2, Conf: 1}, StatusCommitted, key)
 
 			ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-			if err := follower.Step(Message{
+			if err := follower.Step(canonicalTestMessage(Message{
 				Type:    MsgPreAccept,
 				From:    1,
 				To:      3,
@@ -1027,9 +1071,8 @@ func TestDepsCommittedPrefixEvidenceRequiresContiguousCommittedPrefix(t *testing
 				Seq:     1,
 				Deps:    follower.q.deps(),
 				Command: dependencyEvidenceCommand(100, "prefix-target", key),
-			}); err != nil {
-				t.Fatalf("Step(preaccept with %s prefix hole) err=%v", tc.wantCause, err)
-			}
+			})); err != nil { t.Fatalf("Step(preaccept with %s prefix hole) err=%v", tc.wantCause, err)
+ }
 			resp := optimizedRequireMessage(t, follower.Ready().Messages, MsgPreAcceptResp, 1)
 			if !instanceNumsEqual(resp.Deps, []InstanceNum{0, 2, 0, 0, 0}) {
 				t.Fatalf("prefix-hole response deps = %v, want compact dependency through replica 2 instance 2", resp.Deps)
@@ -1112,23 +1155,22 @@ func seedDependencyRecord(t *testing.T, rn *RawNode, ref InstanceRef, status Sta
 
 func dependencyEvidenceCommand(sequence uint64, payload string, key []byte) Command {
 	return Command{
-		ID:           CommandID{Client: 90, Sequence: sequence},
-		Payload:      []byte(payload),
-		ConflictKeys: [][]byte{append([]byte(nil), key...)},
+		ID:        CommandID{Client: 90, Sequence: sequence},
+		Payload:   []byte(payload),
+		Footprint: Footprint{Points: [][]byte{append([]byte(nil), key...)}},
 	}
 }
 
 func stepFiveNodeMatchingPreAcceptResp(t *testing.T, rn *RawNode, inst *instance, ref InstanceRef, from ReplicaID, depsCommitted uint64) {
 	t.Helper()
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from,
 		To:     1,
 		Ref:    ref,
 		Ballot: inst.rec.Ballot,
 		Seq:    inst.rec.Seq,
 		Deps:   append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true,
-		DepsCommitted: depsCommitted}); err != nil {
-		t.Fatalf("step matching dependency-evidence preaccept response from %d: %v", from, err)
-	}
+		DepsCommitted: depsCommitted})); err != nil { t.Fatalf("step matching dependency-evidence preaccept response from %d: %v", from, err)
+ }
 }
 
 func requireFiveNodeSlowAccept(t *testing.T, rd Ready, ref InstanceRef, attrs Attributes) {
@@ -1151,8 +1193,8 @@ func requireFiveNodeSlowAccept(t *testing.T, rd Ready, ref InstanceRef, attrs At
 			t.Fatalf("dependency-evidence accept message to %d = %#v, want canonical accepted attrs seq %d deps %v", to, msg, attrs.Seq, attrs.Deps)
 		}
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("dependency-evidence slow accept emitted committed commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("dependency-evidence slow accept emitted committed commands: %#v", rd.Apply)
 	}
 }
 
@@ -1163,7 +1205,7 @@ func TestOutboundPreAcceptProcessAtCarriesCreatedTickOnRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 21, Sequence: 1}, Payload: []byte("process-at-local"), ConflictKeys: [][]byte{[]byte("process-at-local-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 21, Sequence: 1}, Payload: []byte("process-at-local"), Footprint: Footprint{Points: [][]byte{[]byte("process-at-local-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1186,8 +1228,8 @@ func TestOutboundPreAcceptProcessAtCarriesCreatedTickOnRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry := rn.Ready()
-	if len(retry.Records) != 0 || len(retry.Committed) != 0 {
-		t.Fatalf("preaccept retry changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Committed)
+	if len(retry.Records) != 0 || len(retry.Apply) != 0 {
+		t.Fatalf("preaccept retry changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Apply)
 	}
 	requirePreAcceptProcessAt(t, retry.Messages, ref, rn.instances[ref].rec, 5, []ReplicaID{2, 3})
 }
@@ -1199,11 +1241,10 @@ func TestInboundFuturePreAcceptTimingWaitsForProcessAt(t *testing.T) {
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	msg := processAtPreAccept(ref, 1, 2, 3, 3, Command{ID: CommandID{Client: 22, Sequence: 1}, Payload: []byte("delayed"), ConflictKeys: [][]byte{[]byte("delayed-key")}})
+	msg := processAtPreAccept(ref, 1, 2, 3, 3, Command{ID: CommandID{Client: 22, Sequence: 1}, Payload: []byte("delayed"), Footprint: Footprint{Points: [][]byte{[]byte("delayed-key")}}})
 
-	if err := rn.Step(msg); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(msg)); err != nil { t.Fatal(err)
+ }
 	if rn.HasReady() {
 		t.Fatalf("future preaccept produced ready work before ProcessAt: %#v", rn.Ready())
 	}
@@ -1236,12 +1277,11 @@ func TestInboundFutureProcessAtPreAcceptWithNonDefaultBallotProcessesImmediately
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
 	ref := InstanceRef{Replica: 1, Instance: 7, Conf: 1}
-	msg := processAtPreAccept(ref, 1, 2, 9, 3, Command{ID: CommandID{Client: 23, Sequence: 1}, Payload: []byte("non-default-ballot"), ConflictKeys: [][]byte{[]byte("non-default-ballot-key")}})
+	msg := processAtPreAccept(ref, 1, 2, 9, 3, Command{ID: CommandID{Client: 23, Sequence: 1}, Payload: []byte("non-default-ballot"), Footprint: Footprint{Points: [][]byte{[]byte("non-default-ballot-key")}}})
 	msg.Ballot = Ballot{Number: 1, Replica: 1}
 
-	if err := rn.Step(msg); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(msg)); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if len(rd.Records) != 1 || rd.Records[0].Ref != ref || rd.Records[0].Status != StatusPreAccepted {
 		t.Fatalf("non-default ballot future preaccept records = %#v, want immediate pre-accepted record for %s", rd.Records, ref)
@@ -1263,7 +1303,7 @@ func TestPreAcceptRejectWithNonGreaterHintIsIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 24, Sequence: 1}, Payload: []byte("stale-reject"), ConflictKeys: [][]byte{[]byte("stale-reject-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 24, Sequence: 1}, Payload: []byte("stale-reject"), Footprint: Footprint{Points: [][]byte{[]byte("stale-reject-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1275,7 +1315,7 @@ func TestPreAcceptRejectWithNonGreaterHintIsIgnored(t *testing.T) {
 		t.Fatalf("missing local instance %s", ref)
 	}
 	ballot := inst.rec.Ballot
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgPreAcceptResp,
 		From:         2,
 		To:           1,
@@ -1285,9 +1325,8 @@ func TestPreAcceptRejectWithNonGreaterHintIsIgnored(t *testing.T) {
 		Reject:       true,
 		RejectReason: RejectNone,
 		RejectHint:   ballot,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	if inst.phase != phasePreAccept || inst.rec.Ballot != ballot {
 		t.Fatalf("non-greater preaccept reject changed phase/ballot to %d/%v, want preaccept/%v", inst.phase, inst.rec.Ballot, ballot)
 	}
@@ -1307,14 +1346,13 @@ func TestDuePreAcceptTimingOrdersByProcessAtAndRef(t *testing.T) {
 	second := InstanceRef{Replica: 2, Instance: 2, Conf: 1}
 	later := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
 	messages := []Message{
-		processAtPreAccept(second, 2, 4, 2, 4, Command{ID: CommandID{Client: 31, Sequence: 2}, Payload: []byte("arrived-first-but-ref-second"), ConflictKeys: [][]byte{sharedKey}}),
-		processAtPreAccept(later, 3, 4, 3, 4, Command{ID: CommandID{Client: 31, Sequence: 3}, Payload: []byte("later-process-at"), ConflictKeys: [][]byte{sharedKey}}),
-		processAtPreAccept(first, 1, 4, 2, 4, Command{ID: CommandID{Client: 31, Sequence: 1}, Payload: []byte("arrived-last-but-ref-first"), ConflictKeys: [][]byte{sharedKey}}),
+		processAtPreAccept(second, 2, 4, 2, 4, Command{ID: CommandID{Client: 31, Sequence: 2}, Payload: []byte("arrived-first-but-ref-second"), Footprint: Footprint{Points: [][]byte{sharedKey}}}),
+		processAtPreAccept(later, 3, 4, 3, 4, Command{ID: CommandID{Client: 31, Sequence: 3}, Payload: []byte("later-process-at"), Footprint: Footprint{Points: [][]byte{sharedKey}}}),
+		processAtPreAccept(first, 1, 4, 2, 4, Command{ID: CommandID{Client: 31, Sequence: 1}, Payload: []byte("arrived-last-but-ref-first"), Footprint: Footprint{Points: [][]byte{sharedKey}}}),
 	}
 	for _, msg := range messages {
-		if err := rn.Step(msg); err != nil {
-			t.Fatalf("Step(%s %s) err=%v", msg.Type, msg.Ref, err)
-		}
+		if err := rn.Step(canonicalTestMessage(msg)); err != nil { t.Fatalf("Step(%s %s) err=%v", msg.Type, msg.Ref, err)
+ }
 	}
 	if rn.HasReady() {
 		t.Fatalf("queued future preaccepts produced ready before due tick: %#v", rn.Ready())
@@ -1360,19 +1398,18 @@ func TestDeferredPreAcceptTimingClonesCommandBuffers(t *testing.T) {
 	payload := []byte("queued-payload")
 	key := []byte("queued-key")
 	msg := processAtPreAccept(InstanceRef{Replica: 1, Instance: 2, Conf: 1}, 1, 2, 2, 3, Command{
-		ID:           CommandID{Client: 41, Sequence: 1},
-		Payload:      payload,
-		ConflictKeys: [][]byte{key},
+		ID:        CommandID{Client: 41, Sequence: 1},
+		Payload:   payload,
+		Footprint: Footprint{Points: [][]byte{key}},
 	})
-	if err := rn.Step(msg); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(msg)); err != nil { t.Fatal(err)
+ }
 
 	payload[0] = 'X'
 	key[0] = 'Y'
 	msg.Deps[0] = 99
 	msg.Command.Payload[1] = 'Z'
-	msg.Command.ConflictKeys[0][1] = 'W'
+	msg.Command.Footprint.Points[0][1] = 'W'
 
 	if err := rn.Tick(); err != nil {
 		t.Fatal(err)
@@ -1389,8 +1426,8 @@ func TestDeferredPreAcceptTimingClonesCommandBuffers(t *testing.T) {
 	if !bytes.Equal(got.Command.Payload, []byte("queued-payload")) {
 		t.Fatalf("deferred preaccept retained caller payload buffer: got %q", got.Command.Payload)
 	}
-	if len(got.Command.ConflictKeys) != 1 || !bytes.Equal(got.Command.ConflictKeys[0], []byte("queued-key")) {
-		t.Fatalf("deferred preaccept retained caller conflict-key buffer: got %q", got.Command.ConflictKeys)
+	if len(got.Command.Footprint.Points) != 1 || !bytes.Equal(got.Command.Footprint.Points[0], []byte("queued-key")) {
+		t.Fatalf("deferred preaccept retained caller conflict-key buffer: got %q", got.Command.Footprint.Points)
 	}
 	if !instanceNumsEqual(got.Deps, []InstanceNum{0, 0, 0}) {
 		t.Fatalf("deferred preaccept retained caller deps buffer: got %v", got.Deps)
@@ -1404,7 +1441,7 @@ func TestPreAcceptTimingFastCommitsUnanimousRepliesWithStaleOriginator(t *testin
 		t.Fatal(err)
 	}
 	remainingApplyHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("stale-originator"), ConflictKeys: [][]byte{[]byte("stale-originator-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 45, Sequence: 1}, Payload: []byte("stale-originator"), Footprint: Footprint{Points: [][]byte{[]byte("stale-originator-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1427,9 +1464,8 @@ func TestPreAcceptTimingFastCommitsUnanimousRepliesWithStaleOriginator(t *testin
 			Ballot: inst.rec.Ballot,
 			Seq:    remoteAttrs.Seq,
 			Deps:   append([]InstanceNum(nil), remoteAttrs.Deps...), FastPathEligible: true}
-		if err := rn.Step(resp); err != nil {
-			t.Fatalf("Step(unanimous preaccept response from %d) err=%v", from, err)
-		}
+		if err := rn.Step(canonicalTestMessage(resp)); err != nil { t.Fatalf("Step(unanimous preaccept response from %d) err=%v", from, err)
+ }
 	}
 
 	if inst.phase != phaseCommitted {
@@ -1478,11 +1514,11 @@ func proposeTimedCommandWithPriorConflict(t *testing.T) (*RawNode, *instance, In
 		Status:  StatusCommitted,
 		Seq:     1,
 		Deps:    rn.q.deps(),
-		Command: Command{ID: CommandID{Client: 60, Sequence: 1}, Payload: []byte("prior-conflict"), ConflictKeys: [][]byte{key}},
+		Command: Command{ID: CommandID{Client: 60, Sequence: 1}, Payload: []byte("prior-conflict"), Footprint: Footprint{Points: [][]byte{key}}},
 	})
 	rn.executed.add(conflictingRef)
 
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 62, Sequence: 1}, Payload: []byte("timed-originator"), ConflictKeys: [][]byte{key}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 62, Sequence: 1}, Payload: []byte("timed-originator"), Footprint: Footprint{Points: [][]byte{key}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1499,7 +1535,7 @@ func proposeTimedCommandWithPriorConflict(t *testing.T) (*RawNode, *instance, In
 		Status:  StatusCommitted,
 		Seq:     1,
 		Deps:    rn.q.deps(),
-		Command: Command{ID: CommandID{Client: 61, Sequence: 1}, Payload: []byte("remote-only-dependency"), ConflictKeys: [][]byte{key}},
+		Command: Command{ID: CommandID{Client: 61, Sequence: 1}, Payload: []byte("remote-only-dependency"), Footprint: Footprint{Points: [][]byte{key}}},
 	})
 	rn.executed.add(remoteOnlyRef)
 
@@ -1515,14 +1551,13 @@ func proposeTimedCommandWithPriorConflict(t *testing.T) (*RawNode, *instance, In
 
 func stepTimedPreAcceptResp(t *testing.T, rn *RawNode, inst *instance, ref InstanceRef, from ReplicaID, attrs Attributes) {
 	t.Helper()
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from,
 		To:     1,
 		Ref:    ref,
 		Ballot: inst.rec.Ballot,
 		Seq:    attrs.Seq,
-		Deps:   append([]InstanceNum(nil), attrs.Deps...), FastPathEligible: true}); err != nil {
-		t.Fatalf("Step(timed preaccept response from %d) err=%v", from, err)
-	}
+		Deps:   append([]InstanceNum(nil), attrs.Deps...), FastPathEligible: true})); err != nil { t.Fatalf("Step(timed preaccept response from %d) err=%v", from, err)
+ }
 }
 
 func requireTimedSlowAccept(t *testing.T, rd Ready, ref InstanceRef, attrs Attributes) {
@@ -1545,8 +1580,8 @@ func requireTimedSlowAccept(t *testing.T, rd Ready, ref InstanceRef, attrs Attri
 			t.Fatalf("timed slow-accept message to %d = %#v, want canonical accepted attrs seq %d deps %v", to, msg, attrs.Seq, attrs.Deps)
 		}
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("timed slow-accept emitted committed commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("timed slow-accept emitted committed commands: %#v", rd.Apply)
 	}
 }
 
@@ -1636,7 +1671,7 @@ func TestPreAcceptFastCommitRejectsNonDefaultBallot(t *testing.T) {
 				t.Fatal(err)
 			}
 			remainingApplyHardStateOnly(t, rn, 0)
-			ref, err := rn.Propose(Command{ID: CommandID{Client: 46, Sequence: 1}, Payload: []byte("guarded-stale-originator"), ConflictKeys: [][]byte{[]byte("guarded-stale-originator-key")}})
+			ref, err := rn.Propose(Command{ID: CommandID{Client: 46, Sequence: 1}, Payload: []byte("guarded-stale-originator"), Footprint: Footprint{Points: [][]byte{[]byte("guarded-stale-originator-key")}}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1658,17 +1693,16 @@ func TestPreAcceptFastCommitRejectsNonDefaultBallot(t *testing.T) {
 					Ballot: inst.rec.Ballot,
 					Seq:    remoteAttrs.Seq,
 					Deps:   append([]InstanceNum(nil), remoteAttrs.Deps...), FastPathEligible: true}
-				if err := rn.Step(resp); err != nil {
-					t.Fatalf("Step(stale-originator guarded response from %d) err=%v", from, err)
-				}
+				if err := rn.Step(canonicalTestMessage(resp)); err != nil { t.Fatalf("Step(stale-originator guarded response from %d) err=%v", from, err)
+ }
 			}
 
 			if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted {
 				t.Fatalf("guarded stale-originator replies phase/status = %d/%s, want slow-path accept/accepted", inst.phase, inst.rec.Status)
 			}
 			rd := rn.Ready()
-			if len(rd.Committed) != 0 {
-				t.Fatalf("guarded stale-originator replies committed fast-path commands: %#v", rd.Committed)
+			if len(rd.Apply) != 0 {
+				t.Fatalf("guarded stale-originator replies committed fast-path commands: %#v", rd.Apply)
 			}
 			if rec := optimizedRequireRecord(t, rd, ref); rec.Status != StatusAccepted || rec.Seq != remoteAttrs.Seq || !instanceNumsEqual(rec.Deps, remoteAttrs.Deps) {
 				t.Fatalf("guarded stale-originator record = %#v, want accepted with reply attrs seq %d deps %v", rec, remoteAttrs.Seq, remoteAttrs.Deps)
@@ -1701,7 +1735,8 @@ func TestMessageCodecProcessAtRoundTripAndChecksum(t *testing.T) {
 		Ballot:    Ballot{Replica: 1},
 		Seq:       4,
 		Deps:      []InstanceNum{0, 2, 0},
-		Command:   Command{ID: CommandID{Client: 51, Sequence: 1}, Payload: []byte("codec-process-at"), ConflictKeys: [][]byte{[]byte("codec-key")}},
+		Kind:      EntryCommand,
+		Command:   Command{ID: CommandID{Client: 51, Sequence: 1}, Payload: []byte("codec-process-at"), Footprint: Footprint{Points: [][]byte{[]byte("codec-key")}}},
 	}
 	encoded, err := EncodeMessage(nil, msg)
 	if err != nil {
@@ -1823,7 +1858,7 @@ func TestRemainingResponseBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1940,8 +1975,8 @@ func TestRemainingResponseBranches(t *testing.T) {
 		if prep.phase != phaseAccept || prep.rec.Status != StatusAccepted {
 			t.Fatalf("non-owner StatusNone quorum did not start accept: phase=%d record=%#v", prep.phase, prep.rec)
 		}
-		if prep.rec.Command.Kind != CommandNoop {
-			t.Fatalf("StatusNone quorum command kind=%d, want noop", prep.rec.Command.Kind)
+		if prep.rec.Kind != EntryNoop {
+			t.Fatalf("StatusNone quorum command kind=%d, want noop", prep.rec.Kind)
 		}
 	})
 }
@@ -1958,14 +1993,14 @@ func TestConflictIndexIncludesKnownInstancesFromEveryReplica(t *testing.T) {
 			Status:  StatusCommitted,
 			Seq:     7,
 			Deps:    rn.q.deps(),
-			Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("prior-r2"), ConflictKeys: [][]byte{key}},
+			Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("prior-r2"), Footprint: Footprint{Points: [][]byte{key}}},
 		},
 		{
 			Ref:     InstanceRef{Replica: 3, Instance: 3, Conf: 1},
 			Status:  StatusCommitted,
 			Seq:     4,
 			Deps:    rn.q.deps(),
-			Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("prior-r3"), ConflictKeys: [][]byte{key}},
+			Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("prior-r3"), Footprint: Footprint{Points: [][]byte{key}}},
 		},
 	}
 	for _, rec := range priors {
@@ -1973,7 +2008,7 @@ func TestConflictIndexIncludesKnownInstancesFromEveryReplica(t *testing.T) {
 		rn.installInstance(&instance{rec: rec, phase: phaseCommitted})
 	}
 
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("next"), ConflictKeys: [][]byte{key}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("next"), Footprint: Footprint{Points: [][]byte{key}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1991,11 +2026,11 @@ func TestRemainingDependencyAndStorageBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := Command{Kind: CommandConfChange}
+	cmd := Command{Footprint: Footprint{All: true}}
 	for _, rec := range []InstanceRecord{
-		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusNone, Command: Command{Payload: []byte("skip")}}),
-		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 4, Command: Command{Kind: CommandNoop}}),
-		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 3, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 5, Command: Command{Payload: []byte("dep")}}),
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Status: StatusNone, Kind: EntryCommand, Command: Command{Payload: []byte("skip")}}),
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 4, Kind: EntryNoop}),
+		checkedRecord(InstanceRecord{Ref: InstanceRef{Replica: 3, Instance: 1, Conf: 1}, Status: StatusCommitted, Seq: 5, Kind: EntryCommand, Command: Command{Payload: []byte("dep"), Footprint: Footprint{All: true}}}),
 	} {
 		rn.installInstance(&instance{rec: rec, phase: phaseFromStatus(rec.Status)})
 	}
@@ -2003,7 +2038,7 @@ func TestRemainingDependencyAndStorageBranches(t *testing.T) {
 	if attrs.Seq != 6 || attrs.Deps[2] != 1 {
 		t.Fatalf("conf attrs=%#v", attrs)
 	}
-	none := rn.computeAttrs(Command{Kind: CommandNoop}, InstanceRef{})
+	none := rn.computeAttrs(Command{}, InstanceRef{})
 	if none.Seq != 1 {
 		t.Fatal("noop attrs failed")
 	}
@@ -2034,7 +2069,7 @@ func TestFinalExecutionBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := InstanceRef{Replica: 1, Instance: 10, Conf: 1}
-	inst := &instance{rec: InstanceRecord{Ref: ref, Status: StatusPreAccepted, Seq: 1, Deps: single.q.deps(), Command: Command{Payload: []byte("one")}}, phase: phasePreAccept}
+	inst := &instance{rec: checkedRecord(InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusPreAccepted, Seq: 1, Deps: single.q.deps(), Kind: EntryCommand, Command: Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("one"), Footprint: Footprint{All: true}}}), phase: phasePreAccept}
 	single.instances[ref] = inst
 	single.startAccept(inst, inst.rec.Attributes())
 	if inst.rec.Status != StatusExecuted {
@@ -2048,9 +2083,9 @@ func TestFinalExecutionBranches(t *testing.T) {
 	a := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	b := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
 	c := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
-	rn.instances[a] = &instance{rec: InstanceRecord{Ref: a, Status: StatusCommitted, Seq: 3, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("a")}}}
-	rn.instances[b] = &instance{rec: InstanceRecord{Ref: b, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{0, 0, 1}, Command: Command{Payload: []byte("b")}}}
-	rn.instances[c] = &instance{rec: InstanceRecord{Ref: c, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Command: Command{Payload: []byte("c")}}}
+	rn.instances[a] = &instance{rec: checkedRecord(InstanceRecord{Ref: a, Ballot: Ballot{Replica: 1}, Status: StatusCommitted, Seq: 3, Deps: []InstanceNum{0, 1, 0}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("a"), Footprint: Footprint{All: true}}})}
+	rn.instances[b] = &instance{rec: checkedRecord(InstanceRecord{Ref: b, Ballot: Ballot{Replica: 2}, Status: StatusCommitted, Seq: 2, Deps: []InstanceNum{0, 0, 1}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 2, Sequence: 2}, Payload: []byte("b"), Footprint: Footprint{All: true}}})}
+	rn.instances[c] = &instance{rec: checkedRecord(InstanceRecord{Ref: c, Ballot: Ballot{Replica: 3}, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{1, 0, 0}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 2, Sequence: 3}, Payload: []byte("c"), Footprint: Footprint{All: true}}})}
 	view := rn.newExecutionView()
 	comps := rn.executionComponents(&view)
 	if len(comps) != 1 || len(comps[0]) != 3 {
@@ -2058,8 +2093,8 @@ func TestFinalExecutionBranches(t *testing.T) {
 	}
 	rn.tryExecute()
 	rd := rn.Ready()
-	if len(rd.Committed) != 3 || rd.Committed[0].Seq != 1 || rd.Committed[2].Seq != 3 {
-		t.Fatalf("SCC execution order = %#v", rd.Committed)
+	if len(rd.Apply) != 3 || rd.Apply[0].Seq != 1 || rd.Apply[2].Seq != 3 {
+		t.Fatalf("SCC execution order = %#v", rd.Apply)
 	}
 
 	rn2, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3)})
@@ -2068,8 +2103,8 @@ func TestFinalExecutionBranches(t *testing.T) {
 	}
 	x := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	y := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-	rn2.instances[x] = &instance{rec: InstanceRecord{Ref: x, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Command: Command{Payload: []byte("x")}}}
-	rn2.instances[y] = &instance{rec: InstanceRecord{Ref: y, Status: StatusCommitted, Seq: 1, Deps: rn2.q.deps(), Command: Command{Payload: []byte("y")}}}
+	rn2.instances[x] = &instance{rec: checkedRecord(InstanceRecord{Ref: x, Ballot: Ballot{Replica: 1}, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, 1, 0}, Kind: EntryCommand, Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{All: true}}})}
+	rn2.instances[y] = &instance{rec: checkedRecord(InstanceRecord{Ref: y, Ballot: Ballot{Replica: 2}, Status: StatusCommitted, Seq: 1, Deps: rn2.q.deps(), Kind: EntryCommand, Command: Command{ID: CommandID{Client: 3, Sequence: 2}, Payload: []byte("y"), Footprint: Footprint{All: true}}})}
 	view2 := rn2.newExecutionView()
 	var candidates []recoveryCandidate
 	if rn2.componentReady(&view2, []InstanceRef{x}, &candidates) {
@@ -2098,53 +2133,53 @@ func TestFinalExecutionBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conf.applyConfChange(InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command{Kind: CommandConfChange, Payload: []byte{99, 0, 0, 0, 0, 0, 0, 0, 0}})
-	conf.applyConfChange(InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeRemoveVoter), 1, 0, 0, 0, 0, 0, 0, 0}})
+	conf.applyConfChange(InstanceRef{Replica: 1, Instance: 1, Conf: 1}, ConfChange{Type: ConfChangeType(99)})
+	conf.applyConfChange(InstanceRef{Replica: 1, Instance: 2, Conf: 1}, ConfChange{Type: ConfChangeRemoveVoter, Replica: 1})
 	if conf.Status().Conf.Contains(0) {
 		t.Fatal("invalid configuration applied")
 	}
 }
 
-func TestApplyConfChangeRejectsInvalidCommittedPayloads(t *testing.T) {
+func TestApplyConfChangeRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name   string
 		voters []ReplicaID
-		cmd    Command
+		change ConfChange
 	}{
 		{
-			name:   "malformed payload",
+			name:   "malformed value",
 			voters: makeIDs(3),
-			cmd:    Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter), 4}},
+			change: ConfChange{Type: ConfChangeType(99)},
 		},
 		{
 			name:   "add zero",
 			voters: makeIDs(3),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 0}),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 0},
 		},
 		{
 			name:   "add existing voter",
 			voters: makeIDs(3),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 2},
 		},
 		{
 			name:   "add beyond seven voters",
 			voters: makeIDs(7),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 8}),
+			change: ConfChange{Type: ConfChangeAddVoter, Replica: 8},
 		},
 		{
 			name:   "remove absent voter",
 			voters: makeIDs(3),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 4}),
+			change: ConfChange{Type: ConfChangeRemoveVoter, Replica: 4},
 		},
 		{
 			name:   "remove only voter",
 			voters: makeIDs(1),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 1}),
+			change: ConfChange{Type: ConfChangeRemoveVoter, Replica: 1},
 		},
 		{
 			name:   "unknown type",
 			voters: makeIDs(3),
-			cmd:    confChangeCommand(ConfChange{Type: ConfChangeType(99), Replica: 2}),
+			change: ConfChange{Type: ConfChangeType(99), Replica: 2},
 		},
 	}
 
@@ -2157,10 +2192,10 @@ func TestApplyConfChangeRejectsInvalidCommittedPayloads(t *testing.T) {
 			before := rn.Status().Conf
 			rn.pendingConf = true
 
-			rn.applyConfChange(InstanceRef{Replica: 1, Instance: 1, Conf: 1}, tt.cmd)
+			rn.applyConfChange(InstanceRef{Replica: 1, Instance: 1, Conf: 1}, tt.change)
 
 			if rn.pendingConf {
-				t.Fatalf("applyConfChange(%#v) left pendingConf set", tt.cmd)
+				t.Fatalf("applyConfChange(%#v) left pendingConf set", tt.change)
 			}
 			assertConfState(t, rn.Status().Conf, before)
 		})
@@ -2173,13 +2208,13 @@ func TestReadyPersistsExecutedStateForRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 9, Sequence: 1}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("k")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 9, Sequence: 1}, Payload: []byte("value"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
-	if len(rd.Committed) != 1 || rd.Committed[0].Ref != ref || string(rd.Committed[0].Command.Payload) != "value" {
-		t.Fatalf("executed command not emitted in ready: %#v", rd.Committed)
+	if len(rd.Apply) != 1 || rd.Apply[0].Ref != ref || string(rd.Apply[0].Command.Payload) != "value" {
+		t.Fatalf("executed command not emitted in ready: %#v", rd.Apply)
 	}
 	if readyHasStatus(rd, ref, StatusExecuted) {
 		t.Fatalf("first ready persisted executed status before advance for %s: %#v", ref, rd.Records)
@@ -2189,7 +2224,7 @@ func TestReadyPersistsExecutedStateForRestart(t *testing.T) {
 	}
 	advanceOK(t, rn, rd)
 	executedReady := rn.Ready()
-	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+	if len(executedReady.Apply) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
 	}
 	if err := store.ApplyReady(executedReady); err != nil {
@@ -2228,7 +2263,7 @@ func TestRestartReplaysExecutedConfigurationChange(t *testing.T) {
 		Status:  StatusExecuted,
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 	})
 	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
 	if err != nil {
@@ -2241,7 +2276,7 @@ func TestRestartReplaysExecutedConfigurationChange(t *testing.T) {
 	if len(status.Executed) != 1 || status.Executed[0] != ref {
 		t.Fatalf("executed config ref was not retained: %#v", status.Executed)
 	}
-	next, err := restarted.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("after"), ConflictKeys: [][]byte{[]byte("after")}})
+	next, err := restarted.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("after"), Footprint: Footprint{Points: [][]byte{[]byte("after")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2258,7 +2293,8 @@ func TestNewRawNodeRejectsSemanticallyInvalidDurableRecords(t *testing.T) {
 		Status:       StatusPreAccepted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      Command{ID: CommandID{Client: 1, Sequence: 1}, ConflictKeys: [][]byte{[]byte("key")}},
+		Kind:         EntryCommand,
+		Command:      Command{ID: CommandID{Client: 1, Sequence: 1}, Footprint: Footprint{Points: [][]byte{[]byte("key")}}},
 	}
 	tests := []struct {
 		name   string
@@ -2268,17 +2304,16 @@ func TestNewRawNodeRejectsSemanticallyInvalidDurableRecords(t *testing.T) {
 		{name: "unknown configuration", mutate: func(rec *InstanceRecord) { rec.Ref.Conf = 99 }},
 		{name: "non-voter owner", mutate: func(rec *InstanceRecord) { rec.Ref.Replica = 4 }},
 		{name: "invalid status", mutate: func(rec *InstanceRecord) { rec.Status = Status(255) }},
-		{name: "invalid command kind", mutate: func(rec *InstanceRecord) { rec.Command.Kind = CommandKind(255) }},
-		{name: "short configuration command", mutate: func(rec *InstanceRecord) {
-			rec.Command = Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter)}}
+		{name: "invalid command kind", mutate: func(rec *InstanceRecord) { rec.Kind = EntryKind(255) }},
+		{name: "invalid configuration command replica", mutate: func(rec *InstanceRecord) {
+			rec.Kind = EntryConfChange
+			rec.Command = Command{}
+			rec.ConfChange = ConfChange{Type: ConfChangeAddVoter}
 		}},
 		{name: "unknown configuration command type", mutate: func(rec *InstanceRecord) {
-			rec.Command = Command{Kind: CommandConfChange, Payload: make([]byte, 9)}
-			rec.Command.Payload[0] = 255
-		}},
-		{name: "zero configuration command replica", mutate: func(rec *InstanceRecord) {
-			rec.Command = Command{Kind: CommandConfChange, Payload: make([]byte, 9)}
-			rec.Command.Payload[0] = byte(ConfChangeAddVoter)
+			rec.Kind = EntryConfChange
+			rec.Command = Command{}
+			rec.ConfChange = ConfChange{Type: ConfChangeType(255), Replica: 2}
 		}},
 		{name: "zero chosen sequence", mutate: func(rec *InstanceRecord) { rec.Seq = 0 }},
 		{name: "short dependencies", mutate: func(rec *InstanceRecord) { rec.Deps = rec.Deps[:2] }},
@@ -2320,7 +2355,7 @@ func TestNewRawNodeRejectsDuplicateDurableRecords(t *testing.T) {
 		Status:       StatusPreAccepted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      Command{ConflictKeys: [][]byte{[]byte("duplicate-record-key")}},
+		Command:      Command{Footprint: Footprint{Points: [][]byte{[]byte("duplicate-record-key")}}},
 	})
 	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: duplicateRecordStorage{rec: rec}}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("NewRawNode with duplicate durable records err=%v, want ErrInvalidConfig", err)
@@ -2334,9 +2369,8 @@ func TestPreparePromiseForKnownInstancePersistsAndRejectsStaleBallots(t *testing
 	}
 	ref := InstanceRef{Replica: 2, Instance: 10, Conf: 1}
 	promise := Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 2, Replica: 2}}
-	if err := rn.Step(promise); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(promise)); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if len(rd.Records) != 1 || rd.Records[0].Ref != ref || rd.Records[0].Status != StatusNone || rd.Records[0].Ballot != promise.Ballot {
 		t.Fatalf("promise record = %#v", rd.Records)
@@ -2351,9 +2385,8 @@ func TestPreparePromiseForKnownInstancePersistsAndRejectsStaleBallots(t *testing
 
 	stale := promise
 	stale.Ballot = Ballot{Number: 1, Replica: 2}
-	if err := rn.Step(stale); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(stale)); err != nil { t.Fatal(err)
+ }
 	rd = rn.Ready()
 	if len(rd.Messages) != 1 || rd.Messages[0].Type != MsgPrepareResp || !rd.Messages[0].Reject || rd.Messages[0].RejectHint != promise.Ballot {
 		t.Fatalf("stale prepare response = %#v", rd.Messages)
@@ -2374,7 +2407,7 @@ func TestValueMessageWithoutBallotCannotPoisonRestart(t *testing.T) {
 		Ref:     InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{ConflictKeys: [][]byte{[]byte("zero-ballot-poison")}},
+		Command: Command{Footprint: Footprint{Points: [][]byte{[]byte("zero-ballot-poison")}}},
 	})
 	if !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("zero-ballot PreAccept err=%v, want ErrInvalidMessage", err)
@@ -2387,12 +2420,13 @@ func TestValueMessageWithoutBallotCannotPoisonRestart(t *testing.T) {
 
 func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 	tests := []struct {
-		name    string
-		command Command
+		name   string
+		kind   EntryKind
+		change ConfChange
 	}{
-		{name: "short payload", command: Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter)}}},
-		{name: "invalid transition", command: confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2})},
-		{name: "unknown command kind", command: Command{Kind: CommandKind(255)}},
+		{name: "zero replica", kind: EntryConfChange, change: ConfChange{Type: ConfChangeAddVoter}},
+		{name: "invalid transition", kind: EntryConfChange, change: ConfChange{Type: ConfChangeAddVoter, Replica: 2}},
+		{name: "unknown command kind", kind: EntryKind(255)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2402,16 +2436,17 @@ func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := snapshotRemainingNodeProtocol(rn)
-			err = rn.Step(Message{
+			err = rn.Step(canonicalTestMessage(Message{
 				Type:    MsgPreAccept,
 				From:    1,
 				To:      2,
 				Ref:     InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 				Ballot:  Ballot{Replica: 1},
 				Seq:     1,
-				Deps:    []InstanceNum{0, 0, 0},
-				Command: tc.command,
-			})
+				Deps:       []InstanceNum{0, 0, 0},
+				Kind:       tc.kind,
+				ConfChange: tc.change,
+			}))
 			if !errors.Is(err, ErrInvalidMessage) {
 				t.Fatalf("Step malformed configuration command err=%v, want ErrInvalidMessage", err)
 			}
@@ -2432,7 +2467,7 @@ func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 	if _, err := rn.ProposeConfChange(ConfChange{Type: ConfChangeAddVoter, Replica: 4}); !errors.Is(err, ErrVoterCertificateRequired) {
 		t.Fatalf("legacy AddVoter at max configuration err=%v, want ErrVoterCertificateRequired", err)
 	}
-	err = rn.Step(Message{
+	err = rn.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    1,
 		To:      2,
@@ -2440,8 +2475,8 @@ func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
-	})
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
+	}))
 	if !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("max-configuration inbound command err=%v, want ErrInvalidMessage", err)
 	}
@@ -2454,7 +2489,7 @@ func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 		Status:           StatusExecuted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		ConfChangeResult: ConfChangeResult{Outcome: ConfChangeRejectedInvalid},
 	})
 	restarted, err := NewRawNode(Config{ID: 2, Voters: makeIDs(3), Storage: store})
@@ -2464,7 +2499,7 @@ func TestInvalidInboundConfigurationCommandsCannotPoisonRestart(t *testing.T) {
 	if got := restarted.instances[maxRef].rec.ConfChangeResult; got.Outcome != ConfChangeRejectedInvalid || !confStateIsZero(got.Conf) {
 		t.Fatalf("max-configuration durable result=%#v, want RejectedInvalid", got)
 	}
-	if rd := restarted.Ready(); len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 ||
+	if rd := restarted.Ready(); len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 ||
 		(!rd.HardState.Empty() && (!rd.HardState.Equal(restarted.currentHardState) || !rd.MustSync)) {
 		t.Fatalf("explicit max-configuration rejection produced migration payload Ready: %#v", rd)
 	}
@@ -2502,19 +2537,18 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 		RecordBallot: Ballot{Replica: 2},
 		Seq:          1,
 		Deps:         rn.q.deps(),
-		Command:      Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("chosen"), ConflictKeys: [][]byte{[]byte("k")}},
+		Command:      Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("chosen"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	}
-	if err := rn.Step(chosen); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(chosen)); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
-	if len(rd.Committed) != 1 || string(rd.Committed[0].Command.Payload) != "chosen" {
-		t.Fatalf("commit was not applied before accept retry: %#v", rd.Committed)
+	if len(rd.Apply) != 1 || string(rd.Apply[0].Command.Payload) != "chosen" {
+		t.Fatalf("commit was not applied before accept retry: %#v", rd.Apply)
 	}
 	advanceOK(t, rn, rd)
 
 	executedReady := rn.Ready()
-	if len(executedReady.Committed) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
+	if len(executedReady.Apply) != 0 || !readyHasStatus(executedReady, ref, StatusExecuted) {
 		t.Fatalf("executed ready for %s = %#v", ref, executedReady)
 	}
 	var fullRecord InstanceRecord
@@ -2540,11 +2574,10 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 		Ballot:  Ballot{Number: 9, Replica: 2},
 		Seq:     9,
 		Deps:    rn.q.deps(),
-		Command: Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("wrong"), ConflictKeys: [][]byte{[]byte("other")}},
+		Command: Command{ID: CommandID{Client: 1, Sequence: 2}, Payload: []byte("wrong"), Footprint: Footprint{Points: [][]byte{[]byte("other")}}},
 	}
-	if err := rn.Step(retry); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(retry)); err != nil { t.Fatal(err)
+ }
 	loadReady := rn.Ready()
 	if len(loadReady.RecordLoads) != 1 || loadReady.RecordLoads[0] != ref || len(loadReady.Messages) != 0 {
 		t.Fatalf("accept retry ready=%#v, want one record load and no message before restore", loadReady)
@@ -2554,8 +2587,8 @@ func TestAcceptForCommittedInstanceReturnsChosenCommand(t *testing.T) {
 	}
 	advanceOK(t, rn, loadReady)
 	rd = rn.Ready()
-	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
-		t.Fatalf("accept retry changed committed state: records=%#v committed=%#v", rd.Records, rd.Committed)
+	if len(rd.Records) != 0 || len(rd.Apply) != 0 {
+		t.Fatalf("accept retry changed committed state: records=%#v committed=%#v", rd.Records, rd.Apply)
 	}
 	if len(rd.Messages) != 1 {
 		t.Fatalf("accept retry response = %#v, want one chosen commit", rd.Messages)
@@ -2598,7 +2631,7 @@ func TestRestartRetransmitsLocalUncommittedInstances(t *testing.T) {
 				Status:  tt.st,
 				Seq:     1,
 				Deps:    []InstanceNum{0, 0, 0},
-				Command: Command{ID: CommandID{Client: 1, Sequence: uint64(tt.st)}, Payload: []byte(tt.name), ConflictKeys: [][]byte{[]byte(tt.name)}},
+				Command: Command{ID: CommandID{Client: 1, Sequence: uint64(tt.st)}, Payload: []byte(tt.name), Footprint: Footprint{Points: [][]byte{[]byte(tt.name)}}},
 			})
 			restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store, RetryTicks: 2, RecoveryTicks: 5})
 			if err != nil {
@@ -2661,10 +2694,9 @@ func TestLateLogicalPreAcceptIsConservative(t *testing.T) {
 	}
 
 	lateRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	late := processAtPreAccept(lateRef, 1, 2, 2, 3, Command{ID: CommandID{Client: 411, Sequence: 1}, Payload: []byte("late-logical"), ConflictKeys: [][]byte{[]byte("late-logical-key")}})
-	if err := rn.Step(late); err != nil {
-		t.Fatal(err)
-	}
+	late := processAtPreAccept(lateRef, 1, 2, 2, 3, Command{ID: CommandID{Client: 411, Sequence: 1}, Payload: []byte("late-logical"), Footprint: Footprint{Points: [][]byte{[]byte("late-logical-key")}}})
+	if err := rn.Step(canonicalTestMessage(late)); err != nil { t.Fatal(err)
+ }
 	rd := rn.Ready()
 	if len(rd.Records) != 1 || rd.Records[0].Ref != lateRef || rd.Records[0].FastPathEligible ||
 		len(rd.Messages) != 1 || rd.Messages[0].FastPathEligible {
@@ -2676,10 +2708,9 @@ func TestLateLogicalPreAcceptIsConservative(t *testing.T) {
 	advanceOK(t, rn, rd)
 
 	timelyRef := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
-	timely := processAtPreAccept(timelyRef, 3, 2, 3, 3, Command{ID: CommandID{Client: 412, Sequence: 1}, Payload: []byte("timely-logical"), ConflictKeys: [][]byte{[]byte("timely-logical-key")}})
-	if err := rn.Step(timely); err != nil {
-		t.Fatal(err)
-	}
+	timely := processAtPreAccept(timelyRef, 3, 2, 3, 3, Command{ID: CommandID{Client: 412, Sequence: 1}, Payload: []byte("timely-logical"), Footprint: Footprint{Points: [][]byte{[]byte("timely-logical-key")}}})
+	if err := rn.Step(canonicalTestMessage(timely)); err != nil { t.Fatal(err)
+ }
 	if rn.HasReady() {
 		t.Fatalf("future logical message produced Ready before Tick: %#v", rn.Ready())
 	}
@@ -2791,12 +2822,10 @@ func TestLogicalDeferredPoisonDoesNotBlockLaterDuePreAccept(t *testing.T) {
 			remainingApplyHardStateOnly(t, rn, 0)
 			first := processAtPreAccept(InstanceRef{Conf: 1, Replica: 1, Instance: 1}, 1, 2, 2, 3, optimizedTestCommand("poison-a", "poison-a-key"))
 			second := processAtPreAccept(InstanceRef{Conf: 1, Replica: 3, Instance: 1}, 3, 2, 2, 3, optimizedTestCommand("valid-b", "valid-b-key"))
-			if err := rn.Step(first); err != nil {
-				t.Fatal(err)
-			}
-			if err := rn.Step(second); err != nil {
-				t.Fatal(err)
-			}
+			if err := rn.Step(canonicalTestMessage(first)); err != nil { t.Fatal(err)
+ }
+			if err := rn.Step(canonicalTestMessage(second)); err != nil { t.Fatal(err)
+ }
 			firstEntry := rn.deferredIndex[deferredPreAcceptKey{domain: preAcceptLogical, ref: first.Ref, ballot: first.Ballot, from: first.From}]
 			if firstEntry == nil {
 				t.Fatal("first deferred entry missing after admission")
@@ -2839,9 +2868,8 @@ func TestProcessedLogicalPreAcceptRetryReacksPinnedTupleAfterLaterConflict(t *te
 	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	command := optimizedTestCommand("logical-retry", "logical-retry-key")
 	message := processAtPreAccept(ref, 1, 2, 2, 3, command)
-	if err := rn.Step(message); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(message)); err != nil { t.Fatal(err)
+ }
 	if err := rn.Tick(); err != nil {
 		t.Fatal(err)
 	}
@@ -2857,9 +2885,8 @@ func TestProcessedLogicalPreAcceptRetryReacksPinnedTupleAfterLaterConflict(t *te
 	conflictRef := InstanceRef{Conf: 1, Replica: 3, Instance: 1}
 	conflict := checkedRecord(InstanceRecord{Ref: conflictRef, Ballot: Ballot{Replica: 3}, RecordBallot: Ballot{Replica: 3}, Status: StatusCommitted, Seq: pinned.Seq + 10, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("later-conflict", "logical-retry-key"), ProcessAt: 3, TimingDomain: TimingDomainLogical})
 	rn.installInstance(&instance{rec: conflict, phase: phaseCommitted})
-	if err := rn.Step(message); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(message)); err != nil { t.Fatal(err)
+ }
 	if !instanceRecordEqual(rn.instances[ref].rec, pinned) {
 		t.Fatalf("exact logical retry changed pinned tuple: got=%#v want=%#v", rn.instances[ref].rec, pinned)
 	}
@@ -2884,9 +2911,8 @@ func TestTerminalFuturePreAcceptRetriesNeverEnterDeferredQueue(t *testing.T) {
 	rn.installInstance(inst)
 	message := processAtPreAccept(ref, 2, 1, 10, 3, command)
 	for retry := 0; retry < 32; retry++ {
-		if err := rn.Step(message); err != nil {
-			t.Fatalf("terminal future retry %d: %v", retry, err)
-		}
+		if err := rn.Step(canonicalTestMessage(message)); err != nil { t.Fatalf("terminal future retry %d: %v", retry, err)
+ }
 		if len(rn.deferredIndex) != 0 || len(rn.logicalPreAccepts) != 0 {
 			t.Fatalf("terminal future retry %d grew deferred queue: index=%d heap=%d", retry, len(rn.deferredIndex), len(rn.logicalPreAccepts))
 		}
@@ -2924,9 +2950,8 @@ func TestLogicalDeferredPoisonAtMaxStillDrainsIndependentDueTimer(t *testing.T) 
 	poisonRef := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
 	poisonCommand := optimizedTestCommand("max-poison", "max-poison-key")
 	message := processAtPreAccept(poisonRef, 1, 2, ^uint64(0), 3, poisonCommand)
-	if err := rn.Step(message); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(message)); err != nil { t.Fatal(err)
+ }
 	entry := rn.deferredIndex[deferredPreAcceptKey{domain: preAcceptLogical, ref: poisonRef, ballot: message.Ballot, from: message.From}]
 	poisonRec := checkedRecord(InstanceRecord{Ref: poisonRef, Ballot: Ballot{}, RecordBallot: message.Ballot, Status: StatusPreAccepted, Seq: 1, Deps: make([]InstanceNum, 3), Command: poisonCommand, ProcessAt: rn.tick, TimingDomain: TimingDomainLogical})
 	poison := &instance{rec: poisonRec, phase: phaseIdle, generation: ^uint64(0)}

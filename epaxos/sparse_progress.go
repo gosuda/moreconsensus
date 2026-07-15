@@ -1,6 +1,9 @@
 package epaxos
 
-import "sort"
+import (
+	"bytes"
+	"sort"
+)
 
 const (
 	defaultMaxDependencyRecoveriesPerDrive = 8
@@ -357,7 +360,13 @@ func (n *RawNode) executionComponents(view *executionView) [][]InstanceRef {
 					continue
 				}
 				dependencyInst := n.instances[dependency]
-				if dependencyInst == nil || dependencyInst.rec.Status < StatusCommitted || n.dependencyKnownAfter(frame.vertex, dependency, StatusCommitted) {
+				if dependencyInst == nil || dependencyInst.rec.Status < StatusCommitted {
+					continue
+				}
+				baseInst := n.instances[frame.vertex]
+				if n.dependencyKnownAfter(frame.vertex, dependency, StatusCommitted) &&
+					(baseInst == nil || baseInst.rec.Kind != EntryCheckpoint) &&
+					dependencyInst.rec.Kind != EntryCheckpoint {
 					continue
 				}
 				if _, seen := workspace.index[dependency]; !seen {
@@ -498,7 +507,7 @@ func (n *RawNode) hasUnresolvedKnownConflict(view *executionView, base InstanceR
 		if other == nil || other.rec.Status == StatusNone || other.rec.Status >= StatusCommitted {
 			continue
 		}
-		if !commandsConflict(inst.rec.Command, other.rec.Command) || n.dependencyKnownAfter(base, otherRef, StatusPreAccepted) {
+		if !recordsConflict(inst.rec, other.rec) || n.dependencyKnownAfter(base, otherRef, StatusPreAccepted) {
 			continue
 		}
 		blocked = true
@@ -654,7 +663,17 @@ func (n *RawNode) endDrive() {
 	}
 }
 
+func entryCycleKey(rec InstanceRecord) []byte {
+	if rec.Kind == EntryCommand {
+		return rec.Command.CycleKey
+	}
+	return nil
+}
+
 func (n *RawNode) tryExecute() {
+	if n.executionPaused {
+		return
+	}
 	ownedDrive := n.driveDepth == 0
 	if ownedDrive {
 		n.beginDrive()
@@ -670,14 +689,28 @@ func (n *RawNode) tryExecute() {
 			if !n.componentReady(&view, component, &workspace.candidates) {
 				continue
 			}
+			hasCheckpoint := false
+			for _, ref := range component {
+				if inst := n.instances[ref]; inst != nil && inst.rec.Kind == EntryCheckpoint {
+					hasCheckpoint = true
+					break
+				}
+			}
+			if hasCheckpoint && !n.checkpointComponentClosed(component) {
+				continue
+			}
 			sort.Slice(component, func(i, j int) bool {
 				left := n.instances[component[i]].rec
 				right := n.instances[component[j]].rec
 				if left.Seq != right.Seq {
 					return left.Seq < right.Seq
 				}
+				if cycleOrder := bytes.Compare(entryCycleKey(left), entryCycleKey(right)); cycleOrder != 0 {
+					return cycleOrder < 0
+				}
 				return lessRef(left.Ref, right.Ref)
 			})
+			var barrierRef InstanceRef
 			for _, ref := range component {
 				inst := n.instances[ref]
 				if inst == nil || n.executed.contains(ref) {
@@ -686,30 +719,37 @@ func (n *RawNode) tryExecute() {
 				n.executed.add(ref)
 				rec := inst.rec
 				rec.Status = StatusExecuted
-				switch rec.Command.Kind {
-				case CommandUser:
+				switch rec.Kind {
+				case EntryCommand:
 					rec.Checksum = ChecksumRecord(rec)
 					n.setInstanceRecord(inst, rec)
-					n.enqueueCommitted(CommittedCommand{Ref: ref, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: rec.Command.Clone()})
-				case CommandConfChange:
-					rec.ConfChangeResult = n.applyConfChange(ref, rec.Command)
-					rec.Checksum = ChecksumRecord(rec)
-					n.setInstanceRecord(inst, rec)
-					n.enqueueRecord(rec)
-				case CommandMembership:
-					rec.MembershipResult, rec.ConfChangeResult = n.applyMembershipControl(ref, rec.Command)
+					n.enqueueApply(ApplyCommand{Ref: ref, Seq: rec.Seq, Deps: append([]InstanceNum(nil), rec.Deps...), Command: rec.Command.Clone()})
+				case EntryConfChange:
+					rec.ConfChangeResult = n.applyConfChange(ref, rec.ConfChange)
 					rec.Checksum = ChecksumRecord(rec)
 					n.setInstanceRecord(inst, rec)
 					n.enqueueRecord(rec)
-				case CommandNoop:
-					fallthrough
-				default:
+				case EntryMembership:
+					rec.MembershipResult, rec.ConfChangeResult = n.applyMembershipControl(ref, rec.ProtocolControl)
+					rec.Checksum = ChecksumRecord(rec)
+					n.setInstanceRecord(inst, rec)
+					n.enqueueRecord(rec)
+				case EntryNoop, EntryCheckpoint:
 					rec.Checksum = ChecksumRecord(rec)
 					n.setInstanceRecord(inst, rec)
 					n.enqueueRecord(rec)
 				}
 				releaseInstanceVolatile(inst)
+				if rec.Kind == EntryCheckpoint {
+					barrierRef = ref
+				}
 				progress = true
+			}
+			if !barrierRef.IsZero() {
+				if barrier := n.instances[barrierRef]; barrier != nil {
+					n.beginCheckpoint(barrier.rec)
+				}
+				return
 			}
 		}
 		if progress {

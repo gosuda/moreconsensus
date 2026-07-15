@@ -121,14 +121,11 @@ func (o faultClientOperation) command() (Command, error) {
 	for i, key := range ordered {
 		conflicts[i] = []byte(key)
 	}
-	return Command{ID: o.commandID(), Payload: payload, ConflictKeys: conflicts}, nil
+	return Command{ID: o.commandID(), Payload: payload, Footprint: Footprint{Points: conflicts}}, nil
 }
 
 func faultDecodeOperation(cmd Command) (faultClientOperation, error) {
 	var op faultClientOperation
-	if cmd.Kind != CommandUser {
-		return op, fmt.Errorf("command kind %d is not a client operation", cmd.Kind)
-	}
 	dec := json.NewDecoder(bytes.NewReader(cmd.Payload))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&op); err != nil {
@@ -197,7 +194,7 @@ func faultCloneApplicationEvent(event faultApplicationEvent) faultApplicationEve
 	return out
 }
 
-func (a *faultApplicationImage) apply(committed []CommittedCommand) ([]faultApplicationEvent, error) {
+func (a *faultApplicationImage) apply(committed []ApplyCommand) ([]faultApplicationEvent, error) {
 	next := a.clone()
 	newEvents := make([]faultApplicationEvent, 0, len(committed))
 	for _, item := range committed {
@@ -208,7 +205,6 @@ func (a *faultApplicationImage) apply(committed []CommittedCommand) ([]faultAppl
 			continue
 		}
 		event := faultApplicationEvent{Ref: item.Ref, Command: item.Command.Clone()}
-		if item.Command.Kind == CommandUser {
 			op, err := faultDecodeOperation(item.Command)
 			if err != nil {
 				return nil, fmt.Errorf("decode committed operation %s: %w", item.Ref, err)
@@ -222,7 +218,6 @@ func (a *faultApplicationImage) apply(committed []CommittedCommand) ([]faultAppl
 			for _, key := range op.Deletes {
 				delete(next.State, key)
 			}
-		}
 		next.Applied[item.Ref] = event
 		next.Log = append(next.Log, event)
 		newEvents = append(newEvents, event)
@@ -420,7 +415,6 @@ func (h *faultSimHarness) newRawNode(id ReplicaID, store *MemoryStorage) (*RawNo
 			delays[voter] = 0
 		}
 		cfg.TOQ = true
-		cfg.TOQClock = func() uint64 { return h.clocks[id] }
 		cfg.TOQRuntime = &TOQRuntimeConfig{Conf: ConfState{ID: 1, Voters: append([]ReplicaID(nil), h.ids...)}, OneWayDelay: delays}
 	}
 	return NewRawNode(cfg)
@@ -533,7 +527,7 @@ func (h *faultSimHarness) execute(action faultSimAction, receipt *faultActionRec
 			return fmt.Errorf("TOQ node %d does not exist", action.Node)
 		}
 		receipt.Affected = 1
-		if err := r.node.ProcessTOQ(); err != nil {
+		if err := r.node.ProcessTOQ(h.clocks[action.Node]); err != nil {
 			receipt.Rejected = true
 			receipt.Reason = err.Error()
 			if errors.Is(err, ErrTOQClockRollback) {
@@ -583,6 +577,18 @@ func (h *faultSimHarness) executePropose(action faultSimAction, receipt *faultAc
 	cmd, err := op.command()
 	if err != nil {
 		return err
+	}
+	if h.cfg.TOQ {
+		if err := r.node.ProcessTOQ(h.clocks[action.Node]); err != nil {
+			receipt.Affected = 1
+			receipt.Rejected = true
+			receipt.Reason = err.Error()
+			if errors.Is(err, ErrTOQClockRollback) {
+				h.counters["clock-rollback-rejected"]++
+				return nil
+			}
+			return err
+		}
 	}
 	ref, err := r.node.Propose(cmd)
 	if err != nil {
@@ -642,7 +648,7 @@ func (h *faultSimHarness) executePump(receipt *faultActionReceipt) {
 			continue
 		}
 		newCommitted := 0
-		for _, item := range rd.Committed {
+		for _, item := range rd.Apply {
 			if _, exists := r.app.Applied[item.Ref]; !exists {
 				newCommitted++
 			}
@@ -664,7 +670,7 @@ func (h *faultSimHarness) executePump(receipt *faultActionReceipt) {
 			receipt.Affected++
 			continue
 		}
-		events, err := r.app.apply(rd.Committed)
+		events, err := r.app.apply(rd.Apply)
 		if err != nil {
 			rejected = append(rejected, fmt.Sprintf("node %d application: %v", id, err))
 			receipt.Affected++
@@ -715,9 +721,6 @@ func (h *faultSimHarness) enqueueWires(_ ReplicaID, messages []Message, wires []
 
 func (h *faultSimHarness) completeClientOperations(id ReplicaID, events []faultApplicationEvent) {
 	for _, event := range events {
-		if event.Command.Kind != CommandUser {
-			continue
-		}
 		index, ok := h.historyByID[event.Command.ID]
 		if !ok {
 			continue
@@ -806,12 +809,11 @@ func (h *faultSimHarness) executeDeliver(id uint64, receipt *faultActionReceipt)
 		h.counters["malformed"]++
 		return nil
 	}
-	if err := to.node.Step(message); err != nil {
-		receipt.Rejected = true
+	if err := to.node.Step(canonicalTestMessage(message)); err != nil { receipt.Rejected = true
 		receipt.Reason = err.Error()
 		h.counters["delivery-rejected"]++
 		return nil
-	}
+ }
 	return nil
 }
 
@@ -973,12 +975,11 @@ func (h *faultSimHarness) executeMalformed(action faultSimAction, receipt *fault
 		h.counters["malformed"]++
 		return nil
 	}
-	if err := h.replicas[action.Node].node.Step(message); err != nil {
-		receipt.Rejected = true
+	if err := h.replicas[action.Node].node.Step(canonicalTestMessage(message)); err != nil { receipt.Rejected = true
 		receipt.Reason = err.Error()
 		h.counters["malformed"]++
 		return nil
-	}
+ }
 	return errors.New("malformed injection was unexpectedly accepted")
 }
 
@@ -1033,7 +1034,7 @@ func (h *faultSimHarness) executeCrash(action faultSimAction, receipt *faultActi
 			if err := provideRecordLoadsFromStore(r.node, r.store, rd); err != nil {
 				return err
 			}
-			events, err := r.app.apply(rd.Committed)
+			events, err := r.app.apply(rd.Apply)
 			if err != nil {
 				return err
 			}
@@ -1064,7 +1065,7 @@ func (h *faultSimHarness) executeCrash(action faultSimAction, receipt *faultActi
 				if err := provideRecordLoadsFromStore(r.node, r.store, executed); err != nil {
 					return err
 				}
-				events, err := r.app.apply(executed.Committed)
+				events, err := r.app.apply(executed.Apply)
 				if err != nil {
 					return err
 				}
@@ -1119,6 +1120,18 @@ func (h *faultSimHarness) appliedOn(id ReplicaID, refs []InstanceRef) bool {
 	}
 	return true
 }
+func faultHarnessRecordStates(h *faultSimHarness) map[ReplicaID]map[InstanceRef]Status {
+	states := make(map[ReplicaID]map[InstanceRef]Status, len(h.replicas))
+	for id, replica := range h.replicas {
+		records := make(map[InstanceRef]Status, len(replica.store.Records))
+		for ref, record := range replica.store.Records {
+			records[ref] = record.Status
+		}
+		states[id] = records
+	}
+	return states
+}
+
 
 func (h *faultSimHarness) driveUntilApplied(refs []InstanceRef, nodes []ReplicaID, bound int) (int, error) {
 	if bound <= 0 {
@@ -1183,15 +1196,10 @@ func (h *faultSimHarness) recordFailClosed(name string, nodes []ReplicaID, refs 
 }
 
 func faultSameCommand(a, b Command) bool {
-	if a.ID != b.ID || a.Kind != b.Kind || !bytes.Equal(a.Payload, b.Payload) || len(a.ConflictKeys) != len(b.ConflictKeys) {
-		return false
-	}
-	for i := range a.ConflictKeys {
-		if !bytes.Equal(a.ConflictKeys[i], b.ConflictKeys[i]) {
-			return false
-		}
-	}
-	return true
+	return a.ID == b.ID &&
+		bytes.Equal(a.Payload, b.Payload) &&
+		footprintEqual(a.Footprint, b.Footprint) &&
+		bytes.Equal(a.CycleKey, b.CycleKey)
 }
 
 type faultTerminalRecord struct {

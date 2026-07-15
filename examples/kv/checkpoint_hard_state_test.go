@@ -1,7 +1,6 @@
 package kv
 
 import (
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -41,7 +40,7 @@ func TestCheckpointHardStateManifestRoundTrip(t *testing.T) {
 	defer func() { _ = checkpointDB.Close() }()
 	requirePebbleHardState(t, checkpointDB.EPaxosStorage(), hardState)
 	found := false
-	if err := checkpointDB.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := checkpointDB.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		if record.Ref == ref {
 			found = true
 		}
@@ -122,9 +121,6 @@ func TestVerifyCheckpointRejectsOmittedCausalConfigurationOutcome(t *testing.T) 
 		t.Fatal(err)
 	}
 	ref := epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	payload := make([]byte, 9)
-	payload[0] = byte(epaxos.ConfChangeAddVoter)
-	binary.LittleEndian.PutUint64(payload[1:], 2)
 	record := epaxos.InstanceRecord{
 		Ref:          ref,
 		Ballot:       epaxos.Ballot{Replica: 1},
@@ -132,7 +128,8 @@ func TestVerifyCheckpointRejectsOmittedCausalConfigurationOutcome(t *testing.T) 
 		Status:       epaxos.StatusExecuted,
 		Seq:          1,
 		Deps:         []epaxos.InstanceNum{0},
-		Command:      epaxos.Command{Kind: epaxos.CommandConfChange, Payload: payload},
+		Kind:          epaxos.EntryConfChange,
+		ConfChange:    epaxos.ConfChange{Type: epaxos.ConfChangeAddVoter, Replica: 2},
 		ConfChangeResult: epaxos.ConfChangeResult{
 			Outcome: epaxos.ConfChangeApplied,
 			Conf:    epaxos.ConfState{ID: 2, Voters: []epaxos.ReplicaID{1, 2}},
@@ -372,7 +369,7 @@ func TestCheckpointRestoreAndRepairPreserveHardStateAndRecords(t *testing.T) {
 			defer func() { _ = db.Close() }()
 			requirePebbleHardState(t, db.EPaxosStorage(), hardState)
 			found := false
-			if err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+			if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 				found = found || record.Ref == ref
 				return nil
 			}); err != nil {
@@ -403,7 +400,7 @@ func newCheckpointHardStateFixture(t *testing.T) (string, string, epaxos.HardSta
 	if err := db.ApplyReady(epaxos.Ready{
 		HardState: hardState,
 		Records:   []epaxos.InstanceRecord{record},
-		Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
+		Apply: []epaxos.ApplyCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
 		MustSync:  true,
 	}); err != nil {
 		_ = db.Close()

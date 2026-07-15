@@ -27,6 +27,12 @@ const (
 	MsgEvidence
 	// MsgEvidenceResp answers MsgEvidence with the local record, if any.
 	MsgEvidenceResp
+	// MsgCheckpointVote attests a durably prepared checkpoint descriptor.
+	MsgCheckpointVote
+	// MsgCheckpointCertificate announces a slow-quorum checkpoint certificate.
+	MsgCheckpointCertificate
+	// MsgCheckpointOffer offers certified snapshot metadata to a lagging replica.
+	MsgCheckpointOffer
 )
 
 // String returns a stable message type name.
@@ -54,6 +60,12 @@ func (t MessageType) String() string {
 		return "evidence"
 	case MsgEvidenceResp:
 		return "evidence-resp"
+	case MsgCheckpointVote:
+		return "checkpoint-vote"
+	case MsgCheckpointCertificate:
+		return "checkpoint-certificate"
+	case MsgCheckpointOffer:
+		return "checkpoint-offer"
 	default:
 		return "unknown"
 	}
@@ -157,10 +169,12 @@ func mergeAcceptEvidenceEntries(dst, src []AcceptEvidence) []AcceptEvidence {
 
 // Message is the wire-level EPaxos transport value.
 type Message struct {
-	Type MessageType
-	From ReplicaID
-	To   ReplicaID
-	Ref  InstanceRef
+	Type            MessageType
+	From            ReplicaID
+	To              ReplicaID
+	FromIncarnation uint64
+	ToIncarnation   uint64
+	Ref             InstanceRef
 	// ProcessAt is pinned by the instance owner. Its clock domain is encoded
 	// by ProcessAt together with TOQ and is authenticated by the checksum.
 	ProcessAt uint64
@@ -180,6 +194,9 @@ type Message struct {
 	AcceptDeps       []InstanceNum
 	AcceptEvidence   []AcceptEvidence
 	IgnoreDependency TryPreAcceptIgnore
+	Kind             EntryKind
+	ConfChange       ConfChange
+	ProtocolControl  []byte
 	Command          Command
 	Reject           bool
 	RejectReason     RejectReason
@@ -206,10 +223,12 @@ func (m Message) CloneInto(dst *Message) {
 	acceptEvidence := cloneAcceptEvidenceInto(dst.AcceptEvidence, m.AcceptEvidence)
 	command := dst.Command
 	m.Command.CloneInto(&command)
+	control := cloneSliceInto(dst.ProtocolControl, m.ProtocolControl)
 	*dst = m
 	dst.Deps = deps
 	dst.AcceptDeps = acceptDeps
 	dst.AcceptEvidence = acceptEvidence
+	dst.ProtocolControl = control
 	dst.Command = command
 }
 
@@ -237,7 +256,7 @@ func (m Message) AcceptAttributes() (Attributes, bool) {
 
 // Validate checks basic envelope constraints against the supplied configuration.
 func (m Message) Validate(conf ConfState) error {
-	if m.Type < MsgPreAccept || m.Type > MsgEvidenceResp {
+	if m.Type < MsgPreAccept || m.Type > MsgCheckpointOffer {
 		return ErrInvalidMessage
 	}
 	if len(conf.Voters) == 0 || len(conf.Voters) > 7 {
@@ -261,13 +280,16 @@ func (m Message) Validate(conf ConfState) error {
 	if !conf.Contains(m.From) || !conf.Contains(m.To) || !conf.Contains(m.Ref.Replica) {
 		return ErrMessageRejected
 	}
-	if m.Command.Kind > CommandMembership ||
+	if m.Kind > EntryCheckpoint ||
 		m.RecordStatus > StatusExecuted ||
 		m.ConflictStatus > StatusExecuted ||
 		m.RejectReason > RejectAcceptedTarget {
 		return ErrInvalidMessage
 	}
-	if m.Command.Kind == CommandNoop && (m.ProcessAt != 0 || m.TOQ) {
+	if !entryValueCanonical(m.Kind, m.Command, m.ConfChange, m.ProtocolControl) {
+		return ErrInvalidMessage
+	}
+	if m.Kind == EntryNoop && (m.ProcessAt != 0 || m.TOQ) {
 		return ErrInvalidMessage
 	}
 	validBallot := func(ballot Ballot) bool {
@@ -282,6 +304,9 @@ func (m Message) Validate(conf ConfState) error {
 	if m.Ballot == (Ballot{}) {
 		return ErrInvalidMessage
 	}
+	if m.Type == MsgCheckpointVote || m.Type == MsgCheckpointCertificate || m.Type == MsgCheckpointOffer {
+		return validateCheckpointControlMessage(m)
+	}
 	switch m.Type {
 	case MsgPreAccept:
 		if m.Ballot.IsInitialFor(m.Ref.Replica) {
@@ -295,7 +320,8 @@ func (m Message) Validate(conf ConfState) error {
 		if m.From != m.Ballot.Replica {
 			return ErrInvalidMessage
 		}
-	case MsgPreAcceptResp, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp:
+	case MsgPreAcceptResp, MsgAcceptResp, MsgCommit, MsgPrepareResp, MsgTryPreAcceptResp, MsgEvidenceResp,
+		MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 	}
 	validRef := func(ref InstanceRef) bool {
 		return ref.Replica != 0 && ref.Instance != 0 && ref.Conf == conf.ID && conf.Contains(ref.Replica)
@@ -371,7 +397,8 @@ func (m Message) Validate(conf ConfState) error {
 				if !m.Reject || m.RejectReason != RejectAcceptedTarget {
 					return ErrInvalidMessage
 				}
-			case MsgPreAccept, MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence:
+			case MsgPreAccept, MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence,
+				MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 				fallthrough
 			default:
 				return ErrInvalidMessage
@@ -409,7 +436,7 @@ func (m Message) Validate(conf ConfState) error {
 			if m.RecordStatus >= StatusPreAccepted && m.Seq == 0 {
 				return ErrInvalidMessage
 			}
-		case MsgAcceptResp, MsgPrepare, MsgEvidence:
+		case MsgAcceptResp, MsgPrepare, MsgEvidence, MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		}
 	}
 	if (m.AcceptSeq == 0) != (len(m.AcceptDeps) == 0) {
@@ -428,7 +455,8 @@ func (m Message) Validate(conf ConfState) error {
 			if !m.Reject || m.RejectReason != RejectAcceptedTarget {
 				return ErrInvalidMessage
 			}
-		case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+		case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 			fallthrough
 		default:
 			return ErrInvalidMessage
@@ -460,7 +488,8 @@ func (m Message) Validate(conf ConfState) error {
 		if hasAcceptMetadata && (!m.Reject || m.RejectReason != RejectAcceptedTarget) {
 			return ErrInvalidMessage
 		}
-	case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence:
+	case MsgPreAccept, MsgPreAcceptResp, MsgPrepare, MsgTryPreAccept, MsgEvidence,
+		MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		fallthrough
 	default:
 		if hasAcceptMetadata {
@@ -475,7 +504,8 @@ func (m Message) Validate(conf ConfState) error {
 	if m.ProcessAt != 0 {
 		switch m.Type {
 		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidenceResp:
-		case MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence:
+		case MsgPreAcceptResp, MsgAcceptResp, MsgPrepare, MsgEvidence,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 			fallthrough
 		default:
 			return ErrInvalidMessage
@@ -493,7 +523,8 @@ func (m Message) Validate(conf ConfState) error {
 				m.RecordBallot != (Ballot{Replica: m.Ref.Replica}) {
 				return ErrInvalidMessage
 			}
-		case MsgPreAccept, MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
+		case MsgPreAccept, MsgAccept, MsgAcceptResp, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 			fallthrough
 		default:
 			return ErrInvalidMessage
@@ -502,10 +533,8 @@ func (m Message) Validate(conf ConfState) error {
 	if m.DepsCommitted != 0 && (m.Type != MsgPreAcceptResp || m.Reject || m.RecordStatus != StatusNone) {
 		return ErrInvalidMessage
 	}
-	commandEmpty := m.Command.ID == (CommandID{}) &&
-		m.Command.Kind == CommandUser &&
-		len(m.Command.Payload) == 0 &&
-		len(m.Command.ConflictKeys) == 0
+	commandEmpty := m.Kind == 0 && commandEmpty(m.Command) &&
+		m.ConfChange == (ConfChange{}) && len(m.ProtocolControl) == 0
 	depsAllZero := func() bool {
 		for _, dep := range m.Deps {
 			if dep != 0 {
@@ -565,7 +594,8 @@ func (m Message) Validate(conf ConfState) error {
 			default:
 				return ErrInvalidMessage
 			}
-		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence, MsgEvidenceResp:
+		case MsgPreAccept, MsgAccept, MsgCommit, MsgPrepare, MsgTryPreAccept, MsgEvidence, MsgEvidenceResp,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 			fallthrough
 		default:
 			return ErrInvalidMessage
@@ -667,6 +697,8 @@ func (m Message) Validate(conf ConfState) error {
 		} else if m.RecordBallot == (Ballot{}) || m.Seq == 0 {
 			return ErrInvalidMessage
 		}
+	case MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
+		return validateCheckpointControlMessage(m)
 	}
 	if m.DepsCommitted>>uint(len(conf.Voters)) != 0 || (m.DepsCommitted != 0 && m.Type != MsgPreAcceptResp) {
 		return ErrInvalidMessage

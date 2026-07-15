@@ -19,7 +19,7 @@ func protocolCoverageAdvanceHardStateOnly(t *testing.T, rn *RawNode, wantTick ui
 	rd := rn.Ready()
 	want := HardState{Conf: rn.Status().Conf, Tick: wantTick}
 	if !rd.HardState.Equal(want) || !rd.MustSync ||
-		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("hard-state-only Ready = %#v, want %#v without protocol payload", rd, want)
 	}
 	advanceOK(t, rn, rd)
@@ -41,6 +41,7 @@ func TestEncodeMessagePreservesFastPathEligibilityWireMarker(t *testing.T) {
 				Ballot:  Ballot{Number: 1, Replica: 1},
 				Seq:     3,
 				Deps:    []InstanceNum{0, 2, 0},
+				Kind:    EntryCommand,
 				Command: optimizedTestCommand("try-encode", "try-encode-key"), FastPathEligible: tt.fast,
 				DepsCommitted: 0b101}
 			encoded, err := EncodeMessage(nil, msg)
@@ -78,7 +79,7 @@ func TestPrepareExpandsStoredDependencyVectorBeforeResponding(t *testing.T) {
 	})
 	rn.instances[ref] = &instance{rec: rec, phase: phasePreAccept}
 
-	if err := rn.Step(Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Ballot: rec.Ballot}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 1, To: 2, Ref: ref, Ballot: rec.Ballot})); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -122,7 +123,7 @@ func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 		cmd := optimizedTestCommand("already-committed", "already-committed-key")
 		optimizedSeedRecord(t, rn, InstanceRecord{Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusCommitted, Seq: 2, Deps: rn.q.deps(), Command: cmd})
 
-		if err := rn.Step(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 2, Deps: rn.q.deps(), Command: cmd}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 2, Deps: rn.q.deps(), Command: cmd})); err != nil {
 			t.Fatal(err)
 		}
 		rd := rn.Ready()
@@ -147,7 +148,7 @@ func TestTryPreAcceptCommittedAndIdempotentFollowerPaths(t *testing.T) {
 		attrs := Attributes{Seq: 3, Deps: []InstanceNum{0, 1, 0}}
 		optimizedSeedRecord(t, rn, InstanceRecord{Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd})
 
-		if err := rn.Step(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: attrs.Seq, Deps: attrs.Deps, Command: cmd})); err != nil {
 			t.Fatal(err)
 		}
 		rd := rn.Ready()
@@ -172,7 +173,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: hint, Reject: true, RejectReason: RejectStaleBallot, RejectHint: hint, Deps: rn.q.deps()}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: hint, Reject: true, RejectReason: RejectStaleBallot, RejectHint: hint, Deps: rn.q.deps()})); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phasePrepare || inst.rec.Ballot != want {
@@ -189,7 +190,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 	t.Run("committed conflict falls back to slow accept", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
 		conflictRef := InstanceRef{Replica: 2, Instance: 1, Conf: 1}
-		if err := rn.Step(Message{
+		if err := rn.Step(canonicalTestMessage(Message{
 			Type:           MsgTryPreAcceptResp,
 			From:           2,
 			To:             1,
@@ -200,7 +201,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 			RejectReason:   RejectCommittedConflict,
 			ConflictRef:    conflictRef,
 			ConflictStatus: StatusCommitted,
-		}); err != nil {
+		})); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phaseAccept || inst.rec.Status != StatusAccepted || inst.rec.FastPathEligible {
@@ -217,7 +218,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 
 	t.Run("older ballot response is ignored", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 3)
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 2, Replica: 1}, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 2, Replica: 1}, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted})); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 0 {
@@ -231,7 +232,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 	t.Run("nil vote set records first response without quorum", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
 		inst.tryOK = 0
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted})); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 1 {
@@ -248,7 +249,7 @@ func TestTryPreAcceptResponseRecoveryBranches(t *testing.T) {
 	t.Run("duplicate response does not count twice", func(t *testing.T) {
 		rn, inst, ref := protocolTryInstance(t, 3, 1)
 		inst.tryOK = testVoterMask(t, rn.q.conf, 2)
-		if err := rn.Step(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted}); err != nil {
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: inst.rec.Deps, RecordStatus: StatusPreAccepted})); err != nil {
 			t.Fatal(err)
 		}
 		if inst.phase != phaseTryPreAccept || inst.tryOK.len() != 1 {
@@ -278,13 +279,13 @@ func TestPreAcceptRespAllocatesNilVoteMapAndRecordsResponse(t *testing.T) {
 
 	respDeps := []InstanceNum{0, 1, 0}
 	const depsCommitted uint64 = 0b101
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 2,
 		To:     1,
 		Ref:    ref,
 		Ballot: rec.Ballot,
 		Seq:    4,
 		Deps:   respDeps, FastPathEligible: true,
-		DepsCommitted: depsCommitted}); err != nil {
+		DepsCommitted: depsCommitted})); err != nil {
 		t.Fatal(err)
 	}
 	if inst.preOK == nil {
@@ -322,7 +323,7 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 	})
 	rn.instances[conflictRef] = &instance{rec: conflict, phase: phaseCommitted}
 
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:           MsgTryPreAcceptResp,
 		From:           2,
 		To:             1,
@@ -333,7 +334,7 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 		ConflictRef:    conflictRef,
 		ConflictStatus: StatusCommitted,
 		Deps:           rn.q.deps(),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,8 +355,8 @@ func TestTryPreAcceptCommittedConflictRejectionAddsSlowAcceptDependency(t *testi
 			t.Fatalf("committed-conflict slow accept message to %d = %#v, want canonical seq %d deps %v", to, msg, wantSeq, wantDeps)
 		}
 	}
-	if len(rd.Committed) != 0 {
-		t.Fatalf("committed-conflict slow accept emitted committed commands: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("committed-conflict slow accept emitted committed commands: %#v", rd.Apply)
 	}
 }
 
@@ -377,7 +378,7 @@ func TestPrepareResponsePreservesOriginalAcceptEvidenceSender(t *testing.T) {
 	})
 	rn.instances[ref] = &instance{rec: rec, phase: phaseAccept}
 
-	if err := rn.Step(Message{Type: MsgPrepare, From: 1, To: reporter, Ref: ref, Ballot: rec.Ballot}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPrepare, From: 1, To: reporter, Ref: ref, Ballot: rec.Ballot})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -412,7 +413,7 @@ func TestLegacyAggregateAcceptDepsCannotAuthorizeTryPreAcceptIgnoreMarker(t *tes
 
 	targetDeps := rn.q.deps()
 	targetDeps[1] = conflictRef.Instance
-	if err := rn.Step(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: targetRef, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: targetDeps, Command: optimizedTestCommand("target", key)}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAccept, From: 1, To: 2, Ref: targetRef, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: targetDeps, Command: optimizedTestCommand("target", key)})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -477,7 +478,7 @@ func TestTryPreAcceptTimerRebroadcastsOnlyWhileInTryPhase(t *testing.T) {
 			t.Fatalf("TryPreAccept timer message to %d = %#v, want canonical non-fast recovery tuple %#v", to, msg, inst.rec)
 		}
 	}
-	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("TryPreAccept timer emitted durable/application effects: %#v", rd)
 	}
 }
@@ -522,7 +523,7 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 		}
 	}
 	optimizedRequireNoMessageType(t, rd.Messages, MsgAccept)
-	if len(rd.Records) != 0 || len(rd.Committed) != 0 || rd.MustSync {
+	if len(rd.Records) != 0 || len(rd.Apply) != 0 || rd.MustSync {
 		t.Fatalf("TryPreAccept timer retry emitted durable/application effects: %#v", rd)
 	}
 	advanceOK(t, rn, rd)
@@ -551,7 +552,7 @@ func TestTryPreAcceptTimerDropsStaleEvidenceChecksBeforeRetry(t *testing.T) {
 	}
 	optimizedRequireNoMessageType(t, retry.Messages, MsgAccept)
 	if !retry.HardState.Equal(HardState{Conf: rn.Status().Conf, Tick: rn.tick}) ||
-		len(retry.Records) != 0 || len(retry.Committed) != 0 || !retry.MustSync {
+		len(retry.Records) != 0 || len(retry.Apply) != 0 || !retry.MustSync {
 		t.Fatalf("rescheduled TryPreAccept retry did not carry only tick durability plus messages: %#v", retry)
 	}
 }
@@ -623,6 +624,7 @@ func TestSenderPreservingEvidenceValidationAndMergeContracts(t *testing.T) {
 		RecordStatus:   StatusCommitted,
 		Seq:            3,
 		Deps:           append([]InstanceNum(nil), deps...),
+		Kind:           EntryCommand,
 		Command:        optimizedTestCommand("evidence-value", "evidence-key"),
 		AcceptEvidence: []AcceptEvidence{{Sender: 2, Seq: 4, Deps: append([]InstanceNum(nil), deps...)}},
 	}
@@ -760,17 +762,17 @@ func TestMessageValidateRejectsSemanticMalleability(t *testing.T) {
 	deps := []InstanceNum{0, 0, 0}
 	command := optimizedTestCommand("semantic-message", "semantic-message-key")
 	valid := map[MessageType]Message{
-		MsgPreAccept:        {Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgPreAccept:        {Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Kind: EntryCommand, Command: command},
 		MsgPreAcceptResp:    {Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps},
-		MsgAccept:           {Type: MsgAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgAccept:           {Type: MsgAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Kind: EntryCommand, Command: command},
 		MsgAcceptResp:       {Type: MsgAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: deps, RecordStatus: StatusAccepted},
-		MsgCommit:           {Type: MsgCommit, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgCommit:           {Type: MsgCommit, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: deps, Kind: EntryCommand, Command: command},
 		MsgPrepare:          {Type: MsgPrepare, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}},
 		MsgPrepareResp:      {Type: MsgPrepareResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Deps: deps, RecordStatus: StatusNone},
-		MsgTryPreAccept:     {Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: deps, Command: command},
+		MsgTryPreAccept:     {Type: MsgTryPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: deps, Kind: EntryCommand, Command: command},
 		MsgTryPreAcceptResp: {Type: MsgTryPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}, Seq: 1, Deps: deps, RecordStatus: StatusPreAccepted},
 		MsgEvidence:         {Type: MsgEvidence, From: 1, To: 2, Ref: ref, ConflictRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Number: 1, Replica: 1}},
-		MsgEvidenceResp:     {Type: MsgEvidenceResp, From: 2, To: 1, Ref: ref, ConflictRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Number: 1, Replica: 1}, RecordBallot: Ballot{Number: 2, Replica: 2}, Seq: 1, Deps: deps, Command: command, RecordStatus: StatusCommitted},
+		MsgEvidenceResp:     {Type: MsgEvidenceResp, From: 2, To: 1, Ref: ref, ConflictRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Number: 1, Replica: 1}, RecordBallot: Ballot{Number: 2, Replica: 2}, Seq: 1, Deps: deps, Kind: EntryCommand, Command: command, RecordStatus: StatusCommitted},
 	}
 	for typ := MsgPreAccept; typ <= MsgEvidenceResp; typ++ {
 		msg, ok := valid[typ]
@@ -810,7 +812,7 @@ func TestMessageValidateRejectsSemanticMalleability(t *testing.T) {
 		}(), want: ErrInvalidMessage},
 		{name: "invalid record status", msg: func() Message { msg := base; msg.RecordStatus = Status(255); return msg }(), want: ErrInvalidMessage},
 		{name: "invalid conflict status", msg: func() Message { msg := base; msg.ConflictStatus = Status(255); return msg }(), want: ErrInvalidMessage},
-		{name: "invalid command kind", msg: func() Message { msg := base; msg.Command.Kind = CommandKind(255); return msg }(), want: ErrInvalidMessage},
+		{name: "invalid command kind", msg: func() Message { msg := base; msg.Kind = EntryKind(255); return msg }(), want: ErrInvalidMessage},
 		{name: "zero commit sequence", msg: func() Message { msg := base; msg.Seq = 0; return msg }(), want: ErrInvalidMessage},
 		{name: "partial conflict reference", msg: func() Message {
 			msg := valid[MsgEvidence]
@@ -848,6 +850,7 @@ func TestMessageValidateHotPathAllocatesZero(t *testing.T) {
 		RecordStatus: StatusCommitted,
 		Seq:          2,
 		Deps:         []InstanceNum{0, 1, 0},
+		Kind:         EntryCommand,
 		Command:      optimizedTestCommand("validation-allocation", "validation-allocation-key"),
 		AcceptEvidence: []AcceptEvidence{{
 			Sender: 2,
@@ -922,14 +925,14 @@ func TestCodecRejectsMalformedSenderEvidenceWireFrames(t *testing.T) {
 	}{
 		{name: "too many evidence entries", frame: protocolMalformedEvidenceFrame(maxWireAcceptEvidence+1, 0, 0)},
 		{name: "too many evidence deps", frame: protocolMalformedEvidenceFrame(1, maxWireDeps+1, 0)},
-		{name: "too many command conflict keys after evidence", frame: protocolMalformedEvidenceFrame(0, 0, maxWireConflictKeys+1)},
+		{name: "too many command conflict keys after evidence", frame: protocolMalformedEvidenceFrame(0, 0, maxWireFootprintPoints+1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out Message
 			if err := DecodeMessage(tc.frame, &out); !errors.Is(err, ErrInvalidMessage) {
 				t.Fatalf("DecodeMessage err=%v, want %v", err, ErrInvalidMessage)
 			}
-			if out.Type != 0 || len(out.AcceptEvidence) != 0 || len(out.Command.ConflictKeys) != 0 {
+			if out.Type != 0 || len(out.AcceptEvidence) != 0 || len(out.Command.Footprint.Points) != 0 {
 				t.Fatalf("decode failure retained stale data: %#v", out)
 			}
 		})
@@ -985,7 +988,7 @@ func TestEvidenceRequestIsReadOnlyAndPreservesSenderEvidence(t *testing.T) {
 	})
 	rn.instances[ref] = &instance{rec: rec, phase: phaseCommitted}
 
-	if err := rn.Step(Message{Type: MsgEvidence, From: 1, To: 2, Ref: ref, ConflictRef: target, Ballot: Ballot{Number: 2, Replica: 1}}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgEvidence, From: 1, To: 2, Ref: ref, ConflictRef: target, Ballot: Ballot{Number: 2, Replica: 1}})); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -999,7 +1002,7 @@ func TestEvidenceRequestIsReadOnlyAndPreservesSenderEvidence(t *testing.T) {
 	if len(resp.AcceptEvidence) != 1 || resp.AcceptEvidence[0].Sender != 3 || !instanceNumsEqual(resp.AcceptEvidence[0].Deps, acceptDeps) {
 		t.Fatalf("evidence response rewrote sender-preserving AcceptEvidence: %#v", resp.AcceptEvidence)
 	}
-	if len(rd.Records) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("read-only MsgEvidence emitted durable or application effects: %#v", rd)
 	}
 	if got := rn.instances[ref].rec.Deps; len(got) != 1 || got[0] != 7 {
@@ -1018,7 +1021,7 @@ func TestEvidenceRequestIsReadOnlyAndPreservesSenderEvidence(t *testing.T) {
 		TOQPending: true,
 	})
 	rn.instances[pendingRef] = &instance{rec: pending, phase: phasePreAccept}
-	if err := rn.Step(Message{Type: MsgEvidence, From: 1, To: 2, Ref: pendingRef, ConflictRef: target, Ballot: Ballot{Number: 2, Replica: 1}}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgEvidence, From: 1, To: 2, Ref: pendingRef, ConflictRef: target, Ballot: Ballot{Number: 2, Replica: 1}})); err != nil {
 		t.Fatal(err)
 	}
 	pendingResp := optimizedRequireMessage(t, rn.Ready().Messages, MsgEvidenceResp, 1)
@@ -1040,7 +1043,7 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 	rn.tryEvidenceChecks = map[tryEvidenceKey]map[ReplicaID]InstanceRecord{key: records}
 
 	mismatched := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: InstanceRef{Replica: 3, Instance: 7, Conf: 1}, ConflictRef: target, Ballot: ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
-	if err := rn.Step(mismatched); err != nil {
+	if err := rn.Step(canonicalTestMessage(mismatched)); err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 0 {
@@ -1048,7 +1051,7 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 	}
 
 	valid := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Ballot: ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
-	if err := rn.Step(valid); err != nil {
+	if err := rn.Step(canonicalTestMessage(valid)); err != nil {
 		t.Fatal(err)
 	}
 	if got := records[2]; got.Ref != conflict || got.Status != StatusNone {
@@ -1059,7 +1062,7 @@ func TestEvidenceResponsesIgnoreStaleMismatchedAndDuplicateSenders(t *testing.T)
 	duplicate.RecordStatus = StatusCommitted
 	duplicate.RecordBallot = Ballot{Number: 1, Replica: 2}
 	duplicate.Command = optimizedTestCommand("duplicate", "evidence-response-key")
-	if err := rn.Step(duplicate); err != nil {
+	if err := rn.Step(canonicalTestMessage(duplicate)); err != nil {
 		t.Fatal(err)
 	}
 	if got := records[2]; got.Seq != 0 || got.Status != StatusNone {
@@ -1119,7 +1122,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 	oldKey := tryEvidenceKey{target: target, conflict: conflict, ballot: oldBallot.Ballot}
 	oldRecords := make(map[ReplicaID]InstanceRecord)
 	rn.tryEvidenceChecks[oldKey] = oldRecords
-	if err := rn.Step(oldBallot); err != nil {
+	if err := rn.Step(canonicalTestMessage(oldBallot)); err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 0 || len(oldRecords) != 0 || inst.phase != phaseTryPreAccept {
@@ -1133,7 +1136,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 	}
 
 	stale := Message{Type: MsgEvidenceResp, From: 2, To: 1, Ref: conflict, ConflictRef: target, Ballot: inst.rec.Ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
-	if err := rn.Step(stale); err != nil {
+	if err := rn.Step(canonicalTestMessage(stale)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1146,7 +1149,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 	fresh.AcceptSeq = oldBallot.AcceptSeq
 	fresh.AcceptDeps = evidenceDeps
 	fresh.AcceptEvidence = []AcceptEvidence{{Sender: 2, Seq: 5, Deps: evidenceDeps}}
-	if err := rn.Step(fresh); err != nil {
+	if err := rn.Step(canonicalTestMessage(fresh)); err != nil {
 		t.Fatal(err)
 	}
 	if got := records[2]; got.Status != StatusNone || got.Seq != 0 {
@@ -1154,7 +1157,7 @@ func TestEvidenceStaleDuplicateCommittedTupleFallsBackToSlowAccept(t *testing.T)
 	}
 
 	empty := Message{Type: MsgEvidenceResp, From: 3, To: 1, Ref: conflict, ConflictRef: target, Ballot: inst.rec.Ballot, Deps: rn.q.deps(), RecordStatus: StatusNone}
-	if err := rn.Step(empty); err != nil {
+	if err := rn.Step(canonicalTestMessage(empty)); err != nil {
 		t.Fatal(err)
 	}
 	if got := records[2]; got.Status != StatusNone || got.Seq != 0 {
@@ -1560,7 +1563,7 @@ func TestCommitAndPrepareResponsesWithoutRecordBallotFailClosed(t *testing.T) {
 	rn := protocolCoverageNewRawNode(t, 1, 3)
 	ref := InstanceRef{Replica: 2, Instance: 90, Conf: 1}
 	msg := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}, Seq: 1, Deps: rn.q.deps(), Command: optimizedTestCommand("zero-record-ballot", "zero-record-ballot-key")}
-	if err := rn.Step(msg); !errors.Is(err, ErrInvalidMessage) {
+	if err := rn.Step(canonicalTestMessage(msg)); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("commit without RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
 	if rn.HasReady() || rn.instances[ref] != nil {
@@ -1572,7 +1575,7 @@ func TestCommitAndPrepareResponsesWithoutRecordBallotFailClosed(t *testing.T) {
 	rn.instances[recoveryRef] = recovery
 	before := recovery.rec.Clone()
 	resp := Message{Type: MsgPrepareResp, From: 2, To: 1, Ref: recoveryRef, Ballot: recovery.rec.Ballot, RecordStatus: StatusCommitted, Seq: 2, Deps: rn.q.deps(), Command: optimizedTestCommand("prepare-zero-record-ballot", "zero-record-ballot-key")}
-	if err := rn.Step(resp); !errors.Is(err, ErrInvalidMessage) {
+	if err := rn.Step(canonicalTestMessage(resp)); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("prepare response without RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
 	if recovery.prepareOK.len() != 0 || recovery.phase != phasePrepare ||
@@ -1630,13 +1633,13 @@ func protocolMalformedEvidenceFrame(evidence, evidenceDeps, conflictKeys uint64)
 			0,
 			100,
 			1,
-			uint64(CommandUser),
+			uint64(EntryCommand),
 			0,
 			conflictKeys,
 		} {
 			buf = binary.AppendUvarint(buf, v)
 		}
-		if conflictKeys <= maxWireConflictKeys {
+		if conflictKeys <= maxWireFootprintPoints {
 			for range conflictKeys {
 				buf = binary.AppendUvarint(buf, 0)
 			}
@@ -1683,7 +1686,7 @@ func TestPrepareRecoveryPreservesExecutedChosenTuple(t *testing.T) {
 	rn, inst, ballot := optimizedStartRecovery(t, 3, ref)
 	cmd := optimizedTestCommand("executed-prepare-value", "executed-prepare-key")
 	valueBallot := Ballot{Replica: ref.Replica}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:         MsgPrepareResp,
 		From:         2,
 		To:           1,
@@ -1694,7 +1697,7 @@ func TestPrepareRecoveryPreservesExecutedChosenTuple(t *testing.T) {
 		Seq:          1,
 		Deps:         rn.q.deps(),
 		Command:      cmd,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	if inst.phase != phaseCommitted || !commandEqual(inst.rec.Command, cmd) {
@@ -1736,7 +1739,7 @@ func TestReorderedPreAcceptDoesNotDowngradeAcceptedRecord(t *testing.T) {
 				Deps:         rn.q.deps(),
 				Command:      cmd,
 			})
-			if err := rn.Step(Message{
+			if err := rn.Step(canonicalTestMessage(Message{
 				Type:    typ,
 				From:    1,
 				To:      2,
@@ -1745,7 +1748,7 @@ func TestReorderedPreAcceptDoesNotDowngradeAcceptedRecord(t *testing.T) {
 				Seq:     1,
 				Deps:    rn.q.deps(),
 				Command: cmd,
-			}); err != nil {
+			})); err != nil {
 				t.Fatal(err)
 			}
 			got := rn.instances[ref]
@@ -1791,13 +1794,13 @@ func TestNormalFastPathAdoptsCoveringRemoteTupleAtPaperQuorum(t *testing.T) {
 			covering.Deps[1] = dependency.Instance
 			neededRemote := rn.fastQuorumForConf(ref.Conf) - 1
 			for id := ReplicaID(2); id < ReplicaID(2+neededRemote); id++ { //nolint:gosec // G115: test harness converts bounded int index/count
-				if err := rn.Step(Message{Type: MsgPreAcceptResp, From: id,
+				if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: id,
 					To:     1,
 					Ref:    ref,
 					Ballot: inst.rec.Ballot,
 					Seq:    covering.Seq,
 					Deps:   append([]InstanceNum(nil), covering.Deps...), FastPathEligible: true,
-					DepsCommitted: dependencyMask(covering.Deps)}); err != nil {
+					DepsCommitted: dependencyMask(covering.Deps)})); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1836,7 +1839,7 @@ func TestRecoveryRecomputesAttrsForUnsafePreAcceptedCandidate(t *testing.T) {
 	if err := rn.startPrepare(inst); err != nil {
 		panic(err)
 	}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:             MsgPrepareResp,
 		From:             2,
 		To:               1,
@@ -1848,7 +1851,7 @@ func TestRecoveryRecomputesAttrsForUnsafePreAcceptedCandidate(t *testing.T) {
 		Command:          targetCommand,
 		RecordStatus:     StatusPreAccepted,
 		FastPathEligible: false,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1869,13 +1872,13 @@ func TestRecoveryRecomputesAttrsForUnsafePreAcceptedCandidate(t *testing.T) {
 func TestPromisedFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
 	rn := protocolCoverageNewRawNode(t, 3, 3)
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:   MsgPrepare,
 		From:   2,
 		To:     3,
 		Ref:    ref,
 		Ballot: Ballot{Number: 1, Replica: 2},
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	advanceOK(t, rn, rn.Ready())
@@ -1905,13 +1908,13 @@ func TestPromisedFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
 func TestTryPreAcceptFollowerTakesOverAfterCoordinatorDisappears(t *testing.T) {
 	rn := protocolCoverageNewRawNode(t, 3, 3)
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{Type: MsgTryPreAccept, From: 2,
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgTryPreAccept, From: 2,
 		To:      3,
 		Ref:     ref,
 		Ballot:  Ballot{Number: 1, Replica: 2},
 		Seq:     1,
 		Deps:    rn.q.deps(),
-		Command: optimizedTestCommand("orphaned-try", "orphaned-try-key")}); err != nil {
+		Command: optimizedTestCommand("orphaned-try", "orphaned-try-key")})); err != nil {
 		t.Fatal(err)
 	}
 	advanceOK(t, rn, rn.Ready())
@@ -1958,7 +1961,7 @@ func TestLateTimedPreAcceptFallsBackToConservativeConflictOrdering(t *testing.T)
 	earlierRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	step := func(ref InstanceRef, from ReplicaID, payload string) {
 		t.Helper()
-		if err := rn.Step(Message{
+		if err := rn.Step(canonicalTestMessage(Message{
 			Type:      MsgPreAccept,
 			From:      from,
 			To:        2,
@@ -1968,7 +1971,7 @@ func TestLateTimedPreAcceptFallsBackToConservativeConflictOrdering(t *testing.T)
 			Seq:       1,
 			Deps:      rn.q.deps(),
 			Command:   optimizedTestCommand(payload, key),
-		}); err != nil {
+		})); err != nil {
 			t.Fatal(err)
 		}
 		advanceOK(t, rn, rn.Ready())
@@ -2035,7 +2038,7 @@ func TestComputeAttrsUsesMaximumSequenceAcrossCompressedPrefix(t *testing.T) {
 		Status:       StatusCommitted,
 		Seq:          10,
 		Deps:         rn.q.deps(),
-		Command:      Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}},
+		Command:      Command{Footprint: Footprint{Points: [][]byte{[]byte("compressed-prefix-key")}}},
 	})
 	optimizedSeedRecord(t, rn, InstanceRecord{
 		Ref:          laterLowSeq,
@@ -2044,9 +2047,9 @@ func TestComputeAttrsUsesMaximumSequenceAcrossCompressedPrefix(t *testing.T) {
 		Status:       StatusCommitted,
 		Seq:          1,
 		Deps:         rn.q.deps(),
-		Command:      Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}},
+		Command:      Command{Footprint: Footprint{Points: [][]byte{[]byte("compressed-prefix-key")}}},
 	})
-	cmd := Command{ConflictKeys: [][]byte{[]byte("compressed-prefix-key")}}
+	cmd := Command{Footprint: Footprint{Points: [][]byte{[]byte("compressed-prefix-key")}}}
 	attrs := rn.computeAttrs(cmd, InstanceRef{Replica: 1, Instance: 1, Conf: 1})
 	if attrs.Deps[1] != laterLowSeq.Instance || attrs.Seq != 11 {
 		t.Fatalf("compressed-prefix attrs = %#v, want replica-2 prefix %d and seq 11", attrs, laterLowSeq.Instance)
@@ -2097,7 +2100,7 @@ func TestUnresolvedKnownConflictStartsRecoveryOnAnyHealthyReplica(t *testing.T) 
 		if inst != nil && inst.phase == phasePrepare {
 			rd = rn.Ready()
 			wantHard := HardState{Conf: rn.Status().Conf, Tick: tick}
-			if !rd.HardState.Equal(wantHard) || !rd.MustSync || len(rd.Committed) != 0 {
+			if !rd.HardState.Equal(wantHard) || !rd.MustSync || len(rd.Apply) != 0 {
 				t.Fatalf("fallback recovery Ready at tick %d = %#v", tick, rd)
 			}
 			break
@@ -2106,7 +2109,7 @@ func TestUnresolvedKnownConflictStartsRecoveryOnAnyHealthyReplica(t *testing.T) 
 			tickReady := rn.Ready()
 			wantHard := HardState{Conf: rn.Status().Conf, Tick: tick}
 			if !tickReady.HardState.Equal(wantHard) || !tickReady.MustSync ||
-				len(tickReady.Records) != 0 || len(tickReady.Committed) != 0 ||
+				len(tickReady.Records) != 0 || len(tickReady.Apply) != 0 ||
 				len(tickReady.Messages) != len(rn.Status().Conf.Voters)-1 {
 				t.Fatalf("committed-base retry Ready at tick %d = %#v", tick, tickReady)
 			}
@@ -2186,7 +2189,7 @@ func TestTryPreAcceptResponseRequiresCurrentBallotAndExactTuple(t *testing.T) {
 				Deps:         append([]InstanceNum(nil), inst.rec.Deps...),
 			}
 			tc.mutate(&msg)
-			if err := rn.Step(msg); !errors.Is(err, tc.wantErr) {
+			if err := rn.Step(canonicalTestMessage(msg)); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Step error = %v, want %v for message %#v", err, tc.wantErr, msg)
 			}
 			if inst.tryOK.len() != 0 || inst.phase != phaseTryPreAccept || rn.HasReady() {
@@ -2254,7 +2257,7 @@ func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := exact.Clone()
 			tc.mutate(&msg)
-			if err := rn.Step(msg); err != nil {
+			if err := rn.Step(canonicalTestMessage(msg)); err != nil {
 				t.Fatalf("well-formed mismatched AcceptResp rejected before handler: %v", err)
 			}
 			if inst.phase != phaseAccept || inst.accOK.len() != 1 || rn.HasReady() {
@@ -2265,14 +2268,14 @@ func TestMessageValidateAndAcceptResponseExactTupleContract(t *testing.T) {
 
 	malformed := exact.Clone()
 	malformed.RecordBallot.Number++
-	if err := rn.Step(malformed); !errors.Is(err, ErrInvalidMessage) {
+	if err := rn.Step(canonicalTestMessage(malformed)); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("AcceptResp with non-echoed RecordBallot error = %v, want ErrInvalidMessage", err)
 	}
 	if inst.phase != phaseAccept || inst.accOK.len() != 1 || rn.HasReady() {
 		t.Fatalf("malformed AcceptResp changed state: phase=%d accOK=%#v ready=%v", inst.phase, inst.accOK, rn.HasReady())
 	}
 
-	if err := rn.Step(exact); err != nil {
+	if err := rn.Step(canonicalTestMessage(exact)); err != nil {
 		t.Fatal(err)
 	}
 	if inst.phase != phaseCommitted || inst.accOK != 0 {
@@ -2461,6 +2464,7 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 			Ballot:    requestBallot,
 			Seq:       1,
 			Deps:      make([]InstanceNum, 3),
+			Kind:      EntryCommand,
 			Command:   command,
 			ProcessAt: 9,
 			TOQ:       toq,
@@ -2477,7 +2481,8 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 			message.RecordBallot = Ballot{Replica: ref.Replica}
 			message.RecordStatus = StatusAccepted
 			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
-		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
+		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		}
 		return message
 	}
@@ -2487,7 +2492,7 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 		toq    bool
 	}{
 		{name: "toq-value-on-logical-node", config: Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true}, toq: true},
-		{name: "logical-value-on-toq-node-without-runtime", config: Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 0 }}, toq: false},
+		{name: "logical-value-on-toq-node-without-runtime", config: Config{ID: 1, Voters: makeIDs(3), TOQ: true}, toq: false},
 	} {
 		for _, kind := range []MessageType{MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgEvidenceResp} {
 			t.Run(tc.name+"/"+kind.String(), func(t *testing.T) {
@@ -2500,7 +2505,7 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 					t.Fatalf("test message is malformed before domain gate: %v", err)
 				}
 				before := snapshotRemainingNodeProtocol(rn)
-				if err := rn.Step(message); !errors.Is(err, ErrMessageRejected) {
+				if err := rn.Step(canonicalTestMessage(message)); !errors.Is(err, ErrMessageRejected) {
 					t.Fatalf("wrong-domain %s err=%v, want ErrMessageRejected", kind, err)
 				}
 				requireRemainingNodeProtocolUnchanged(t, rn, before)
@@ -2510,7 +2515,7 @@ func TestValueBearingMessagesRejectIncompatibleTimingDomains(t *testing.T) {
 }
 
 func TestRestartRejectsIncompatibleNonNoopTimingDomain(t *testing.T) {
-	record := func(domain TimingDomain, kind CommandKind) InstanceRecord {
+	record := func(domain TimingDomain, kind EntryKind) InstanceRecord {
 		ref := InstanceRef{Conf: 1, Replica: 2, Instance: 1}
 		processAt := uint64(9)
 		if domain == TimingDomainUntimed {
@@ -2522,13 +2527,11 @@ func TestRestartRejectsIncompatibleNonNoopTimingDomain(t *testing.T) {
 			Status:       StatusAccepted,
 			Seq:          1,
 			Deps:         make([]InstanceNum, 3),
-			Command:      Command{ID: CommandID{Client: 1500, Sequence: 1}, Kind: kind, Payload: []byte("restart-domain")},
+			Kind:         kind,
+			Command:      Command{ID: CommandID{Client: 1500, Sequence: 1}, Payload: []byte("restart-domain")},
 			ProcessAt:    processAt,
 			TimingDomain: domain,
 		})
-		if kind == CommandNoop {
-			rec.Command = Command{Kind: CommandNoop}
-		}
 		rec.Checksum = ChecksumRecord(rec)
 		return rec
 	}
@@ -2538,13 +2541,13 @@ func TestRestartRejectsIncompatibleNonNoopTimingDomain(t *testing.T) {
 		store.Records[rec.Ref] = rec.Clone()
 		return store
 	}
-	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true, Storage: makeStore(record(TimingDomainTOQ, CommandUser))}); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TimeOptimization: true, Storage: makeStore(record(TimingDomainTOQ, EntryCommand))}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("logical reopen of TOQ value err=%v, want ErrInvalidConfig", err)
 	}
-	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 0 }, Storage: makeStore(record(TimingDomainLogical, CommandUser))}); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true, Storage: makeStore(record(TimingDomainLogical, EntryCommand))}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("TOQ reopen of logical value err=%v, want ErrInvalidConfig", err)
 	}
-	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: makeStore(record(TimingDomainTOQ, CommandNoop))}); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: makeStore(record(TimingDomainTOQ, EntryNoop))}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("timing-tagged no-op restart err=%v, want ErrInvalidConfig", err)
 	}
 }
@@ -2562,14 +2565,13 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 		},
 		{
 			name: "TOQ",
-			cfg: func(store *MemoryStorage, reads *int) Config {
+			cfg: func(store *MemoryStorage, _ *int) Config {
 				conf := ConfState{ID: 1, Voters: makeIDs(3)}
 				return Config{
 					ID:         1,
 					Voters:     conf.Voters,
 					Storage:    store,
 					TOQ:        true,
-					TOQClock:   func() uint64 { (*reads)++; return 50 },
 					TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 1, 3: 1}},
 				}
 			},
@@ -2588,7 +2590,7 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 				t.Fatal(err)
 			}
 			advanceOK(t, rn, initial)
-			ref, err := rn.Propose(Command{Kind: CommandNoop})
+			ref, err := rn.proposeEntry(EntryNoop, Command{}, ConfChange{}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2597,12 +2599,12 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 				t.Fatalf("no-op Ready records = %#v, want one record for %s", rd.Records, ref)
 			}
 			rec := rd.Records[0]
-			if rec.Command.Kind != CommandNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
+			if rec.Kind != EntryNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
 				t.Fatalf("timed-mode no-op record is not canonical untimed: %#v", rec)
 			}
 			var responses []Message
 			for _, message := range rd.Messages {
-				if message.Command.Kind != CommandNoop || message.ProcessAt != 0 || message.TOQ {
+				if message.Kind != EntryNoop || message.ProcessAt != 0 || message.TOQ {
 					t.Fatalf("timed-mode no-op message is not canonical untimed: %#v", message)
 				}
 				if err := message.Validate(rn.q.conf); err != nil {
@@ -2616,7 +2618,7 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 					t.Fatal(err)
 				}
 				advanceOK(t, follower, follower.Ready())
-				if err := follower.Step(message); err != nil {
+				if err := follower.Step(canonicalTestMessage(message)); err != nil {
 					t.Fatalf("follower %d rejected canonical timed-mode no-op: %v", message.To, err)
 				}
 				followerReady := follower.Ready()
@@ -2636,14 +2638,14 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 			}
 			advanceOK(t, rn, rd)
 			for _, response := range responses {
-				if err := rn.Step(response); err != nil {
+				if err := rn.Step(canonicalTestMessage(response)); err != nil {
 					t.Fatalf("owner rejected no-op response: %v", err)
 				}
 			}
 			if rn.HasReady() {
 				committed := rn.Ready()
 				for _, record := range committed.Records {
-					if record.Command.Kind == CommandNoop && (record.ProcessAt != 0 || record.TimingDomain != TimingDomainUntimed || record.TOQPending || !VerifyRecordChecksum(record)) {
+					if record.Kind == EntryNoop && (record.ProcessAt != 0 || record.TimingDomain != TimingDomainUntimed || record.TOQPending || !VerifyRecordChecksum(record)) {
 						t.Fatalf("committed no-op record lost canonical timing: %#v", record)
 					}
 				}
@@ -2657,7 +2659,7 @@ func TestTimedModesProposeCanonicalUntimedNoop(t *testing.T) {
 				t.Fatalf("restart with canonical no-op: %v", err)
 			}
 			got := restarted.instances[ref]
-			if got == nil || got.rec.Command.Kind != CommandNoop || got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending {
+			if got == nil || got.rec.Kind != EntryNoop || got.rec.ProcessAt != 0 || got.rec.TimingDomain != TimingDomainUntimed || got.rec.TOQPending {
 				t.Fatalf("restarted canonical no-op = %#v", got)
 			}
 		})
@@ -2669,7 +2671,7 @@ func TestTimedNoopMessagesRejectWithoutMutation(t *testing.T) {
 		ref := InstanceRef{Conf: 1, Replica: 2, Instance: InstanceNum(kind)}
 		requestBallot := Ballot{Number: 1, Replica: 2}
 		responseBallot := Ballot{Number: 1, Replica: 1}
-		message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: requestBallot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}, ProcessAt: 9, TOQ: toq}
+		message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: requestBallot, Seq: 1, Deps: make([]InstanceNum, 3), Kind: EntryNoop, ProcessAt: 9, TOQ: toq}
 		switch kind {
 		case MsgCommit:
 			message.RecordBallot = requestBallot
@@ -2682,7 +2684,8 @@ func TestTimedNoopMessagesRejectWithoutMutation(t *testing.T) {
 			message.RecordBallot = Ballot{Replica: ref.Replica}
 			message.RecordStatus = StatusAccepted
 			message.ConflictRef = InstanceRef{Conf: 1, Replica: 1, Instance: 99}
-		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence:
+		case MsgPreAccept, MsgPreAcceptResp, MsgAccept, MsgAcceptResp, MsgPrepare, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		}
 		return message
 	}
@@ -2692,7 +2695,7 @@ func TestTimedNoopMessagesRejectWithoutMutation(t *testing.T) {
 				rn := protocolCoverageNewRawNode(t, 1, 3)
 				message := build(kind, toq)
 				before := snapshotRemainingNodeProtocol(rn)
-				if err := rn.Step(message); !errors.Is(err, ErrInvalidMessage) {
+				if err := rn.Step(canonicalTestMessage(message)); !errors.Is(err, ErrInvalidMessage) {
 					t.Fatalf("timed no-op %s error = %v, want ErrInvalidMessage", kind, err)
 				}
 				requireRemainingNodeProtocolUnchanged(t, rn, before)
@@ -2710,7 +2713,6 @@ func TestTimedModesRejectFreshUntimedValueAndPreserveLegacyContinuation(t *testi
 					cfg.TimeOptimization = true
 				} else {
 					cfg.TOQ = true
-					cfg.TOQClock = func() uint64 { return 0 }
 				}
 				fresh, err := NewRawNode(cfg)
 				if err != nil {
@@ -2725,7 +2727,7 @@ func TestTimedModesRejectFreshUntimedValueAndPreserveLegacyContinuation(t *testi
 					message.RecordBallot = ballot
 				}
 				before := snapshotRemainingNodeProtocol(fresh)
-				if err := fresh.Step(message); !errors.Is(err, ErrMessageRejected) {
+				if err := fresh.Step(canonicalTestMessage(message)); !errors.Is(err, ErrMessageRejected) {
 					t.Fatalf("fresh timed node accepted Untimed %s: %v", kind, err)
 				}
 				requireRemainingNodeProtocolUnchanged(t, fresh, before)
@@ -2741,7 +2743,7 @@ func TestTimedModesRejectFreshUntimedValueAndPreserveLegacyContinuation(t *testi
 				}
 				old := checkedRecord(InstanceRecord{Ref: ref, Ballot: ballot, RecordBallot: ballot, Status: oldStatus, Seq: 1, Deps: make([]InstanceNum, 3), Command: command, ProcessAt: 9, TimingDomain: domain})
 				continued.installInstance(&instance{rec: old, phase: phaseIdle})
-				if err := continued.Step(message); err != nil {
+				if err := continued.Step(canonicalTestMessage(message)); err != nil {
 					t.Fatalf("legacy zero-timing continuation failed: %v", err)
 				}
 				got := continued.instances[ref].rec
@@ -2791,7 +2793,7 @@ func TestSameBallotTimedPhaseConflictsRejectWithoutMutation(t *testing.T) {
 					wantErr = ErrMessageRejected
 				}
 				before := rec.Clone()
-				if err := rn.Step(message); !errors.Is(err, wantErr) {
+				if err := rn.Step(canonicalTestMessage(message)); !errors.Is(err, wantErr) {
 					t.Fatalf("%s conflict error = %v, want %v", mutation, err, wantErr)
 				}
 				if rn.instances[ref] != inst || inst.generation != ^uint64(0) || !instanceRecordEqual(inst.rec, before) || rn.HasReady() {
@@ -2814,7 +2816,7 @@ func TestSameBallotTimedPhaseConflictsRejectWithoutMutation(t *testing.T) {
 		rn.installInstance(&instance{rec: rec, phase: phaseIdle})
 		deps := []InstanceNum{0, 0, 1}
 		message := Message{Type: MsgAccept, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 2, Deps: deps, Command: command, ProcessAt: 100}
-		if err := rn.Step(message); err != nil {
+		if err := rn.Step(canonicalTestMessage(message)); err != nil {
 			t.Fatalf("valid same-value promotion: %v", err)
 		}
 		got := rn.instances[ref].rec
@@ -2883,7 +2885,7 @@ func TestIgnoredResponsesStutterAtGenerationAndTickBoundary(t *testing.T) {
 			rn.currentHardState.Tick = rn.tick
 			rn.acknowledgedHardState = rn.currentHardState.Clone()
 			before := inst.rec.Clone()
-			if err := rn.Step(message); err != nil {
+			if err := rn.Step(canonicalTestMessage(message)); err != nil {
 				t.Fatalf("ignored response returned exhaustion/error: %v", err)
 			}
 			if inst.generation != ^uint64(0) || !instanceRecordEqual(inst.rec, before) || rn.HasReady() {
@@ -2898,7 +2900,7 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 		t.Run(kind.String(), func(t *testing.T) {
 			store := NewMemoryStorage()
 			conf := ConfState{ID: 1, Voters: makeIDs(3)}
-			cfg := Config{ID: 1, Voters: conf.Voters, Storage: store, TOQ: true, TOQClock: func() uint64 { return 50 }, TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 1, 3: 1}}}
+			cfg := Config{ID: 1, Voters: conf.Voters, Storage: store, TOQ: true, TOQRuntime: &TOQRuntimeConfig{Conf: conf, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 1, 3: 1}}}
 			rn, err := NewRawNode(cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -2909,19 +2911,19 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 			}
 			advanceOK(t, rn, initial)
 			ref := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
-			pending := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3), Command: optimizedTestCommand("pending-user", "pending-user-key"), ProcessAt: 60, TimingDomain: TimingDomainTOQ, TOQPending: true}
+			pending := InstanceRecord{Ref: ref, Ballot: Ballot{Replica: 1}, Status: StatusNone, Deps: make([]InstanceNum, 3), Kind: EntryCommand, Command: optimizedTestCommand("pending-user", "pending-user-key"), ProcessAt: 60, TimingDomain: TimingDomainTOQ, TOQPending: true}
 			pending.Checksum = ChecksumRecord(pending)
 			rn.installInstance(&instance{rec: pending, phase: phasePreAccept, processAt: pending.ProcessAt})
 			ballot := Ballot{Number: 1, Replica: 2}
-			message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}
+			message := Message{Type: kind, From: 2, To: 1, Ref: ref, Ballot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Kind: EntryNoop}
 			if kind == MsgCommit {
 				message.RecordBallot = ballot
 			}
-			if err := rn.Step(message); err != nil {
+			if err := rn.Step(canonicalTestMessage(message)); err != nil {
 				t.Fatal(err)
 			}
 			got := rn.instances[ref].rec
-			if got.Command.Kind != CommandNoop || got.ProcessAt != 0 || got.TimingDomain != TimingDomainUntimed || got.TOQPending || !VerifyRecordChecksum(got) {
+			if got.Kind != EntryNoop || got.ProcessAt != 0 || got.TimingDomain != TimingDomainUntimed || got.TOQPending || !VerifyRecordChecksum(got) {
 				t.Fatalf("recovered no-op inherited pending user timing: %#v", got)
 			}
 			rd := rn.Ready()
@@ -2930,8 +2932,8 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 					t.Fatal(err)
 				}
 				advanceOK(t, rn, rd)
-				commit := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}
-				if err := rn.Step(commit); err != nil {
+				commit := Message{Type: MsgCommit, From: 2, To: 1, Ref: ref, Ballot: ballot, RecordBallot: ballot, Seq: 1, Deps: make([]InstanceNum, 3), Kind: EntryNoop}
+				if err := rn.Step(canonicalTestMessage(commit)); err != nil {
 					t.Fatal(err)
 				}
 				rd = rn.Ready()
@@ -2945,19 +2947,19 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 				t.Fatal(err)
 			}
 			advanceOK(t, rn, rd)
-			if terminal := rn.instances[ref]; terminal == nil || terminal.rec.Status != StatusExecuted || terminal.rec.Command.Kind != CommandNoop {
+			if terminal := rn.instances[ref]; terminal == nil || terminal.rec.Status != StatusExecuted || terminal.rec.Kind != EntryNoop {
 				t.Fatalf("recovered no-op did not reach terminal execution: %#v", terminal)
 			}
 			terminal := rn.instances[ref]
 			duplicate := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: ref, Ballot: Ballot{Replica: 1}, ProcessAt: pending.ProcessAt, TOQ: true, Command: pending.Command}
-			if err := rn.Step(duplicate); err != nil {
+			if err := rn.Step(canonicalTestMessage(duplicate)); err != nil {
 				t.Fatalf("late pending-value duplicate: %v", err)
 			}
-			if rn.instances[ref] != terminal || terminal.rec.Command.Kind != CommandNoop || terminal.rec.Status != StatusExecuted {
+			if rn.instances[ref] != terminal || terminal.rec.Kind != EntryNoop || terminal.rec.Status != StatusExecuted {
 				t.Fatalf("late pending-value duplicate resurrected original value: %#v", rn.instances[ref])
 			}
 			duplicateReady := rn.Ready()
-			if len(duplicateReady.Records) != 0 || len(duplicateReady.Messages) != 1 || duplicateReady.Messages[0].Type != MsgCommit || duplicateReady.Messages[0].Command.Kind != CommandNoop {
+			if len(duplicateReady.Records) != 0 || len(duplicateReady.Messages) != 1 || duplicateReady.Messages[0].Type != MsgCommit || duplicateReady.Messages[0].Kind != EntryNoop {
 				t.Fatalf("late pending-value duplicate response = %#v, want canonical no-op Commit only", duplicateReady)
 			}
 			restarted, err := NewRawNode(cfg)
@@ -2965,7 +2967,7 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 				t.Fatalf("restart after pending-user/no-op recovery: %v", err)
 			}
 			restartedRecord := restarted.instances[ref]
-			if restartedRecord == nil || restartedRecord.rec.Command.Kind != CommandNoop || restartedRecord.rec.TimingDomain != TimingDomainUntimed || restartedRecord.rec.ProcessAt != 0 {
+			if restartedRecord == nil || restartedRecord.rec.Kind != EntryNoop || restartedRecord.rec.TimingDomain != TimingDomainUntimed || restartedRecord.rec.ProcessAt != 0 {
 				t.Fatalf("restarted recovered no-op = %#v", restartedRecord)
 			}
 		})
@@ -2973,22 +2975,22 @@ func TestTOQPendingUserSupersededByCanonicalRecoveryNoop(t *testing.T) {
 }
 
 func TestTOQUnavailableRuntimeStillAllowsCanonicalNoop(t *testing.T) {
-	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true, TOQClock: func() uint64 { return 99 }})
+	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), TOQ: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	protocolCoverageAdvanceHardStateOnly(t, rn, 0)
-	ref, err := rn.Propose(Command{Kind: CommandNoop})
+	ref, err := rn.proposeEntry(EntryNoop, Command{}, ConfChange{}, nil)
 	if err != nil {
 		t.Fatalf("canonical no-op with unavailable TOQ runtime: %v", err)
 	}
 	rd := rn.Ready()
 	rec := optimizedRequireRecord(t, rd, ref)
-	if rec.Command.Kind != CommandNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
+	if rec.Kind != EntryNoop || rec.ProcessAt != 0 || rec.TimingDomain != TimingDomainUntimed || rec.TOQPending || !VerifyRecordChecksum(rec) {
 		t.Fatalf("no-runtime TOQ no-op record = %#v", rec)
 	}
 	for _, message := range rd.Messages {
-		if message.ProcessAt != 0 || message.TOQ || message.Command.Kind != CommandNoop {
+		if message.ProcessAt != 0 || message.TOQ || message.Kind != EntryNoop {
 			t.Fatalf("no-runtime TOQ no-op message = %#v", message)
 		}
 	}

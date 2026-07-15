@@ -10,7 +10,7 @@ func configOrderingAdvanceInitial(t *testing.T, rn *RawNode, store *MemoryStorag
 	rd := rn.Ready()
 	want := HardState{Conf: rn.Status().Conf, Tick: rn.tick}
 	if !rd.HardState.Equal(want) || !rd.MustSync ||
-		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+		len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("initial Ready = %#v, want hard-state-only %#v", rd, want)
 	}
 	if store != nil {
@@ -37,13 +37,12 @@ func TestInboundPendingConfChangeRejectsLocalUserProposeUntilExecuted(t *testing
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: confCmd,
+		Kind: EntryConfChange, ConfChange: confCmd,
 	}
-	if err := rn.Step(preAccept); err != nil {
-		t.Fatalf("Step(%s config change) err=%v", preAccept.Type, err)
-	}
+	if err := rn.Step(canonicalTestMessage(preAccept)); err != nil { t.Fatalf("Step(%s config change) err=%v", preAccept.Type, err)
+ }
 	stored := rn.instances[confRef]
-	if stored == nil || stored.rec.Status != StatusPreAccepted || stored.rec.Command.Kind != CommandConfChange {
+	if stored == nil || stored.rec.Status != StatusPreAccepted || stored.rec.Kind != EntryConfChange {
 		t.Fatalf("stored config-change record for %s = %#v, want pre-accepted config change", confRef, stored)
 	}
 	if !rn.pendingConf {
@@ -63,11 +62,12 @@ func TestInboundPendingConfChangeRejectsLocalUserProposeUntilExecuted(t *testing
 		RecordBallot: stored.rec.RecordBallot,
 		Seq:          stored.rec.Seq,
 		Deps:         append([]InstanceNum(nil), stored.rec.Deps...),
+		Kind:         stored.rec.Kind,
+		ConfChange:   stored.rec.ConfChange,
 		Command:      stored.rec.Command,
 	}
-	if err := rn.Step(commit); err != nil {
-		t.Fatalf("Step(%s config change) err=%v", commit.Type, err)
-	}
+	if err := rn.Step(canonicalTestMessage(commit)); err != nil { t.Fatalf("Step(%s config change) err=%v", commit.Type, err)
+ }
 	if rn.pendingConf {
 		t.Fatalf("executed config change %s left pending configuration barrier set", confRef)
 	}
@@ -93,7 +93,7 @@ func TestPendingConfChangeDependencyIncludedInUserPreAcceptResp(t *testing.T) {
 
 	confRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	confCmd := confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4})
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    1,
 		To:      2,
@@ -101,10 +101,9 @@ func TestPendingConfChangeDependencyIncludedInUserPreAcceptResp(t *testing.T) {
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: confCmd,
-	}); err != nil {
-		t.Fatalf("Step(%s config change) err=%v", MsgPreAccept, err)
-	}
+		Kind: EntryConfChange, ConfChange: confCmd,
+	})); err != nil { t.Fatalf("Step(%s config change) err=%v", MsgPreAccept, err)
+ }
 
 	userRef := InstanceRef{Replica: 3, Instance: 1, Conf: confRef.Conf}
 	userPreAccept := Message{
@@ -117,9 +116,8 @@ func TestPendingConfChangeDependencyIncludedInUserPreAcceptResp(t *testing.T) {
 		Deps:    []InstanceNum{0, 0, 0},
 		Command: configOrderingUserCommand(20, "after-known-conf"),
 	}
-	if err := rn.Step(userPreAccept); err != nil {
-		t.Fatalf("Step(%s user command) err=%v", userPreAccept.Type, err)
-	}
+	if err := rn.Step(canonicalTestMessage(userPreAccept)); err != nil { t.Fatalf("Step(%s user command) err=%v", userPreAccept.Type, err)
+ }
 
 	resp := requireConfigOrderingPreAcceptResp(t, rn.Ready().Messages, userRef)
 	if resp.Reject {
@@ -151,7 +149,7 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 
 	executedRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
 	executedCmd := confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4})
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    1,
 		To:      2,
@@ -159,14 +157,13 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: executedCmd,
-	}); err != nil {
-		t.Fatalf("Step(%s first config change) err=%v", MsgPreAccept, err)
-	}
+		Kind: EntryConfChange, ConfChange: executedCmd,
+	})); err != nil { t.Fatalf("Step(%s first config change) err=%v", MsgPreAccept, err)
+ }
 
 	pendingRef := InstanceRef{Replica: 3, Instance: 1, Conf: 1}
 	pendingCmd := confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5})
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    3,
 		To:      2,
@@ -174,17 +171,16 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 		Ballot:  Ballot{Replica: 3},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: pendingCmd,
-	}); err != nil {
-		t.Fatalf("Step(%s second config change) err=%v", MsgPreAccept, err)
-	}
+		Kind: EntryConfChange, ConfChange: pendingCmd,
+	})); err != nil { t.Fatalf("Step(%s second config change) err=%v", MsgPreAccept, err)
+ }
 
 	first := rn.instances[executedRef]
-	if first == nil || first.rec.Command.Kind != CommandConfChange || first.rec.Status != StatusPreAccepted {
+	if first == nil || first.rec.Kind != EntryConfChange || first.rec.Status != StatusPreAccepted {
 		t.Fatalf("first config-change record for %s = %#v, want pre-accepted config change", executedRef, first)
 	}
 	second := rn.instances[pendingRef]
-	if second == nil || second.rec.Command.Kind != CommandConfChange || second.rec.Status != StatusPreAccepted {
+	if second == nil || second.rec.Kind != EntryConfChange || second.rec.Status != StatusPreAccepted {
 		t.Fatalf("second config-change record for %s = %#v, want pre-accepted config change", pendingRef, second)
 	}
 
@@ -197,11 +193,12 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 		RecordBallot: first.rec.RecordBallot,
 		Seq:          first.rec.Seq,
 		Deps:         append([]InstanceNum(nil), first.rec.Deps...),
+		Kind:         first.rec.Kind,
+		ConfChange:   first.rec.ConfChange,
 		Command:      first.rec.Command,
 	}
-	if err := rn.Step(commit); err != nil {
-		t.Fatalf("Step(%s first config change) err=%v", commit.Type, err)
-	}
+	if err := rn.Step(canonicalTestMessage(commit)); err != nil { t.Fatalf("Step(%s first config change) err=%v", commit.Type, err)
+ }
 	if got := rn.instances[executedRef].rec.Status; got != StatusExecuted {
 		t.Fatalf("first config change %s status=%s, want %s", executedRef, got, StatusExecuted)
 	}
@@ -227,11 +224,12 @@ func TestRefreshPendingConfRetainsBarrierForSecondUnexecutedConfChange(t *testin
 		RecordBallot: second.rec.RecordBallot,
 		Seq:          second.rec.Seq,
 		Deps:         append([]InstanceNum(nil), second.rec.Deps...),
+		Kind:         second.rec.Kind,
+		ConfChange:   second.rec.ConfChange,
 		Command:      second.rec.Command,
 	}
-	if err := rn.Step(commitSecond); err != nil {
-		t.Fatalf("Step(%s second config change) err=%v", commitSecond.Type, err)
-	}
+	if err := rn.Step(canonicalTestMessage(commitSecond)); err != nil { t.Fatalf("Step(%s second config change) err=%v", commitSecond.Type, err)
+ }
 	if got := rn.instances[pendingRef].rec.Status; got != StatusExecuted {
 		t.Fatalf("second config change %s status=%s, want %s", pendingRef, got, StatusExecuted)
 	}
@@ -283,7 +281,7 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 		Status:           StatusExecuted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		FastPathEligible: true,
 	})
 	store.Records[removeRef] = checkedRecord(InstanceRecord{
@@ -292,7 +290,7 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 		Status:           StatusExecuted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
 		FastPathEligible: true,
 	})
 	store.Records[oldRef] = checkedRecord(InstanceRecord{
@@ -328,7 +326,7 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 	assertConfigOrderingDependencyLane(t, restarted, oldRef, InstanceRef{Replica: 3, Instance: 1, Conf: 1})
 	assertConfigOrderingDependencyLane(t, restarted, midRef, InstanceRef{Replica: 3, Instance: 1, Conf: 2})
 
-	if err := restarted.Step(Message{
+	if err := restarted.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    3,
 		To:      1,
@@ -337,10 +335,9 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 		Seq:     3,
 		Deps:    []InstanceNum{0, 0, 2},
 		Command: configOrderingUserCommand(42, "old-conf-after-restart"),
-	}); err != nil {
-		t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
-	}
-	if err := restarted.Step(Message{
+	})); err != nil { t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
+ }
+	if err := restarted.Step(canonicalTestMessage(Message{
 		Type:    MsgPreAccept,
 		From:    4,
 		To:      1,
@@ -349,9 +346,8 @@ func TestConfigReplayReconstructsHistoryFromExecutedRecordsOnRestart(t *testing.
 		Seq:     3,
 		Deps:    []InstanceNum{0, 0, 1, 1},
 		Command: configOrderingUserCommand(43, "mid-conf-after-restart"),
-	}); err != nil {
-		t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
-	}
+	})); err != nil { t.Fatalf("Step accepted-domain %s after restart err=%v", MsgPreAccept, err)
+ }
 
 	ref, err := restarted.Propose(configOrderingUserCommand(44, "current-conf-after-restart"))
 	if err != nil {
@@ -387,7 +383,7 @@ func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
 		Status:           StatusExecuted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		FastPathEligible: true,
 	})
 	store.Records[removeRef] = checkedRecord(InstanceRecord{
@@ -396,7 +392,7 @@ func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
 		Status:           StatusExecuted,
 		Seq:              1,
 		Deps:             []InstanceNum{0, 0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
 		FastPathEligible: true,
 	})
 	store.Records[pendingRef] = checkedRecord(InstanceRecord{
@@ -405,7 +401,7 @@ func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
 		Status:           StatusPreAccepted,
 		Seq:              2,
 		Deps:             []InstanceNum{0, 0, 0},
-		Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 5},
 		FastPathEligible: true,
 	})
 
@@ -415,7 +411,7 @@ func TestConfigReplayRestoresPendingConfChangeBarrierOnRestart(t *testing.T) {
 	}
 	assertConfState(t, restarted.Status().Conf, ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}})
 	pending := restarted.instances[pendingRef]
-	if pending == nil || pending.rec.Status != StatusPreAccepted || pending.rec.Command.Kind != CommandConfChange {
+	if pending == nil || pending.rec.Status != StatusPreAccepted || pending.rec.Kind != EntryConfChange {
 		t.Fatalf("restarted pending config-change record for %s = %#v, want unexecuted config change", pendingRef, pending)
 	}
 	if !restarted.pendingConf {
@@ -441,7 +437,7 @@ func TestConfigReplayRejectsConflictingStoredConfigsOnRestart(t *testing.T) {
 			Status:           StatusExecuted,
 			Seq:              1,
 			Deps:             []InstanceNum{0, 0, 0},
-			Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 			FastPathEligible: true,
 		})
 		store.Records[removeRef] = checkedRecord(InstanceRecord{
@@ -450,7 +446,7 @@ func TestConfigReplayRejectsConflictingStoredConfigsOnRestart(t *testing.T) {
 			Status:           StatusExecuted,
 			Seq:              1,
 			Deps:             []InstanceNum{0, 0, 0, 0},
-			Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+			Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
 			FastPathEligible: true,
 		})
 		return store
@@ -542,7 +538,7 @@ func TestConfigReplayMigratesMalformedConfChangeToRejectedInvalid(t *testing.T) 
 		Status:  StatusExecuted,
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{Kind: CommandConfChange, Payload: []byte{byte(ConfChangeAddVoter), 4}},
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter},
 	})
 
 	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
@@ -571,7 +567,7 @@ func TestInvalidConfChangeConfigReplayBecomesRejectedInvalid(t *testing.T) {
 		Status:  StatusExecuted,
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 2},
 	})
 
 	restarted, err := NewRawNode(Config{ID: 1, Voters: makeIDs(3), Storage: store})
@@ -600,7 +596,9 @@ func (s *configOutcomeReplayStorage) InitialState() (StorageState, error) {
 	return StorageState{HardState: HardState{Conf: s.hard.Conf.Clone(), Tick: s.hard.Tick}, ConfigHistory: history}, nil
 }
 
-func (s *configOutcomeReplayStorage) LoadInstances(fn func(InstanceRecord) error) error {
+func (s *configOutcomeReplayStorage) LoadCheckpoint() (Checkpoint, error) { return Checkpoint{}, nil }
+
+func (s *configOutcomeReplayStorage) LoadInstances(_ ExecutionFrontier, fn func(InstanceRecord) error) error {
 	for i := range s.records {
 		index := i
 		if s.reverse {
@@ -611,6 +609,15 @@ func (s *configOutcomeReplayStorage) LoadInstances(fn func(InstanceRecord) error
 		}
 	}
 	return nil
+}
+
+func (s *configOutcomeReplayStorage) LoadInstance(ref InstanceRef) (InstanceRecord, bool, error) {
+	for _, record := range s.records {
+		if record.Ref == ref {
+			return record.Clone(), true, nil
+		}
+	}
+	return InstanceRecord{}, false, nil
 }
 
 func TestConcurrentSameGenerationConfigOutcomesReplayExecutionWinner(t *testing.T) {
@@ -639,7 +646,7 @@ func TestConcurrentSameGenerationConfigOutcomesReplayExecutionWinner(t *testing.
 				Status:       StatusCommitted,
 				Seq:          1,
 				Deps:         []InstanceNum{0, 0, 0},
-				Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 5}),
+				Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 5},
 			})
 			add4 := checkedRecord(InstanceRecord{
 				Ref:          add4Ref,
@@ -648,7 +655,7 @@ func TestConcurrentSameGenerationConfigOutcomesReplayExecutionWinner(t *testing.
 				Status:       StatusCommitted,
 				Seq:          2,
 				Deps:         []InstanceNum{0, 1, 0},
-				Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+				Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 			})
 			// Insert in reference order even though the dependency requires Add5
 			// to execute first.
@@ -736,7 +743,7 @@ func TestConcurrentSameGenerationConfigOutcomesReplayExecutionWinner(t *testing.
 				initial := restarted.Ready()
 				wantHard := HardState{Conf: wantConf2}
 				if !initial.HardState.Equal(wantHard) || !initial.MustSync ||
-					len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Committed) != 0 {
+					len(initial.Records) != 0 || len(initial.Messages) != 0 || len(initial.Apply) != 0 {
 					t.Fatalf("legacy restart initial Ready = %#v, want hard-state-only %#v", initial, wantHard)
 				}
 				restartDurable := NewMemoryStorage()
@@ -770,7 +777,7 @@ func TestLegacyDuplicateConfigOutcomesMigrateInExecutionOrder(t *testing.T) {
 					Status:       StatusExecuted,
 					Seq:          2,
 					Deps:         []InstanceNum{0, 1, 0},
-					Command:      add5,
+					Kind: EntryConfChange, ConfChange: add5,
 				}),
 				checkedRecord(InstanceRecord{
 					Ref:          InstanceRef{Replica: 2, Instance: 1, Conf: 1},
@@ -779,7 +786,7 @@ func TestLegacyDuplicateConfigOutcomesMigrateInExecutionOrder(t *testing.T) {
 					Status:       StatusExecuted,
 					Seq:          1,
 					Deps:         []InstanceNum{0, 0, 0},
-					Command:      add5,
+					Kind: EntryConfChange, ConfChange: add5,
 				}),
 			},
 			winnerRef: InstanceRef{Replica: 2, Instance: 1, Conf: 1},
@@ -795,7 +802,7 @@ func TestLegacyDuplicateConfigOutcomesMigrateInExecutionOrder(t *testing.T) {
 					Status:       StatusExecuted,
 					Seq:          2,
 					Deps:         []InstanceNum{0, 1, 0},
-					Command:      add5,
+					Kind: EntryConfChange, ConfChange: add5,
 				}),
 				checkedRecord(InstanceRecord{
 					Ref:          InstanceRef{Replica: 2, Instance: 1, Conf: 1},
@@ -804,7 +811,7 @@ func TestLegacyDuplicateConfigOutcomesMigrateInExecutionOrder(t *testing.T) {
 					Status:       StatusExecuted,
 					Seq:          2,
 					Deps:         []InstanceNum{1, 0, 0},
-					Command:      add5,
+					Kind: EntryConfChange, ConfChange: add5,
 				}),
 			},
 			winnerRef: InstanceRef{Replica: 1, Instance: 1, Conf: 1},
@@ -875,7 +882,7 @@ func TestLegacyInvalidBeforeValidConfigMigrationDoesNotConsumeGeneration(t *test
 			Status:       StatusExecuted,
 			Seq:          1,
 			Deps:         []InstanceNum{0, 0, 0},
-			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+			Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 2},
 		}),
 		checkedRecord(InstanceRecord{
 			Ref:          validRef,
@@ -884,7 +891,7 @@ func TestLegacyInvalidBeforeValidConfigMigrationDoesNotConsumeGeneration(t *test
 			Status:       StatusExecuted,
 			Seq:          2,
 			Deps:         []InstanceNum{1, 0, 0},
-			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		}),
 	}
 	for _, reverse := range []bool{false, true} {
@@ -938,7 +945,7 @@ func TestConfigReplayRejectsInvalidExplicitOutcomeChains(t *testing.T) {
 			Status:           StatusExecuted,
 			Seq:              1,
 			Deps:             []InstanceNum{0, 0, 0},
-			Command:          confChangeCommand(change),
+			Kind: EntryConfChange, ConfChange: change,
 			ConfChangeResult: result,
 		})
 	}
@@ -1020,13 +1027,12 @@ func TestConfChangeResultReadyFencesSuccessorMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := rn.instances[confRef]
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type: MsgPreAcceptResp, From: 2, To: 1, Ref: confRef,
 		Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...),
 		FastPathEligible: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})); err != nil { t.Fatal(err)
+ }
 	successorRef, err := rn.Propose(configOrderingUserCommand(70, "successor-before-advance"))
 	if err != nil {
 		t.Fatal(err)
@@ -1091,7 +1097,7 @@ func TestInvalidExecutedConfChangeDoesNotConsumeGeneration(t *testing.T) {
 		Status:       StatusCommitted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 2}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 2},
 	})
 	valid := checkedRecord(InstanceRecord{
 		Ref:          validRef,
@@ -1100,7 +1106,7 @@ func TestInvalidExecutedConfChangeDoesNotConsumeGeneration(t *testing.T) {
 		Status:       StatusCommitted,
 		Seq:          2,
 		Deps:         []InstanceNum{1, 0, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 	})
 	rn.instances[invalidRef] = &instance{rec: invalid, phase: phaseCommitted}
 	rn.instances[validRef] = &instance{rec: valid, phase: phaseCommitted}
@@ -1137,7 +1143,7 @@ func TestConfigReplayAcceptsSupersededWithStoredWinnerCheckpoint(t *testing.T) {
 		Status:       StatusExecuted,
 		Seq:          2,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 		ConfChangeResult: ConfChangeResult{
 			Outcome: ConfChangeRejectedSuperseded,
 		},
@@ -1168,7 +1174,7 @@ func TestMemoryStorageRejectsConflictingAppliedSuccessorAtomically(t *testing.T)
 			Status:       StatusExecuted,
 			Seq:          1,
 			Deps:         []InstanceNum{0, 0, 0},
-			Command:      confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: replica}),
+			Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: replica},
 			ConfChangeResult: ConfChangeResult{
 				Outcome: ConfChangeApplied,
 				Conf:    ConfState{ID: 2, Voters: voters},
@@ -1230,9 +1236,9 @@ func assertConfigOrderingDependencyLane(t *testing.T, rn *RawNode, ref, want Ins
 
 func configOrderingUserCommand(sequence uint64, payload string) Command {
 	return Command{
-		ID:           CommandID{Client: 91, Sequence: sequence},
-		Payload:      []byte(payload),
-		ConflictKeys: [][]byte{[]byte("user-key")},
+		ID:        CommandID{Client: 91, Sequence: sequence},
+		Payload:   []byte(payload),
+		Footprint: Footprint{Points: [][]byte{[]byte("user-key")}},
 	}
 }
 

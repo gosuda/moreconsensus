@@ -7,9 +7,9 @@ import (
 
 func bootstrapOrderingUser(client uint64, payload string) Command {
 	return Command{
-		ID:           CommandID{Client: client, Sequence: 1},
-		Payload:      []byte(payload),
-		ConflictKeys: [][]byte{[]byte("bootstrap-order")},
+		ID:        CommandID{Client: client, Sequence: 1},
+		Payload:   []byte(payload),
+		Footprint: Footprint{Points: [][]byte{[]byte("bootstrap-order")}},
 	}
 }
 
@@ -30,7 +30,7 @@ func TestMembershipUserOrderingAcrossFence(t *testing.T) {
 		if membership == nil {
 			t.Fatalf("missing membership prepare instance %s", plan.Reservations.Prepare)
 		}
-		if !membership.rec.Command.ConflictsWith(fixture.node.instances[userRef].rec.Command) {
+		if !recordsConflict(membership.rec, fixture.node.instances[userRef].rec) {
 			t.Fatal("membership and user commands were not classified as conflicting")
 		}
 		if membership.rec.Deps[0] < userRef.Instance {
@@ -55,7 +55,7 @@ func TestMembershipUserOrderingAcrossFence(t *testing.T) {
 		if membership == nil {
 			t.Fatalf("missing membership instance %s", membershipRef)
 		}
-		if !user.rec.Command.ConflictsWith(membership.rec.Command) {
+		if !recordsConflict(user.rec, membership.rec) {
 			t.Fatal("user and membership commands were not classified as conflicting")
 		}
 		if user.rec.Deps[0] < membershipRef.Instance {
@@ -79,21 +79,21 @@ func TestConflictIndexScopesConfigurationsAndExcludedLaneMaximum(t *testing.T) {
 			Status:  StatusPreAccepted,
 			Seq:     2,
 			Deps:    rn.q.deps(),
-			Command: Command{Payload: []byte("conf-one"), ConflictKeys: [][]byte{key}},
+			Command: Command{Payload: []byte("conf-one"), Footprint: Footprint{Points: [][]byte{key}}},
 		},
 		{
 			Ref:     InstanceRef{Replica: 2, Instance: 1, Conf: 2},
 			Status:  StatusPreAccepted,
 			Seq:     3,
 			Deps:    rn.q.deps(),
-			Command: Command{Payload: []byte("conf-two-old"), ConflictKeys: [][]byte{key}},
+			Command: Command{Payload: []byte("conf-two-old"), Footprint: Footprint{Points: [][]byte{key}}},
 		},
 		{
 			Ref:     InstanceRef{Replica: 2, Instance: 2, Conf: 2},
 			Status:  StatusPreAccepted,
 			Seq:     4,
 			Deps:    rn.q.deps(),
-			Command: Command{Payload: []byte("conf-two-latest"), ConflictKeys: [][]byte{key}},
+			Command: Command{Payload: []byte("conf-two-latest"), Footprint: Footprint{Points: [][]byte{key}}},
 		},
 	}
 	for _, rec := range records {
@@ -109,7 +109,7 @@ func TestConflictIndexScopesConfigurationsAndExcludedLaneMaximum(t *testing.T) {
 		t.Fatalf("configuration 2 index=%d, want latest %s", resident, records[2].Ref)
 	}
 
-	newCommand := Command{Payload: []byte("new"), ConflictKeys: [][]byte{key}}
+	newCommand := Command{Payload: []byte("new"), Footprint: Footprint{Points: [][]byte{key}}}
 	attrs := rn.computeAttrs(newCommand, InstanceRef{Replica: 1, Instance: 9, Conf: 2})
 	if attrs.Deps[1] != records[2].Ref.Instance {
 		t.Fatalf("configuration-scoped deps=%v, want configuration 2 latest instance %d", attrs.Deps, records[2].Ref.Instance)

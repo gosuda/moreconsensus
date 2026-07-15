@@ -43,7 +43,7 @@ func TestPebbleHardStateOnlyPersistenceRoundTrip(t *testing.T) {
 			}
 			requirePebbleHardState(t, db.EPaxosStorage(), hardState)
 			loaded := 0
-			if err := db.EPaxosStorage().LoadInstances(func(epaxos.InstanceRecord) error {
+			if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(epaxos.InstanceRecord) error {
 				loaded++
 				return nil
 			}); err != nil {
@@ -121,7 +121,7 @@ func TestDBApplyReadyHardStateRecordAndMarkerAreAtomicAndReplayable(t *testing.T
 	rd := epaxos.Ready{
 		HardState: hardState,
 		Records:   []epaxos.InstanceRecord{record},
-		Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
+		Apply: []epaxos.ApplyCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
 		MustSync:  true,
 	}
 
@@ -240,7 +240,7 @@ func TestDBApplyReadyRejectsHardStateRegressionAndConflictWithoutMutation(t *tes
 			rd := epaxos.Ready{
 				HardState: tc.hardState,
 				Records:   []epaxos.InstanceRecord{record},
-				Committed: []epaxos.CommittedCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
+				Apply: []epaxos.ApplyCommand{{Ref: ref, Seq: record.Seq, Deps: record.Deps, Command: command}},
 				MustSync:  true,
 			}
 			if err := db.ApplyReady(rd); !errors.Is(err, epaxos.ErrInvalidConfig) {
@@ -413,7 +413,7 @@ func TestPebbleHardStateLegacyAbsenceIsReadable(t *testing.T) {
 	defer func() { _ = reopened.Close() }()
 	requirePebbleHardState(t, reopened.EPaxosStorage(), epaxos.HardState{})
 	loaded := 0
-	if err := reopened.EPaxosStorage().LoadInstances(func(got epaxos.InstanceRecord) error {
+	if err := reopened.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(got epaxos.InstanceRecord) error {
 		loaded++
 		if got.Ref != ref {
 			t.Fatalf("legacy record ref=%s, want %s", got.Ref, ref)
@@ -436,6 +436,7 @@ func hardStateTestRecord(ref epaxos.InstanceRef, command epaxos.Command) epaxos.
 		Status:       epaxos.StatusExecuted,
 		Seq:          1,
 		Deps:         []epaxos.InstanceNum{0},
+		Kind:          epaxos.EntryCommand,
 		Command:      command,
 	}
 	record.Checksum = epaxos.ChecksumRecord(record)
@@ -459,7 +460,7 @@ func requirePebbleHardState(t *testing.T, storage *PebbleStorage, want epaxos.Ha
 func requireNoHardStateTestRecord(t *testing.T, db *DB, ref epaxos.InstanceRef) {
 	t.Helper()
 	found := false
-	if err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		if record.Ref == ref {
 			found = true
 		}
@@ -476,7 +477,7 @@ func requireAppliedHardStateTestBatch(t *testing.T, db *DB, hardState epaxos.Har
 	t.Helper()
 	requirePebbleHardState(t, db.EPaxosStorage(), hardState)
 	found := false
-	if err := db.EPaxosStorage().LoadInstances(func(record epaxos.InstanceRecord) error {
+	if err := db.EPaxosStorage().LoadInstances(epaxos.ExecutionFrontier{}, func(record epaxos.InstanceRecord) error {
 		if record.Ref == ref {
 			found = true
 			if !epaxos.VerifyRecordChecksum(record) {

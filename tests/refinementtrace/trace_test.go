@@ -184,8 +184,8 @@ func TestCapturedSemanticsCoverFiniteContract(t *testing.T) {
 						successor.Voters[0] == 1 && successor.Voters[1] == 2
 			}
 			for _, record := range event.Post.Durable.Records {
-				oldPin = oldPin || record.Ref.Conf == 1 && record.Command.Kind == "config-change"
-				newPin = newPin || record.Ref.Conf == 2 && record.Command.Kind == "user"
+				oldPin = oldPin || record.Ref.Conf == 1 && record.Kind == "config-change"
+				newPin = newPin || record.Ref.Conf == 2 && record.Kind == "user"
 				appliedOutcome = appliedOutcome || record.ConfChangeResult.Outcome == "applied"
 			}
 		}

@@ -6,7 +6,7 @@ import (
 )
 
 func toqTestCommand(client uint64, payload, key string) Command {
-	return Command{ID: CommandID{Client: client, Sequence: 1}, Payload: []byte(payload), ConflictKeys: [][]byte{[]byte(key)}}
+	return Command{ID: CommandID{Client: client, Sequence: 1}, Payload: []byte(payload), Footprint: Footprint{Points: [][]byte{[]byte(key)}}}
 }
 
 func newTOQTestRawNode(t *testing.T, id ReplicaID, voters int, clock *uint64, store *MemoryStorage, syncGroup []ReplicaID, delays map[ReplicaID]uint64) *RawNode {
@@ -23,13 +23,17 @@ func newTOQTestRawNode(t *testing.T, id ReplicaID, voters int, clock *uint64, st
 		RetryTicks:    2,
 		RecoveryTicks: 10,
 		TOQ:           true,
-		TOQClock:      func() uint64 { return *clock },
 		TOQRuntime:    runtime,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	applyInitialTOQHardState(t, store, rn)
+	if !rn.toqClosed || *clock >= rn.toqClosedThrough {
+		if err := rn.ProcessTOQ(*clock); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return rn
 }
 
@@ -82,7 +86,7 @@ func applyTOQHardStateOnly(t *testing.T, store *MemoryStorage, rn *RawNode, want
 	if rd.HardState.Empty() || !rd.HardState.Equal(rn.currentHardState) || rd.HardState.Tick != wantTick || !rd.MustSync {
 		t.Fatalf("TOQ hard-state-only Ready = %#v, want exact current hard state at tick %d", rd, wantTick)
 	}
-	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("TOQ hard-state-only Ready at tick %d carried protocol payload: %#v", wantTick, rd)
 	}
 	applyAndAdvanceTOQReady(t, store, rn, rd)
@@ -98,7 +102,8 @@ func TestTOQImmediateProcessAtProposeAssignsLocalAttrsAndValidatesMessages(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	clock = 1
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -106,25 +111,25 @@ func TestTOQImmediateProcessAtProposeAssignsLocalAttrsAndValidatesMessages(t *te
 		t.Fatalf("immediate TOQ ready records = %#v, want pending record followed by assigned attrs", rd.Records)
 	}
 	pending := rd.Records[0]
-	if pending.Ref != ref || pending.Status != StatusNone || !pending.TOQPending || pending.ProcessAt != 0 || pending.Seq != 0 {
-		t.Fatalf("immediate TOQ pending record = %#v, want StatusNone TOQPending at ProcessAt 0", pending)
+	if pending.Ref != ref || pending.Status != StatusNone || !pending.TOQPending || pending.ProcessAt != 1 || pending.Seq != 0 {
+		t.Fatalf("immediate TOQ pending record = %#v, want StatusNone TOQPending at ProcessAt 1", pending)
 	}
 	assigned := rd.Records[1]
-	if assigned.Ref != ref || assigned.Status != StatusPreAccepted || assigned.TOQPending || assigned.ProcessAt != 0 || assigned.Seq != 1 || !assigned.FastPathEligible {
-		t.Fatalf("immediate TOQ assigned record = %#v, want preaccepted fast-path attrs at ProcessAt 0", assigned)
+	if assigned.Ref != ref || assigned.Status != StatusPreAccepted || assigned.TOQPending || assigned.ProcessAt != 1 || assigned.Seq != 1 || !assigned.FastPathEligible {
+		t.Fatalf("immediate TOQ assigned record = %#v, want preaccepted fast-path attrs at ProcessAt 1", assigned)
 	}
 	if !instanceNumsEqual(assigned.Deps, []InstanceNum{0, 0, 0}) {
 		t.Fatalf("immediate TOQ assigned deps = %v, want no conflicts", assigned.Deps)
 	}
-	requireTOQPreAccepts(t, rd.Messages, ref, 0, []ReplicaID{2, 3})
+	requireTOQPreAccepts(t, rd.Messages, ref, 1, []ReplicaID{2, 3})
 	for _, msg := range rd.Messages {
 		if err := msg.Validate(rn.q.conf); err != nil {
 			t.Fatalf("immediate TOQ PreAccept message %#v failed validation: %v", msg, err)
 		}
 	}
 	inst := rn.instances[ref]
-	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.rec.ProcessAt != 0 || inst.preOK.len() != 1 {
-		t.Fatalf("local immediate TOQ instance = %#v, want assigned local preaccept vote at ProcessAt 0", inst)
+	if inst == nil || inst.rec.TOQPending || inst.rec.Status != StatusPreAccepted || inst.rec.ProcessAt != 1 || inst.preOK.len() != 1 {
+		t.Fatalf("local immediate TOQ instance = %#v, want assigned local preaccept vote at ProcessAt 1", inst)
 	}
 	if resident, _ := rn.engine.keyMax(1, []byte("toq-immediate-key"), instanceLane{conf: 1, replica: 1}); resident != ref.Instance {
 		t.Fatalf("immediate TOQ command conflict index = %d, want %s", resident, ref)
@@ -152,7 +157,7 @@ func TestTOQImmediateProcessAtSkipsLaterSameTimestampConflict(t *testing.T) {
 		Seq:              5,
 		Deps:             rn.q.deps(),
 		Command:          toqTestCommand(213, "toq-zero-later-conflict", "toq-zero-order-key"),
-		ProcessAt:        0,
+		ProcessAt:        1,
 		FastPathEligible: true,
 	})
 
@@ -160,10 +165,11 @@ func TestTOQImmediateProcessAtSkipsLaterSameTimestampConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	clock = 1
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
-	if !preAcceptOrderBefore(0, ref, 0, laterRef) {
+	if !preAcceptOrderBefore(1, ref, 1, laterRef) {
 		t.Fatalf("test setup candidate ref %s must sort before existing same-timestamp conflict %s", ref, laterRef)
 	}
 	rd := rn.Ready()
@@ -171,8 +177,8 @@ func TestTOQImmediateProcessAtSkipsLaterSameTimestampConflict(t *testing.T) {
 		t.Fatalf("immediate TOQ ready records = %#v, want pending record followed by assigned attrs", rd.Records)
 	}
 	assigned := rd.Records[1]
-	if assigned.Status != StatusPreAccepted || assigned.TOQPending || assigned.ProcessAt != 0 || !assigned.FastPathEligible {
-		t.Fatalf("immediate TOQ zero-timestamp assignment = %#v, want ordinary fast-path preaccepted record at ProcessAt 0", assigned)
+	if assigned.Status != StatusPreAccepted || assigned.TOQPending || assigned.ProcessAt != 1 || !assigned.FastPathEligible {
+		t.Fatalf("immediate TOQ timestamp assignment = %#v, want ordinary fast-path preaccepted record at ProcessAt 1", assigned)
 	}
 	if assigned.Seq != 1 || !instanceNumsEqual(assigned.Deps, []InstanceNum{0, 0, 0}) {
 		t.Fatalf("immediate TOQ zero-timestamp attrs = seq %d deps %v, want no dependency on later same-timestamp conflict %s", assigned.Seq, assigned.Deps, laterRef)
@@ -246,7 +252,7 @@ func TestTOQProcessAtAssignsLocalAttrsAndRetriesStayExplicit(t *testing.T) {
 	applyAndAdvanceTOQReady(t, store, rn, initial)
 
 	clock = processAt
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assignedReady := rn.Ready()
@@ -274,8 +280,8 @@ func TestTOQProcessAtAssignsLocalAttrsAndRetriesStayExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry := rn.Ready()
-	if len(retry.Records) != 0 || len(retry.Committed) != 0 {
-		t.Fatalf("TOQ PreAccept retry changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Committed)
+	if len(retry.Records) != 0 || len(retry.Apply) != 0 {
+		t.Fatalf("TOQ PreAccept retry changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Apply)
 	}
 	requireTOQPreAccepts(t, retry.Messages, ref, processAt, []ReplicaID{2, 3})
 }
@@ -304,7 +310,7 @@ func TestTOQPendingRetryCannotStartAcceptBeforeProcessAt(t *testing.T) {
 			Ballot: inst.rec.Ballot,
 			Seq:    1,
 			Deps:   []InstanceNum{0, 0, 0}, FastPathEligible: true}
-		if err := rn.Step(resp); err != nil {
+		if err := rn.Step(canonicalTestMessage(resp)); err != nil {
 			t.Fatalf("step preaccept response from %d: %v", from, err)
 		}
 	}
@@ -342,6 +348,7 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 		Status:           StatusPreAccepted,
 		Seq:              3,
 		Deps:             []InstanceNum{0, 0, 0},
+		Kind:             EntryCommand,
 		Command:          toqTestCommand(209, "toq-restart-conflict", "toq-restart-key"),
 		FastPathEligible: true,
 		ProcessAt:        40,
@@ -393,8 +400,8 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeProcessAtRetry := restarted.Ready()
-	if len(beforeProcessAtRetry.Records) != 0 || len(beforeProcessAtRetry.Committed) != 0 {
-		t.Fatalf("TOQ retry before ProcessAt produced durable/application work: records=%#v committed=%#v", beforeProcessAtRetry.Records, beforeProcessAtRetry.Committed)
+	if len(beforeProcessAtRetry.Records) != 0 || len(beforeProcessAtRetry.Apply) != 0 {
+		t.Fatalf("TOQ retry before ProcessAt produced durable/application work: records=%#v committed=%#v", beforeProcessAtRetry.Records, beforeProcessAtRetry.Apply)
 	}
 	requireTOQPreAccepts(t, beforeProcessAtRetry.Messages, ref, processAt, []ReplicaID{2, 3})
 	if inst.rec.Status != StatusNone || !inst.rec.TOQPending {
@@ -406,7 +413,7 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 	applyAndAdvanceTOQReady(t, store, restarted, beforeProcessAtRetry)
 
 	clock = processAt
-	if err := restarted.ProcessTOQ(); err != nil {
+	if err := restarted.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assignedReady := restarted.Ready()
@@ -444,8 +451,8 @@ func TestTOQPendingLocalRestartWaitsAndAssignsAtProcessAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry := restarted.Ready()
-	if len(retry.Records) != 0 || len(retry.Committed) != 0 {
-		t.Fatalf("TOQ retry after assignment changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Committed)
+	if len(retry.Records) != 0 || len(retry.Apply) != 0 {
+		t.Fatalf("TOQ retry after assignment changed durable/application work: records=%#v committed=%#v", retry.Records, retry.Apply)
 	}
 	requireTOQPreAccepts(t, retry.Messages, ref, processAt, []ReplicaID{2, 3})
 	for _, msg := range retry.Messages {
@@ -467,7 +474,7 @@ func TestTOQPendingConfChangeRestartRejectsNewProposalsBeforeProcessAt(t *testin
 	processAt := uint64(67)
 	initial := rn.Ready()
 	pending := optimizedRequireRecord(t, initial, confRef)
-	if pending.Status != StatusNone || !pending.TOQPending || pending.ProcessAt != processAt || pending.Command.Kind != CommandConfChange {
+	if pending.Status != StatusNone || !pending.TOQPending || pending.ProcessAt != processAt || pending.Kind != EntryConfChange {
 		t.Fatalf("initial TOQ config-change record = %#v, want durable pending config change at ProcessAt %d", pending, processAt)
 	}
 	applyAndAdvanceTOQReady(t, store, rn, initial)
@@ -475,14 +482,14 @@ func TestTOQPendingConfChangeRestartRejectsNewProposalsBeforeProcessAt(t *testin
 	if !ok {
 		t.Fatalf("missing durable TOQ config-change record for %s", confRef)
 	}
-	if stored.Status != StatusNone || !stored.TOQPending || stored.ProcessAt != processAt || stored.Command.Kind != CommandConfChange {
+	if stored.Status != StatusNone || !stored.TOQPending || stored.ProcessAt != processAt || stored.Kind != EntryConfChange {
 		t.Fatalf("stored TOQ config-change record = %#v, want durable pending config change at ProcessAt %d", stored, processAt)
 	}
 
 	clock = processAt - 1
 	restarted := newTOQTestRawNode(t, 1, 3, &clock, store, nil, map[ReplicaID]uint64{1: 0, 2: 4, 3: 7})
 	inst := restarted.instances[confRef]
-	if inst == nil || inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.rec.ProcessAt != processAt || inst.rec.Command.Kind != CommandConfChange {
+	if inst == nil || inst.rec.Status != StatusNone || !inst.rec.TOQPending || inst.rec.ProcessAt != processAt || inst.rec.Kind != EntryConfChange {
 		t.Fatalf("restarted TOQ config-change instance = %#v, want durable pending config change before ProcessAt", inst)
 	}
 	before := snapshotRemainingNodeProtocol(restarted)
@@ -502,30 +509,29 @@ func TestTOQConfigReplayRestartUsesReplayedCurrentVoters(t *testing.T) {
 		removeRef := InstanceRef{Replica: 2, Instance: 1, Conf: 2}
 
 		store.Records[addRef] = checkedRecord(InstanceRecord{
-			Ref:              addRef,
-			Ballot:           Ballot{Replica: 1},
-			Status:           StatusExecuted,
-			Seq:              1,
-			Deps:             []InstanceNum{0, 0, 0},
-			Command:          confChangeCommand(ConfChange{Type: ConfChangeAddVoter, Replica: 4}),
+			Ref:    addRef,
+			Ballot: Ballot{Replica: 1},
+			Status: StatusExecuted,
+			Seq:    1,
+			Deps:   []InstanceNum{0, 0, 0},
+			Kind:   EntryConfChange, ConfChange: ConfChange{Type: ConfChangeAddVoter, Replica: 4},
 			FastPathEligible: true,
 			ProcessAt:        1,
 			TimingDomain:     TimingDomainTOQ,
 		})
 		store.Records[removeRef] = checkedRecord(InstanceRecord{
-			Ref:              removeRef,
-			Ballot:           Ballot{Replica: 2},
-			Status:           StatusExecuted,
-			Seq:              1,
-			Deps:             []InstanceNum{0, 0, 0, 0},
-			Command:          confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+			Ref:    removeRef,
+			Ballot: Ballot{Replica: 2},
+			Status: StatusExecuted,
+			Seq:    1,
+			Deps:   []InstanceNum{0, 0, 0, 0},
+			Kind:   EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
 			FastPathEligible: true,
 			ProcessAt:        2,
 			TimingDomain:     TimingDomainTOQ,
 		})
 		return store
 	}
-	clock := uint64(80)
 	newConfig := func(store *MemoryStorage) Config {
 		return Config{
 			ID:            1,
@@ -534,7 +540,6 @@ func TestTOQConfigReplayRestartUsesReplayedCurrentVoters(t *testing.T) {
 			RetryTicks:    2,
 			RecoveryTicks: 10,
 			TOQ:           true,
-			TOQClock:      func() uint64 { return clock },
 			TOQRuntime: &TOQRuntimeConfig{
 				Conf:        ConfState{ID: 3, Voters: []ReplicaID{1, 2, 4}},
 				OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 5, 4: 9},
@@ -587,12 +592,12 @@ func TestTOQAppliedSuccessorWithoutRuntimeInputsRejectsLocalProposals(t *testing
 	rn := newTOQTestRawNode(t, 1, 2, &clock, store, nil, map[ReplicaID]uint64{1: 0, 2: 7})
 
 	confRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type: MsgCommit, From: 1, To: 1, Ref: confRef,
 		Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1},
 		Seq: 1, Deps: []InstanceNum{0, 0}, ProcessAt: clock, TOQ: true,
-		Command: confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 2}),
-	}); err != nil {
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 2},
+	})); err != nil {
 		t.Fatal(err)
 	}
 	assertConfState(t, rn.Status().Conf, ConfState{ID: 2, Voters: []ReplicaID{1}})
@@ -637,12 +642,12 @@ func TestTOQAppliedSuccessorUsesPreprovisionedImplicitBound(t *testing.T) {
 	}
 
 	confRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type: MsgCommit, From: 1, To: 1, Ref: confRef,
 		Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1},
 		Seq: 1, Deps: []InstanceNum{0, 0}, ProcessAt: clock, TOQ: true,
-		Command: confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 2}),
-	}); err != nil {
+		Kind: EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 2},
+	})); err != nil {
 		t.Fatal(err)
 	}
 	if rn.toqActive == nil || !rn.Status().TOQAvailable || !sameReplicaIDs(rn.toqActive.group, []ReplicaID{1}) {
@@ -666,8 +671,8 @@ func TestTOQAppliedSuccessorUsesPreprovisionedImplicitBound(t *testing.T) {
 		t.Fatalf("successor TOQ proposal ref=%s, want configuration 2", ref)
 	}
 	rec := rn.instances[ref].rec
-	if !rec.TOQPending || rec.ProcessAt != clock {
-		t.Fatalf("successor TOQ record=%#v, want pending at %d", rec, clock)
+	if !rec.TOQPending || rec.ProcessAt != clock+1 {
+		t.Fatalf("successor TOQ record=%#v, want pending at %d", rec, clock+1)
 	}
 }
 
@@ -683,7 +688,7 @@ func TestTOQAppliedSuccessorRemovingExplicitGroupMemberRejectsLocalProposals(t *
 		Status:       StatusCommitted,
 		Seq:          1,
 		Deps:         []InstanceNum{0, 0, 0},
-		Command:      confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 2}),
+		Kind:         EntryConfChange, ConfChange: ConfChange{Type: ConfChangeRemoveVoter, Replica: 2},
 	})
 	rn.instances[ref] = &instance{rec: rec, phase: phaseCommitted}
 	rn.markPendingConf(rec)
@@ -720,21 +725,22 @@ func TestTOQReceiverComputesAttrsAtProcessAtFromFlaggedPreAccept(t *testing.T) {
 	})
 
 	ref := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	if err := rn.Step(Message{
+	if err := rn.Step(canonicalTestMessage(Message{
 		Type:      MsgPreAccept,
 		From:      1,
 		To:        2,
 		Ref:       ref,
 		Ballot:    Ballot{Replica: 1},
 		TOQ:       true,
-		ProcessAt: clock,
+		ProcessAt: clock + 1,
 		Seq:       0,
 		Deps:      nil,
 		Command:   toqTestCommand(204, "receiver-toq", "shared-toq-receiver"),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	clock++
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 
@@ -779,7 +785,7 @@ func TestTOQFiveNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T)
 	applyAndAdvanceTOQReady(t, store, rn, initial)
 
 	clock = processAt
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assignedReady := rn.Ready()
@@ -796,13 +802,13 @@ func TestTOQFiveNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T)
 
 	covering := Attributes{Seq: 3, Deps: []InstanceNum{0, 1, 1, 0, 0}}
 	for _, from := range []ReplicaID{2, 3} {
-		if err := rn.Step(Message{Type: MsgPreAcceptResp, From: from,
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: from,
 			To:     1,
 			Ref:    ref,
 			Ballot: inst.rec.Ballot,
 			Seq:    covering.Seq,
 			Deps:   append([]InstanceNum(nil), covering.Deps...), FastPathEligible: true,
-			DepsCommitted: dependencyMask(covering.Deps)}); err != nil {
+			DepsCommitted: dependencyMask(covering.Deps)})); err != nil {
 			t.Fatalf("step TOQ covering response from %d: %v", from, err)
 		}
 	}
@@ -858,7 +864,7 @@ func TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T
 		applyAndAdvanceTOQReady(t, store, rn, initial)
 
 		clock = processAt
-		if err := rn.ProcessTOQ(); err != nil {
+		if err := rn.ProcessTOQ(clock); err != nil {
 			t.Fatal(err)
 		}
 		assignedReady := rn.Ready()
@@ -881,13 +887,13 @@ func TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T
 	t.Run("covering remote reply commits at local plus one boundary", func(t *testing.T) {
 		rn, _, ref, inst, localAttrs := startScenario(t, 230, "toq-three-fast")
 		covering := Attributes{Seq: localAttrs.Seq + 1, Deps: []InstanceNum{0, 1, 1}}
-		if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2,
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 2,
 			To:     1,
 			Ref:    ref,
 			Ballot: inst.rec.Ballot,
 			Seq:    covering.Seq,
 			Deps:   append([]InstanceNum(nil), covering.Deps...), FastPathEligible: true,
-			DepsCommitted: dependencyMask(covering.Deps)}); err != nil {
+			DepsCommitted: dependencyMask(covering.Deps)})); err != nil {
 			t.Fatalf("step TOQ covering response: %v", err)
 		}
 
@@ -916,13 +922,13 @@ func TestTOQThreeNodeFastCommitUsesOptimizedQuorumWithCoveringAttrs(t *testing.T
 	t.Run("non-covering remote reply cannot fast commit at same boundary", func(t *testing.T) {
 		rn, _, ref, inst, _ := startScenario(t, 231, "toq-three-non-covering")
 		nonCovering := Attributes{Seq: 1, Deps: []InstanceNum{0, 0, 0}}
-		if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2,
+		if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 2,
 			To:     1,
 			Ref:    ref,
 			Ballot: inst.rec.Ballot,
 			Seq:    nonCovering.Seq,
 			Deps:   append([]InstanceNum(nil), nonCovering.Deps...), FastPathEligible: true,
-			DepsCommitted: dependencyMask(nonCovering.Deps)}); err != nil {
+			DepsCommitted: dependencyMask(nonCovering.Deps)})); err != nil {
 			t.Fatalf("step TOQ non-covering response: %v", err)
 		}
 
@@ -961,7 +967,7 @@ func TestTOQPrepareBeforeProcessAtWaitsForPendingAssignment(t *testing.T) {
 	applyAndAdvanceTOQReady(t, store, rn, initial)
 
 	prepare := Message{Type: MsgPrepare, From: 2, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 2}}
-	if err := rn.Step(prepare); err != nil {
+	if err := rn.Step(canonicalTestMessage(prepare)); err != nil {
 		t.Fatal(err)
 	}
 	if rn.HasReady() {
@@ -976,7 +982,7 @@ func TestTOQPrepareBeforeProcessAtWaitsForPendingAssignment(t *testing.T) {
 	}
 
 	clock = processAt
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assignedReady := rn.Ready()
@@ -986,7 +992,7 @@ func TestTOQPrepareBeforeProcessAtWaitsForPendingAssignment(t *testing.T) {
 	}
 	applyAndAdvanceTOQReady(t, store, rn, assignedReady)
 
-	if err := rn.Step(prepare); err != nil {
+	if err := rn.Step(canonicalTestMessage(prepare)); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -1012,7 +1018,7 @@ func TestTOQMessageValidationRejectsInvalidFlagBoundaries(t *testing.T) {
 		{name: "delayed-process-at", processAt: 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			valid := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, TOQ: true, ProcessAt: tc.processAt, Seq: 0, Deps: nil, Command: cmd}
+			valid := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, TOQ: true, ProcessAt: tc.processAt, Seq: 0, Deps: nil, Kind: EntryCommand, Command: cmd}
 			if err := valid.Validate(conf); err != nil {
 				t.Fatalf("valid explicit TOQ PreAccept at ProcessAt %d rejected: %v", tc.processAt, err)
 			}
@@ -1049,7 +1055,7 @@ func TestFlaggedTOQPreAcceptRejectsLegacyAttrsButAllowsImmediateProcessAt(t *tes
 	ref := InstanceRef{Replica: 1, Instance: 2, Conf: 1}
 	cmd := toqTestCommand(217, "toq-attr-validation", "toq-attr-validation-key")
 
-	validImmediate := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, TOQ: true, ProcessAt: 0, Command: cmd}
+	validImmediate := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: ref, Ballot: Ballot{Replica: 1}, TOQ: true, ProcessAt: 0, Kind: EntryCommand, Command: cmd}
 	if err := validImmediate.Validate(conf); err != nil {
 		t.Fatalf("flagged immediate TOQ PreAccept with empty attrs rejected: %v", err)
 	}
@@ -1075,14 +1081,11 @@ func TestFlaggedTOQPreAcceptRejectsLegacyAttrsButAllowsImmediateProcessAt(t *tes
 	}
 }
 
-func TestTOQConfigValidationRejectsUnsafeClockAndSyncGroup(t *testing.T) {
-	clock := uint64(10)
-	validClock := func() uint64 { return clock }
+func TestTOQConfigValidationRejectsUnsafeRuntimeAndSyncGroup(t *testing.T) {
 	base := Config{
-		ID:       1,
-		Voters:   makeIDs(3),
-		TOQ:      true,
-		TOQClock: validClock,
+		ID:     1,
+		Voters: makeIDs(3),
+		TOQ:    true,
 		TOQRuntime: &TOQRuntimeConfig{
 			Conf:        ConfState{ID: 1, Voters: makeIDs(3)},
 			OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 2, 3: 3},
@@ -1097,13 +1100,6 @@ func TestTOQConfigValidationRejectsUnsafeClockAndSyncGroup(t *testing.T) {
 			name: "time optimization cannot be combined with TOQ",
 			mutate: func(cfg Config) Config {
 				cfg.TimeOptimization = true
-				return cfg
-			},
-		},
-		{
-			name: "missing synchronized clock",
-			mutate: func(cfg Config) Config {
-				cfg.TOQClock = nil
 				return cfg
 			},
 		},
@@ -1175,7 +1171,7 @@ func TestTOQLocalSelfMessageIgnoresStaleAssignment(t *testing.T) {
 	applyAndAdvanceTOQReady(t, store, rn, initial)
 
 	clock = stale.ProcessAt
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assignedReady := rn.Ready()
@@ -1201,7 +1197,8 @@ func TestSingleVoterTOQProposalCommitsAfterLocalProcessAtAssignment(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	clock = 8
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1209,8 +1206,8 @@ func TestSingleVoterTOQProposalCommitsAfterLocalProcessAtAssignment(t *testing.T
 	if len(rd.Messages) != 0 {
 		t.Fatalf("single-voter TOQ proposal sent peer messages: %#v", rd.Messages)
 	}
-	if len(rd.Committed) != 1 || rd.Committed[0].Ref != ref || string(rd.Committed[0].Command.Payload) != "toq-single-voter" {
-		t.Fatalf("single-voter TOQ committed commands = %#v, want proposed command for %s", rd.Committed, ref)
+	if len(rd.Apply) != 1 || rd.Apply[0].Ref != ref || string(rd.Apply[0].Command.Payload) != "toq-single-voter" {
+		t.Fatalf("single-voter TOQ committed commands = %#v, want proposed command for %s", rd.Apply, ref)
 	}
 	var sawPending, sawPreAccepted, sawCommitted bool
 	for _, rec := range rd.Records {
@@ -1237,11 +1234,11 @@ func TestStepRejectsTOQFlagMismatchWithNodeMode(t *testing.T) {
 	}
 	remainingApplyHardStateOnly(t, nonTOQ, 0)
 	before := snapshotRemainingNodeProtocol(nonTOQ)
-	flagged := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 2}, TOQ: true, ProcessAt: 9, Command: cmd}
+	flagged := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: InstanceRef{Replica: 2, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 2}, TOQ: true, ProcessAt: 9, Kind: EntryCommand, Command: cmd}
 	if err := flagged.Validate(nonTOQ.q.conf); err != nil {
 		t.Fatalf("test setup flagged TOQ message failed validation before Step mode check: %v", err)
 	}
-	if err := nonTOQ.Step(flagged); !errors.Is(err, ErrMessageRejected) {
+	if err := nonTOQ.Step(canonicalTestMessage(flagged)); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("non-TOQ Step(flagged TOQ PreAccept) err=%v, want %v", err, ErrMessageRejected)
 	}
 	requireRemainingNodeProtocolUnchanged(t, nonTOQ, before)
@@ -1249,11 +1246,11 @@ func TestStepRejectsTOQFlagMismatchWithNodeMode(t *testing.T) {
 	clock := uint64(1)
 	toq := newTOQTestRawNode(t, 1, 3, &clock, NewMemoryStorage(), nil, map[ReplicaID]uint64{1: 0, 2: 3, 3: 5})
 	before = snapshotRemainingNodeProtocol(toq)
-	unflaggedTimed := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: InstanceRef{Replica: 2, Instance: 2, Conf: 1}, Ballot: Ballot{Replica: 2}, ProcessAt: 9, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: cmd}
+	unflaggedTimed := Message{Type: MsgPreAccept, From: 2, To: 1, Ref: InstanceRef{Replica: 2, Instance: 2, Conf: 1}, Ballot: Ballot{Replica: 2}, ProcessAt: 9, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Kind: EntryCommand, Command: cmd}
 	if err := unflaggedTimed.Validate(toq.q.conf); err != nil {
 		t.Fatalf("test setup unflagged timed message failed validation before Step TOQ check: %v", err)
 	}
-	if err := toq.Step(unflaggedTimed); !errors.Is(err, ErrMessageRejected) {
+	if err := toq.Step(canonicalTestMessage(unflaggedTimed)); !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("TOQ Step(unflagged timed PreAccept) err=%v, want %v", err, ErrMessageRejected)
 	}
 	requireRemainingNodeProtocolUnchanged(t, toq, before)
@@ -1300,7 +1297,6 @@ func TestMaybeFinalizePreAcceptLeavesPendingTOQUnfinalized(t *testing.T) {
 
 func TestTOQExplicitSamplingRollbackAndClosedBoundary(t *testing.T) {
 	clock := uint64(10)
-	reads := 0
 	store := NewMemoryStorage()
 	rn, err := NewRawNode(Config{
 		ID:            2,
@@ -1309,10 +1305,6 @@ func TestTOQExplicitSamplingRollbackAndClosedBoundary(t *testing.T) {
 		RetryTicks:    2,
 		RecoveryTicks: 10,
 		TOQ:           true,
-		TOQClock: func() uint64 {
-			reads++
-			return clock
-		},
 		TOQRuntime: &TOQRuntimeConfig{
 			Conf:        ConfState{ID: 1, Voters: makeIDs(3)},
 			OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0},
@@ -1321,15 +1313,9 @@ func TestTOQExplicitSamplingRollbackAndClosedBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reads != 0 {
-		t.Fatalf("NewRawNode sampled TOQ clock %d times, want zero", reads)
-	}
 	applyInitialTOQHardState(t, store, rn)
 	if err := rn.Tick(); err != nil {
 		t.Fatal(err)
-	}
-	if reads != 0 {
-		t.Fatalf("Tick sampled TOQ clock %d times, want zero", reads)
 	}
 	applyTOQHardStateOnly(t, store, rn, 1)
 
@@ -1343,33 +1329,26 @@ func TestTOQExplicitSamplingRollbackAndClosedBoundary(t *testing.T) {
 		Ballot:    Ballot{Replica: 1},
 		Command:   toqTestCommand(401, "explicit-sample", "explicit-sample-key"),
 	}
-	if err := rn.Step(future); err != nil {
+	if err := rn.Step(canonicalTestMessage(future)); err != nil {
 		t.Fatal(err)
 	}
-	if reads != 0 {
-		t.Fatalf("Step sampled TOQ clock %d times, want zero", reads)
-	}
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
-	if reads != 1 || !rn.toqClosed || rn.toqClosedThrough != 10 {
-		t.Fatalf("ProcessTOQ sample/closure reads=%d closed=%v through=%d, want 1/true/10", reads, rn.toqClosed, rn.toqClosedThrough)
+	if !rn.toqClosed || rn.toqClosedThrough != 10 {
+		t.Fatalf("ProcessTOQ closure closed=%v through=%d, want true/10", rn.toqClosed, rn.toqClosedThrough)
 	}
 
 	before := snapshotRemainingNodeProtocol(rn)
 	clock = 9
-	if err := rn.ProcessTOQ(); !errors.Is(err, ErrTOQClockRollback) {
+	if err := rn.ProcessTOQ(clock); !errors.Is(err, ErrTOQClockRollback) {
 		t.Fatalf("ProcessTOQ rollback err=%v, want %v", err, ErrTOQClockRollback)
 	}
 	requireRemainingNodeProtocolUnchanged(t, rn, before)
 
-	clock = 10
 	ref, err := rn.Propose(toqTestCommand(402, "closed-successor", "closed-successor-key"))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if reads != 3 {
-		t.Fatalf("proposal clock reads=%d, want rollback attempt plus one proposal sample", reads)
 	}
 	if got := rn.instances[ref].rec.ProcessAt; got != 11 {
 		t.Fatalf("proposal after closed bucket ProcessAt=%d, want 11", got)
@@ -1387,12 +1366,12 @@ func TestTOQTimestampOverflowRejectsProtocolMutation(t *testing.T) {
 	if rn.nextInstance != next || len(rn.instances) != 0 || len(rn.timers) != 0 || len(rn.deferredIndex) != 0 || rn.HasReady() {
 		t.Fatalf("overflow proposal mutated protocol state: next=%d instances=%d timers=%d deferred=%d ready=%#v", rn.nextInstance, len(rn.instances), len(rn.timers), len(rn.deferredIndex), rn.Ready())
 	}
-	if rn.toqSeen || rn.toqLastNow != 0 {
-		t.Fatalf("overflow proposal mutated monotonic observation: seen=%v last=%d", rn.toqSeen, rn.toqLastNow)
+	if !rn.toqSeen || rn.toqLastNow != clock {
+		t.Fatalf("overflow proposal changed monotonic observation: seen=%v last=%d", rn.toqSeen, rn.toqLastNow)
 	}
 
 	zeroDelay := newTOQTestRawNode(t, 1, 1, &clock, NewMemoryStorage(), nil, map[ReplicaID]uint64{1: 0})
-	if err := zeroDelay.ProcessTOQ(); err != nil {
+	if err := zeroDelay.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := zeroDelay.Propose(toqTestCommand(404, "closed-max", "closed-max-key")); !errors.Is(err, ErrTOQTimestampOverflow) {
@@ -1404,7 +1383,7 @@ func TestProcessTOQLogicalOverflowIsAtomic(t *testing.T) {
 	clock := uint64(10)
 	rn := newTOQTestRawNode(t, 2, 3, &clock, NewMemoryStorage(), nil, map[ReplicaID]uint64{1: 0, 2: 0, 3: 0})
 	message := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, ProcessAt: 20, TOQ: true, Ballot: Ballot{Replica: 1}, Command: toqTestCommand(413, "toq-logical-overflow", "toq-logical-overflow-key")}
-	if err := rn.Step(message); err != nil {
+	if err := rn.Step(canonicalTestMessage(message)); err != nil {
 		t.Fatal(err)
 	}
 	rn.tick = ^uint64(0)
@@ -1412,14 +1391,13 @@ func TestProcessTOQLogicalOverflowIsAtomic(t *testing.T) {
 	rn.acknowledgedHardState = rn.currentHardState.Clone()
 	clock = 20
 	before := snapshotRemainingNodeProtocol(rn)
-	if err := rn.ProcessTOQ(); !errors.Is(err, ErrLogicalTimeExhausted) {
+	if err := rn.ProcessTOQ(clock); !errors.Is(err, ErrLogicalTimeExhausted) {
 		t.Fatalf("ProcessTOQ at exhausted logical time err=%v, want %v", err, ErrLogicalTimeExhausted)
 	}
 	requireRemainingNodeProtocolUnchanged(t, rn, before)
 }
 
 func TestDeferredTOQUniqueConflictAndBound(t *testing.T) {
-	clock := uint64(10)
 	store := NewMemoryStorage()
 	rn, err := NewRawNode(Config{
 		ID:                    2,
@@ -1428,7 +1406,6 @@ func TestDeferredTOQUniqueConflictAndBound(t *testing.T) {
 		RetryTicks:            2,
 		RecoveryTicks:         10,
 		TOQ:                   true,
-		TOQClock:              func() uint64 { return clock },
 		TOQRuntime:            &TOQRuntimeConfig{Conf: ConfState{ID: 1, Voters: makeIDs(3)}, OneWayDelay: map[ReplicaID]uint64{1: 0, 2: 0, 3: 0}},
 		MaxDeferredPreAccepts: 1,
 	})
@@ -1446,12 +1423,13 @@ func TestDeferredTOQUniqueConflictAndBound(t *testing.T) {
 		Ballot:    Ballot{Replica: 1},
 		Command:   toqTestCommand(405, "first", "dedup-key"),
 	}
-	if err := rn.Step(original); err != nil {
+	original = canonicalTestMessage(original)
+	if err := rn.Step(canonicalTestMessage(original)); err != nil {
 		t.Fatal(err)
 	}
 	duplicate := original.Clone()
 	duplicate.Checksum = ChecksumMessage(duplicate)
-	if err := rn.Step(duplicate); err != nil {
+	if err := rn.Step(canonicalTestMessage(duplicate)); err != nil {
 		t.Fatalf("exact duplicate with canonical checksum err=%v", err)
 	}
 	if len(rn.deferredIndex) != 1 || rn.toqPreAccepts.Len() != 1 {
@@ -1459,22 +1437,22 @@ func TestDeferredTOQUniqueConflictAndBound(t *testing.T) {
 	}
 	conflicting := original.Clone()
 	conflicting.Command = toqTestCommand(406, "conflict", "dedup-key")
-	if err := rn.Step(conflicting); !errors.Is(err, ErrInvalidMessage) {
+	if err := rn.Step(canonicalTestMessage(conflicting)); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("conflicting duplicate err=%v, want %v", err, ErrInvalidMessage)
 	}
 	second := original.Clone()
 	second.From = 3
 	second.Ref = InstanceRef{Replica: 3, Instance: 1, Conf: 1}
 	second.Ballot = Ballot{Replica: 3}
-	if err := rn.Step(second); !errors.Is(err, ErrDeferredQueueFull) || !errors.Is(err, ErrMessageRejected) {
+	if err := rn.Step(canonicalTestMessage(second)); !errors.Is(err, ErrDeferredQueueFull) || !errors.Is(err, ErrMessageRejected) {
 		t.Fatalf("bounded queue err=%v, want ErrDeferredQueueFull and ErrMessageRejected", err)
 	}
 	if len(rn.deferredIndex) != 1 || !deferredMessageEqual(rn.toqPreAccepts[0].message, original) {
 		t.Fatalf("conflict/bound replaced first queue entry: %#v", rn.toqPreAccepts)
 	}
 
-	clock = 20
-	if err := rn.ProcessTOQ(); err != nil {
+	clock := uint64(20)
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -1494,12 +1472,12 @@ func TestTOQEqualTimestampTotalOrderAndLateFallback(t *testing.T) {
 			messages[0], messages[1] = messages[1], messages[0]
 		}
 		for _, message := range messages {
-			if err := rn.Step(message); err != nil {
+			if err := rn.Step(canonicalTestMessage(message)); err != nil {
 				t.Fatal(err)
 			}
 		}
 		clock = 20
-		if err := rn.ProcessTOQ(); err != nil {
+		if err := rn.ProcessTOQ(clock); err != nil {
 			t.Fatal(err)
 		}
 		return rn.Ready()
@@ -1522,11 +1500,11 @@ func TestTOQEqualTimestampTotalOrderAndLateFallback(t *testing.T) {
 
 	clock := uint64(20)
 	late := newTOQTestRawNode(t, 2, 3, &clock, NewMemoryStorage(), nil, map[ReplicaID]uint64{1: 0, 2: 0, 3: 0})
-	if err := late.ProcessTOQ(); err != nil {
+	if err := late.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	message := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: InstanceRef{Replica: 1, Instance: 2, Conf: 1}, ProcessAt: 20, TOQ: true, Ballot: Ballot{Replica: 1}, Command: toqTestCommand(409, "late", "late-key")}
-	if err := late.Step(message); err != nil {
+	if err := late.Step(canonicalTestMessage(message)); err != nil {
 		t.Fatal(err)
 	}
 	rd := late.Ready()
@@ -1540,21 +1518,21 @@ func TestTOQRestartRejectsRollbackBelowProcessedFloor(t *testing.T) {
 	store := NewMemoryStorage()
 	rn := newTOQTestRawNode(t, 2, 3, &clock, store, nil, map[ReplicaID]uint64{1: 0, 2: 0, 3: 0})
 	message := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, ProcessAt: 30, TOQ: true, Ballot: Ballot{Replica: 1}, Command: toqTestCommand(410, "restart-floor", "restart-floor-key")}
-	if err := rn.Step(message); err != nil {
+	if err := rn.Step(canonicalTestMessage(message)); err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatal(err)
 	}
 	assigned := rn.instances[message.Ref].rec
 	recoveryBallot := Ballot{Number: 1, Replica: 3}
-	if err := rn.Step(Message{Type: MsgAccept, From: 3, To: 2, Ref: message.Ref, ProcessAt: 30, TOQ: true, Ballot: recoveryBallot, Seq: assigned.Seq, Deps: assigned.Deps, Command: assigned.Command}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgAccept, From: 3, To: 2, Ref: message.Ref, ProcessAt: 30, TOQ: true, Ballot: recoveryBallot, Seq: assigned.Seq, Deps: assigned.Deps, Command: assigned.Command})); err != nil {
 		t.Fatal(err)
 	}
 	if got := rn.instances[message.Ref].rec.ProcessAt; got != 30 {
 		t.Fatalf("Accept discarded ProcessAt: got %d, want 30", got)
 	}
-	if err := rn.Step(Message{Type: MsgCommit, From: 3, To: 2, Ref: message.Ref, ProcessAt: 30, TOQ: true, Ballot: recoveryBallot, RecordBallot: recoveryBallot, Seq: assigned.Seq, Deps: assigned.Deps, Command: assigned.Command}); err != nil {
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgCommit, From: 3, To: 2, Ref: message.Ref, ProcessAt: 30, TOQ: true, Ballot: recoveryBallot, RecordBallot: recoveryBallot, Seq: assigned.Seq, Deps: assigned.Deps, Command: assigned.Command})); err != nil {
 		t.Fatal(err)
 	}
 	if got := rn.instances[message.Ref].rec.ProcessAt; got != 30 {
@@ -1568,7 +1546,7 @@ func TestTOQRestartRejectsRollbackBelowProcessedFloor(t *testing.T) {
 	clock = 29
 	restarted := newTOQTestRawNode(t, 2, 3, &clock, store, nil, map[ReplicaID]uint64{1: 0, 2: 0, 3: 0})
 	before := snapshotRemainingNodeProtocol(restarted)
-	if err := restarted.ProcessTOQ(); !errors.Is(err, ErrTOQClockRollback) {
+	if err := restarted.ProcessTOQ(clock); !errors.Is(err, ErrTOQClockRollback) {
 		t.Fatalf("restart rollback err=%v, want %v", err, ErrTOQClockRollback)
 	}
 	requireRemainingNodeProtocolUnchanged(t, restarted, before)
@@ -1614,7 +1592,8 @@ func rnDepsForValidation(typ MessageType, conf ConfState) []InstanceNum {
 	switch typ {
 	case MsgPreAcceptResp, MsgAccept, MsgCommit, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp:
 		return make([]InstanceNum, len(conf.Voters))
-	case MsgPreAccept, MsgAcceptResp, MsgPrepare, MsgEvidence, MsgEvidenceResp:
+	case MsgPreAccept, MsgAcceptResp, MsgPrepare, MsgEvidence, MsgEvidenceResp,
+		MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		fallthrough
 	default:
 		return nil
@@ -1626,10 +1605,10 @@ func TestTOQDeferredGenerationPoisonDoesNotBlockLaterDuePreAccept(t *testing.T) 
 	rn := newTOQTestRawNode(t, 2, 3, &clock, NewMemoryStorage(), nil, map[ReplicaID]uint64{1: 0, 2: 0, 3: 0})
 	first := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: InstanceRef{Conf: 1, Replica: 1, Instance: 1}, Ballot: Ballot{Replica: 1}, ProcessAt: 20, TOQ: true, Command: toqTestCommand(420, "poison-a", "poison-a-key")}
 	second := Message{Type: MsgPreAccept, From: 3, To: 2, Ref: InstanceRef{Conf: 1, Replica: 3, Instance: 1}, Ballot: Ballot{Replica: 3}, ProcessAt: 20, TOQ: true, Command: toqTestCommand(421, "valid-b", "valid-b-key")}
-	if err := rn.Step(first); err != nil {
+	if err := rn.Step(canonicalTestMessage(first)); err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.Step(second); err != nil {
+	if err := rn.Step(canonicalTestMessage(second)); err != nil {
 		t.Fatal(err)
 	}
 	firstKey := deferredPreAcceptKey{domain: preAcceptTOQ, ref: first.Ref, ballot: first.Ballot, from: first.From}
@@ -1638,7 +1617,7 @@ func TestTOQDeferredGenerationPoisonDoesNotBlockLaterDuePreAccept(t *testing.T) 
 	poison := &instance{rec: rec, phase: phaseIdle, generation: ^uint64(0)}
 	rn.installInstance(poison)
 	clock = 20
-	if err := rn.ProcessTOQ(); !errors.Is(err, ErrLogicalTimeExhausted) {
+	if err := rn.ProcessTOQ(clock); !errors.Is(err, ErrLogicalTimeExhausted) {
 		t.Fatalf("poisoned ProcessTOQ error = %v, want %v", err, ErrLogicalTimeExhausted)
 	}
 	if len(rn.deferredIndex) != 0 || firstEntry == nil || firstEntry.index != -1 {
@@ -1654,7 +1633,7 @@ func TestTOQDeferredGenerationPoisonDoesNotBlockLaterDuePreAccept(t *testing.T) 
 		t.Fatalf("poisoned ProcessTOQ did not close sampled bucket: closed=%v through=%d", rn.toqClosed, rn.toqClosedThrough)
 	}
 	late := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: InstanceRef{Conf: 1, Replica: 1, Instance: 2}, Ballot: Ballot{Replica: 1}, ProcessAt: 20, TOQ: true, Command: toqTestCommand(422, "late-same-time", "late-same-time-key")}
-	if err := rn.Step(late); err != nil {
+	if err := rn.Step(canonicalTestMessage(late)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rn.deferredIndex) != 0 {
@@ -1663,7 +1642,7 @@ func TestTOQDeferredGenerationPoisonDoesNotBlockLaterDuePreAccept(t *testing.T) 
 	if got := rn.instances[late.Ref]; got == nil || got.rec.FastPathEligible {
 		t.Fatalf("late same-time TOQ message regained fast eligibility: %#v", got)
 	}
-	if err := rn.ProcessTOQ(); err != nil {
+	if err := rn.ProcessTOQ(clock); err != nil {
 		t.Fatalf("later ProcessTOQ repeated poison error: %v", err)
 	}
 }

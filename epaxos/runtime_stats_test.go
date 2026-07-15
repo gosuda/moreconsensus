@@ -8,7 +8,7 @@ func TestIsExecutedAndRuntimeStatsAreAllocationFree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1000, Sequence: 1}, Payload: []byte("runtime-stats"), ConflictKeys: [][]byte{[]byte("runtime-stats-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1000, Sequence: 1}, Payload: []byte("runtime-stats"), Footprint: Footprint{Points: [][]byte{[]byte("runtime-stats-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestRuntimeStatsTracksReadyQueuesDeferralsRecoveriesAndLogicalAge(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1001, Sequence: 1}, Payload: []byte("queue-stats"), ConflictKeys: [][]byte{[]byte("queue-stats-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1001, Sequence: 1}, Payload: []byte("queue-stats"), Footprint: Footprint{Points: [][]byte{[]byte("queue-stats-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,9 +60,8 @@ func TestRuntimeStatsTracksReadyQueuesDeferralsRecoveriesAndLogicalAge(t *testin
 		t.Fatalf("frozen RuntimeStats=%#v", frozenStats)
 	}
 	inst := rn.instances[ref]
-	if err := rn.Step(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true}); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(Message{Type: MsgPreAcceptResp, From: 2, To: 1, Ref: ref, Ballot: inst.rec.Ballot, Seq: inst.rec.Seq, Deps: append([]InstanceNum(nil), inst.rec.Deps...), FastPathEligible: true})); err != nil { t.Fatal(err)
+ }
 	if got := rn.RuntimeStats(); got.NextReadyRecords == 0 || got.NextReadyMessages == 0 {
 		t.Fatalf("concurrent Ready output not isolated in next queue: %#v", got)
 	}
@@ -72,10 +71,9 @@ func TestRuntimeStatsTracksReadyQueuesDeferralsRecoveriesAndLogicalAge(t *testin
 		t.Fatal(err)
 	}
 	deferredRef := InstanceRef{Replica: 1, Instance: 1, Conf: 1}
-	deferred := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: deferredRef, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Payload: []byte("deferred"), ConflictKeys: [][]byte{[]byte("deferred-key")}}, ProcessAt: 5}
-	if err := timed.Step(deferred); err != nil {
-		t.Fatal(err)
-	}
+	deferred := Message{Type: MsgPreAccept, From: 1, To: 2, Ref: deferredRef, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Payload: []byte("deferred"), Footprint: Footprint{Points: [][]byte{[]byte("deferred-key")}}}, ProcessAt: 5}
+	if err := timed.Step(canonicalTestMessage(deferred)); err != nil { t.Fatal(err)
+ }
 	if got := timed.RuntimeStats(); got.DeferredPreAccepts != 1 {
 		t.Fatalf("deferred RuntimeStats=%#v", got)
 	}

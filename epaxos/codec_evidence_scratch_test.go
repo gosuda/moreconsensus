@@ -9,7 +9,6 @@ import (
 
 func TestDecodeMessageRejectsOversizedMessageType(t *testing.T) {
 	valid, _ := evidenceScratchTestMessages()
-	valid.Type = MessageType(1)
 	encoded := mustEncodeMessageSeed(valid)
 	frame := append([]byte(nil), encoded[:len(wireMagic)]...)
 	frame = binary.AppendUvarint(frame, 257)
@@ -78,9 +77,9 @@ func TestDecodeScratchResetClearsAcceptEvidenceReferencesAndKeepsCapacity(t *tes
 	acceptDepsCap := cap(scratch.AcceptDeps)
 	evidenceCap := cap(scratch.AcceptEvidence)
 	evidenceDepsCap := cap(scratch.AcceptEvidenceDeps)
-	keysCap := cap(scratch.ConflictKeys)
+	keysCap := cap(scratch.Points)
 	retainedEvidence := scratch.AcceptEvidence[:cap(scratch.AcceptEvidence)]
-	retainedKeys := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
+	retainedKeys := scratch.Points[:cap(scratch.Points)]
 
 	// Reset must clear pointer-bearing slots outside the current length too.
 	scratch.AcceptEvidence = scratch.AcceptEvidence[:1]
@@ -89,7 +88,7 @@ func TestDecodeScratchResetClearsAcceptEvidenceReferencesAndKeepsCapacity(t *tes
 		Seq:    99,
 		Deps:   []InstanceNum{99},
 	}
-	scratch.ConflictKeys = scratch.ConflictKeys[:1]
+	scratch.Points = scratch.Points[:1]
 	retainedKeys[len(retainedKeys)-1] = []byte("inactive-key-reference")
 	scratch.Reset()
 
@@ -97,7 +96,7 @@ func TestDecodeScratchResetClearsAcceptEvidenceReferencesAndKeepsCapacity(t *tes
 		len(scratch.AcceptDeps) != 0 || cap(scratch.AcceptDeps) != acceptDepsCap ||
 		len(scratch.AcceptEvidence) != 0 || cap(scratch.AcceptEvidence) != evidenceCap ||
 		len(scratch.AcceptEvidenceDeps) != 0 || cap(scratch.AcceptEvidenceDeps) != evidenceDepsCap ||
-		len(scratch.ConflictKeys) != 0 || cap(scratch.ConflictKeys) != keysCap {
+		len(scratch.Points) != 0 || cap(scratch.Points) != keysCap {
 		t.Fatalf("Reset changed scratch capacity or retained active lengths: %#v", scratch)
 	}
 	for i, evidence := range retainedEvidence {
@@ -185,7 +184,7 @@ func TestDecodeMessageWithScratchMalformedAcceptEvidenceReuseHasNoAllocation(t *
 			scratch := newEvidenceDecodeScratch(large)
 			initialEvidenceCap := cap(scratch.AcceptEvidence)
 			initialEvidenceDepsCap := cap(scratch.AcceptEvidenceDeps)
-			initialKeyCap := cap(scratch.ConflictKeys)
+			initialKeyCap := cap(scratch.Points)
 			var out Message
 			if err := DecodeMessageWithScratch(valid, &out, &scratch); err != nil {
 				t.Fatal(err)
@@ -211,23 +210,23 @@ func TestDecodeMessageWithScratchMalformedAcceptEvidenceReuseHasNoAllocation(t *
 			}
 			if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 ||
 				len(scratch.AcceptEvidence) != 0 || len(scratch.AcceptEvidenceDeps) != 0 ||
-				len(scratch.ConflictKeys) != 0 {
+				len(scratch.Points) != 0 {
 				t.Fatalf("malformed evidence decode retained scratch lengths: %#v", scratch)
 			}
 			if cap(scratch.AcceptEvidence) != initialEvidenceCap ||
 				cap(scratch.AcceptEvidenceDeps) != initialEvidenceDepsCap ||
-				cap(scratch.ConflictKeys) != initialKeyCap {
+				cap(scratch.Points) != initialKeyCap {
 				t.Fatalf("malformed evidence decode amplified scratch capacity: evidence=%d/%d deps=%d/%d keys=%d/%d",
 					cap(scratch.AcceptEvidence), initialEvidenceCap,
 					cap(scratch.AcceptEvidenceDeps), initialEvidenceDepsCap,
-					cap(scratch.ConflictKeys), initialKeyCap)
+					cap(scratch.Points), initialKeyCap)
 			}
 			for i, evidence := range scratch.AcceptEvidence[:cap(scratch.AcceptEvidence)] {
 				if evidence.Sender != 0 || evidence.Seq != 0 || evidence.Deps != nil {
 					t.Fatalf("malformed evidence decode retained outer slot %d: %#v", i, evidence)
 				}
 			}
-			for i, key := range scratch.ConflictKeys[:cap(scratch.ConflictKeys)] {
+			for i, key := range scratch.Points[:cap(scratch.Points)] {
 				if key != nil {
 					t.Fatalf("malformed evidence decode retained key slot %d: %q", i, key)
 				}
@@ -266,7 +265,7 @@ func newEvidenceDecodeScratch(m Message) DecodeScratch {
 		AcceptDeps:         make([]InstanceNum, 0, len(m.AcceptDeps)),
 		AcceptEvidence:     make([]AcceptEvidence, 0, len(m.AcceptEvidence)),
 		AcceptEvidenceDeps: make([]InstanceNum, 0, totalEvidenceDeps),
-		ConflictKeys:       make([][]byte, 0, len(m.Command.ConflictKeys)),
+		Points:             make([][]byte, 0, len(m.Command.Footprint.Points)),
 	}
 }
 

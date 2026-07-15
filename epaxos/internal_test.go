@@ -37,23 +37,23 @@ func TestValueHelpersAndStrings(t *testing.T) {
 	if err != nil || next != (Ballot{Number: 8, Replica: 3}) {
 		t.Fatalf("ballot next = %#v, %v", next, err)
 	}
-	userA := Command{Payload: []byte("a"), ConflictKeys: [][]byte{[]byte("x")}}
-	userB := Command{Payload: []byte("b"), ConflictKeys: [][]byte{[]byte("x")}}
-	userC := Command{Payload: []byte("c"), ConflictKeys: [][]byte{[]byte("y")}}
+	userA := Command{Payload: []byte("a"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}
+	userB := Command{Payload: []byte("b"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}
+	userC := Command{Payload: []byte("c"), Footprint: Footprint{Points: [][]byte{[]byte("y")}}}
 	if !userA.ConflictsWith(userB) || userA.ConflictsWith(userC) {
 		t.Fatal("user conflict failed")
 	}
-	if userA.ConflictsWith(Command{Kind: CommandNoop}) {
-		t.Fatal("noop conflict failed")
+	if userA.ConflictsWith(Command{}) {
+		t.Fatal("empty footprint conflict failed")
 	}
-	if !userA.ConflictsWith(Command{Kind: CommandConfChange}) {
-		t.Fatal("conf change conflict failed")
+	if !userA.ConflictsWith(Command{Footprint: Footprint{All: true}}) {
+		t.Fatal("global footprint conflict failed")
 	}
 	borrowed := userA.Borrow()
 	if !bytes.Equal(borrowed.Payload, userA.Payload) {
 		t.Fatal("borrow changed command")
 	}
-	rd := Ready{Records: []InstanceRecord{{}}, Messages: []Message{{Deps: []InstanceNum{1}}}, Committed: []CommittedCommand{{}}, MustSync: true}
+	rd := Ready{Records: []InstanceRecord{{}}, Messages: []Message{{Deps: []InstanceNum{1}}}, Apply: []ApplyCommand{{}}, MustSync: true}
 	rd.Release()
 	if !rd.Empty() || rd.MustSync {
 		t.Fatal("ready release failed")
@@ -83,32 +83,27 @@ func TestConfigValidationAndMessageValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}}
+	base := canonicalTestMessage(Message{Type: MsgCommit, From: 1, To: 1, Ref: InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Ballot: Ballot{Replica: 1}, RecordBallot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Kind: EntryNoop})
 	bad := base
 	bad.Type = 99
-	if err := rn.Step(bad); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("bad type err=%v", err)
-	}
+	if err := rn.Step(canonicalTestMessage(bad)); !errors.Is(err, ErrInvalidMessage) { t.Fatalf("bad type err=%v", err)
+ }
 	bad = base
 	bad.From = 9
-	if err := rn.Step(bad); !errors.Is(err, ErrMessageRejected) {
-		t.Fatalf("unknown sender err=%v", err)
-	}
+	if err := rn.Step(canonicalTestMessage(bad)); !errors.Is(err, ErrMessageRejected) { t.Fatalf("unknown sender err=%v", err)
+ }
 	bad = base
 	bad.Deps = nil
-	if err := rn.Step(bad); !errors.Is(err, ErrInvalidMessage) {
-		t.Fatalf("bad deps err=%v", err)
-	}
+	if err := rn.Step(canonicalTestMessage(bad)); !errors.Is(err, ErrInvalidMessage) { t.Fatalf("bad deps err=%v", err)
+ }
 	bad = base
 	bad.Checksum = [32]byte{1}
-	if err := rn.Step(bad); !errors.Is(err, ErrChecksumMismatch) {
-		t.Fatalf("bad checksum err=%v", err)
-	}
+	if err := rn.Step(canonicalTestMessage(bad)); !errors.Is(err, ErrChecksumMismatch) { t.Fatalf("bad checksum err=%v", err)
+ }
 	bad = base
 	bad.To = 2
-	if err := rn.Step(bad); !errors.Is(err, ErrMessageRejected) {
-		t.Fatalf("wrong target err=%v", err)
-	}
+	if err := rn.Step(canonicalTestMessage(bad)); !errors.Is(err, ErrMessageRejected) { t.Fatalf("wrong target err=%v", err)
+ }
 }
 
 func TestMessageValidateRequiresDependencyVectorWidthForAttributes(t *testing.T) {
@@ -273,12 +268,12 @@ func TestStorageEdgeCases(t *testing.T) {
 		t.Fatal("instance lookup did not clone")
 	}
 	st.Records[rec.Ref] = InstanceRecord{Ref: rec.Ref, Checksum: [32]byte{1}}
-	if err := st.LoadInstances(func(InstanceRecord) error { return nil }); !errors.Is(err, ErrChecksumMismatch) {
+	if err := st.LoadInstances(ExecutionFrontier{}, func(InstanceRecord) error { return nil }); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("checksum mismatch err=%v", err)
 	}
 	st.Records[rec.Ref] = rec
 	sentinel := errors.New("sentinel")
-	if err := st.LoadInstances(func(InstanceRecord) error { return sentinel }); !errors.Is(err, sentinel) {
+	if err := st.LoadInstances(ExecutionFrontier{}, func(InstanceRecord) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("callback err=%v", err)
 	}
 	nilMap := &MemoryStorage{}
@@ -293,7 +288,7 @@ func TestStorageEdgeCases(t *testing.T) {
 func TestPrepareRecoveryPath(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	s.drain()
-	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +305,7 @@ func TestPrepareRecoveryPath(t *testing.T) {
 func TestRejectPathsAndTimers(t *testing.T) {
 	s := newSimCluster(t, 3, false)
 	s.drain()
-	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}})
+	ref, err := s.nodes[1].Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,16 +314,14 @@ func TestRejectPathsAndTimers(t *testing.T) {
 		t.Fatal("expected preaccept messages")
 	}
 	msg := rd.Messages[0]
-	if err := s.nodes[msg.To].Step(msg); err != nil {
-		t.Fatal(err)
-	}
+	if err := s.nodes[msg.To].Step(canonicalTestMessage(msg)); err != nil { t.Fatal(err)
+ }
 	remote := s.nodes[msg.To].instances[ref]
 	remote.rec.Ballot = Ballot{Number: 9, Replica: msg.To}
-	lowAccept := Message{Type: MsgAccept, From: 1, To: msg.To, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: Command{Payload: []byte("x"), ConflictKeys: [][]byte{[]byte("x")}}}
+	lowAccept := Message{Type: MsgAccept, From: 1, To: msg.To, Ref: ref, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0, 0, 0}, Command: Command{Payload: []byte("x"), Footprint: Footprint{Points: [][]byte{[]byte("x")}}}}
 	lowAccept.Checksum = ChecksumMessage(lowAccept)
-	if err := s.nodes[msg.To].Step(lowAccept); err != nil {
-		t.Fatal(err)
-	}
+	if err := s.nodes[msg.To].Step(canonicalTestMessage(lowAccept)); err != nil { t.Fatal(err)
+ }
 	if err := s.nodes[1].Advance(rd); err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +379,7 @@ func TestEncodeMessageRejectsWireLimitOverflowWithoutAppending(t *testing.T) {
 			name: "too many conflict keys",
 			msg: func() Message {
 				msg := base
-				msg.Command.ConflictKeys = make([][]byte, maxWireConflictKeys+1)
+				msg.Command.Footprint.Points = make([][]byte, maxWireFootprintPoints+1)
 				return msg
 			}(),
 		},
@@ -451,13 +444,13 @@ func malformedCodecFrame(deps, acceptDeps, conflictKeys uint64) []byte {
 			for _, v := range []uint64{
 				0,
 				0,
-				uint64(CommandNoop),
+				uint64(EntryNoop),
 				0,
 				conflictKeys,
 			} {
 				buf = binary.AppendUvarint(buf, v)
 			}
-			if conflictKeys <= maxWireConflictKeys {
+			if conflictKeys <= maxWireFootprintPoints {
 				for range conflictKeys {
 					buf = binary.AppendUvarint(buf, 0)
 				}
@@ -489,7 +482,7 @@ func TestDecodeMessageRejectsOverwideDependencyAndConflictKeyCounts(t *testing.T
 		},
 		{
 			name:  "conflict keys",
-			frame: malformedCodecFrame(0, 0, maxWireConflictKeys+1),
+			frame: malformedCodecFrame(0, 0, maxWireFootprintPoints+1),
 		},
 	}
 
@@ -501,24 +494,24 @@ func TestDecodeMessageRejectsOverwideDependencyAndConflictKeyCounts(t *testing.T
 				AcceptSeq:  8,
 				AcceptDeps: []InstanceNum{9},
 				Command: Command{
-					Payload:      []byte("stale-payload"),
-					ConflictKeys: [][]byte{[]byte("stale-key")},
+					Payload:   []byte("stale-payload"),
+					Footprint: Footprint{Points: [][]byte{[]byte("stale-key")}},
 				},
 			}
 			scratch := DecodeScratch{
-				Deps:         []InstanceNum{1, 2},
-				AcceptDeps:   []InstanceNum{3, 4},
-				ConflictKeys: [][]byte{[]byte("old-key")},
+				Deps:       []InstanceNum{1, 2},
+				AcceptDeps: []InstanceNum{3, 4},
+				Points:     [][]byte{[]byte("old-key")},
 			}
 
 			if err := DecodeMessageWithScratch(tc.frame, &out, &scratch); !errors.Is(err, ErrInvalidMessage) {
 				t.Fatalf("DecodeMessageWithScratch(%s) err=%v, want %v", tc.name, err, ErrInvalidMessage)
 			}
-			if out.Type != 0 || len(out.Deps) != 0 || out.AcceptSeq != 0 || len(out.AcceptDeps) != 0 || len(out.Command.Payload) != 0 || len(out.Command.ConflictKeys) != 0 {
+			if out.Type != 0 || len(out.Deps) != 0 || out.AcceptSeq != 0 || len(out.AcceptDeps) != 0 || len(out.Command.Payload) != 0 || len(out.Command.Footprint.Points) != 0 {
 				t.Fatalf("decode failure left stale message data: %#v", out)
 			}
-			if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 || len(scratch.ConflictKeys) != 0 {
-				t.Fatalf("decode failure left scratch populated: deps=%v acceptDeps=%v keys=%v", scratch.Deps, scratch.AcceptDeps, scratch.ConflictKeys)
+			if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 || len(scratch.Points) != 0 {
+				t.Fatalf("decode failure left scratch populated: deps=%v acceptDeps=%v keys=%v", scratch.Deps, scratch.AcceptDeps, scratch.Points)
 			}
 		})
 	}
@@ -537,7 +530,7 @@ func TestCodecMalformedBranches(t *testing.T) {
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many accept deps err=%v", err)
 	}
-	buf = malformedCodecFrame(0, 0, maxWireConflictKeys+1)
+	buf = malformedCodecFrame(0, 0, maxWireFootprintPoints+1)
 	if err := DecodeMessage(buf, &out); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("too many keys err=%v", err)
 	}

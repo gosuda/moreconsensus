@@ -6,10 +6,12 @@ import (
 	"sort"
 )
 
-// Storage loads the complete durable state for a RawNode.
+// Storage exposes startup checkpoint-plus-delta state and exact record loads.
 type Storage interface {
 	InitialState() (StorageState, error)
-	LoadInstances(func(InstanceRecord) error) error
+	LoadCheckpoint() (Checkpoint, error)
+	LoadInstances(after ExecutionFrontier, yield func(InstanceRecord) error) error
+	LoadInstance(ref InstanceRef) (InstanceRecord, bool, error)
 }
 
 // MemoryStorage is a deterministic in-memory storage implementation for tests and examples.
@@ -25,6 +27,7 @@ type MemoryStorage struct {
 	AllocatorFloor   InstanceNum
 	TOQClosedThrough uint64
 	Records          map[InstanceRef]InstanceRecord
+	Checkpoint       Checkpoint
 	FailWrites       bool
 }
 
@@ -81,11 +84,18 @@ func (m *MemoryStorage) storageState() (StorageState, error) {
 	return state, nil
 }
 
-// LoadInstances iterates over durable records in deterministic order.
-func (m *MemoryStorage) LoadInstances(fn func(InstanceRecord) error) error {
+// LoadCheckpoint returns an ownership-independent durable checkpoint.
+func (m *MemoryStorage) LoadCheckpoint() (Checkpoint, error) {
+	return m.Checkpoint.Clone(), nil
+}
+
+// LoadInstances iterates over records strictly after the compacted frontier.
+func (m *MemoryStorage) LoadInstances(after ExecutionFrontier, yield func(InstanceRecord) error) error {
 	refs := make([]InstanceRef, 0, len(m.Records))
 	for ref := range m.Records {
-		refs = append(refs, ref)
+		if !frontierCovers(after, ref) {
+			refs = append(refs, ref)
+		}
 	}
 	sortRefs(refs)
 	for _, ref := range refs {
@@ -96,11 +106,20 @@ func (m *MemoryStorage) LoadInstances(fn func(InstanceRecord) error) error {
 			!VerifyRecordChecksumWithoutConfChangeResult(rec) {
 			return ErrChecksumMismatch
 		}
-		if err := fn(rec); err != nil {
+		if err := yield(rec); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// LoadInstance returns one non-compacted durable record.
+func (m *MemoryStorage) LoadInstance(ref InstanceRef) (InstanceRecord, bool, error) {
+	if frontierCovers(m.Checkpoint.CompactedThrough, ref) {
+		return InstanceRecord{}, false, nil
+	}
+	rec, ok := m.Records[ref]
+	return rec.Clone(), ok, nil
 }
 
 // ApplyReady durably applies a Ready batch atomically in persistence order.
@@ -128,6 +147,7 @@ func (m *MemoryStorage) deepClone() *MemoryStorage {
 		Frontiers:        cloneFrontierUpdates(m.Frontiers),
 		AllocatorFloor:   m.AllocatorFloor,
 		TOQClosedThrough: m.TOQClosedThrough,
+		Checkpoint:       m.Checkpoint.Clone(),
 		Records:          make(map[InstanceRef]InstanceRecord, len(m.Records)),
 		FailWrites:       m.FailWrites,
 	}
@@ -210,6 +230,9 @@ func (m *MemoryStorage) applyReadyValidated(rd Ready) error {
 
 	lastRecord := make(map[InstanceRef]int, len(rd.Records))
 	for i, rec := range rd.Records {
+		if frontierCovers(m.Checkpoint.CompactedThrough, rec.Ref) {
+			return fmt.Errorf("%w: record %s is below compacted frontier", ErrInvalidCheckpoint, rec.Ref)
+		}
 		if !VerifyRecordChecksum(rec) {
 			return ErrChecksumMismatch
 		}
@@ -345,6 +368,48 @@ func (m *MemoryStorage) applyReadyValidated(rd Ready) error {
 		return err
 	}
 
+	checkpoint := m.Checkpoint.Clone()
+	historyByID := make(map[ConfID]ConfState, len(history))
+	for _, entry := range history {
+		historyByID[entry.Conf.ID] = entry.Conf.Clone()
+	}
+	if rd.Snapshot != nil {
+		if rd.Snapshot.Mode != SnapshotPersistLocal && rd.Snapshot.Mode != SnapshotInstall {
+			return ErrInvalidCheckpoint
+		}
+		next := rd.Snapshot.Checkpoint.Clone()
+		if rd.Snapshot.Mode == SnapshotInstall && !checkpointCertified(next) {
+			return ErrInvalidCheckpoint
+		}
+		if err := validateCheckpoint(next, historyByID); err != nil {
+			return err
+		}
+		if !checkpoint.Empty() {
+			if frontierRegressesExecution(checkpoint.Descriptor.Through, next.Descriptor.Through) ||
+				frontierRegressesExecution(checkpoint.CompactedThrough, next.CompactedThrough) {
+				return ErrInvalidCheckpoint
+			}
+			if checkpoint.Descriptor.ID == next.Descriptor.ID &&
+				checkpointCertified(checkpoint) && !checkpointCertified(next) {
+				return ErrInvalidCheckpoint
+			}
+		}
+		checkpoint = next
+	}
+	expectedCompaction := canonicalCompactionRanges(checkpoint)
+	if len(rd.Compact) > 0 {
+		if !checkpointCertified(checkpoint) || len(rd.Compact) != len(expectedCompaction) {
+			return ErrInvalidCheckpoint
+		}
+		for i := range rd.Compact {
+			if rd.Compact[i] != expectedCompaction[i] {
+				return ErrInvalidCheckpoint
+			}
+		}
+		checkpoint.CompactedThrough = checkpoint.Descriptor.Through.Clone()
+		checkpoint.Checksum = DigestCheckpoint(checkpoint)
+	}
+
 	m.Hard = candidate.HardState.Clone()
 	m.ConfigHistory = cloneConfigHistory(candidate.ConfigHistory)
 	m.Configs = m.Configs[:0]
@@ -363,6 +428,14 @@ func (m *MemoryStorage) applyReadyValidated(rd Ready) error {
 	}
 	for _, rec := range rd.Records {
 		m.Records[rec.Ref] = rec.Clone()
+	}
+	m.Checkpoint = checkpoint.Clone()
+	if len(rd.Compact) > 0 {
+		for ref := range m.Records {
+			if frontierCovers(m.Checkpoint.CompactedThrough, ref) {
+				delete(m.Records, ref)
+			}
+		}
 	}
 	return nil
 }

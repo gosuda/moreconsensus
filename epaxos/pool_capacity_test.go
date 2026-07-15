@@ -8,11 +8,11 @@ func TestTypedPoolsRetainBoundedCapacityAndClearData(t *testing.T) {
 	message.AcceptDeps = append(message.AcceptDeps, 3, 2, 1)
 	message.AcceptEvidence = append(message.AcceptEvidence, AcceptEvidence{Sender: 1, Seq: 2, Deps: []InstanceNum{1, 2, 3}})
 	message.Command.Payload = append(message.Command.Payload, []byte("message-secret")...)
-	message.Command.ConflictKeys = append(message.Command.ConflictKeys, []byte("key-secret"))
+	message.Command.Footprint.Points = append(message.Command.Footprint.Points, []byte("key-secret"))
 	depsCap := cap(message.Deps)
 	payloadCap := cap(message.Command.Payload)
 	resetMessageForPool(message)
-	if len(message.Deps) != 0 || len(message.AcceptDeps) != 0 || len(message.AcceptEvidence) != 0 || len(message.Command.Payload) != 0 || len(message.Command.ConflictKeys) != 0 {
+	if len(message.Deps) != 0 || len(message.AcceptDeps) != 0 || len(message.AcceptEvidence) != 0 || len(message.Command.Payload) != 0 || len(message.Command.Footprint.Points) != 0 {
 		t.Fatalf("reset message was not logically empty: %#v", message)
 	}
 	if cap(message.Deps) < depsCap || cap(message.Command.Payload) < payloadCap {
@@ -25,7 +25,7 @@ func TestTypedPoolsRetainBoundedCapacityAndClearData(t *testing.T) {
 	}
 	PutMessage(message)
 	message = GetMessage()
-	if len(message.Deps) != 0 || len(message.AcceptDeps) != 0 || len(message.AcceptEvidence) != 0 || len(message.Command.Payload) != 0 || len(message.Command.ConflictKeys) != 0 {
+	if len(message.Deps) != 0 || len(message.AcceptDeps) != 0 || len(message.AcceptEvidence) != 0 || len(message.Command.Payload) != 0 || len(message.Command.Footprint.Points) != 0 {
 		t.Fatalf("pooled message was not logically empty: %#v", message)
 	}
 	PutMessage(message)
@@ -34,7 +34,7 @@ func TestTypedPoolsRetainBoundedCapacityAndClearData(t *testing.T) {
 	command.Payload = append(command.Payload, []byte("command-secret")...)
 	commandCap := cap(command.Payload)
 	resetCommandForPool(command)
-	if len(command.Payload) != 0 || len(command.ConflictKeys) != 0 || cap(command.Payload) < commandCap {
+	if len(command.Payload) != 0 || len(command.Footprint.Points) != 0 || cap(command.Payload) < commandCap {
 		t.Fatalf("reset command/capacity = %#v cap=%d, want empty cap >= %d", command, cap(command.Payload), commandCap)
 	}
 	for i, value := range command.Payload[:cap(command.Payload)] {
@@ -44,7 +44,7 @@ func TestTypedPoolsRetainBoundedCapacityAndClearData(t *testing.T) {
 	}
 	PutCommand(command)
 	command = GetCommand()
-	if len(command.Payload) != 0 || len(command.ConflictKeys) != 0 {
+	if len(command.Payload) != 0 || len(command.Footprint.Points) != 0 {
 		t.Fatalf("pooled command was not logically empty: %#v", command)
 	}
 	PutCommand(command)
@@ -54,10 +54,10 @@ func TestTypedPoolsRetainBoundedCapacityAndClearData(t *testing.T) {
 	scratch.acceptDeps(7)
 	scratch.acceptEvidence(3)
 	scratch.acceptEvidenceDeps(21)
-	scratch.conflictKeys(4)
+	scratch.points(4)
 	PutDecodeScratch(scratch)
 	scratch = GetDecodeScratch()
-	if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 || len(scratch.AcceptEvidence) != 0 || len(scratch.AcceptEvidenceDeps) != 0 || len(scratch.ConflictKeys) != 0 {
+	if len(scratch.Deps) != 0 || len(scratch.AcceptDeps) != 0 || len(scratch.AcceptEvidence) != 0 || len(scratch.AcceptEvidenceDeps) != 0 || len(scratch.Points) != 0 {
 		t.Fatalf("pooled decode scratch was not logically empty: %#v", scratch)
 	}
 	PutDecodeScratch(scratch)
@@ -72,14 +72,14 @@ func TestTypedPoolWarmPathsAllocateZero(t *testing.T) {
 		AcceptDeps:     []InstanceNum{0, 0, 0},
 		AcceptEvidence: []AcceptEvidence{{Sender: 1, Seq: 1, Deps: []InstanceNum{1, 2, 3}}},
 		Command: Command{
-			Payload:      []byte{1, 2, 3, 4},
-			ConflictKeys: [][]byte{[]byte("key")},
+			Payload:   []byte{1, 2, 3, 4},
+			Footprint: Footprint{Points: [][]byte{[]byte("key")}},
 		},
 	}
 	message := GetMessage()
 	messageShape.CloneInto(message)
 	PutMessage(message)
-	commandShape := Command{Payload: []byte{1, 2, 3, 4}, ConflictKeys: [][]byte{[]byte("key")}}
+	commandShape := Command{Payload: []byte{1, 2, 3, 4}, Footprint: Footprint{Points: [][]byte{[]byte("key")}}}
 	command := GetCommand()
 	commandShape.CloneInto(command)
 	PutCommand(command)
@@ -88,7 +88,7 @@ func TestTypedPoolWarmPathsAllocateZero(t *testing.T) {
 	scratch.acceptDeps(7)
 	scratch.acceptEvidence(3)
 	scratch.acceptEvidenceDeps(21)
-	scratch.conflictKeys(4)
+	scratch.points(4)
 	PutDecodeScratch(scratch)
 
 	messageAllocs := testing.AllocsPerRun(1000, func() {
@@ -113,7 +113,7 @@ func TestTypedPoolWarmPathsAllocateZero(t *testing.T) {
 		s.acceptDeps(7)
 		s.acceptEvidence(3)
 		s.acceptEvidenceDeps(21)
-		s.conflictKeys(4)
+		s.points(4)
 		PutDecodeScratch(s)
 	})
 	if scratchAllocs != 0 {
@@ -126,14 +126,14 @@ func TestCloneIntoClearsInactiveCapacity(t *testing.T) {
 	key := []byte("key-secret")
 	conflictSlots := make([][]byte, 3)
 	conflictSlots[2] = key
-	dstCommand := Command{Payload: payload[:0], ConflictKeys: conflictSlots[:0]}
+	dstCommand := Command{Payload: payload[:0], Footprint: Footprint{Points: conflictSlots[:0]}}
 	(Command{}).CloneInto(&dstCommand)
 	for i, value := range payload {
 		if value != 0 {
 			t.Fatalf("distinct zero-length payload capacity retained byte %d at offset %d", value, i)
 		}
 	}
-	if got := dstCommand.ConflictKeys[:cap(dstCommand.ConflictKeys)][2]; got != nil {
+	if got := dstCommand.Footprint.Points[:cap(dstCommand.Footprint.Points)][2]; got != nil {
 		t.Fatalf("inactive conflict-key slot retained %q", got)
 	}
 	if got := string(key); got != "key-secret" {
@@ -156,9 +156,9 @@ func TestCloneIntoClearsInactiveCapacity(t *testing.T) {
 	recordSlots[1] = InstanceRecord{Deps: []InstanceNum{1}, Command: Command{Payload: []byte("record-secret")}}
 	messageSlots := make([]Message, 2)
 	messageSlots[1] = Message{Deps: []InstanceNum{1}, Command: Command{Payload: []byte("message-secret")}}
-	committedSlots := make([]CommittedCommand, 2)
-	committedSlots[1] = CommittedCommand{Deps: []InstanceNum{1}, Command: Command{Payload: []byte("committed-secret")}}
-	dstReady := Ready{Records: recordSlots[:0], Messages: messageSlots[:0], Committed: committedSlots[:0]}
+	committedSlots := make([]ApplyCommand, 2)
+	committedSlots[1] = ApplyCommand{Deps: []InstanceNum{1}, Command: Command{Payload: []byte("committed-secret")}}
+	dstReady := Ready{Records: recordSlots[:0], Messages: messageSlots[:0], Apply: committedSlots[:0]}
 	(Ready{}).CloneInto(&dstReady)
 	if got := dstReady.Records[:cap(dstReady.Records)][1]; got.Deps != nil || got.Command.Payload != nil {
 		t.Fatalf("inactive Ready record retained references: %#v", got)
@@ -166,7 +166,7 @@ func TestCloneIntoClearsInactiveCapacity(t *testing.T) {
 	if got := dstReady.Messages[:cap(dstReady.Messages)][1]; got.Deps != nil || got.Command.Payload != nil {
 		t.Fatalf("inactive Ready message retained references: %#v", got)
 	}
-	if got := dstReady.Committed[:cap(dstReady.Committed)][1]; got.Deps != nil || got.Command.Payload != nil {
+	if got := dstReady.Apply[:cap(dstReady.Apply)][1]; got.Deps != nil || got.Command.Payload != nil {
 		t.Fatalf("inactive Ready command retained references: %#v", got)
 	}
 }
@@ -175,12 +175,12 @@ func TestCloneIntoHandlesShiftedOuterSliceOverlap(t *testing.T) {
 	keyBacking := []byte("firstsecond")
 	keySlots := [][]byte{keyBacking[:5], keyBacking[5:], nil}
 	sourceKeys := keySlots[:2]
-	dstCommand := Command{ConflictKeys: keySlots[1:1]}
-	(Command{ConflictKeys: sourceKeys}).CloneInto(&dstCommand)
-	if got := string(dstCommand.ConflictKeys[0]); got != "first" {
+	dstCommand := Command{Footprint: Footprint{Points: keySlots[1:1]}}
+	(Command{Footprint: Footprint{Points: sourceKeys}}).CloneInto(&dstCommand)
+	if got := string(dstCommand.Footprint.Points[0]); got != "first" {
 		t.Fatalf("shifted conflict key[0] = %q, want first", got)
 	}
-	if got := string(dstCommand.ConflictKeys[1]); got != "second" {
+	if got := string(dstCommand.Footprint.Points[1]); got != "second" {
 		t.Fatalf("shifted conflict key[1] = %q, want second", got)
 	}
 
@@ -225,7 +225,8 @@ func TestCloneIntoSelfPreservesDecodedAndCrossFieldAliases(t *testing.T) {
 		AcceptSeq:        3,
 		AcceptDeps:       []InstanceNum{1, 1, 0},
 		AcceptEvidence:   []AcceptEvidence{{Sender: 1, Seq: 3, Deps: []InstanceNum{1, 1, 0}}},
-		Command:          Command{Payload: []byte("payload"), ConflictKeys: [][]byte{[]byte("alpha"), []byte("beta")}},
+		Kind:             EntryCommand,
+		Command:          Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("payload"), Footprint: Footprint{Points: [][]byte{[]byte("alpha"), []byte("beta")}}},
 		DepsCommitted:    2,
 		FastPathEligible: false,
 	}
@@ -248,10 +249,10 @@ func TestCloneIntoSelfPreservesDecodedAndCrossFieldAliases(t *testing.T) {
 	aliased := Message{
 		Deps:       depsBacking[:3:6],
 		AcceptDeps: depsBacking[3:6],
-		Command: Command{ConflictKeys: [][]byte{
+		Command: Command{Footprint: Footprint{Points: [][]byte{
 			keyBacking[:3:6],
 			keyBacking[3:6],
-		}},
+		}}},
 	}
 	wantAliased := aliased.Clone()
 	aliased.CloneInto(&aliased)
@@ -263,12 +264,12 @@ func TestCloneIntoSelfPreservesDecodedAndCrossFieldAliases(t *testing.T) {
 func TestCloneIntoSelfDoesNotClearActiveDataAliasedByInactiveSlots(t *testing.T) {
 	key := []byte("key")
 	keySlots := [][]byte{key, key}
-	command := Command{ConflictKeys: keySlots[:1]}
+	command := Command{Footprint: Footprint{Points: keySlots[:1]}}
 	command.CloneInto(&command)
-	if got := string(command.ConflictKeys[0]); got != "key" {
+	if got := string(command.Footprint.Points[0]); got != "key" {
 		t.Fatalf("inactive conflict-key alias cleared active key: %q", got)
 	}
-	if command.ConflictKeys[:cap(command.ConflictKeys)][1] != nil {
+	if command.Footprint.Points[:cap(command.Footprint.Points)][1] != nil {
 		t.Fatal("inactive conflict-key slot retained a reference")
 	}
 
@@ -303,16 +304,16 @@ func TestCloneIntoSelfDoesNotClearActiveDataAliasedByInactiveSlots(t *testing.T)
 
 func TestConflictKeyPoolRetentionBoundariesAreAllOrNothing(t *testing.T) {
 	t.Run("per-key boundary retained and cleared", func(t *testing.T) {
-		key := make([]byte, maxPooledConflictKeyBytes)
+		key := make([]byte, maxPooledFootprintPointBytes)
 		for i := range key {
 			key[i] = 0xa5
 		}
-		command := &Command{ConflictKeys: [][]byte{key}}
+		command := &Command{Footprint: Footprint{Points: [][]byte{key}}}
 		resetCommandForPool(command)
-		if cap(command.ConflictKeys) != 1 || cap(command.ConflictKeys[:cap(command.ConflictKeys)][0]) != maxPooledConflictKeyBytes {
-			t.Fatalf("boundary key capacity was not retained: %#v", command.ConflictKeys)
+		if cap(command.Footprint.Points) != 1 || cap(command.Footprint.Points[:cap(command.Footprint.Points)][0]) != maxPooledFootprintPointBytes {
+			t.Fatalf("boundary key capacity was not retained: %#v", command.Footprint.Points)
 		}
-		for i, value := range command.ConflictKeys[:cap(command.ConflictKeys)][0][:maxPooledConflictKeyBytes] {
+		for i, value := range command.Footprint.Points[:cap(command.Footprint.Points)][0][:maxPooledFootprintPointBytes] {
 			if value != 0 {
 				t.Fatalf("boundary key retained byte %x at %d", value, i)
 			}
@@ -320,26 +321,26 @@ func TestConflictKeyPoolRetentionBoundariesAreAllOrNothing(t *testing.T) {
 	})
 
 	t.Run("oversized key drops complete arena", func(t *testing.T) {
-		command := &Command{ConflictKeys: [][]byte{
+		command := &Command{Footprint: Footprint{Points: [][]byte{
 			make([]byte, 32),
-			make([]byte, maxPooledConflictKeyBytes+1),
+			make([]byte, maxPooledFootprintPointBytes+1),
 			make([]byte, 32),
-		}}
+		}}}
 		resetCommandForPool(command)
-		if command.ConflictKeys != nil {
-			t.Fatalf("oversized key retained partial arena: %#v", command.ConflictKeys)
+		if command.Footprint.Points != nil {
+			t.Fatalf("oversized key retained partial arena: %#v", command.Footprint.Points)
 		}
 	})
 
 	t.Run("aggregate boundary retained", func(t *testing.T) {
 		keys := make([][]byte, 4)
 		for i := range keys {
-			keys[i] = make([]byte, maxPooledConflictKeyBytes)
+			keys[i] = make([]byte, maxPooledFootprintPointBytes)
 		}
-		command := &Command{ConflictKeys: keys}
+		command := &Command{Footprint: Footprint{Points: keys}}
 		resetCommandForPool(command)
-		if cap(command.ConflictKeys) != len(keys) {
-			t.Fatalf("aggregate boundary capacity=%d, want %d", cap(command.ConflictKeys), len(keys))
+		if cap(command.Footprint.Points) != len(keys) {
+			t.Fatalf("aggregate boundary capacity=%d, want %d", cap(command.Footprint.Points), len(keys))
 		}
 	})
 
@@ -350,10 +351,10 @@ func TestConflictKeyPoolRetentionBoundariesAreAllOrNothing(t *testing.T) {
 			keys[i][0] = 0x5a
 		}
 		aliases := append([][]byte(nil), keys...)
-		command := &Command{ConflictKeys: keys}
+		command := &Command{Footprint: Footprint{Points: keys}}
 		resetCommandForPool(command)
-		if command.ConflictKeys != nil {
-			t.Fatalf("aggregate overflow retained partial arena: %#v", command.ConflictKeys)
+		if command.Footprint.Points != nil {
+			t.Fatalf("aggregate overflow retained partial arena: %#v", command.Footprint.Points)
 		}
 		for i, key := range aliases {
 			if key[0] != 0 {

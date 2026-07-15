@@ -199,7 +199,7 @@ func runOneCampaign(cfg runnerConfig, build buildArtifacts, size int, profile, c
 		recorder: newHistoryRecorder(cfg.requestTimeout),
 		prefix:   fmt.Sprintf("fc-%d-%s-%x", size, strings.ReplaceAll(profile, "-", "_"), cfg.seed),
 		//nolint:gosec // G404: weak random is fine for test generation
-		rng:      rand.New(rand.NewPCG(cfg.seed, uint64(size)<<32|uint64(len(profile)))),
+		rng: rand.New(rand.NewPCG(cfg.seed, uint64(size)<<32|uint64(len(profile)))),
 	}
 	manifest := state.manifest("starting", "")
 	if err := writeJSONDurable(filepath.Join(caseDir, "manifest.json"), manifest); err != nil {

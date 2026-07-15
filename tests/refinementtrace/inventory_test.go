@@ -49,8 +49,9 @@ var rawNodeMethodContracts = map[string]rawNodeMethodContract{
 	"Status":            {},
 	"BootstrapClosure":  {},
 	"BootstrapStatus":   {},
-	"VisitConflicts":    {},
+
 	"ProvideRecordLoad": {Mutates: true, Models: []string{"ReadyAdvance.tla", "EPaxosRawNodeRefinement.tla"}, Gap: "async folded-record reload is covered by Go tests; no RawNode refinement-trace action yet"},
+	"ProvideCheckpoint": {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "application checkpoint materialization is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
 }
 
 func exportedRawNodeMethods(t *testing.T) map[string]struct{} {

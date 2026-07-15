@@ -1,7 +1,6 @@
 package epaxos
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -195,18 +194,20 @@ func (s Status) String() string {
 	}
 }
 
-// CommandKind describes how the EPaxos core should treat a command.
-type CommandKind uint8
+// EntryKind discriminates application values from protocol-only entries.
+type EntryKind uint8
 
 const (
-	// CommandUser is an application command.
-	CommandUser CommandKind = iota
-	// CommandNoop is a recovery command with no application effect.
-	CommandNoop
-	// CommandConfChange is a membership-change command.
-	CommandConfChange
-	// CommandMembership is a certified voter-bootstrap control command.
-	CommandMembership
+	// EntryCommand carries an opaque application command.
+	EntryCommand EntryKind = iota + 1
+	// EntryNoop carries no application or protocol value.
+	EntryNoop
+	// EntryConfChange carries a legacy validated configuration change.
+	EntryConfChange
+	// EntryMembership carries membership protocol control.
+	EntryMembership
+	// EntryCheckpoint carries certified checkpoint protocol control.
+	EntryCheckpoint
 )
 
 // CommandID is an application-supplied id used for duplicate detection by clients.
@@ -215,40 +216,33 @@ type CommandID struct {
 	Sequence uint64
 }
 
-// Command is the application value proposed through EPaxos.
+// Command is an opaque application value proposed through EPaxos.
 //
-// Payload is opaque to the consensus core. ConflictKeys are correctness
-// metadata, not an optimization hint: two user commands conflict when any
-// conflict key is byte-identical, so the application must include every
-// ordering-relevant key. Configuration changes and certified bootstrap
-// controls conflict with every non-noop command. The core never mutates
-// Payload or ConflictKeys. Propose clones these slices unless
-// Config.ZeroCopyProposals is true.
+// Footprint is correctness metadata, not an optimization hint. Payload,
+// CommandID, and CycleKey are opaque to the core. Propose canonicalizes the
+// footprint and clones all referenced bytes unless ZeroCopyProposals is set.
 type Command struct {
-	ID           CommandID
-	Kind         CommandKind
-	Payload      []byte
-	ConflictKeys [][]byte
+	ID        CommandID
+	Payload   []byte
+	Footprint Footprint
+	CycleKey  []byte
 }
 
-// Reset releases references held by the command so it can be reused by a caller.
+// Reset releases references held by the command so it can be reused.
 func (c *Command) Reset() {
 	c.ID = CommandID{}
-	c.Kind = CommandUser
 	c.Payload = nil
-	c.ConflictKeys = nil
+	c.Footprint = Footprint{}
+	c.CycleKey = nil
 }
 
 // CloneInto deep-copies c into dst while reusing destination capacity.
 func (c Command) CloneInto(dst *Command) {
 	payload := cloneSliceInto(dst.Payload, c.Payload)
-	conflictKeys := cloneByteSlicesInto(dst.ConflictKeys, c.ConflictKeys)
-	*dst = Command{
-		ID:           c.ID,
-		Kind:         c.Kind,
-		Payload:      payload,
-		ConflictKeys: conflictKeys,
-	}
+	footprint := dst.Footprint
+	cloneFootprintInto(&footprint, c.Footprint)
+	cycleKey := cloneSliceInto(dst.CycleKey, c.CycleKey)
+	*dst = Command{ID: c.ID, Payload: payload, Footprint: footprint, CycleKey: cycleKey}
 }
 
 // Clone returns a deep copy of the command.
@@ -258,38 +252,38 @@ func (c Command) Clone() Command {
 	return out
 }
 
-// Borrow returns the command unchanged when the caller transfers ownership of
-// its Payload and ConflictKeys slices to the node.
+// Borrow returns c unchanged. The caller transfers ownership of all referenced
+// buffers for the lifetime documented by Config.ZeroCopyProposals.
 func (c Command) Borrow() Command { return c }
 
-// commandHasGlobalConflictScope reports whether kind participates in the
-// protocol-wide non-noop conflict relation.
-func commandHasGlobalConflictScope(kind CommandKind) bool {
-	return kind == CommandConfChange || kind == CommandMembership
+// ConflictsWith reports whether two application commands overlap.
+func (c Command) ConflictsWith(other Command) bool {
+	return footprintsConflict(c.Footprint, other.Footprint)
 }
 
-// commandsConflict is the single conflict relation used by public helpers and
-// protocol dependency/recovery paths.
-func commandsConflict(c, other Command) bool {
-	if c.Kind == CommandNoop || other.Kind == CommandNoop {
+func commandEmpty(c Command) bool {
+	return c.ID == (CommandID{}) && len(c.Payload) == 0 && len(c.Footprint.Points) == 0 &&
+		len(c.Footprint.Spans) == 0 && !c.Footprint.All && len(c.CycleKey) == 0
+}
+
+func entryValueCanonical(kind EntryKind, command Command, change ConfChange, control []byte) bool {
+	changeEmpty := change == (ConfChange{})
+	switch kind {
+	case 0:
+		return commandEmpty(command) && changeEmpty && len(control) == 0
+	case EntryCommand:
+		return changeEmpty && len(control) == 0 && footprintCanonical(command.Footprint) &&
+			len(command.CycleKey) <= maxWireCycleKeyBytes
+	case EntryNoop:
+		return commandEmpty(command) && changeEmpty && len(control) == 0
+	case EntryConfChange:
+		return commandEmpty(command) && len(control) == 0 &&
+			(change.Type == ConfChangeAddVoter || change.Type == ConfChangeRemoveVoter) && change.Replica != 0
+	case EntryMembership, EntryCheckpoint:
+		return commandEmpty(command) && changeEmpty && len(control) != 0 && len(control) <= maxWireProtocolControl
+	default:
 		return false
 	}
-	if commandHasGlobalConflictScope(c.Kind) || commandHasGlobalConflictScope(other.Kind) {
-		return true
-	}
-	for _, a := range c.ConflictKeys {
-		for _, b := range other.ConflictKeys {
-			if bytes.Equal(a, b) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// ConflictsWith reports whether two commands must be ordered by dependencies.
-func (c Command) ConflictsWith(other Command) bool {
-	return commandsConflict(c, other)
 }
 
 // ConfChangeType identifies the membership operation in a configuration command.
@@ -302,7 +296,7 @@ const (
 	ConfChangeRemoveVoter
 )
 
-// ConfChange is encoded into a CommandConfChange command by ProposeConfChange.
+// ConfChange is encoded into a EntryConfChange command by ProposeConfChange.
 type ConfChange struct {
 	Type    ConfChangeType
 	Replica ReplicaID
@@ -427,10 +421,6 @@ type Config struct {
 	// mode from TimeOptimization and requires an explicitly sampled clock plus
 	// conservative delay-bound inputs from the embedding application.
 	TOQ bool
-	// TOQClock returns the caller-managed TOQ clock. The core samples it only
-	// while proposing a TOQ instance or explicitly closing buckets through
-	// ProcessTOQ; NewRawNode, Tick, and Step never read it.
-	TOQClock func() uint64
 	// TOQRuntime binds operational timing inputs to an exact configuration.
 	// Nil is valid and leaves local TOQ proposal capability unavailable until
 	// RefreshTOQConfig installs a matching entry.
@@ -451,11 +441,19 @@ type Config struct {
 	// MaxResidentInstances fails local Propose when engine.residentCount exceeds
 	// the bound (0 = unlimited).
 	MaxResidentInstances int
-	// ZeroCopyProposals makes Propose retain command Payload and ConflictKeys
-	// slices instead of cloning them. When true, the caller transfers ownership
-	// of those slices and must not mutate or reuse them while they remain
-	// observable through Ready or Status.
+	// ZeroCopyProposals borrows already-canonical Payload, Footprint, and
+	// CycleKey buffers. The caller must not mutate or reuse borrowed buffers
+	// while they remain observable through Ready or Status. Canonicalization
+	// that sorts, merges, deduplicates, or removes resources produces owned data.
 	ZeroCopyProposals bool
+	// MaxFootprintPoints bounds raw point count on local proposals.
+	MaxFootprintPoints int
+	// MaxFootprintSpans bounds raw span count on local proposals.
+	MaxFootprintSpans int
+	// MaxFootprintBytes bounds total raw footprint endpoint bytes.
+	MaxFootprintBytes int
+	// MaxCycleKeyBytes bounds replicated SCC tie-break metadata.
+	MaxCycleKeyBytes int
 	// MaxReadyMessages caps Ready.Messages without capping durable records or
 	// committed application commands. A value less than one leaves messages
 	// uncapped.
@@ -528,6 +526,9 @@ type InstanceRecord struct {
 	// AcceptEvidence preserves original Accept/AcceptReply senders. It is tied
 	// to this record's current value tuple and must be cleared when that tuple changes.
 	AcceptEvidence   []AcceptEvidence
+	Kind             EntryKind
+	ConfChange       ConfChange
+	ProtocolControl  []byte
 	Command          Command
 	FastPathEligible bool
 	// ProcessAt is pinned when an instance is created or first received.
@@ -558,6 +559,7 @@ func (r InstanceRecord) CloneInto(dst *InstanceRecord) {
 	acceptEvidence := cloneAcceptEvidenceInto(dst.AcceptEvidence, r.AcceptEvidence)
 	command := dst.Command
 	r.Command.CloneInto(&command)
+	control := cloneSliceInto(dst.ProtocolControl, r.ProtocolControl)
 	conf := dst.ConfChangeResult.Conf
 	r.ConfChangeResult.Conf.CloneInto(&conf)
 	membership := r.MembershipResult.Clone()
@@ -565,6 +567,7 @@ func (r InstanceRecord) CloneInto(dst *InstanceRecord) {
 	dst.Deps = deps
 	dst.AcceptDeps = acceptDeps
 	dst.AcceptEvidence = acceptEvidence
+	dst.ProtocolControl = control
 	dst.Command = command
 	dst.ConfChangeResult.Conf = conf
 	dst.MembershipResult = membership
@@ -624,9 +627,9 @@ func (a Attributes) Equal(b Attributes) bool {
 	return true
 }
 
-// CommittedCommand is emitted to the application after dependency ordering
-// closes. The application must apply Ready.Committed in slice order.
-type CommittedCommand struct {
+// ApplyCommand is emitted after dependency closure. Applications must apply
+// Ready.Apply strictly in slice order.
+type ApplyCommand struct {
 	Ref     InstanceRef
 	Seq     uint64
 	Deps    []InstanceNum
@@ -634,7 +637,7 @@ type CommittedCommand struct {
 }
 
 // CloneInto deep-copies c into dst while reusing destination capacity.
-func (c CommittedCommand) CloneInto(dst *CommittedCommand) {
+func (c ApplyCommand) CloneInto(dst *ApplyCommand) {
 	deps := cloneSliceInto(dst.Deps, c.Deps)
 	command := dst.Command
 	c.Command.CloneInto(&command)
@@ -643,9 +646,9 @@ func (c CommittedCommand) CloneInto(dst *CommittedCommand) {
 	dst.Command = command
 }
 
-// Clone returns a deep copy of the committed command.
-func (c CommittedCommand) Clone() CommittedCommand {
-	var out CommittedCommand
+// Clone returns a deep copy of the apply command.
+func (c ApplyCommand) Clone() ApplyCommand {
+	var out ApplyCommand
 	c.CloneInto(&out)
 	return out
 }
@@ -657,9 +660,8 @@ type RecordLoadResult struct {
 	Found  bool
 }
 
-// Ready batches records to persist, messages to send, and commands to apply.
-// Committed is already dependency-ordered; callers must preserve its slice
-// order when applying commands.
+// Ready batches deterministic effects for the embedding. Apply is already
+// dependency-ordered and must not be reordered or applied in parallel.
 type Ready struct {
 	HardState         HardState
 	ConfigHistory     []ConfigHistoryEntry
@@ -670,9 +672,12 @@ type Ready struct {
 	AllocatorFloor    InstanceNum
 	Messages          []Message
 	BootstrapMessages []BootstrapMessage
-	Committed         []CommittedCommand
-	// RecordLoads requests durable InstanceRecords for folded refs referenced by
-	// inbound messages. Sorted and deduplicated; stable until Advance.
+	Apply             []ApplyCommand
+	Snapshot          *Snapshot
+	Checkpoint        *CheckpointRequest
+	Compact           []CompactionRange
+	// RecordLoads requests durable records for folded refs. Sorted,
+	// deduplicated, and stable until Advance.
 	RecordLoads []InstanceRef
 	MustSync    bool
 }
@@ -682,7 +687,8 @@ func (r Ready) Empty() bool {
 	return r.HardState.Empty() && len(r.ConfigHistory) == 0 && len(r.Records) == 0 &&
 		len(r.BootstrapRecords) == 0 && r.LocalVoterState == nil && len(r.FrontierUpdates) == 0 &&
 		r.AllocatorFloor == 0 && len(r.Messages) == 0 && len(r.BootstrapMessages) == 0 &&
-		len(r.Committed) == 0 && len(r.RecordLoads) == 0 && !r.MustSync
+		len(r.Apply) == 0 && len(r.RecordLoads) == 0 && r.Snapshot == nil && r.Checkpoint == nil &&
+		len(r.Compact) == 0 && !r.MustSync
 }
 
 // CloneInto deep-copies r into dst while reusing destination capacity.
@@ -801,26 +807,26 @@ func (r Ready) CloneInto(dst *Ready) {
 	}
 	clear(bootstrapMessages[len(bootstrapMessages):cap(bootstrapMessages)])
 
-	sourceCommitted := r.Committed
-	if slicesPartiallyOverlap(dst.Committed, sourceCommitted) {
-		snapshot := make([]CommittedCommand, len(sourceCommitted))
-		for i := range sourceCommitted {
-			sourceCommitted[i].CloneInto(&snapshot[i])
+	sourceApply := r.Apply
+	if slicesPartiallyOverlap(dst.Apply, sourceApply) {
+		snapshot := make([]ApplyCommand, len(sourceApply))
+		for i := range sourceApply {
+			sourceApply[i].CloneInto(&snapshot[i])
 		}
-		sourceCommitted = snapshot
+		sourceApply = snapshot
 	}
-	committed := dst.Committed
-	if cap(committed) < len(sourceCommitted) {
-		committed = make([]CommittedCommand, len(sourceCommitted))
+	apply := dst.Apply
+	if cap(apply) < len(sourceApply) {
+		apply = make([]ApplyCommand, len(sourceApply))
 	} else {
-		committed = committed[:len(sourceCommitted)]
+		apply = apply[:len(sourceApply)]
 	}
-	for i := range sourceCommitted {
-		sourceCommitted[i].CloneInto(&committed[i])
+	for i := range sourceApply {
+		sourceApply[i].CloneInto(&apply[i])
 	}
-	fullCommitted := committed[:cap(committed)]
-	for i := len(committed); i < len(fullCommitted); i++ {
-		fullCommitted[i] = CommittedCommand{}
+	fullApply := apply[:cap(apply)]
+	for i := len(apply); i < len(fullApply); i++ {
+		fullApply[i] = ApplyCommand{}
 	}
 
 	sourceLoads := r.RecordLoads
@@ -836,6 +842,18 @@ func (r Ready) CloneInto(dst *Ready) {
 	copy(recordLoads, sourceLoads)
 	clear(recordLoads[len(recordLoads):cap(recordLoads)])
 
+	var snapshotWork *Snapshot
+	if r.Snapshot != nil {
+		cloned := r.Snapshot.Clone()
+		snapshotWork = &cloned
+	}
+	var checkpointRequest *CheckpointRequest
+	if r.Checkpoint != nil {
+		cloned := r.Checkpoint.Clone()
+		checkpointRequest = &cloned
+	}
+	compact := cloneSliceInto(dst.Compact, r.Compact)
+
 	*dst = Ready{
 		HardState:         hardState,
 		ConfigHistory:     history,
@@ -846,7 +864,10 @@ func (r Ready) CloneInto(dst *Ready) {
 		AllocatorFloor:    r.AllocatorFloor,
 		Messages:          messages,
 		BootstrapMessages: bootstrapMessages,
-		Committed:         committed,
+		Apply:             apply,
+		Snapshot:          snapshotWork,
+		Checkpoint:        checkpointRequest,
+		Compact:           compact,
 		RecordLoads:       recordLoads,
 		MustSync:          r.MustSync,
 	}
@@ -883,9 +904,16 @@ func (r *Ready) Release() {
 	for i := range r.BootstrapMessages {
 		r.BootstrapMessages[i] = BootstrapMessage{}
 	}
-	for i := range r.Committed {
-		r.Committed[i] = CommittedCommand{}
+	for i := range r.Apply {
+		r.Apply[i] = ApplyCommand{}
 	}
+	if r.Snapshot != nil {
+		*r.Snapshot = Snapshot{}
+	}
+	if r.Checkpoint != nil {
+		*r.Checkpoint = CheckpointRequest{}
+	}
+	clear(r.Compact)
 	r.HardState = HardState{}
 	r.Records = nil
 	r.ConfigHistory = nil
@@ -894,8 +922,11 @@ func (r *Ready) Release() {
 	r.LocalVoterState = nil
 	r.FrontierUpdates = nil
 	r.AllocatorFloor = 0
-	r.Committed = nil
+	r.Apply = nil
 	r.BootstrapMessages = nil
+	r.Snapshot = nil
+	r.Checkpoint = nil
+	r.Compact = nil
 	r.MustSync = false
 }
 

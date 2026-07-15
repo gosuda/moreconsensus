@@ -24,8 +24,8 @@ func BenchmarkApplyReady(b *testing.B) {
 					record := epaxos.InstanceRecord{
 						Ref:    epaxos.InstanceRef{Replica: 1, Instance: epaxos.InstanceNum(uint64(iteration)*uint64(count) + uint64(index) + 1), Conf: 1}, //nolint:gosec // benchmark loop variables are positive
 						Ballot: epaxos.Ballot{Replica: 1}, RecordBallot: epaxos.Ballot{Replica: 1},
-						Status: epaxos.StatusAccepted, Seq: 1, Deps: []epaxos.InstanceNum{0},
-						Command: epaxos.Command{Kind: epaxos.CommandUser, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("fixed-conflict-key")}},
+						Status: epaxos.StatusAccepted, Seq: 1, Deps: []epaxos.InstanceNum{0}, Kind: epaxos.EntryCommand,
+						Command: epaxos.Command{Payload: []byte("value"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("fixed-conflict-key")}}},
 					}
 					record.Checksum = epaxos.ChecksumRecord(record)
 					records[index] = record

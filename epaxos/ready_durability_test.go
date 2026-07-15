@@ -7,13 +7,13 @@ import (
 	"testing"
 )
 
-func TestUserCommittedCommandQueuesExecutedRecordOnlyAfterAdvance(t *testing.T) {
+func TestUserAppliedCommandQueuesExecutedRecordOnlyAfterAdvance(t *testing.T) {
 	store := NewMemoryStorage()
 	rn, err := NewRawNode(Config{ID: 1, Voters: makeIDs(1), Storage: store})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := Command{ID: CommandID{Client: 12, Sequence: 34}, Payload: []byte("durable-user"), ConflictKeys: [][]byte{[]byte("durable-key")}}
+	cmd := Command{ID: CommandID{Client: 12, Sequence: 34}, Payload: []byte("durable-user"), Footprint: Footprint{Points: [][]byte{[]byte("durable-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +21,7 @@ func TestUserCommittedCommandQueuesExecutedRecordOnlyAfterAdvance(t *testing.T) 
 
 	rd := rn.Ready()
 	committed := requireCommittedForRef(t, rd, ref)
-	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) || committed.Command.Kind != CommandUser {
+	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
 		t.Fatalf("committed command = %#v, want user command %#v", committed.Command, cmd)
 	}
 	if !readyHasStatus(rd, ref, StatusCommitted) {
@@ -39,8 +39,8 @@ func TestUserCommittedCommandQueuesExecutedRecordOnlyAfterAdvance(t *testing.T) 
 
 	advanceOK(t, rn, rd)
 	next := rn.Ready()
-	if len(next.Committed) != 0 {
-		t.Fatalf("post-Advance ready emitted application commands: %#v", next.Committed)
+	if len(next.Apply) != 0 {
+		t.Fatalf("post-Advance ready emitted application commands: %#v", next.Apply)
 	}
 	if !readyHasStatus(next, ref, StatusExecuted) {
 		t.Fatalf("post-Advance ready for %s did not persist executed record: %#v", ref, next.Records)
@@ -60,14 +60,14 @@ func TestOutstandingCommittedReadyRemainsVisibleUntilAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := Command{ID: CommandID{Client: 44, Sequence: 55}, Payload: []byte("retry-user"), ConflictKeys: [][]byte{[]byte("retry-key")}}
+	cmd := Command{ID: CommandID{Client: 44, Sequence: 55}, Payload: []byte("retry-user"), Footprint: Footprint{Points: [][]byte{[]byte("retry-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rd := rn.Ready()
-	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+	if len(rd.Records) == 0 || len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
 		t.Fatalf("ready for %s = %#v", ref, rd)
 	}
 	if readyHasStatus(rd, ref, StatusExecuted) {
@@ -80,7 +80,7 @@ func TestOutstandingCommittedReadyRemainsVisibleUntilAdvance(t *testing.T) {
 	retry := rn.Ready()
 	requireSameReady(t, retry, rd)
 	committed := requireCommittedForRef(t, retry, ref)
-	if committed.Command.ID != cmd.ID || committed.Command.Kind != CommandUser || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
 		t.Fatalf("retry committed command = %#v, want %#v", committed.Command, cmd)
 	}
 
@@ -93,7 +93,7 @@ func TestOutstandingCommittedReadyRemainsVisibleUntilAdvance(t *testing.T) {
 	}
 
 	executed := rn.Ready()
-	if len(executed.Committed) != 0 || !readyHasStatus(executed, ref, StatusExecuted) {
+	if len(executed.Apply) != 0 || !readyHasStatus(executed, ref, StatusExecuted) {
 		t.Fatalf("post-Advance ready for %s = %#v, want executed record without replaying command", ref, executed)
 	}
 	if err := store.ApplyReady(executed); err != nil {
@@ -111,12 +111,12 @@ func TestAdvanceRejectsEmptyAcknowledgementAndAcceptsOutstandingReady(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("empty-ack"), ConflictKeys: [][]byte{[]byte("empty-ack-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: []byte("empty-ack"), Footprint: Footprint{Points: [][]byte{[]byte("empty-ack-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
-	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+	if len(rd.Records) == 0 || len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
 		t.Fatalf("ready for %s = %#v", ref, rd)
 	}
 	if err := store.ApplyReady(rd); err != nil {
@@ -130,7 +130,7 @@ func TestAdvanceRejectsEmptyAcknowledgementAndAcceptsOutstandingReady(t *testing
 
 	advanceOK(t, rn, rd)
 	next := rn.Ready()
-	if len(next.Committed) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
+	if len(next.Apply) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
 		t.Fatalf("ready after accepting outstanding batch for %s = %#v", ref, next)
 	}
 }
@@ -143,7 +143,7 @@ func TestAdvanceRejectsNonEmptyAcknowledgementWithoutOutstandingReady(t *testing
 
 	advanceInvalid(t, rn, Ready{Records: []InstanceRecord{{Ref: InstanceRef{Replica: 1, Instance: 99, Conf: 1}}}, MustSync: true})
 
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("after-empty-window"), ConflictKeys: [][]byte{[]byte("after-empty-window-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("after-empty-window"), Footprint: Footprint{Points: [][]byte{[]byte("after-empty-window-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("sync-bit"), ConflictKeys: [][]byte{[]byte("sync-bit-key")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("sync-bit"), Footprint: Footprint{Points: [][]byte{[]byte("sync-bit-key")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
@@ -198,7 +198,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 4, Sequence: 1}, Payload: []byte("capped-message"), ConflictKeys: [][]byte{[]byte("capped-message-key")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 4, Sequence: 1}, Payload: []byte("capped-message"), Footprint: Footprint{Points: [][]byte{[]byte("capped-message-key")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
@@ -214,7 +214,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 			},
 			verify: func(t *testing.T, rn *RawNode, rd Ready) {
 				tail := rn.Ready()
-				if len(tail.Records) != 0 || len(tail.Committed) != 0 || len(tail.Messages) != 1 || tail.Messages[0].Ref != rd.Messages[0].Ref {
+				if len(tail.Records) != 0 || len(tail.Apply) != 0 || len(tail.Messages) != 1 || tail.Messages[0].Ref != rd.Messages[0].Ref {
 					t.Fatalf("ready after capped acknowledgement = %#v", tail)
 				}
 				advanceOK(t, rn, tail)
@@ -230,7 +230,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 5, Sequence: 1}, Payload: []byte("dep-element"), ConflictKeys: [][]byte{[]byte("dep-element-key")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 5, Sequence: 1}, Payload: []byte("dep-element"), Footprint: Footprint{Points: [][]byte{[]byte("dep-element-key")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
@@ -257,7 +257,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("dep-width"), ConflictKeys: [][]byte{[]byte("dep-width-key")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("dep-width"), Footprint: Footprint{Points: [][]byte{[]byte("dep-width-key")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
@@ -284,7 +284,7 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("payload-match"), ConflictKeys: [][]byte{[]byte("payload-match-key")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("payload-match"), Footprint: Footprint{Points: [][]byte{[]byte("payload-match-key")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
@@ -311,18 +311,18 @@ func TestAdvanceRejectsStrictAcknowledgementMismatchesWithoutDroppingReady(t *te
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("conflict-key"), ConflictKeys: [][]byte{[]byte("conflict-key-a")}}); err != nil {
+				if _, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("conflict-key"), Footprint: Footprint{Points: [][]byte{[]byte("conflict-key-a")}}}); err != nil {
 					t.Fatal(err)
 				}
 				rd := rn.Ready()
-				if len(rd.Records) == 0 || len(rd.Records[0].Command.ConflictKeys) != 1 || len(rd.Records[0].Command.ConflictKeys[0]) == 0 {
+				if len(rd.Records) == 0 || len(rd.Records[0].Command.Footprint.Points) != 1 || len(rd.Records[0].Command.Footprint.Points[0]) == 0 {
 					t.Fatalf("ready lacks command conflict key: %#v", rd)
 				}
 				return rn, rd
 			},
 			mismatched: func(_ *RawNode, rd Ready) Ready {
 				bad := cloneReady(rd)
-				bad.Records[0].Command.ConflictKeys[0][0] = 'C'
+				bad.Records[0].Command.Footprint.Points[0][0] = 'C'
 				return bad
 			},
 			verify: func(t *testing.T, rn *RawNode, _ Ready) {
@@ -348,12 +348,12 @@ func TestAdvanceAcceptsRecordOnlyAcknowledgementWithoutExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("record-only"), ConflictKeys: [][]byte{[]byte("record-only-key")}})
+	ref, err := rn.Propose(Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: []byte("record-only"), Footprint: Footprint{Points: [][]byte{[]byte("record-only-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
-	if len(rd.Records) == 0 || len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
+	if len(rd.Records) == 0 || len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
 		t.Fatalf("ready for %s = %#v", ref, rd)
 	}
 	if err := store.ApplyReady(Ready{HardState: rd.HardState, Records: rd.Records, MustSync: rd.MustSync}); err != nil {
@@ -366,12 +366,12 @@ func TestAdvanceAcceptsRecordOnlyAcknowledgementWithoutExecution(t *testing.T) {
 	}
 
 	committedOnly := rn.Ready()
-	if len(committedOnly.Records) != 0 || len(committedOnly.Committed) != 1 || committedOnly.Committed[0].Ref != ref {
+	if len(committedOnly.Records) != 0 || len(committedOnly.Apply) != 1 || committedOnly.Apply[0].Ref != ref {
 		t.Fatalf("ready after record-only acknowledgement for %s = %#v", ref, committedOnly)
 	}
 	advanceOK(t, rn, committedOnly)
 	next := rn.Ready()
-	if len(next.Committed) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
+	if len(next.Apply) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
 		t.Fatalf("ready after committed acknowledgement for %s = %#v; instance=%#v pending=%#v next=%#v durable=%v", ref, next, rn.instances[ref], rn.pendingReady, rn.nextReady, rn.durableExecuted.contains(ref))
 	}
 }
@@ -391,7 +391,7 @@ func TestAdvanceRejectsMessageOrCommittedBeforeRecordBarrier(t *testing.T) {
 					t.Fatal(err)
 				}
 				for seq := uint64(1); seq <= 2; seq++ {
-					if _, err := rn.Propose(Command{ID: CommandID{Client: 20, Sequence: seq}, Payload: []byte("barrier-message"), ConflictKeys: [][]byte{[]byte("barrier-message-key")}}); err != nil {
+					if _, err := rn.Propose(Command{ID: CommandID{Client: 20, Sequence: seq}, Payload: []byte("barrier-message"), Footprint: Footprint{Points: [][]byte{[]byte("barrier-message-key")}}}); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -418,22 +418,22 @@ func TestAdvanceRejectsMessageOrCommittedBeforeRecordBarrier(t *testing.T) {
 					t.Fatal(err)
 				}
 				for seq := uint64(1); seq <= 2; seq++ {
-					if _, err := rn.Propose(Command{ID: CommandID{Client: 21, Sequence: seq}, Payload: []byte("barrier-committed"), ConflictKeys: [][]byte{[]byte("barrier-committed-key")}}); err != nil {
+					if _, err := rn.Propose(Command{ID: CommandID{Client: 21, Sequence: seq}, Payload: []byte("barrier-committed"), Footprint: Footprint{Points: [][]byte{[]byte("barrier-committed-key")}}}); err != nil {
 						t.Fatal(err)
 					}
 				}
 				rd := rn.Ready()
-				if len(rd.Records) < 2 || len(rd.Committed) == 0 {
+				if len(rd.Records) < 2 || len(rd.Apply) == 0 {
 					t.Fatalf("ready lacks committed barrier inputs: %#v", rd)
 				}
 				return rn, rd
 			},
 			mismatched: func(rd Ready) Ready {
-				return Ready{Records: rd.Records[:1], Committed: rd.Committed[:1], MustSync: rd.MustSync}
+				return Ready{Records: rd.Records[:1], Apply: rd.Apply[:1], MustSync: rd.MustSync}
 			},
 			verify: func(t *testing.T, rn *RawNode) {
 				next := rn.Ready()
-				if len(next.Committed) != 0 || len(next.Records) != 2 {
+				if len(next.Apply) != 0 || len(next.Records) != 2 {
 					t.Fatalf("executed ready after matching acknowledgement = %#v", next)
 				}
 				for _, rec := range next.Records {
@@ -469,7 +469,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				ref, err := rn.Propose(Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("mutated-record"), ConflictKeys: [][]byte{[]byte("mutated-record-key")}})
+				ref, err := rn.Propose(Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: []byte("mutated-record"), Footprint: Footprint{Points: [][]byte{[]byte("mutated-record-key")}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -486,7 +486,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 			},
 			verify: func(t *testing.T, rn *RawNode, ref InstanceRef) {
 				next := rn.Ready()
-				if len(next.Committed) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
+				if len(next.Apply) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
 					t.Fatalf("ready after matching acknowledgement for %s = %#v", ref, next)
 				}
 			},
@@ -498,7 +498,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				ref, err := rn.Propose(Command{ID: CommandID{Client: 4, Sequence: 1}, Payload: []byte("mutated-message"), ConflictKeys: [][]byte{[]byte("mutated-message-key")}})
+				ref, err := rn.Propose(Command{ID: CommandID{Client: 4, Sequence: 1}, Payload: []byte("mutated-message"), Footprint: Footprint{Points: [][]byte{[]byte("mutated-message-key")}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -527,7 +527,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				ref, err := rn.Propose(Command{ID: CommandID{Client: 5, Sequence: 1}, Payload: []byte("mutated-committed"), ConflictKeys: [][]byte{[]byte("mutated-committed-key")}})
+				ref, err := rn.Propose(Command{ID: CommandID{Client: 5, Sequence: 1}, Payload: []byte("mutated-committed"), Footprint: Footprint{Points: [][]byte{[]byte("mutated-committed-key")}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -539,12 +539,12 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 			},
 			mismatched: func(rd Ready) Ready {
 				bad := cloneReady(rd)
-				bad.Committed[0].Seq++
+				bad.Apply[0].Seq++
 				return bad
 			},
 			verify: func(t *testing.T, rn *RawNode, ref InstanceRef) {
 				next := rn.Ready()
-				if len(next.Committed) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
+				if len(next.Apply) != 0 || !readyHasStatus(next, ref, StatusExecuted) {
 					t.Fatalf("ready after matching acknowledgement for %s = %#v", ref, next)
 				}
 			},
@@ -556,7 +556,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				ref, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("long-record"), ConflictKeys: [][]byte{[]byte("long-record-key")}})
+				ref, err := rn.Propose(Command{ID: CommandID{Client: 6, Sequence: 1}, Payload: []byte("long-record"), Footprint: Footprint{Points: [][]byte{[]byte("long-record-key")}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -584,7 +584,7 @@ func TestAdvanceRejectsMutatedReadyItemsWithoutDroppingPendingWork(t *testing.T)
 				if err != nil {
 					t.Fatal(err)
 				}
-				ref, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("long-message"), ConflictKeys: [][]byte{[]byte("long-message-key")}})
+				ref, err := rn.Propose(Command{ID: CommandID{Client: 7, Sequence: 1}, Payload: []byte("long-message"), Footprint: Footprint{Points: [][]byte{[]byte("long-message-key")}}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -622,15 +622,15 @@ func TestAdvanceRejectsOverlongCommittedAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := Command{ID: CommandID{Client: 90, Sequence: 12}, Payload: []byte("capped-user"), ConflictKeys: [][]byte{[]byte("capped-key")}}
+	cmd := Command{ID: CommandID{Client: 90, Sequence: 12}, Payload: []byte("capped-user"), Footprint: Footprint{Points: [][]byte{[]byte("capped-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rd := rn.Ready()
-	if len(rd.Committed) != 1 || rd.Committed[0].Ref != ref {
-		t.Fatalf("ready committed commands = %#v, want only %s", rd.Committed, ref)
+	if len(rd.Apply) != 1 || rd.Apply[0].Ref != ref {
+		t.Fatalf("ready committed commands = %#v, want only %s", rd.Apply, ref)
 	}
 	if err := store.ApplyReady(rd); err != nil {
 		t.Fatal(err)
@@ -644,13 +644,13 @@ func TestAdvanceRejectsOverlongCommittedAcknowledgement(t *testing.T) {
 		Status:       StatusExecuted,
 		Seq:          99,
 		Deps:         rn.q.deps(),
-		Command:      Command{ID: CommandID{Client: 91, Sequence: 13}, Payload: []byte("unrelated-user"), ConflictKeys: [][]byte{[]byte("unrelated-key")}},
+		Command:      Command{ID: CommandID{Client: 91, Sequence: 13}, Payload: []byte("unrelated-user"), Footprint: Footprint{Points: [][]byte{[]byte("unrelated-key")}}},
 	}
 	other.Checksum = ChecksumRecord(other)
 	rn.installInstance(&instance{rec: other, phase: phaseCommitted})
 
 	ack := cloneReady(rd)
-	ack.Committed = append(ack.Committed, CommittedCommand{
+	ack.Apply = append(ack.Apply, ApplyCommand{
 		Ref:     otherRef,
 		Seq:     other.Seq,
 		Deps:    append([]InstanceNum(nil), other.Deps...),
@@ -660,8 +660,8 @@ func TestAdvanceRejectsOverlongCommittedAcknowledgement(t *testing.T) {
 
 	advanceOK(t, rn, rd)
 	next := rn.Ready()
-	if len(next.Committed) != 0 {
-		t.Fatalf("post-Advance ready emitted application commands: %#v", next.Committed)
+	if len(next.Apply) != 0 {
+		t.Fatalf("post-Advance ready emitted application commands: %#v", next.Apply)
 	}
 	if !readyHasStatus(next, ref, StatusExecuted) {
 		t.Fatalf("post-Advance ready for %s did not persist executed record: %#v", ref, next.Records)
@@ -683,7 +683,7 @@ func TestRestartWithOnlyCommittedRecordReemitsUserCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := Command{ID: CommandID{Client: 56, Sequence: 78}, Payload: []byte("replay-user"), ConflictKeys: [][]byte{[]byte("replay-key")}}
+	cmd := Command{ID: CommandID{Client: 56, Sequence: 78}, Payload: []byte("replay-user"), Footprint: Footprint{Points: [][]byte{[]byte("replay-key")}}}
 	ref, err := rn.Propose(cmd)
 	if err != nil {
 		t.Fatal(err)
@@ -702,11 +702,11 @@ func TestRestartWithOnlyCommittedRecordReemitsUserCommand(t *testing.T) {
 	}
 	replayed := restarted.Ready()
 	committed := requireCommittedForRef(t, replayed, ref)
-	if committed.Command.ID != cmd.ID || committed.Command.Kind != CommandUser || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
+	if committed.Command.ID != cmd.ID || !bytes.Equal(committed.Command.Payload, cmd.Payload) {
 		t.Fatalf("replayed command = %#v, want %#v", committed.Command, cmd)
 	}
-	if len(committed.Command.ConflictKeys) != 1 || !bytes.Equal(committed.Command.ConflictKeys[0], cmd.ConflictKeys[0]) {
-		t.Fatalf("replayed command keys = %#v, want %#v", committed.Command.ConflictKeys, cmd.ConflictKeys)
+	if len(committed.Command.Footprint.Points) != 1 || !bytes.Equal(committed.Command.Footprint.Points[0], cmd.Footprint.Points[0]) {
+		t.Fatalf("replayed command keys = %#v, want %#v", committed.Command.Footprint.Points, cmd.Footprint.Points)
 	}
 	if readyHasStatus(replayed, ref, StatusExecuted) {
 		t.Fatalf("restart ready for %s persisted executed record before Advance: %#v", ref, replayed.Records)
@@ -725,8 +725,8 @@ func TestConfChangeExecutesWithoutApplicationCommit(t *testing.T) {
 	}
 
 	rd := f.node.Ready()
-	if len(rd.Committed) != 0 {
-		t.Fatalf("certified membership control appeared as application command: %#v", rd.Committed)
+	if len(rd.Apply) != 0 {
+		t.Fatalf("certified membership control appeared as application command: %#v", rd.Apply)
 	}
 	if !readyHasStatus(rd, ref, StatusExecuted) {
 		t.Fatalf("certified activation Ready for %s did not persist executed record: %#v", ref, rd.Records)
@@ -752,7 +752,7 @@ func TestConfChangeExecutesWithoutApplicationCommit(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing stored certified activation record %s", ref)
 	}
-	if stored.Status != StatusExecuted || stored.Command.Kind != CommandMembership ||
+	if stored.Status != StatusExecuted || stored.Kind != EntryMembership ||
 		stored.MembershipResult.Outcome != BootstrapOutcomeActivated ||
 		stored.ConfChangeResult.Outcome != ConfChangeApplied {
 		t.Fatalf("stored certified activation record = %#v", stored)
@@ -783,9 +783,9 @@ func cloneReady(rd Ready) Ready {
 	for i := range rd.Messages {
 		out.Messages[i] = rd.Messages[i].Clone()
 	}
-	out.Committed = make([]CommittedCommand, len(rd.Committed))
-	for i := range rd.Committed {
-		out.Committed[i] = rd.Committed[i].Clone()
+	out.Apply = make([]ApplyCommand, len(rd.Apply))
+	for i := range rd.Apply {
+		out.Apply[i] = rd.Apply[i].Clone()
 	}
 	return out
 }
@@ -797,15 +797,15 @@ func requireSameReady(t *testing.T, got, want Ready) {
 	}
 }
 
-func requireCommittedForRef(t *testing.T, rd Ready, ref InstanceRef) CommittedCommand {
+func requireCommittedForRef(t *testing.T, rd Ready, ref InstanceRef) ApplyCommand {
 	t.Helper()
-	for _, c := range rd.Committed {
+	for _, c := range rd.Apply {
 		if c.Ref == ref {
 			return c
 		}
 	}
-	t.Fatalf("ready did not include committed command %s: %#v", ref, rd.Committed)
-	return CommittedCommand{}
+	t.Fatalf("ready did not include committed command %s: %#v", ref, rd.Apply)
+	return ApplyCommand{}
 }
 
 func readyHasStatus(rd Ready, ref InstanceRef, status Status) bool {

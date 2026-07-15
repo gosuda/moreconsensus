@@ -65,8 +65,18 @@ func TestNativeHostValidationRejectsLinuxRootAndContainers(t *testing.T) {
 	tests := []hostEnvironment{
 		{GOOS: "linux", EUID: 1000, Lookup: lookup},
 		{GOOS: "darwin", EUID: 0, Lookup: lookup},
-		{GOOS: "darwin", EUID: 501, Lookup: func(name string) string { if name == "LIMA_INSTANCE" { return "vm" }; return "" }},
-		{GOOS: "darwin", EUID: 501, Lookup: func(name string) string { if name == "KUBERNETES_SERVICE_HOST" { return "cluster" }; return "" }},
+		{GOOS: "darwin", EUID: 501, Lookup: func(name string) string {
+			if name == "LIMA_INSTANCE" {
+				return "vm"
+			}
+			return ""
+		}},
+		{GOOS: "darwin", EUID: 501, Lookup: func(name string) string {
+			if name == "KUBERNETES_SERVICE_HOST" {
+				return "cluster"
+			}
+			return ""
+		}},
 	}
 	for _, host := range tests {
 		if err := validateNativeDarwinHost(host); err == nil {

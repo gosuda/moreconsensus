@@ -1436,7 +1436,7 @@ func membershipResultEqual(a, b MembershipResult) bool {
 
 func validateMembershipResult(record InstanceRecord) error {
 	result := record.MembershipResult
-	if record.Command.Kind != CommandMembership || record.Status != StatusExecuted {
+	if record.Kind != EntryMembership || record.Status != StatusExecuted {
 		if !membershipResultAbsent(record) {
 			return fmt.Errorf("%w: membership result outside executed membership command", ErrInvalidConfig)
 		}
@@ -1768,22 +1768,18 @@ func unmarshalBootstrapCanonical(encoded []byte, value any) error {
 	return nil
 }
 
-func encodeMembershipCommand(wire membershipCommandWire) (Command, error) {
+func encodeMembershipCommand(wire membershipCommandWire) ([]byte, error) {
 	wire.Version = bootstrapWireVersion
 	payload, err := marshalBootstrapCanonical(wire)
 	if err != nil {
-		return Command{}, err
+		return nil, err
 	}
-	return Command{Kind: CommandMembership, Payload: payload, ConflictKeys: [][]byte{[]byte("\xffmembership")}}, nil
+	return payload, nil
 }
 
-func decodeMembershipCommand(command Command) (membershipCommandWire, error) {
-	if command.Kind != CommandMembership || command.ID != (CommandID{}) || len(command.ConflictKeys) != 1 ||
-		!bytes.Equal(command.ConflictKeys[0], []byte("\xffmembership")) {
-		return membershipCommandWire{}, ErrBootstrapControl
-	}
+func decodeMembershipCommand(control []byte) (membershipCommandWire, error) {
 	var wire membershipCommandWire
-	if err := unmarshalBootstrapCanonical(command.Payload, &wire); err != nil || wire.Version != bootstrapWireVersion ||
+	if err := unmarshalBootstrapCanonical(control, &wire); err != nil || wire.Version != bootstrapWireVersion ||
 		wire.Operation < membershipPrepare || wire.Operation > membershipAbort {
 		return membershipCommandWire{}, ErrBootstrapControl
 	}
@@ -1807,8 +1803,8 @@ func decodeMembershipCommand(command Command) (membershipCommandWire, error) {
 	return wire, nil
 }
 
-func membershipCommandValidForRef(command Command, ref InstanceRef, conf ConfState) bool {
-	wire, err := decodeMembershipCommand(command)
+func membershipCommandValidForRef(control []byte, ref InstanceRef, conf ConfState) bool {
+	wire, err := decodeMembershipCommand(control)
 	if err != nil || !confStateEqual(wire.Plan.Request.Base, conf) {
 		return false
 	}
@@ -2074,21 +2070,21 @@ func (n *RawNode) PrepareVoter(request PrepareVoterRequest) (VoterPlan, error) {
 	return plan.Clone(), nil
 }
 
-func (n *RawNode) proposeMembershipAt(ref InstanceRef, command Command) error {
-	if !membershipCommandValidForRef(command, ref, n.confFor(ref.Conf)) {
+func (n *RawNode) proposeMembershipAt(ref InstanceRef, control []byte) error {
+	if !membershipCommandValidForRef(control, ref, n.confFor(ref.Conf)) {
 		return ErrBootstrapControl
 	}
 	if existing := n.instances[ref]; existing != nil {
-		if commandEqual(existing.rec.Command, command) {
+		if existing.rec.Kind == EntryMembership && bytes.Equal(existing.rec.ProtocolControl, control) {
 			return nil
 		}
 		return ErrBootstrapControl
 	}
-	attrs := n.computeAttrs(command, ref)
+	attrs := n.computeAttrs(Command{Footprint: Footprint{All: true}}, ref)
 	record := InstanceRecord{
 		Ref: ref, Ballot: Ballot{Replica: ref.Replica}, RecordBallot: Ballot{Replica: ref.Replica},
-		Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Command: command.Clone(),
-		FastPathEligible: true, TimingDomain: TimingDomainUntimed,
+		Status: StatusPreAccepted, Seq: attrs.Seq, Deps: attrs.Deps, Kind: EntryMembership,
+		ProtocolControl: bytes.Clone(control), FastPathEligible: true, TimingDomain: TimingDomainUntimed,
 	}
 	record.Checksum = ChecksumRecord(record)
 	inst := &instance{rec: record, phase: phasePreAccept, preOK: getAttrVoteSet(), createdTick: n.tick}
@@ -2837,12 +2833,14 @@ func (n *RawNode) admitWhileFenced(message Message) error {
 			}
 			return nil
 		case MsgPreAcceptResp, MsgPrepareResp, MsgAcceptResp:
-			if message.Command.Kind == CommandUser && len(message.Command.Payload) == 0 {
+			if message.Kind == 0 && commandEmpty(message.Command) &&
+				message.ConfChange == (ConfChange{}) && len(message.ProtocolControl) == 0 {
 				return nil
 			}
-		case MsgPreAccept, MsgAccept, MsgCommit, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+		case MsgPreAccept, MsgAccept, MsgCommit, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp,
+			MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 		}
-		wire, err := decodeMembershipCommand(message.Command)
+		wire, err := decodeMembershipCommand(message.ProtocolControl)
 		if err != nil || wire.Operation != operation || wire.Plan.Request.Plan != state.record.Plan.Request.Plan {
 			return ErrBootstrapControl
 		}
@@ -2876,32 +2874,33 @@ func (n *RawNode) admitWhileFenced(message Message) error {
 		if inst == nil {
 			return ErrBootstrapContradiction
 		}
-	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp:
+	case MsgPreAcceptResp, MsgAcceptResp, MsgPrepareResp, MsgTryPreAccept, MsgTryPreAcceptResp, MsgEvidence, MsgEvidenceResp,
+		MsgCheckpointVote, MsgCheckpointCertificate, MsgCheckpointOffer:
 	}
 	return nil
 }
 
-func (n *RawNode) membershipAllNoneCommand(ref InstanceRef) (Command, bool) {
+func (n *RawNode) membershipAllNoneCommand(ref InstanceRef) ([]byte, bool) {
 	state, operation, ok := n.findBootstrapControl(ref)
 	if !ok || (operation != membershipActivate && operation != membershipAbort) ||
 		state.durableDigest != state.record.Digest {
-		return Command{}, false
+		return nil, false
 	}
 	wire := membershipCommandWire{Operation: operation, Plan: state.record.Plan.Clone(), FenceDigest: state.record.FenceQuorum.Digest}
 	if operation == membershipActivate {
 		if state.record.SnapshotCertificate.Digest == (StateDigest{}) || state.record.ReadyCertificate.Digest == (StateDigest{}) {
-			return Command{}, false
+			return nil, false
 		}
 		wire.Snapshot = state.record.SnapshotCertificate.Clone()
 		wire.Ready = state.record.ReadyCertificate.Clone()
 	}
-	command, err := encodeMembershipCommand(wire)
-	return command, err == nil
+	control, err := encodeMembershipCommand(wire)
+	return control, err == nil
 }
 
-func (n *RawNode) applyMembershipControl(ref InstanceRef, command Command) (MembershipResult, ConfChangeResult) {
-	wire, err := decodeMembershipCommand(command)
-	if err != nil || !membershipCommandValidForRef(command, ref, n.confFor(ref.Conf)) {
+func (n *RawNode) applyMembershipControl(ref InstanceRef, control []byte) (MembershipResult, ConfChangeResult) {
+	wire, err := decodeMembershipCommand(control)
+	if err != nil || !membershipCommandValidForRef(control, ref, n.confFor(ref.Conf)) {
 		return MembershipResult{Plan: wire.Plan.Request.Plan, Outcome: BootstrapOutcomeRejectedInvalid, ExitRef: ref}, ConfChangeResult{}
 	}
 	state := n.bootstrapPlans[wire.Plan.Request.Plan]

@@ -17,7 +17,7 @@ func sampleDarwinProcess(ctx context.Context, pid int) (rssKiB uint64, fdCount i
 	}
 	psPath, err := exec.LookPath("ps")
 	if err != nil {
-		return 0, 0, fmt.Errorf("Darwin ps unavailable: %w", err)
+		return 0, 0, fmt.Errorf("darwin ps unavailable: %w", err)
 	}
 	psOutput, err := runExternalOutput(ctx, []string{psPath, "-o", "rss=", "-p", strconv.Itoa(pid)}, "")
 	if err != nil {
@@ -30,7 +30,7 @@ func sampleDarwinProcess(ctx context.Context, pid int) (rssKiB uint64, fdCount i
 	}
 	lsofPath, err := exec.LookPath("lsof")
 	if err != nil {
-		return 0, 0, fmt.Errorf("Darwin lsof unavailable: %w", err)
+		return 0, 0, fmt.Errorf("darwin lsof unavailable: %w", err)
 	}
 	lsofOutput, err := runExternalOutput(ctx, []string{lsofPath, "-n", "-P", "-p", strconv.Itoa(pid)}, "")
 	if err != nil {

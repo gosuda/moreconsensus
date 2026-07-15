@@ -32,7 +32,7 @@ func FuzzDecodeMessageWithScratchNeverPanics(f *testing.F) {
 			AcceptDeps:         make([]InstanceNum, 0, 7),
 			AcceptEvidence:     make([]AcceptEvidence, 0, 7),
 			AcceptEvidenceDeps: make([]InstanceNum, 0, 49),
-			ConflictKeys:       make([][]byte, 0, 8),
+			Points:             make([][]byte, 0, 8),
 		}
 		var msg Message
 		if err := DecodeMessageWithScratch(frame, &msg, &scratch); err == nil {
@@ -95,11 +95,11 @@ func FuzzStepNeverPanicsOnMalformedMessage(f *testing.F) {
 			AcceptSeq:      uint64(at(13)),
 			AcceptDeps:     acceptDeps,
 			AcceptEvidence: evidence,
+			Kind: EntryKind(at(16)),
 			Command: Command{
-				ID:           CommandID{Client: uint64(at(14)), Sequence: uint64(at(15))},
-				Kind:         CommandKind(at(16)),
-				Payload:      payload,
-				ConflictKeys: keys,
+				ID:        CommandID{Client: uint64(at(14)), Sequence: uint64(at(15))},
+				Payload:   payload,
+				Footprint: Footprint{Points: keys},
 			},
 			ProcessAt:        uint64(at(17)),
 			TOQ:              at(18)&1 != 0,
@@ -122,7 +122,7 @@ func FuzzStepNeverPanicsOnMalformedMessage(f *testing.F) {
 
 func FuzzRestartNeverPanicsOnMalformedChecksummedRecord(f *testing.F) {
 	f.Add([]byte(nil))
-	f.Add([]byte{1, 1, 1, byte(StatusCommitted), byte(CommandNoop), 3})
+	f.Add([]byte{1, 1, 1, byte(StatusCommitted), byte(EntryNoop), 3})
 	f.Add([]byte{0xff, 0, 2, 0xff, 0xff, 9, 9, 9})
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		at := func(i int) byte {
@@ -143,9 +143,9 @@ func FuzzRestartNeverPanicsOnMalformedChecksummedRecord(f *testing.F) {
 			Status:       Status(at(3)),
 			Seq:          uint64(at(4)),
 			Deps:         deps,
+			Kind: EntryKind(at(4)),
 			Command: Command{
 				ID:      CommandID{Client: uint64(at(6)), Sequence: uint64(at(7))},
-				Kind:    CommandKind(at(4)),
 				Payload: append([]byte(nil), data...),
 			},
 			FastPathEligible: at(6)&1 != 0,

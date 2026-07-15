@@ -44,7 +44,7 @@ func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
 		{
 			name: "committed put",
 			write: func(db *DB) error {
-				return db.ApplyCommitted(epaxos.CommittedCommand{
+				return db.ApplyCommitted(epaxos.ApplyCommand{
 					Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
 					Command: CommandForPut(1, 2, embeddedKey, []byte("embedded")),
 				})
@@ -53,7 +53,7 @@ func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
 		{
 			name: "committed delete",
 			write: func(db *DB) error {
-				return db.ApplyCommitted(epaxos.CommittedCommand{
+				return db.ApplyCommitted(epaxos.ApplyCommand{
 					Ref:     epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
 					Command: CommandForDelete(1, 2, embeddedKey),
 				})
@@ -62,7 +62,7 @@ func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
 		{
 			name: "transaction put",
 			write: func(db *DB) error {
-				return db.ApplyCommitted(epaxos.CommittedCommand{
+				return db.ApplyCommitted(epaxos.ApplyCommand{
 					Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
 					Command: CommandForTxn(1, 2, []TxnOp{
 						{Key: []byte("a"), Value: []byte("txn-overwrite")},
@@ -74,7 +74,7 @@ func TestEmbeddedSeparatorUserKeysAreRejected(t *testing.T) {
 		{
 			name: "transaction delete",
 			write: func(db *DB) error {
-				return db.ApplyCommitted(epaxos.CommittedCommand{
+				return db.ApplyCommitted(epaxos.ApplyCommand{
 					Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1},
 					Command: CommandForTxn(1, 2, []TxnOp{
 						{Key: []byte("a"), Value: []byte("txn-overwrite")},
@@ -189,11 +189,11 @@ func TestPutGetScanAndApplyCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	cmd := epaxos.CommittedCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: CommandForPut(1, 1, []byte("alpha"), []byte("one"))}
+	cmd := epaxos.ApplyCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: CommandForPut(1, 1, []byte("alpha"), []byte("one"))}
 	if err := db.ApplyCommitted(cmd); err != nil {
 		t.Fatal(err)
 	}
-	cmd = epaxos.CommittedCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Command: CommandForPut(1, 2, []byte("beta"), []byte("two"))}
+	cmd = epaxos.ApplyCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 2, Conf: 1}, Command: CommandForPut(1, 2, []byte("beta"), []byte("two"))}
 	if err := db.ApplyCommitted(cmd); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestPutGetScanAndApplyCommitted(t *testing.T) {
 	if len(rev) != 1 || string(rev[0].Key) != "beta" {
 		t.Fatalf("reverse scan %#v", rev)
 	}
-	cmd = epaxos.CommittedCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1}, Command: CommandForDelete(1, 3, []byte("alpha"))}
+	cmd = epaxos.ApplyCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 3, Conf: 1}, Command: CommandForDelete(1, 3, []byte("alpha"))}
 	if err := db.ApplyCommitted(cmd); err != nil {
 		t.Fatal(err)
 	}
@@ -239,11 +239,11 @@ func TestApplyCommittedUsesApplyOrderInsteadOfInstanceRefOrder(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	first := epaxos.CommittedCommand{
+	first := epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 2, Instance: 99, Conf: 1},
 		Command: CommandForPut(2, 99, []byte("shared"), []byte("first-applied")),
 	}
-	second := epaxos.CommittedCommand{
+	second := epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Command: CommandForPut(1, 1, []byte("shared"), []byte("second-applied")),
 	}
@@ -279,7 +279,7 @@ func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
 	if err := db.PutVersion([]byte("gone"), []byte("old"), 1); err != nil {
 		t.Fatal(err)
 	}
-	cmd := epaxos.CommittedCommand{
+	cmd := epaxos.ApplyCommand{
 		Ref: epaxos.InstanceRef{Replica: 1, Instance: 9, Conf: 1},
 		Command: CommandForTxn(7, 11, []TxnOp{
 			{Key: []byte("alpha"), Value: []byte("one")},
@@ -305,17 +305,17 @@ func TestTransactionCommandAppliesPutAndDeleteAtomically(t *testing.T) {
 	}
 }
 
-func TestCommandForTxnDeduplicatesConflictKeysAndKeepsPayloadOps(t *testing.T) {
+func TestCommandForTxnDeduplicatesFootprintPointsAndKeepsPayloadOps(t *testing.T) {
 	cmd := CommandForTxn(7, 12, []TxnOp{
 		{Key: []byte("alpha"), Value: []byte("one")},
 		{Key: []byte("beta"), Value: []byte("two")},
 		{Delete: true, Key: []byte("alpha")},
 		{Key: []byte("alpha"), Value: []byte("three")},
 	})
-	if len(cmd.ConflictKeys) != 2 ||
-		string(cmd.ConflictKeys[0]) != "alpha" ||
-		string(cmd.ConflictKeys[1]) != "beta" {
-		t.Fatalf("conflict keys=%q", cmd.ConflictKeys)
+	if len(cmd.Footprint.Points) != 2 ||
+		string(cmd.Footprint.Points[0]) != "alpha" ||
+		string(cmd.Footprint.Points[1]) != "beta" {
+		t.Fatalf("conflict keys=%q", cmd.Footprint.Points)
 	}
 	wantPayload := []byte{
 		opTxn, 4,
@@ -333,7 +333,7 @@ func TestCommandForTxnDeduplicatesConflictKeysAndKeepsPayloadOps(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	if err := db.ApplyCommitted(epaxos.CommittedCommand{Command: cmd}); err != nil {
+	if err := db.ApplyCommitted(epaxos.ApplyCommand{Command: cmd}); err != nil {
 		t.Fatal(err)
 	}
 	value, ok, err := db.Get([]byte("alpha"))
@@ -352,7 +352,7 @@ func TestDeleteCommandRejectsMalformedPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	err = db.ApplyCommitted(epaxos.CommittedCommand{
+	err = db.ApplyCommitted(epaxos.ApplyCommand{
 		Ref:     epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Command: epaxos.Command{Payload: []byte{opDelete, 1, 'k'}},
 	})
@@ -380,7 +380,7 @@ func TestTransactionRejectsMalformedPayloads(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := db.ApplyCommitted(epaxos.CommittedCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: epaxos.Command{Payload: tc.payload}})
+			err := db.ApplyCommitted(epaxos.ApplyCommand{Ref: epaxos.InstanceRef{Replica: 1, Instance: 1, Conf: 1}, Command: epaxos.Command{Payload: tc.payload}})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err=%v, want containing %q", err, tc.want)
 			}

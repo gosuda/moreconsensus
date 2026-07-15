@@ -27,10 +27,9 @@ func TestPoolClearsOwnedReferencesAndReusesWarmObjects(t *testing.T) {
 		Ref:  InstanceRef{Replica: 1, Instance: 9, Conf: 1},
 		Deps: deps,
 		Command: Command{
-			ID:           CommandID{Client: 7, Sequence: 8},
-			Kind:         CommandConfChange,
-			Payload:      payload,
-			ConflictKeys: keys,
+			ID:        CommandID{Client: 7, Sequence: 8},
+			Payload:   payload,
+			Footprint: Footprint{Points: keys},
 		},
 	}
 	PutMessage(m)
@@ -39,7 +38,7 @@ func TestPoolClearsOwnedReferencesAndReusesWarmObjects(t *testing.T) {
 	PutMessage(gotMessage)
 
 	c := GetCommand()
-	*c = Command{ID: CommandID{Client: 11, Sequence: 12}, Kind: CommandConfChange, Payload: payload, ConflictKeys: keys}
+	*c = Command{ID: CommandID{Client: 11, Sequence: 12}, Payload: payload, Footprint: Footprint{Points: keys}}
 	PutCommand(c)
 	gotCommand := GetCommand()
 	assertCommandCleared(t, *gotCommand)
@@ -71,7 +70,7 @@ func TestReadyReleaseClearsHeadersAndBackingArraysWithoutAllocation(t *testing.T
 		Status:  StatusCommitted,
 		Seq:     10,
 		Deps:    deps,
-		Command: Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, ConflictKeys: keys},
+		Command: Command{ID: CommandID{Client: 1, Sequence: 1}, Payload: payload, Footprint: Footprint{Points: keys}},
 	}}
 	messages := []Message{{
 		Type:    MsgCommit,
@@ -80,17 +79,17 @@ func TestReadyReleaseClearsHeadersAndBackingArraysWithoutAllocation(t *testing.T
 		Ref:     InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Seq:     10,
 		Deps:    deps,
-		Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: payload, ConflictKeys: keys},
+		Command: Command{ID: CommandID{Client: 2, Sequence: 1}, Payload: payload, Footprint: Footprint{Points: keys}},
 	}}
-	committed := []CommittedCommand{{
+	committed := []ApplyCommand{{
 		Ref:     InstanceRef{Replica: 1, Instance: 1, Conf: 1},
 		Seq:     10,
 		Deps:    deps,
-		Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: payload, ConflictKeys: keys},
+		Command: Command{ID: CommandID{Client: 3, Sequence: 1}, Payload: payload, Footprint: Footprint{Points: keys}},
 	}}
-	rd := Ready{Records: records, Messages: messages, Committed: committed, MustSync: true}
+	rd := Ready{Records: records, Messages: messages, Apply: committed, MustSync: true}
 	rd.Release()
-	if rd.Records != nil || rd.Messages != nil || rd.Committed != nil || rd.MustSync {
+	if rd.Records != nil || rd.Messages != nil || rd.Apply != nil || rd.MustSync {
 		t.Fatalf("released Ready kept headers or sync bit: %#v", rd)
 	}
 	assertCommandCleared(t, records[0].Command)
@@ -105,12 +104,12 @@ func TestReadyReleaseClearsHeadersAndBackingArraysWithoutAllocation(t *testing.T
 
 	allocRecords := make([]InstanceRecord, 1)
 	allocMessages := make([]Message, 1)
-	allocCommitted := make([]CommittedCommand, 1)
+	allocCommitted := make([]ApplyCommand, 1)
 	allocs := testing.AllocsPerRun(1000, func() {
-		allocRecords[0] = InstanceRecord{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
-		allocMessages[0] = Message{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
-		allocCommitted[0] = CommittedCommand{Deps: deps, Command: Command{Payload: payload, ConflictKeys: keys}}
-		ready := Ready{Records: allocRecords, Messages: allocMessages, Committed: allocCommitted, MustSync: true} //nolint:gocritic // unslice: keep explicit slice form in test fixture
+		allocRecords[0] = InstanceRecord{Deps: deps, Command: Command{Payload: payload, Footprint: Footprint{Points: keys}}}
+		allocMessages[0] = Message{Deps: deps, Command: Command{Payload: payload, Footprint: Footprint{Points: keys}}}
+		allocCommitted[0] = ApplyCommand{Deps: deps, Command: Command{Payload: payload, Footprint: Footprint{Points: keys}}}
+		ready := Ready{Records: allocRecords, Messages: allocMessages, Apply: allocCommitted, MustSync: true} //nolint:gocritic // unslice: keep explicit slice form in test fixture
 		ready.Release()
 	})
 	if allocs != 0 {
@@ -185,7 +184,7 @@ func TestRecordChecksumVersionsDistinguishDurableMetadata(t *testing.T) {
 		Status:           StatusPreAccepted,
 		Seq:              7,
 		Deps:             []InstanceNum{0, 4, 5},
-		Command:          Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("checksum-version"), ConflictKeys: [][]byte{[]byte("checksum-version-key")}},
+		Command:          Command{ID: CommandID{Client: 91, Sequence: 1}, Payload: []byte("checksum-version"), Footprint: Footprint{Points: [][]byte{[]byte("checksum-version-key")}}},
 		FastPathEligible: true,
 		ProcessAt:        42,
 		TimingDomain:     TimingDomainTOQ,
@@ -315,10 +314,11 @@ func allocationTestMessage() Message {
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
 		Seq:    11,
 		Deps:   []InstanceNum{4, 5, 6},
+		Kind:   EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 9, Sequence: 10},
-			Payload:      []byte("allocation-payload"),
-			ConflictKeys: [][]byte{[]byte("allocation-key-a"), []byte("allocation-key-b")},
+			ID:        CommandID{Client: 9, Sequence: 10},
+			Payload:   []byte("allocation-payload"),
+			Footprint: Footprint{Points: [][]byte{[]byte("allocation-key-a"), []byte("allocation-key-b")}},
 		},
 		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 }
@@ -330,6 +330,7 @@ func allocationTestRecord(m Message) InstanceRecord {
 		Status:  StatusCommitted,
 		Seq:     m.Seq,
 		Deps:    m.Deps,
+		Kind:    m.Kind,
 		Command: m.Command,
 	}
 }
@@ -401,10 +402,11 @@ func TestEncodeDecodeMessagePreservesExplicitTOQPreAccept(t *testing.T) {
 		ProcessAt: 123,
 		TOQ:       true,
 		Ballot:    Ballot{Replica: 1},
+		Kind:      EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 77, Sequence: 3},
-			Payload:      []byte("toq-wire-payload"),
-			ConflictKeys: [][]byte{[]byte("toq-wire-key")},
+			ID:        CommandID{Client: 77, Sequence: 3},
+			Payload:   []byte("toq-wire-payload"),
+			Footprint: Footprint{Points: [][]byte{[]byte("toq-wire-key")}},
 		},
 		RecordStatus: StatusNone,
 	}
@@ -441,10 +443,11 @@ func TestEncodeDecodeMessagePreservesAcceptEvidence(t *testing.T) {
 			{Sender: 3, Seq: 10, Deps: []InstanceNum{1, 4, 6}},
 			{Sender: 1, Seq: 9, Deps: []InstanceNum{3, 4, 5}},
 		},
+		Kind: EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 78, Sequence: 4},
-			Payload:      []byte("accept-evidence-wire-payload"),
-			ConflictKeys: [][]byte{[]byte("accept-evidence-wire-key")},
+			ID:        CommandID{Client: 78, Sequence: 4},
+			Payload:   []byte("accept-evidence-wire-payload"),
+			Footprint: Footprint{Points: [][]byte{[]byte("accept-evidence-wire-key")}},
 		}}
 	encoded, err := EncodeMessage(nil, want)
 	if err != nil {
@@ -480,27 +483,27 @@ func TestDecodeMessageRejectsOverwideWireCountsBeforeAllocation(t *testing.T) {
 		frame []byte
 	}{
 		{name: "dependency count", frame: malformedWireCountFrame(maxWireDeps+1, 0)},
-		{name: "conflict key count", frame: malformedWireCountFrame(0, maxWireConflictKeys+1)},
+		{name: "conflict key count", frame: malformedWireCountFrame(0, maxWireFootprintPoints+1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := Message{
 				Type: MsgCommit,
 				Deps: []InstanceNum{9},
 				Command: Command{
-					Payload:      []byte("stale-payload"),
-					ConflictKeys: [][]byte{[]byte("stale-key")},
+					Payload:   []byte("stale-payload"),
+					Footprint: Footprint{Points: [][]byte{[]byte("stale-key")}},
 				},
 			}
 			scratch := DecodeScratch{
-				Deps:         []InstanceNum{1, 2, 3},
-				ConflictKeys: [][]byte{[]byte("old-key")},
+				Deps:   []InstanceNum{1, 2, 3},
+				Points: [][]byte{[]byte("old-key")},
 			}
 			if err := DecodeMessageWithScratch(tc.frame, &out, &scratch); !errors.Is(err, ErrInvalidMessage) {
 				t.Fatalf("DecodeMessageWithScratch(%s) err=%v, want %v", tc.name, err, ErrInvalidMessage)
 			}
 			assertMessageCleared(t, &out)
-			if len(scratch.Deps) != 0 || len(scratch.ConflictKeys) != 0 {
-				t.Fatalf("decode failure left scratch populated: deps=%v keys=%v", scratch.Deps, scratch.ConflictKeys)
+			if len(scratch.Deps) != 0 || len(scratch.Points) != 0 {
+				t.Fatalf("decode failure left scratch populated: deps=%v keys=%v", scratch.Deps, scratch.Points)
 			}
 		})
 	}
@@ -536,13 +539,13 @@ func malformedWireCountFrame(deps, conflictKeys uint64) []byte {
 		for _, v := range []uint64{
 			0,
 			0,
-			uint64(CommandNoop),
+			uint64(EntryNoop),
 			0,
 			conflictKeys,
 		} {
 			buf = binary.AppendUvarint(buf, v)
 		}
-		if conflictKeys <= maxWireConflictKeys {
+		if conflictKeys <= maxWireFootprintPoints {
 			for range conflictKeys {
 				buf = binary.AppendUvarint(buf, 0)
 			}
@@ -562,8 +565,8 @@ func TestDecodeMessageWithScratchUsesPresizedMetadataWithoutAllocation(t *testin
 	input := decodeScratchTestMessage()
 	encoded := mustEncodeMessageSeed(input)
 	scratch := DecodeScratch{
-		Deps:         make([]InstanceNum, 0, len(input.Deps)),
-		ConflictKeys: make([][]byte, 0, len(input.Command.ConflictKeys)),
+		Deps:   make([]InstanceNum, 0, len(input.Deps)),
+		Points: make([][]byte, 0, len(input.Command.Footprint.Points)),
 	}
 	var out Message
 
@@ -574,8 +577,8 @@ func TestDecodeMessageWithScratchUsesPresizedMetadataWithoutAllocation(t *testin
 	if len(out.Deps) == 0 || len(scratch.Deps) == 0 || &out.Deps[0] != &scratch.Deps[0] {
 		t.Fatalf("decoded deps did not use scratch storage: deps=%#v scratch=%#v", out.Deps, scratch.Deps)
 	}
-	if len(out.Command.ConflictKeys) == 0 || len(scratch.ConflictKeys) == 0 || &out.Command.ConflictKeys[0] != &scratch.ConflictKeys[0] {
-		t.Fatalf("decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.ConflictKeys, scratch.ConflictKeys)
+	if len(out.Command.Footprint.Points) == 0 || len(scratch.Points) == 0 || &out.Command.Footprint.Points[0] != &scratch.Points[0] {
+		t.Fatalf("decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.Footprint.Points, scratch.Points)
 	}
 
 	allocs := testing.AllocsPerRun(1000, func() {
@@ -594,11 +597,11 @@ func TestDecodeMessageWithScratchGrowsUndersizedMetadataStorage(t *testing.T) {
 	oldDeps := []InstanceNum{99}
 	oldKey := []byte("stale-key-reference")
 	scratch := DecodeScratch{
-		Deps:         oldDeps[:0],
-		ConflictKeys: [][]byte{oldKey},
+		Deps:   oldDeps[:0],
+		Points: [][]byte{oldKey},
 	}
 	oldDepSlots := scratch.Deps[:cap(scratch.Deps)]
-	oldKeySlots := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
+	oldKeySlots := scratch.Points[:cap(scratch.Points)]
 	var out Message
 
 	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
@@ -609,20 +612,20 @@ func TestDecodeMessageWithScratchGrowsUndersizedMetadataStorage(t *testing.T) {
 	if cap(scratch.Deps) < len(input.Deps) {
 		t.Fatalf("scratch deps capacity = %d, want at least decoded deps %d", cap(scratch.Deps), len(input.Deps))
 	}
-	if cap(scratch.ConflictKeys) < len(input.Command.ConflictKeys) {
-		t.Fatalf("scratch conflict key capacity = %d, want at least decoded keys %d", cap(scratch.ConflictKeys), len(input.Command.ConflictKeys))
+	if cap(scratch.Points) < len(input.Command.Footprint.Points) {
+		t.Fatalf("scratch conflict key capacity = %d, want at least decoded keys %d", cap(scratch.Points), len(input.Command.Footprint.Points))
 	}
 	if len(out.Deps) == 0 || len(scratch.Deps) == 0 || &out.Deps[0] != &scratch.Deps[0] {
 		t.Fatalf("grown decoded deps did not use scratch storage: deps=%#v scratch=%#v", out.Deps, scratch.Deps)
 	}
-	if len(out.Command.ConflictKeys) == 0 || len(scratch.ConflictKeys) == 0 || &out.Command.ConflictKeys[0] != &scratch.ConflictKeys[0] {
-		t.Fatalf("grown decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.ConflictKeys, scratch.ConflictKeys)
+	if len(out.Command.Footprint.Points) == 0 || len(scratch.Points) == 0 || &out.Command.Footprint.Points[0] != &scratch.Points[0] {
+		t.Fatalf("grown decoded conflict keys did not use scratch storage: keys=%#v scratch=%#v", out.Command.Footprint.Points, scratch.Points)
 	}
 	if &scratch.Deps[0] == &oldDepSlots[0] {
 		t.Fatalf("undersized deps scratch reused old storage with capacity %d for %d decoded deps", cap(oldDepSlots), len(input.Deps))
 	}
-	if &scratch.ConflictKeys[0] == &oldKeySlots[0] {
-		t.Fatalf("undersized conflict-key scratch reused old storage with capacity %d for %d decoded keys", cap(oldKeySlots), len(input.Command.ConflictKeys))
+	if &scratch.Points[0] == &oldKeySlots[0] {
+		t.Fatalf("undersized conflict-key scratch reused old storage with capacity %d for %d decoded keys", cap(oldKeySlots), len(input.Command.Footprint.Points))
 	}
 	if oldKeySlots[0] != nil {
 		t.Fatalf("scratch growth retained stale conflict key bytes: %q", oldKeySlots[0])
@@ -639,10 +642,10 @@ func TestDecodeScratchResetClearsConflictKeyRefsAndKeepsCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	depsCap := cap(scratch.Deps)
-	keysCap := cap(scratch.ConflictKeys)
-	retainedKeySlots := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
-	if len(retainedKeySlots) != len(input.Command.ConflictKeys) {
-		t.Fatalf("scratch conflict-key slots = %d, want %d before reset", len(retainedKeySlots), len(input.Command.ConflictKeys))
+	keysCap := cap(scratch.Points)
+	retainedKeySlots := scratch.Points[:cap(scratch.Points)]
+	if len(retainedKeySlots) != len(input.Command.Footprint.Points) {
+		t.Fatalf("scratch conflict-key slots = %d, want %d before reset", len(retainedKeySlots), len(input.Command.Footprint.Points))
 	}
 
 	scratch.Reset()
@@ -650,8 +653,8 @@ func TestDecodeScratchResetClearsConflictKeyRefsAndKeepsCapacity(t *testing.T) {
 	if len(scratch.Deps) != 0 || cap(scratch.Deps) != depsCap {
 		t.Fatalf("reset deps len/cap = %d/%d, want 0/%d", len(scratch.Deps), cap(scratch.Deps), depsCap)
 	}
-	if len(scratch.ConflictKeys) != 0 || cap(scratch.ConflictKeys) != keysCap {
-		t.Fatalf("reset conflict keys len/cap = %d/%d, want 0/%d", len(scratch.ConflictKeys), cap(scratch.ConflictKeys), keysCap)
+	if len(scratch.Points) != 0 || cap(scratch.Points) != keysCap {
+		t.Fatalf("reset conflict keys len/cap = %d/%d, want 0/%d", len(scratch.Points), cap(scratch.Points), keysCap)
 	}
 	for i, key := range retainedKeySlots {
 		if key != nil {
@@ -664,8 +667,8 @@ func TestDecodeMessageWithScratchAliasesInputPayloadAndKeyBytes(t *testing.T) {
 	input := decodeScratchTestMessage()
 	encoded := mustEncodeMessageSeed(input)
 	scratch := DecodeScratch{
-		Deps:         make([]InstanceNum, 0, len(input.Deps)),
-		ConflictKeys: make([][]byte, 0, len(input.Command.ConflictKeys)),
+		Deps:   make([]InstanceNum, 0, len(input.Deps)),
+		Points: make([][]byte, 0, len(input.Command.Footprint.Points)),
 	}
 	var out Message
 	if err := DecodeMessageWithScratch(encoded, &out, &scratch); err != nil {
@@ -676,7 +679,7 @@ func TestDecodeMessageWithScratchAliasesInputPayloadAndKeyBytes(t *testing.T) {
 	if payloadOffset < 0 {
 		t.Fatal("encoded payload bytes not found")
 	}
-	keyOffset := bytes.Index(encoded, input.Command.ConflictKeys[0])
+	keyOffset := bytes.Index(encoded, input.Command.Footprint.Points[0])
 	if keyOffset < 0 {
 		t.Fatal("encoded conflict key bytes not found")
 	}
@@ -686,36 +689,36 @@ func TestDecodeMessageWithScratchAliasesInputPayloadAndKeyBytes(t *testing.T) {
 	if !bytes.Equal(out.Command.Payload, []byte("Scratch-payload")) {
 		t.Fatalf("decoded payload does not alias input buffer: %q", out.Command.Payload)
 	}
-	if len(out.Command.ConflictKeys) != len(input.Command.ConflictKeys) || !bytes.Equal(out.Command.ConflictKeys[0], []byte("Scratch-key-a")) {
-		t.Fatalf("decoded conflict key does not alias input buffer: %q", out.Command.ConflictKeys)
+	if len(out.Command.Footprint.Points) != len(input.Command.Footprint.Points) || !bytes.Equal(out.Command.Footprint.Points[0], []byte("Scratch-key-a")) {
+		t.Fatalf("decoded conflict key does not alias input buffer: %q", out.Command.Footprint.Points)
 	}
 }
 
-func TestDecodeMessageWithScratchReuseClearsInactiveConflictKeys(t *testing.T) {
+func TestDecodeMessageWithScratchReuseClearsInactiveFootprintPoints(t *testing.T) {
 	first := decodeScratchTestMessage([]byte("scratch-key-a"), []byte("scratch-key-b"))
 	second := decodeScratchTestMessage([]byte("scratch-key-c"))
 	firstEncoded := mustEncodeMessageSeed(first)
 	secondEncoded := mustEncodeMessageSeed(second)
 	scratch := DecodeScratch{
-		Deps:         make([]InstanceNum, 0, len(first.Deps)),
-		ConflictKeys: make([][]byte, 0, len(first.Command.ConflictKeys)),
+		Deps:   make([]InstanceNum, 0, len(first.Deps)),
+		Points: make([][]byte, 0, len(first.Command.Footprint.Points)),
 	}
 	var out Message
 	if err := DecodeMessageWithScratch(firstEncoded, &out, &scratch); err != nil {
 		t.Fatal(err)
 	}
-	if len(scratch.ConflictKeys) != 2 {
-		t.Fatalf("first decode conflict keys = %d, want 2", len(scratch.ConflictKeys))
+	if len(scratch.Points) != 2 {
+		t.Fatalf("first decode conflict keys = %d, want 2", len(scratch.Points))
 	}
 	if err := DecodeMessageWithScratch(secondEncoded, &out, &scratch); err != nil {
 		t.Fatal(err)
 	}
 	assertDecodedScratchMessage(t, out, second)
-	if len(out.Command.ConflictKeys) != 1 {
-		t.Fatalf("second decode conflict keys = %d, want 1", len(out.Command.ConflictKeys))
+	if len(out.Command.Footprint.Points) != 1 {
+		t.Fatalf("second decode conflict keys = %d, want 1", len(out.Command.Footprint.Points))
 	}
-	retained := scratch.ConflictKeys[:cap(scratch.ConflictKeys)]
-	for i := len(out.Command.ConflictKeys); i < len(retained); i++ {
+	retained := scratch.Points[:cap(scratch.Points)]
+	for i := len(out.Command.Footprint.Points); i < len(retained); i++ {
 		if retained[i] != nil {
 			t.Fatalf("scratch retained inactive conflict key %d: %q", i, retained[i])
 		}
@@ -756,8 +759,8 @@ func TestDecodeMessageWithScratchClearsDestinationOnMalformedInput(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scratch := DecodeScratch{
-				Deps:         make([]InstanceNum, 0, len(base.Deps)),
-				ConflictKeys: make([][]byte, 0, len(base.Command.ConflictKeys)),
+				Deps:   make([]InstanceNum, 0, len(base.Deps)),
+				Points: make([][]byte, 0, len(base.Command.Footprint.Points)),
 			}
 			out := Message{
 				Type:   MsgAccept,
@@ -768,16 +771,16 @@ func TestDecodeMessageWithScratchClearsDestinationOnMalformedInput(t *testing.T)
 				Seq:    1,
 				Deps:   []InstanceNum{99},
 				Command: Command{
-					ID:           CommandID{Client: 7, Sequence: 8},
-					Payload:      []byte("previous-payload"),
-					ConflictKeys: [][]byte{[]byte("previous-key")},
+					ID:        CommandID{Client: 7, Sequence: 8},
+					Payload:   []byte("previous-payload"),
+					Footprint: Footprint{Points: [][]byte{[]byte("previous-key")}},
 				},
 			}
 			if err := DecodeMessageWithScratch(tc.data, &out, &scratch); !errors.Is(err, tc.want) {
 				t.Fatalf("DecodeMessageWithScratch error = %v, want %v", err, tc.want)
 			}
 			assertMessageCleared(t, &out)
-			if len(scratch.Deps) != 0 || len(scratch.ConflictKeys) != 0 {
+			if len(scratch.Deps) != 0 || len(scratch.Points) != 0 {
 				t.Fatalf("scratch exposed decoded metadata after error: %#v", scratch)
 			}
 		})
@@ -791,10 +794,11 @@ func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
 		Seq:    11,
 		Deps:   []InstanceNum{4, 5},
+		Kind:   EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 9, Sequence: 10},
-			Payload:      []byte("partial-decode-payload"),
-			ConflictKeys: [][]byte{[]byte("partial-decode-key")},
+			ID:        CommandID{Client: 9, Sequence: 10},
+			Payload:   []byte("partial-decode-payload"),
+			Footprint: Footprint{Points: [][]byte{[]byte("partial-decode-key")}},
 		},
 		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 	valid := mustEncodeMessageSeed(base)
@@ -837,9 +841,9 @@ func TestDecodeMessageClearsDestinationOnPartialDecodeErrors(t *testing.T) {
 				Seq:    1,
 				Deps:   []InstanceNum{99},
 				Command: Command{
-					ID:           CommandID{Client: 7, Sequence: 8},
-					Payload:      []byte("previous-payload"),
-					ConflictKeys: [][]byte{[]byte("previous-key")},
+					ID:        CommandID{Client: 7, Sequence: 8},
+					Payload:   []byte("previous-payload"),
+					Footprint: Footprint{Points: [][]byte{[]byte("previous-key")}},
 				},
 			}
 			if err := DecodeMessage(tc.data, &out); !errors.Is(err, tc.want) {
@@ -860,10 +864,11 @@ func decodeScratchTestMessage(keys ...[]byte) Message {
 		Ballot: Ballot{Epoch: 2, Number: 3, Replica: 1},
 		Seq:    11,
 		Deps:   []InstanceNum{4, 5, 6},
+		Kind:   EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 9, Sequence: 10},
-			Payload:      []byte("scratch-payload"),
-			ConflictKeys: keys,
+			ID:        CommandID{Client: 9, Sequence: 10},
+			Payload:   []byte("scratch-payload"),
+			Footprint: Footprint{Points: keys},
 		},
 		RejectHint: Ballot{Epoch: 3, Number: 4, Replica: 2}}
 }
@@ -883,10 +888,11 @@ func decodeMessageSeedCorpus() [][]byte {
 		Ballot: Ballot{Epoch: 1, Number: 2, Replica: 1},
 		Seq:    3,
 		Deps:   []InstanceNum{0, 4, 5},
+		Kind:   EntryCommand,
 		Command: Command{
-			ID:           CommandID{Client: 9, Sequence: 10},
-			Payload:      []byte("payload"),
-			ConflictKeys: [][]byte{[]byte("alpha"), []byte("beta")},
+			ID:        CommandID{Client: 9, Sequence: 10},
+			Payload:   []byte("payload"),
+			Footprint: Footprint{Points: [][]byte{[]byte("alpha"), []byte("beta")}},
 		}}
 	valid := mustEncodeMessageSeed(base)
 	mutatedChecksum := append([]byte(nil), valid...)
@@ -901,9 +907,9 @@ func decodeMessageSeedCorpus() [][]byte {
 	}
 
 	maxKeys := base
-	maxKeys.Command.ConflictKeys = make([][]byte, 128)
-	for i := range maxKeys.Command.ConflictKeys {
-		maxKeys.Command.ConflictKeys[i] = []byte{byte(i), byte(127 - i)}
+	maxKeys.Command.Footprint.Points = make([][]byte, 128)
+	for i := range maxKeys.Command.Footprint.Points {
+		maxKeys.Command.Footprint.Points[i] = []byte{byte(i), byte(127 - i)}
 	}
 
 	seeds := [][]byte{
@@ -912,7 +918,7 @@ func decodeMessageSeedCorpus() [][]byte {
 		mustEncodeMessageSeed(maxKeys),
 		malformedCodecFrame(maxWireDeps+1, 0, 0),
 		malformedCodecFrame(0, maxWireDeps+1, 0),
-		malformedCodecFrame(0, 0, maxWireConflictKeys+1),
+		malformedCodecFrame(0, 0, maxWireFootprintPoints+1),
 		valid[:len(valid)-1],
 		valid[:len(wireMagic)],
 		valid[:len(wireMagic)+32],
@@ -986,7 +992,7 @@ func assertMessageCleared(t *testing.T, m *Message) {
 
 func assertCommandCleared(t *testing.T, c Command) {
 	t.Helper()
-	if c.ID != (CommandID{}) || c.Kind != CommandUser || len(c.Payload) != 0 || len(c.ConflictKeys) != 0 {
+	if c.ID != (CommandID{}) || len(c.Payload) != 0 || len(c.Footprint.Points) != 0 || len(c.Footprint.Spans) != 0 || c.Footprint.All || len(c.CycleKey) != 0 {
 		t.Fatalf("command retained caller-owned data: %#v", c)
 	}
 	for i, value := range c.Payload[:cap(c.Payload)] {
@@ -994,7 +1000,7 @@ func assertCommandCleared(t *testing.T, c Command) {
 			t.Fatalf("command retained payload byte %d at slot %d", value, i)
 		}
 	}
-	for i, key := range c.ConflictKeys[:cap(c.ConflictKeys)] {
+	for i, key := range c.Footprint.Points[:cap(c.Footprint.Points)] {
 		if len(key) != 0 {
 			t.Fatalf("command retained conflict-key length at slot %d: %#v", i, key)
 		}
@@ -1013,10 +1019,10 @@ func dependencyIteratorAllocationNode(t testing.TB, through InstanceNum) (*RawNo
 		t.Fatal(err)
 	}
 	base := InstanceRef{Conf: 1, Replica: 1, Instance: 1}
-	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, through, 0}, Command: Command{Kind: CommandNoop}}})
+	rn.installInstance(&instance{rec: InstanceRecord{Ref: base, Status: StatusCommitted, Seq: 1, Deps: []InstanceNum{0, through, 0}, Kind: EntryNoop}})
 	for _, number := range []InstanceNum{1, 8} {
 		ref := InstanceRef{Conf: 1, Replica: 2, Instance: number}
-		rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: make([]InstanceNum, 3), Command: Command{Kind: CommandNoop}}})
+		rn.installInstance(&instance{rec: InstanceRecord{Ref: ref, Status: StatusCommitted, Seq: 1, Deps: make([]InstanceNum, 3), Kind: EntryNoop}})
 	}
 	return rn, base
 }

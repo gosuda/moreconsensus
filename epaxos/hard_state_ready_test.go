@@ -18,7 +18,7 @@ func TestInitialReadyCarriesCompleteHardState(t *testing.T) {
 	if !rd.HardState.Equal(want) {
 		t.Fatalf("initial hard state = %#v, want %#v", rd.HardState, want)
 	}
-	if !rd.MustSync || len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if !rd.MustSync || len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("initial Ready = %#v, want hard-state-only sync", rd)
 	}
 	repeated := rn.Ready()
@@ -65,7 +65,7 @@ func TestTickReadyPersistsAndRestartsLogicalTime(t *testing.T) {
 	if rd.HardState.Tick != 1 || rd.HardState.Conf.ID != 1 || !rd.MustSync {
 		t.Fatalf("tick-only Ready = %#v, want complete hard state at tick 1", rd)
 	}
-	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Committed) != 0 {
+	if len(rd.Records) != 0 || len(rd.Messages) != 0 || len(rd.Apply) != 0 {
 		t.Fatalf("tick-only Ready carried payload work: %#v", rd)
 	}
 	if err := store.ApplyReady(rd); err != nil {
@@ -118,11 +118,10 @@ func TestOutstandingReadyFrozenWhileTickAndStepAccumulate(t *testing.T) {
 		Ballot:  Ballot{Replica: 1},
 		Seq:     1,
 		Deps:    []InstanceNum{0, 0, 0},
-		Command: Command{ID: CommandID{Client: 700, Sequence: 1}, Payload: []byte("frozen-step"), ConflictKeys: [][]byte{[]byte("frozen-step-key")}},
+		Command: Command{ID: CommandID{Client: 700, Sequence: 1}, Payload: []byte("frozen-step"), Footprint: Footprint{Points: [][]byte{[]byte("frozen-step-key")}}},
 	}
-	if err := rn.Step(msg); err != nil {
-		t.Fatal(err)
-	}
+	if err := rn.Step(canonicalTestMessage(msg)); err != nil { t.Fatal(err)
+ }
 	if got := rn.Ready(); !reflect.DeepEqual(got, frozen) {
 		t.Fatalf("outstanding Ready changed after Tick/Step: got %#v want %#v", got, frozen)
 	}
@@ -150,7 +149,7 @@ func TestAdvanceHardStateAndPayloadPrefixesPreserveBarriers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rn.Propose(Command{ID: CommandID{Client: 701, Sequence: 1}, Payload: []byte("prefix"), ConflictKeys: [][]byte{[]byte("prefix-key")}}); err != nil {
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 701, Sequence: 1}, Payload: []byte("prefix"), Footprint: Footprint{Points: [][]byte{[]byte("prefix-key")}}}); err != nil {
 		t.Fatal(err)
 	}
 	rd := rn.Ready()
@@ -407,7 +406,7 @@ func TestTickGeneratedRetryIsFencedByHardState(t *testing.T) {
 	if err := rn.Advance(initial); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rn.Propose(Command{ID: CommandID{Client: 702, Sequence: 1}, Payload: []byte("retry-fence"), ConflictKeys: [][]byte{[]byte("retry-fence-key")}}); err != nil {
+	if _, err := rn.Propose(Command{ID: CommandID{Client: 702, Sequence: 1}, Payload: []byte("retry-fence"), Footprint: Footprint{Points: [][]byte{[]byte("retry-fence-key")}}}); err != nil {
 		t.Fatal(err)
 	}
 	proposal := rn.Ready()
@@ -444,7 +443,7 @@ func TestCappedFrozenReadyDoesNotExposeLaterMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := rn.Propose(Command{ID: CommandID{Client: 703, Sequence: 1}, Payload: []byte("first-cap"), ConflictKeys: [][]byte{[]byte("first-cap-key")}})
+	first, err := rn.Propose(Command{ID: CommandID{Client: 703, Sequence: 1}, Payload: []byte("first-cap"), Footprint: Footprint{Points: [][]byte{[]byte("first-cap-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +451,7 @@ func TestCappedFrozenReadyDoesNotExposeLaterMessages(t *testing.T) {
 	if len(frozen.Messages) != 1 || frozen.Messages[0].Ref != first {
 		t.Fatalf("frozen capped Ready = %#v, want one message for %s", frozen, first)
 	}
-	second, err := rn.Propose(Command{ID: CommandID{Client: 703, Sequence: 2}, Payload: []byte("second-cap"), ConflictKeys: [][]byte{[]byte("second-cap-key")}})
+	second, err := rn.Propose(Command{ID: CommandID{Client: 703, Sequence: 2}, Payload: []byte("second-cap"), Footprint: Footprint{Points: [][]byte{[]byte("second-cap-key")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +484,7 @@ func hardStateStorageRecord(ref InstanceRef, payload string) InstanceRecord {
 		Status:           StatusPreAccepted,
 		Seq:              1,
 		Deps:             make([]InstanceNum, 3),
-		Command:          Command{ID: CommandID{Client: uint64(ref.Instance), Sequence: 1}, Payload: []byte(payload), ConflictKeys: [][]byte{[]byte(payload)}},
+		Command:          Command{ID: CommandID{Client: uint64(ref.Instance), Sequence: 1}, Payload: []byte(payload), Footprint: Footprint{Points: [][]byte{[]byte(payload)}}},
 		FastPathEligible: true,
 	}
 	rec.Checksum = ChecksumRecord(rec)

@@ -34,7 +34,7 @@ type stressTransportCluster struct {
 	ids     []ReplicaID
 	nodes   map[ReplicaID]*RawNode
 	stores  map[ReplicaID]*MemoryStorage
-	apps    map[ReplicaID][]CommittedCommand
+	apps    map[ReplicaID][]ApplyCommand
 	pending []Message
 	rng     *stressRNG
 	opt     bool
@@ -48,7 +48,7 @@ func newStressTransportCluster(t *testing.T, size int, seed uint64, opt bool) *s
 		ids:    ids,
 		nodes:  make(map[ReplicaID]*RawNode, size),
 		stores: make(map[ReplicaID]*MemoryStorage, size),
-		apps:   make(map[ReplicaID][]CommittedCommand, size),
+		apps:   make(map[ReplicaID][]ApplyCommand, size),
 		rng:    newStressRNG(seed),
 		opt:    opt,
 	}
@@ -90,7 +90,7 @@ func (s *stressTransportCluster) captureReady(id ReplicaID) {
 	if err := s.stores[id].ApplyReady(rd); err != nil {
 		s.t.Fatalf("apply ready %d: %v", id, err)
 	}
-	s.apps[id] = append(s.apps[id], rd.Committed...)
+	s.apps[id] = append(s.apps[id], rd.Apply...)
 	s.pending = append(s.pending, rd.Messages...)
 	if err := rn.Advance(rd); err != nil {
 		s.t.Fatalf("advance %d: %v", id, err)
@@ -112,9 +112,8 @@ func (s *stressTransportCluster) deliver(m Message) {
 	if to == nil {
 		return
 	}
-	if err := to.Step(m); err != nil && !errors.Is(err, ErrMessageRejected) {
-		s.t.Fatalf("step %s %d->%d: %v; message=%#v", m.Type, m.From, m.To, err, m)
-	}
+	if err := to.Step(canonicalTestMessage(m)); err != nil && !errors.Is(err, ErrMessageRejected) { s.t.Fatalf("step %s %d->%d: %v; message=%#v", m.Type, m.From, m.To, err, m)
+ }
 }
 
 func (s *stressTransportCluster) takePending() (Message, bool) {
@@ -279,9 +278,9 @@ func stressCommand(size, index int, rng *stressRNG) Command {
 		keys = append(keys, []byte(fmt.Sprintf("pair-%d", index%2)))
 	}
 	return Command{
-		ID:           CommandID{Client: uint64(100 + index%size), Sequence: uint64(index + 1)}, //nolint:gosec // G115: test harness converts bounded int index/count
-		Payload:      []byte(fmt.Sprintf("cmd-%02d", index)),
-		ConflictKeys: keys,
+		ID:        CommandID{Client: uint64(100 + index%size), Sequence: uint64(index + 1)}, //nolint:gosec // G115: test harness converts bounded int index/count
+		Payload:   []byte(fmt.Sprintf("cmd-%02d", index)),
+		Footprint: Footprint{Points: keys},
 	}
 }
 
@@ -312,7 +311,7 @@ func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals 
 		switch {
 		case commandEqual(baseRecord.Command, proposal.cmd):
 			chosen = append(chosen, proposal)
-		case baseRecord.Command.Kind != CommandNoop:
+		case baseRecord.Kind != EntryNoop:
 			t.Fatalf("proposed instance %s chose unexpected command %#v instead of %#v or no-op", proposal.ref, baseRecord.Command, proposal.cmd)
 		}
 	}
@@ -327,11 +326,8 @@ func assertStressConvergence(t *testing.T, s *stressTransportCluster, proposals 
 		if len(app) != len(proposals) {
 			t.Fatalf("node %d applied %d commands, want %d: %#v", id, len(app), len(proposals), app)
 		}
-		gotByID := make(map[CommandID]CommittedCommand, len(app))
-		for pos, c := range app {
-			if c.Command.Kind != CommandUser {
-				t.Fatalf("node %d applied non-user command at %d: %#v", id, pos, c)
-			}
+		gotByID := make(map[CommandID]ApplyCommand, len(app))
+		for _, c := range app {
 			if _, ok := gotByID[c.Command.ID]; ok {
 				t.Fatalf("node %d applied command id %#v more than once", id, c.Command.ID)
 			}
@@ -398,7 +394,7 @@ func stressTuplePairs(s *stressTransportCluster, left, right InstanceRef) map[Re
 	return pairs
 }
 
-func commandIndexes(app []CommittedCommand) map[CommandID]int {
+func commandIndexes(app []ApplyCommand) map[CommandID]int {
 	idx := make(map[CommandID]int, len(app))
 	for i, c := range app {
 		idx[c.Command.ID] = i
@@ -407,11 +403,11 @@ func commandIndexes(app []CommittedCommand) map[CommandID]int {
 }
 
 func sameCommandBytes(got, want Command) bool {
-	if got.ID != want.ID || got.Kind != CommandUser || !bytes.Equal(got.Payload, want.Payload) || len(got.ConflictKeys) != len(want.ConflictKeys) {
+	if got.ID != want.ID || !bytes.Equal(got.Payload, want.Payload) || !footprintEqual(got.Footprint, want.Footprint) || !bytes.Equal(got.CycleKey, want.CycleKey) {
 		return false
 	}
-	for i := range got.ConflictKeys {
-		if !bytes.Equal(got.ConflictKeys[i], want.ConflictKeys[i]) {
+	for i := range got.Footprint.Points {
+		if !bytes.Equal(got.Footprint.Points[i], want.Footprint.Points[i]) {
 			return false
 		}
 	}

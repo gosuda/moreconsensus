@@ -1,23 +1,25 @@
 // Package epaxos implements a deterministic, library-embedded EPaxos core.
 //
-// RawNode follows the same ownership split as raft-style libraries: the
-// application owns durable storage, transport, and logical ticking, while the
-// node owns protocol state. Calls to Propose and Step only mutate local state.
-// All externally visible work is returned through Ready.
+// RawNode owns only deterministic protocol state. The embedding owns durable
+// storage, transport, application state and responses, snapshot materialization,
+// and any wall-clock sampling. Propose treats Command.Payload and Command.ID as
+// opaque bytes and metadata; the core interprets only the canonical logical
+// Footprint and replicated CycleKey. Protocol no-ops, configuration changes,
+// certified membership controls, and checkpoint barriers are separate entry
+// kinds and never appear in Ready.Apply.
 //
-// A typical integration loop persists records before sending messages or
-// acknowledging committed commands. The application must apply
-// rd.Committed in the order provided by the slice:
+// All external work leaves through Ready. An embedding processes each batch in
+// phase order: atomically persist hard state, protocol records, and snapshot
+// metadata; send messages; install a received application snapshot; apply
+// Ready.Apply strictly in slice order; service Ready.Checkpoint; atomically
+// execute Ready.Compact; then acknowledge the exact completed prefix with
+// Advance. Ready work may repeat unchanged before Advance and after a crash.
+// Application effects and the CommandID-to-response/digest record therefore
+// must be committed atomically by the embedding.
 //
 //	for rn.HasReady() {
 //		rd := rn.Ready()
-//		if err := storage.ApplyReady(rd); err != nil {
-//			return err
-//		}
-//		for _, msg := range rd.Messages {
-//			send(msg)
-//		}
-//		if err := apply(rd.Committed); err != nil {
+//		if err := processInPhaseOrder(rd); err != nil {
 //			return err
 //		}
 //		if err := rn.Advance(rd); err != nil {
@@ -26,27 +28,22 @@
 //		rd.Release()
 //	}
 //
-// `Ready.Committed` is already dependency-ordered; callers must not reorder or
-// parallelize entries across that slice.
+// A Footprint contains canonical byte-lexicographic points, half-open spans, or
+// explicit group-wide All scope. Nonoverlapping commands may execute in either
+// order, so the embedding must guarantee strong commutativity of final state,
+// each response, dedup state, and deterministic side effects. CycleKey orders
+// equal-sequence members of an SCC after Seq and before InstanceRef.
 //
-// Advance accepts exact prefixes of the outstanding Ready. Applications may
-// acknowledge only records after partial durable writes, but messages and
-// committed commands require all records from the same Ready batch to be
-// acknowledged first. This preserves the durable-before-visible barrier.
-// If storage or application work fails before Advance, Ready returns the same
-// outstanding batch again so the caller can retry without losing progress.
+// Transport integrations use EncodeMessage and DecodeMessageWithScratch.
+// Decoded command and footprint bytes alias the input buffer; Step owns anything
+// it retains. Propose normally clones payload, footprint, and cycle bytes. With
+// ZeroCopyProposals, the caller transfers already-canonical buffers until they
+// are no longer observable through Ready or Status.
 //
-// Transport integrations use EncodeMessage to append into caller-owned buffers
-// and DecodeMessageWithScratch to reuse decoded dependency and conflict-key
-// slice headers. Decoded payload and conflict-key bytes alias the input buffer;
-// Step copies inbound command bytes before retaining them.
-//
-// By default Propose clones command payload and conflict-key slices. When
-// Config.ZeroCopyProposals is true, the caller transfers ownership of those
-// slices to the node until they are no longer observable through Ready or
-// Status.
+// Ready.RecordLoads requests retained durable records; ProvideRecordLoad returns
+// the result. Ready.Checkpoint requests an opaque application snapshot handle
+// and digest; ProvideCheckpoint returns it. Certified checkpoints bind an exact
+// execution frontier before Ready.Compact authorizes durable protocol deletion.
+// Restart installs the checkpoint and replays only retained delta. The core
+// never performs I/O or calls an application callback.
 package epaxos
-
-// Ready.RecordLoads requests durable records for folded instance refs; embeddings respond via ProvideRecordLoad.
-
-// VisitConflicts enumerates resident conflicting instances for embeddings; folded history is omitted.

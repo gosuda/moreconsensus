@@ -61,7 +61,8 @@ func proxyMessage(t *testing.T, from, to epaxos.ReplicaID, instance epaxos.Insta
 		Ref:    epaxos.InstanceRef{Replica: from, Instance: instance, Conf: 1},
 		Ballot: epaxos.Ballot{Replica: from}, RecordBallot: epaxos.Ballot{Replica: from},
 		Seq: 1, Deps: []epaxos.InstanceNum{0, 0}, RecordStatus: epaxos.StatusPreAccepted,
-		Command: epaxos.Command{ID: epaxos.CommandID{Client: uint64(from), Sequence: uint64(instance)}, Payload: []byte("value"), ConflictKeys: [][]byte{[]byte("key")}},
+		Kind: epaxos.EntryCommand,
+		Command: epaxos.Command{ID: epaxos.CommandID{Client: uint64(from), Sequence: uint64(instance)}, Payload: []byte("value"), Footprint: epaxos.Footprint{Points: [][]byte{[]byte("key")}}},
 	}
 	body, err := epaxos.EncodeMessage(nil, message)
 	if err != nil {

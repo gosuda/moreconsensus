@@ -128,9 +128,8 @@ func TestFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t *tes
 	beforeInstances := len(f.node.instances)
 	beforeReady := f.node.Ready()
 	for _, message := range messages {
-		if err := f.node.Step(message); !errors.Is(err, ErrBootstrapFenced) {
-			t.Fatalf("%s above fence err=%v", message.Type, err)
-		}
+		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapFenced) { t.Fatalf("%s above fence err=%v", message.Type, err)
+ }
 	}
 	afterReady := f.node.Ready()
 	if len(f.node.instances) != beforeInstances || len(afterReady.Records) != len(beforeReady.Records) || len(afterReady.Messages) != len(beforeReady.Messages) {
@@ -140,7 +139,7 @@ func TestFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t *tes
 
 func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
-	userRef, err := f.node.Propose(Command{Payload: []byte("before-fence"), ConflictKeys: [][]byte{[]byte("k")}})
+	userRef, err := f.node.Propose(Command{Payload: []byte("before-fence"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,9 +153,8 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 		t.Fatalf("durable pre-fence record %s not found", userRef)
 	}
 	retry := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: userRef, Ballot: stored.Ballot, Seq: stored.Seq, Deps: stored.Deps, Command: stored.Command}
-	if err := f.node.Step(retry); err != nil {
-		t.Fatalf("matching pre-fence retry: %v", err)
-	}
+	if err := f.node.Step(canonicalTestMessage(retry)); err != nil { t.Fatalf("matching pre-fence retry: %v", err)
+ }
 	loadReady := f.node.Ready()
 	if len(loadReady.RecordLoads) != 1 || loadReady.RecordLoads[0] != userRef {
 		t.Fatalf("matching retry Ready=%#v, want one record load", loadReady)
@@ -172,9 +170,8 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 	}
 
 	retry.Command.Payload = []byte("different")
-	if err := f.node.Step(retry); err != nil {
-		t.Fatalf("different retry deferred error=%v, want asynchronous validation", err)
-	}
+	if err := f.node.Step(canonicalTestMessage(retry)); err != nil { t.Fatalf("different retry deferred error=%v, want asynchronous validation", err)
+ }
 	loadReady = f.node.Ready()
 	if err := provideRecordLoadsFromStore(f.node, f.store, loadReady); !errors.Is(err, ErrBootstrapFenced) {
 		t.Fatalf("different retry replay err=%v, want ErrBootstrapFenced", err)
@@ -183,9 +180,8 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 		t.Fatal(err)
 	}
 	recovery := Message{Type: MsgPrepare, From: 1, To: 1, Ref: userRef, Ballot: Ballot{Epoch: 1, Replica: 1}}
-	if err := f.node.Step(recovery); err != nil {
-		t.Fatalf("old-config recovery below frontier: %v", err)
-	}
+	if err := f.node.Step(canonicalTestMessage(recovery)); err != nil { t.Fatalf("old-config recovery below frontier: %v", err)
+ }
 }
 
 func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *testing.T) {
@@ -194,17 +190,21 @@ func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *tes
 	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
-	wrong := []Command{{Payload: []byte("user")}, {Kind: CommandNoop}}
 	abort, err := encodeMembershipCommand(membershipCommandWire{Operation: membershipAbort, Plan: plan})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong = append(wrong, abort)
-	for _, command := range wrong {
-		message := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: plan.Reservations.Activate, Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0}, Command: command}
-		if err := f.node.Step(message); !errors.Is(err, ErrBootstrapControl) {
-			t.Fatalf("control command %#v err=%v", command, err)
-		}
+	wrong := []Message{
+		{Kind: EntryCommand, Command: Command{Payload: []byte("user"), Footprint: Footprint{All: true}}},
+		{Kind: EntryNoop},
+		{Kind: EntryMembership, ProtocolControl: abort},
+	}
+	for _, value := range wrong {
+		message := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: plan.Reservations.Activate,
+			Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0},
+			Kind: value.Kind, Command: value.Command, ProtocolControl: value.ProtocolControl}
+		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapControl) { t.Fatalf("control value %#v err=%v", value, err)
+ }
 	}
 }
 

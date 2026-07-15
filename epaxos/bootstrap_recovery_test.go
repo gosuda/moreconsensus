@@ -69,11 +69,11 @@ func TestAllNoneReservedAbortRecoverySelectsAbortNotNoop(t *testing.T) {
 	}
 	drainBootstrapProtocolReady(t, fixture.node, fixture.store)
 	record, ok := fixture.store.Instance(plan.Reservations.Abort)
-	if !ok || record.Status != StatusExecuted || record.Command.Kind != CommandMembership ||
+	if !ok || record.Status != StatusExecuted || record.Kind != EntryMembership ||
 		record.MembershipResult.Outcome != BootstrapOutcomeAborted {
 		t.Fatalf("recovered abort record=%#v present=%v", record, ok)
 	}
-	wire, err := decodeMembershipCommand(record.Command)
+	wire, err := decodeMembershipCommand(record.ProtocolControl)
 	if err != nil || wire.Operation != membershipAbort {
 		t.Fatalf("recovered all-none value=%#v err=%v", wire, err)
 	}
@@ -292,12 +292,11 @@ func TestControlRecoveryUsesOldPerInstanceBallotsAndQuorumAfterOwnerCrash(t *tes
 		Type: MsgPrepareResp, From: 1, To: 2, Ref: prepare.Ref, Ballot: prepare.Ballot,
 		RecordStatus: StatusNone, Deps: make([]InstanceNum, len(plan.Request.Base.Voters)),
 	}
-	if err := node.Step(response); err != nil {
-		t.Fatal(err)
-	}
+	if err := node.Step(canonicalTestMessage(response)); err != nil { t.Fatal(err)
+ }
 	messages = drainBootstrapProtocolReady(t, node, store)
 	accept := bootstrapMessageOfType(t, messages, MsgAccept, plan.Reservations.Abort)
-	if accept.Ballot != prepare.Ballot || accept.Command.Kind != CommandMembership {
+	if accept.Ballot != prepare.Ballot || accept.Kind != EntryMembership {
 		t.Fatalf("old-config Accept=%#v", accept)
 	}
 	acceptResponse := Message{
@@ -305,9 +304,8 @@ func TestControlRecoveryUsesOldPerInstanceBallotsAndQuorumAfterOwnerCrash(t *tes
 		RecordBallot: accept.Ballot, Seq: accept.Seq, Deps: append([]InstanceNum(nil), accept.Deps...),
 		RecordStatus: StatusAccepted,
 	}
-	if err := node.Step(acceptResponse); err != nil {
-		t.Fatal(err)
-	}
+	if err := node.Step(canonicalTestMessage(acceptResponse)); err != nil { t.Fatal(err)
+ }
 	drainBootstrapProtocolReady(t, node, store)
 	record, ok := store.Instance(plan.Reservations.Abort)
 	if !ok || record.Status != StatusExecuted || record.MembershipResult.Outcome != BootstrapOutcomeAborted {
@@ -318,10 +316,11 @@ func TestControlRecoveryUsesOldPerInstanceBallotsAndQuorumAfterOwnerCrash(t *tes
 	}
 }
 
-func installCommittedBootstrapControl(node *RawNode, ref InstanceRef, command Command) {
+func installCommittedBootstrapControl(node *RawNode, ref InstanceRef, control []byte) {
 	record := InstanceRecord{
 		Ref: ref, Ballot: Ballot{Replica: ref.Replica}, RecordBallot: Ballot{Replica: ref.Replica},
-		Status: StatusCommitted, Seq: 1, Deps: node.depsForConf(ref.Conf), Command: command.Clone(),
+		Status: StatusCommitted, Seq: 1, Deps: node.depsForConf(ref.Conf),
+		Kind: EntryMembership, ProtocolControl: append([]byte(nil), control...),
 		TimingDomain: TimingDomainUntimed,
 	}
 	record.Checksum = ChecksumRecord(record)
@@ -386,9 +385,8 @@ func TestBootstrapReadyCausallyFencesSuccessorMessages(t *testing.T) {
 		Ref:    InstanceRef{Replica: fixture.target.Replica, Instance: 1, Conf: plan.Successor.ID},
 		Ballot: Ballot{Epoch: 1, Replica: fixture.target.Replica},
 	}
-	if err := fixture.node.Step(message); !errors.Is(err, ErrBootstrapEligibility) {
-		t.Fatalf("successor message before activation durability err=%v", err)
-	}
+	if err := fixture.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapEligibility) { t.Fatalf("successor message before activation durability err=%v", err)
+ }
 	rd := fixture.node.Ready()
 	if rd.LocalVoterState == nil || !rd.MustSync {
 		t.Fatalf("activation Ready=%#v", rd)
@@ -399,9 +397,8 @@ func TestBootstrapReadyCausallyFencesSuccessorMessages(t *testing.T) {
 	if err := fixture.node.Advance(rd); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.node.Step(message); err != nil {
-		t.Fatalf("successor message after activation durability: %v", err)
-	}
+	if err := fixture.node.Step(canonicalTestMessage(message)); err != nil { t.Fatalf("successor message after activation durability: %v", err)
+ }
 }
 
 func restartBootstrapFixture(t *testing.T, fixture bootstrapTestFixture, voters []ReplicaID, identities []VoterIdentity) *RawNode {
@@ -505,9 +502,8 @@ func TestAddedVoterNeverCountsForOldPinnedRecoveryAfterCertifiedActivation(t *te
 		Ref:    InstanceRef{Replica: 1, Instance: 50, Conf: plan.Request.Base.ID},
 		Ballot: Ballot{Epoch: 1, Replica: 1},
 	}
-	if err := target.Step(old); !errors.Is(err, ErrMessageRejected) {
-		t.Fatalf("added voter accepted old-config vote: %v", err)
-	}
+	if err := target.Step(canonicalTestMessage(old)); !errors.Is(err, ErrMessageRejected) { t.Fatalf("added voter accepted old-config vote: %v", err)
+ }
 	if target.HasReady() {
 		t.Fatalf("rejected old-config vote created Ready: %#v", target.Ready())
 	}
@@ -517,7 +513,7 @@ func TestRemovedCertifiedVoterStillServesPinnedHistoricalRecovery(t *testing.T) 
 	fixture := newBootstrapTestFixture(t, 3, 3)
 	result := fixture.node.applyConfChange(
 		InstanceRef{Replica: 1, Instance: 10, Conf: 1},
-		confChangeCommand(ConfChange{Type: ConfChangeRemoveVoter, Replica: 3}),
+		ConfChange{Type: ConfChangeRemoveVoter, Replica: 3},
 	)
 	if result.Outcome != ConfChangeApplied || result.Conf.Contains(3) {
 		t.Fatalf("remove result=%#v", result)
@@ -537,9 +533,8 @@ func TestRemovedCertifiedVoterStillServesPinnedHistoricalRecovery(t *testing.T) 
 		Ref:    InstanceRef{Replica: 1, Instance: 50, Conf: 1},
 		Ballot: Ballot{Epoch: 1, Replica: 1},
 	}
-	if err := fixture.node.Step(message); err != nil {
-		t.Fatalf("removed voter rejected historical recovery: %v", err)
-	}
+	if err := fixture.node.Step(canonicalTestMessage(message)); err != nil { t.Fatalf("removed voter rejected historical recovery: %v", err)
+ }
 	if !fixture.node.HasReady() {
 		t.Fatal("historical recovery produced no durable promise/response")
 	}
@@ -636,12 +631,15 @@ func newTOQBootstrapFixture(t *testing.T) bootstrapTestFixture {
 	node, err := NewRawNode(Config{
 		ID: 1, Voters: base.Voters, Cluster: fixture.cluster,
 		LocalIdentity: fixture.identities[0], VoterIdentities: fixture.identities, Storage: fixture.store,
-		TOQ: true, TOQClock: func() uint64 { return 10 }, TOQRuntime: &runtime,
+		TOQ: true, TOQRuntime: &runtime,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture.node = node
+	if err := fixture.node.ProcessTOQ(10); err != nil {
+		t.Fatal(err)
+	}
 	return fixture
 }
 
@@ -649,6 +647,7 @@ func TestBootstrapTOQRuntimeAndClosedFloorMustMatchSuccessor(t *testing.T) {
 	fixture := newTOQBootstrapFixture(t)
 	request := fixture.request()
 	request.TOQ = true
+	request.TOQClosedThrough = 10
 	request.SuccessorTOQ = TOQRuntimeConfig{
 		Conf:        ConfState{ID: request.Base.ID + 1, Voters: []ReplicaID{1, fixture.target.Replica}},
 		OneWayDelay: map[ReplicaID]uint64{1: 0, fixture.target.Replica: 1},
@@ -816,9 +815,8 @@ func TestLiveOldQuorumAfterFencerCrashesCanFinalizeButCannotChooseOrdinaryWork(t
 				Ballot: Ballot{Replica: 1}, Seq: 1, Deps: make([]InstanceNum, voters),
 				Command: Command{Payload: []byte("post-fence")},
 			}
-			if err := fixture.node.Step(ordinary); !errors.Is(err, ErrBootstrapFenced) {
-				t.Fatalf("post-fence ordinary admission err=%v", err)
-			}
+			if err := fixture.node.Step(canonicalTestMessage(ordinary)); !errors.Is(err, ErrBootstrapFenced) { t.Fatalf("post-fence ordinary admission err=%v", err)
+ }
 			if _, err := fixture.node.AbortVoter(plan); err != nil {
 				t.Fatalf("old-config exit could not be proposed: %v", err)
 			}
