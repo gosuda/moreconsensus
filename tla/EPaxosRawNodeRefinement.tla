@@ -265,18 +265,24 @@ Init ==
 (* one of these abstract actions or a stutter of PaperVars.                 *)
 (***************************************************************************)
 
-PaperChoose(i) ==
-    /\ paperDecision[i] = NoTuple
-    /\ paperDecision'[i] # NoTuple
-    /\ paperDecision'[i].conf = i.conf
+PaperChooseRel(i, dec, dec2) ==
+    /\ dec[i] = NoTuple
+    /\ dec2[i] # NoTuple
+    /\ dec2[i].conf = i.conf
     /\ \A other \in Instances \ {i} :
-           paperDecision'[other] = paperDecision[other]
+           dec2[other] = dec[other]
+
+PaperExecuteRel(i, dec, ex, ex2) ==
+    /\ dec[i] # NoTuple
+    /\ i \notin ex
+    /\ ex2 = ex \cup {i}
+
+PaperChoose(i) ==
+    /\ PaperChooseRel(i, paperDecision, paperDecision')
     /\ UNCHANGED <<paperExecuted, paperEvidence, paperConfig>>
 
 PaperExecute(i) ==
-    /\ paperDecision[i] # NoTuple
-    /\ i \notin paperExecuted
-    /\ paperExecuted' = paperExecuted \cup {i}
+    /\ PaperExecuteRel(i, paperDecision, paperExecuted, paperExecuted')
     /\ UNCHANGED <<paperDecision, paperEvidence, paperConfig>>
 
 PaperBeginRecovery(i) ==
@@ -304,6 +310,20 @@ PaperObserveRecovery(i) ==
            paperEvidence'[other] = paperEvidence[other]
     /\ UNCHANGED <<paperDecision, paperExecuted, paperConfig>>
 
+(***************************************************************************)
+(* PaperChooseAndExecute checks the Go RawNode's one-observable-transition  *)
+(* choose-then-execute persistence through an explicit intermediate         *)
+(* decision valuation.  TLC evaluates both relations for every matching     *)
+(* trace pair rather than relying on a hand-expanded composition.            *)
+(***************************************************************************)
+
+PaperChooseAndExecute(i) ==
+    LET mid == [paperDecision EXCEPT ![i] = paperDecision'[i]]
+    IN  /\ paperDecision' = mid
+        /\ PaperChooseRel(i, paperDecision, mid)
+        /\ PaperExecuteRel(i, mid, paperExecuted, paperExecuted')
+        /\ UNCHANGED <<paperEvidence, paperConfig>>
+
 PaperReconfigure ==
     /\ paperConfig = OldConfig
     /\ paperConfig' = NewConfig
@@ -315,6 +335,208 @@ PaperNext ==
     \/ \E i \in Instances : PaperBeginRecovery(i)
     \/ \E i \in Instances : PaperObserveRecovery(i)
     \/ PaperReconfigure
+
+(***************************************************************************)
+(* Trace-only actions for the complete twelve-variable abstraction.        *)
+(* These are deliberately not disjuncts of PaperNext or any workflow Next: *)
+(* they check concrete trace pairs without widening an existing model.     *)
+(***************************************************************************)
+
+TraceMappedVars ==
+    <<records, durableRecords, recoveryEvidence, applied, applyLog,
+      currentTick, toqPending, activeConfig,
+      paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+OtherRecordsUnchanged(i) ==
+    \A other \in Instances \ {i} : records'[other] = records[other]
+
+OtherDurableRecordsUnchanged(i) ==
+    \A other \in Instances \ {i} : durableRecords'[other] = durableRecords[other]
+
+TraceTuple(i) ==
+    Tuple(i, IF i = A THEN CmdA ELSE CmdB, 1, {})
+
+(* RawNode.Propose/ProposeConfChange -> propose -> installInstance/enqueueRecord *)
+(* stores the local pre-accepted record (epaxos/node.go:1841-2020).          *)
+TraceProposePreAccepted(i) ==
+    /\ records[i].status = "empty"
+    /\ records'[i].ref = i
+    /\ records'[i].status = "preaccepted"
+    /\ records'[i].ballot = records[i].ballot
+    /\ records'[i].recordBallot = records[i].recordBallot
+    /\ records'[i].tuple = TraceTuple(i)
+    /\ records'[i].wire = Wire(0)
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.Step -> handleAccept seeds an accepted record before Ready exposes *)
+(* it (epaxos/node.go: Step -> handleAccept).                            *)
+TraceSeedAccepted(i) ==
+    /\ records[i].status = "empty"
+    /\ records'[i].ref = i
+    /\ records'[i].status = "accepted"
+    /\ records'[i].ballot = records'[i].recordBallot
+    /\ records'[i].ballot > 0
+    /\ records'[i].ballot = 1
+    /\ records'[i].tuple = TraceTuple(i)
+    /\ records'[i].wire = Wire(0)
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.Step -> handleCommit changes only the volatile record status and *)
+(* preserves the accepted tuple and ballot (epaxos/node.go: handleCommit).  *)
+TraceCommitVolatile(i) ==
+    /\ records[i].status \in {"preaccepted", "accepted"}
+    /\ records'[i] = [records[i] EXCEPT !.status = "committed"]
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.Tick assigns n.tick = next, advancing the logical clock by one   *)
+(* when no designated instance is otherwise touched (epaxos/node.go:1450). *)
+TraceTickOnly ==
+    /\ currentTick' = currentTick + 1
+    /\ UNCHANGED <<records, durableRecords, recoveryEvidence, applied,
+         applyLog, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.Tick -> onTimer -> startPrepare -> startPrepareFrom both advances *)
+(* the clock and raises the volatile promise ballot (epaxos/node.go:1450,   *)
+(* 4337, 4071-4094).                                                        *)
+TracePromiseAndTick(i) ==
+    /\ currentTick' = currentTick + 1
+    /\ records'[i].ballot > records[i].ballot
+    /\ records'[i].status = records[i].status
+    /\ records'[i].recordBallot = records[i].recordBallot
+    /\ records'[i].tuple = records[i].tuple
+    /\ records'[i].ref = records[i].ref
+    /\ records'[i].wire = records[i].wire
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.Step -> handlePrepareResp -> startAccept records the selected    *)
+(* recovery ballot before emitting the next Ready (epaxos/node.go:3070,     *)
+(* 3151-3160).                                                              *)
+TraceAcceptRecoveryTuple(i) ==
+    /\ records[i].status = "accepted"
+    /\ records'[i] = [records[i] EXCEPT !.recordBallot = records[i].ballot]
+    /\ records[i].recordBallot < records[i].ballot
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* RawNode.ProcessTOQ -> processDeferredPreAccepts -> handleLocalTOQPreAccept *)
+(* -> commit admits the due decision (epaxos/node.go:1751-1804).            *)
+TraceTOQCommitVolatile(i) ==
+    /\ records[i].status = "empty"
+    /\ records'[i].ref = i
+    /\ records'[i].status = "committed"
+    /\ records'[i].ballot = records[i].ballot
+    /\ records'[i].recordBallot = records[i].recordBallot
+    /\ records'[i].tuple = TraceTuple(i)
+    /\ records'[i].wire = Wire(0)
+    /\ OtherRecordsUnchanged(i)
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* Ready persistence -> storage ApplyReady -> semantic durable snapshot copies *)
+(* the designated Ready record exactly (tests/refinementtrace: consumeReady). *)
+TracePersistRecord(i) ==
+    /\ durableRecords'[i] = records[i]
+    /\ durableRecords'[i] # durableRecords[i]
+    /\ OtherDurableRecordsUnchanged(i)
+    /\ UNCHANGED <<records, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* Ready persistence of a pending TOQ marker follows RawNode.Propose -> Ready *)
+(* -> storage ApplyReady (tests/refinementtrace: consumeReady).              *)
+TraceSetTOQPending ==
+    /\ ~toqPending
+    /\ toqPending'
+    /\ UNCHANGED <<records, durableRecords, recoveryEvidence, applied,
+         applyLog, currentTick, activeConfig,
+         paperDecision, paperExecuted, paperEvidence, paperConfig>>
+
+(* Ready persistence of a chosen record: RawNode.Step -> handleCommit ->     *)
+(* Ready, then storage ApplyReady (epaxos/node.go: handleCommit).            *)
+TracePersistChoose(i) ==
+    /\ PaperChoose(i)
+    /\ durableRecords'[i] = records[i]
+    /\ durableRecords'[i] # durableRecords[i]
+    /\ OtherDurableRecordsUnchanged(i)
+    /\ UNCHANGED <<records, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, activeConfig>>
+
+(* TOQ Ready persistence additionally clears the durable pending marker      *)
+(* (RawNode.ProcessTOQ -> Ready -> storage ApplyReady).                     *)
+TracePersistChooseAndClearTOQ(i) ==
+    /\ PaperChoose(i)
+    /\ durableRecords'[i] = records[i]
+    /\ durableRecords'[i] # durableRecords[i]
+    /\ OtherDurableRecordsUnchanged(i)
+    /\ toqPending
+    /\ ~toqPending'
+    /\ UNCHANGED <<records, recoveryEvidence, applied, applyLog,
+         currentTick, activeConfig>>
+
+(* RawNode.Step -> handleCommit -> tryExecute -> Ready; application ack is   *)
+(* represented by applied/applyLog (epaxos/sparse_progress.go: tryExecute). *)
+TraceExecuteMapped(i) ==
+    /\ PaperExecute(i)
+    /\ applied' = applied \cup {i}
+    /\ applyLog' = Append(applyLog, i)
+    /\ UNCHANGED <<records, durableRecords, recoveryEvidence,
+         currentTick, toqPending, activeConfig>>
+
+(* Config commit executes atomically before its Ready is persisted:         *)
+(* RawNode.Step -> handleCommit -> tryExecute -> Ready -> storage ApplyReady *)
+(* (epaxos/node.go: handleCommit; epaxos/sparse_progress.go: tryExecute).    *)
+TracePersistChooseAndExecute(i) ==
+    /\ PaperChooseAndExecute(i)
+    /\ durableRecords'[i] = records[i]
+    /\ durableRecords'[i] # durableRecords[i]
+    /\ OtherDurableRecordsUnchanged(i)
+    /\ applied' = applied \cup {i}
+    /\ applyLog' = Append(applyLog, i)
+    /\ UNCHANGED <<records, recoveryEvidence,
+         currentTick, toqPending, activeConfig>>
+
+(* Recovery promise persistence: RawNode.Tick -> onTimer -> startPrepare -> *)
+(* Ready -> storage ApplyReady starts the matching evidence epoch           *)
+(* (epaxos/node.go:1450, 4337, 4071; tests/refinementtrace: consumeReady).  *)
+TracePersistBeginRecovery(i) ==
+    /\ PaperBeginRecovery(i)
+    /\ durableRecords'[i] = records[i]
+    /\ durableRecords'[i] # durableRecords[i]
+    /\ OtherDurableRecordsUnchanged(i)
+    /\ recoveryEvidence' = paperEvidence'
+    /\ recoveryEvidence'[i].ballot = records'[i].ballot
+    /\ recoveryEvidence'[i].recordBallot = records'[i].recordBallot
+    /\ recoveryEvidence'[i].tuple = records'[i].tuple
+    /\ UNCHANGED <<records, applied, applyLog,
+         currentTick, toqPending, activeConfig>>
+
+(* Config-change application: RawNode.Step -> handleCommit -> tryExecute -> *)
+(* applyConfChange commits the volatile record and installs the new config *)
+(* (epaxos/node.go:2846, 5660).                                            *)
+TraceReconfigureCommit(i) ==
+    /\ PaperReconfigure
+    /\ records[i].status = "preaccepted"
+    /\ records'[i] = [records[i] EXCEPT !.status = "committed"]
+    /\ OtherRecordsUnchanged(i)
+    /\ activeConfig' = NewConfig
+    /\ UNCHANGED <<durableRecords, recoveryEvidence, applied, applyLog,
+         currentTick, toqPending, paperDecision, paperExecuted, paperEvidence>>
 
 RefinementAction == PaperNext \/ UNCHANGED PaperVars
 RefinementProperty == [][RefinementAction]_PaperVars

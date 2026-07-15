@@ -26,6 +26,7 @@ AGENTS.md
 
 # Generated validation artifacts
 states/
+tla/traces/
 jepsen/target/
 jepsen/.lein-failures
 jepsen/store/

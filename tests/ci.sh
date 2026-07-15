@@ -7,6 +7,7 @@ cd "$ROOT"
 bash tests/toolchain_audit.sh
 bash tests/go_coverage.sh
 bash tests/tla_model_check_fast.sh
+bash tests/trace_refinement_check.sh
 bash tests/fuzz_stress_campaign.sh
 bash tests/chaos_fault_campaign.sh
 bash tests/jepsen_remote_preflight_audit.sh
