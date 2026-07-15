@@ -128,8 +128,9 @@ func TestFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier(t *tes
 	beforeInstances := len(f.node.instances)
 	beforeReady := f.node.Ready()
 	for _, message := range messages {
-		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapFenced) { t.Fatalf("%s above fence err=%v", message.Type, err)
- }
+		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapFenced) {
+			t.Fatalf("%s above fence err=%v", message.Type, err)
+		}
 	}
 	afterReady := f.node.Ready()
 	if len(f.node.instances) != beforeInstances || len(afterReady.Records) != len(beforeReady.Records) || len(afterReady.Messages) != len(beforeReady.Messages) {
@@ -153,8 +154,9 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 		t.Fatalf("durable pre-fence record %s not found", userRef)
 	}
 	retry := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: userRef, Ballot: stored.Ballot, Seq: stored.Seq, Deps: stored.Deps, Command: stored.Command}
-	if err := f.node.Step(canonicalTestMessage(retry)); err != nil { t.Fatalf("matching pre-fence retry: %v", err)
- }
+	if err := f.node.Step(canonicalTestMessage(retry)); err != nil {
+		t.Fatalf("matching pre-fence retry: %v", err)
+	}
 	loadReady := f.node.Ready()
 	if len(loadReady.RecordLoads) != 1 || loadReady.RecordLoads[0] != userRef {
 		t.Fatalf("matching retry Ready=%#v, want one record load", loadReady)
@@ -170,8 +172,9 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 	}
 
 	retry.Command.Payload = []byte("different")
-	if err := f.node.Step(canonicalTestMessage(retry)); err != nil { t.Fatalf("different retry deferred error=%v, want asynchronous validation", err)
- }
+	if err := f.node.Step(canonicalTestMessage(retry)); err != nil {
+		t.Fatalf("different retry deferred error=%v, want asynchronous validation", err)
+	}
 	loadReady = f.node.Ready()
 	if err := provideRecordLoadsFromStore(f.node, f.store, loadReady); !errors.Is(err, ErrBootstrapFenced) {
 		t.Fatalf("different retry replay err=%v, want ErrBootstrapFenced", err)
@@ -180,8 +183,9 @@ func TestFenceAllowsOnlyMatchingPreFenceRetryOrRecoveryBelowFrontier(t *testing.
 		t.Fatal(err)
 	}
 	recovery := Message{Type: MsgPrepare, From: 1, To: 1, Ref: userRef, Ballot: Ballot{Epoch: 1, Replica: 1}}
-	if err := f.node.Step(canonicalTestMessage(recovery)); err != nil { t.Fatalf("old-config recovery below frontier: %v", err)
- }
+	if err := f.node.Step(canonicalTestMessage(recovery)); err != nil {
+		t.Fatalf("old-config recovery below frontier: %v", err)
+	}
 }
 
 func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *testing.T) {
@@ -203,8 +207,9 @@ func TestReservedControlRefsRejectUserNoopWrongPlanAndSwappedExitCommands(t *tes
 		message := Message{Type: MsgPreAccept, From: 1, To: 1, Ref: plan.Reservations.Activate,
 			Ballot: Ballot{Replica: 1}, Seq: 1, Deps: []InstanceNum{0},
 			Kind: value.Kind, Command: value.Command, ProtocolControl: value.ProtocolControl}
-		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapControl) { t.Fatalf("control value %#v err=%v", value, err)
- }
+		if err := f.node.Step(canonicalTestMessage(message)); !errors.Is(err, ErrBootstrapControl) {
+			t.Fatalf("control value %#v err=%v", value, err)
+		}
 	}
 }
 
@@ -398,20 +403,24 @@ func TestFencingLayersRejectFoldedLoadAndStaleBootstrapAuth(t *testing.T) {
 	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 5}
 	rec := checkedRecord(InstanceRecord{
 		Ref: ref, Status: StatusCommitted, Seq: 3, Ballot: Ballot{Replica: 1},
-		Deps: f.node.q.deps(), Command: Command{Payload: []byte("chosen"), ConflictKeys: [][]byte{[]byte("k")}},
+		Deps: f.node.q.deps(), Command: Command{Payload: []byte("chosen"), Footprint: Footprint{Points: [][]byte{[]byte("k")}}},
 	})
 	foldTestRef(&f.node.engine, rec)
 	if err := f.node.BeginVoterFence(plan); err != nil {
 		t.Fatal(err)
 	}
 	before := f.node.Ready()
-	late := Message{Type: MsgPrepare, From: 1, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}}
+	late := Message{
+		Type: MsgPrepare, From: 1, To: 1, FromIncarnation: 2, ToIncarnation: 2,
+		Ref: ref, Ballot: Ballot{Number: 1, Replica: 1},
+	}
+	late.Checksum = ChecksumMessage(late)
 	if err := f.node.Step(late); !errors.Is(err, ErrBootstrapFenced) {
 		t.Fatalf("fenced folded message err=%v", err)
 	}
-	// Ordinary messages carry no incarnation. This folded prepare has no
-	// resident payload-absent instance, so it does not defer a record load;
-	// closed-config admission then rejects it.
+	// The MEP3 folded prepare passes incarnation admission but has no resident
+	// payload-absent instance, so it does not defer a record load; closed-config
+	// admission then rejects it.
 	afterFoldedMessage := f.node.Ready()
 	if len(f.node.pendingRecordLoads) != 0 || len(afterFoldedMessage.RecordLoads) != len(before.RecordLoads) {
 		t.Fatalf("fenced folded message queued record load: pending=%#v before=%#v after=%#v", f.node.pendingRecordLoads, before.RecordLoads, afterFoldedMessage.RecordLoads)

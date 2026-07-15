@@ -60,8 +60,7 @@ The checked Go-trace-to-TLC replay proves sampled admission for four captured sc
 | `tla/EPaxosVoterBootstrap.tla` | Finite bootstrap fencing, target readiness, activation, abort, crash-prefix, race, and fairness obligations. | `tests/tla_model_check_fast.sh` runs base sizes 1–6 (successor sizes 2–7) plus crash-prefix, race, and fairness configurations; bootstrap is outside the sampled Go-to-TLC replay. |
 | `tla/KVTimestampStaleness.tla` and `tla/KVOmissionRecovery.tla` | Example KV timestamp and omission/recovery slices. | `examples/kv`, Jepsen checker tests. |
 
-The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 31 named finite jobs, including the positive compaction/fencing configuration, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
-The fast gate is executable through `python3 tests/tla_model_check_runner.py --profile fast` (or its shell wrapper) and includes the certified-compaction fast configuration. The full profile includes the larger finite configuration. Both are bounded state-space checks, not exhaustive proofs.
+The fast gate is executable through `bash tests/tla_model_check_fast.sh` (or `python3 tests/tla_model_check_runner.py --profile fast`) and covers 32 named finite jobs, including the certified-compaction configuration, the positive compaction/fencing configuration, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
 
 ## Paper-grounded claim map
 
@@ -117,7 +116,7 @@ This replay proves sampled admission. Separately, the AST-checked inventory cove
 - `go test ./... -count=1` passes.
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
-- `bash tests/tla_model_check_fast.sh` passes all 31 configured jobs, including the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
+- `bash tests/tla_model_check_fast.sh` passes all 32 configured jobs, including the certified-compaction configuration, the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
 - `tests/trace_refinement_check.sh` accepts all four scenario traces and rejects all five negative controls.
 - `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 87.3% against 85.0% minimum and `examples/kv` 90.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - TLAPS 1.6.0-pre at version `763bf3c`, from the newest prebuilt x86_64-linux release asset (no 1.6.0 final exists), reports 876 obligations for `tla/EPaxosInductiveProofs.tla`: 867 proved, 9 failed, and 0 omitted. `tests/tlaps_check.sh` exits 10, preserving that failure.
