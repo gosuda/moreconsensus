@@ -1543,6 +1543,7 @@ func (n *RawNode) Tick() error {
 	n.currentHardState.Tick = next
 	if n.recoveryTicks > 0 && n.tick%n.recoveryTicks == 0 {
 		n.rebroadcastCommits()
+		n.retryCheckpointControl()
 	}
 	firstErr := n.processDeferredPreAccepts(preAcceptLogical, n.tick)
 	for n.timers.Len() > 0 {

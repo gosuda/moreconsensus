@@ -316,6 +316,20 @@ func (n *RawNode) broadcastCheckpointControl(typ MessageType, control checkpoint
 	}
 }
 
+func (n *RawNode) retryCheckpointControl() {
+	round := n.checkpointRound
+	if round == nil || !round.preparedDurable || checkpointCertified(round.checkpoint) {
+		return
+	}
+	vote, ok := round.votes[n.id]
+	if !ok {
+		return
+	}
+	n.broadcastCheckpointControl(MsgCheckpointVote, checkpointControlWire{
+		Type: checkpointControlVote, Descriptor: round.checkpoint.Descriptor, Vote: vote,
+	})
+}
+
 func (n *RawNode) maybeCertifyCheckpoint() {
 	round := n.checkpointRound
 	if round == nil || !round.preparedDurable || checkpointCertified(round.checkpoint) {
@@ -367,6 +381,11 @@ func (n *RawNode) handleCheckpointControl(message Message) error {
 		expected := n.voterIdentity(message.From)
 		if !voterIdentityEqual(expected, wire.Vote.Voter) {
 			return ErrMessageRejected
+		}
+		if n.durableCheckpointCovers(wire.Descriptor) {
+			n.enqueueLatestCheckpointCertificate(message.From)
+			n.enqueueLatestCheckpointOffer(message.From)
+			return nil
 		}
 		round := n.checkpointRound
 		if round == nil || !checkpointDescriptorEqual(round.checkpoint.Descriptor, wire.Descriptor) {
@@ -520,15 +539,32 @@ func (n *RawNode) compactCheckpointMetadata() {
 	}
 }
 
+func (n *RawNode) enqueueLatestCheckpointCertificate(to ReplicaID) {
+	n.enqueueLatestCheckpointControl(to, MsgCheckpointCertificate, checkpointControlCertificate)
+}
+
 func (n *RawNode) enqueueLatestCheckpointOffer(to ReplicaID) {
-	if !checkpointCertified(n.durableCheckpoint) || len(n.durableCheckpoint.ApplicationSnapshot) == 0 {
+	n.enqueueLatestCheckpointControl(to, MsgCheckpointOffer, checkpointControlOffer)
+}
+
+func (n *RawNode) enqueueLatestCheckpointControl(to ReplicaID, messageType MessageType, controlType checkpointControlType) {
+	checkpoint := n.durableCheckpoint
+	if !checkpointCertified(checkpoint) || len(checkpoint.ApplicationSnapshot) == 0 {
 		return
 	}
-	payload, err := encodeCheckpointControl(checkpointControlWire{Type: checkpointControlOffer, Checkpoint: n.durableCheckpoint})
+	payload, err := encodeCheckpointControl(checkpointControlWire{Type: controlType, Checkpoint: checkpoint})
 	if err != nil {
 		return
 	}
-	barrier := n.durableCheckpoint.Descriptor.Barrier
-	n.enqueueMessage(Message{Type: MsgCheckpointOffer, From: n.id, To: to, Ref: barrier,
+	barrier := checkpoint.Descriptor.Barrier
+	n.enqueueMessage(Message{Type: messageType, From: n.id, To: to, Ref: barrier,
 		Ballot: Ballot{Replica: barrier.Replica}, Kind: EntryCheckpoint, ProtocolControl: payload})
+}
+
+func (n *RawNode) durableCheckpointCovers(descriptor CheckpointDescriptor) bool {
+	checkpoint := n.durableCheckpoint
+	return checkpointCertified(checkpoint) &&
+		descriptor.Cluster == n.cluster &&
+		descriptor.ID == deriveCheckpointID(descriptor.BarrierTupleDigest, descriptor.Through) &&
+		!frontierRegressesExecution(descriptor.Through, checkpoint.Descriptor.Through)
 }

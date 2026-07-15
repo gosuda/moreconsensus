@@ -16,6 +16,7 @@ type simCluster struct {
 	drop              map[[2]ReplicaID]bool
 	paused            map[ReplicaID]bool
 	delayed           []Message
+	checkpointResult  *CheckpointResult
 	opt               bool
 	logicalTicks      uint64
 	deliveredMessages uint64
@@ -135,6 +136,14 @@ func (s *simCluster) drain() {
 			}
 			progress = true
 			rd := rn.Ready()
+			if rd.Checkpoint != nil && s.checkpointResult != nil {
+				result := *s.checkpointResult
+				result.ID = rd.Checkpoint.ID
+				result.ApplicationSnapshot = bytes.Clone(s.checkpointResult.ApplicationSnapshot)
+				if err := rn.ProvideCheckpoint(result); err != nil {
+					s.t.Fatalf("provide checkpoint %d: %v", id, err)
+				}
+			}
 			s.readyBatches++
 			if err := s.stores[id].ApplyReady(rd); err != nil {
 				s.t.Fatalf("apply ready %d: %v", id, err)

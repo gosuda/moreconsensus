@@ -445,6 +445,130 @@ func TestCheckpointPeerHandoffPreservesReceiverCompactionFloor(t *testing.T) {
 	}
 }
 
+func TestPreparedCheckpointVoteRetriesOnRecoveryTick(t *testing.T) {
+	conf := ConfState{ID: 1, Voters: []ReplicaID{1, 2}}
+	storage := NewMemoryStorage()
+	node, err := NewRawNode(Config{
+		ID: 1, Voters: conf.Voters, Storage: storage, RetryTicks: 2, RecoveryTicks: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for node.HasReady() {
+		advanceCheckpointReady(t, node, storage, node.Ready())
+	}
+
+	prepared := testCertifiedCheckpointWithFloor(t, conf, 1, 1, 0, 0, 0x44)
+	prepared.Certificate = CheckpointCertificate{}
+	prepared.Checksum = DigestCheckpoint(prepared)
+	vote := VoterAcknowledgement{
+		Voter:          VoterIdentity{Replica: 1, Incarnation: 1},
+		AttestedDigest: DigestCheckpointDescriptor(prepared.Descriptor),
+	}
+	node.checkpointRound = &checkpointRound{
+		barrier: prepared.Descriptor.Barrier,
+		request: CheckpointRequest{
+			ID: prepared.Descriptor.ID, Through: prepared.Descriptor.Through.Clone(),
+		},
+		checkpoint: prepared, votes: map[ReplicaID]VoterAcknowledgement{1: vote},
+		preparedDurable: true,
+	}
+	node.executionPaused = true
+
+	for tick := 1; tick <= 5; tick++ {
+		if err := node.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		ready := node.Ready()
+		if tick < 5 && len(ready.Messages) != 0 {
+			t.Fatalf("checkpoint vote retried at tick %d before recovery interval", tick)
+		}
+		if tick == 5 {
+			if len(ready.Messages) != 1 || ready.Messages[0].Type != MsgCheckpointVote || ready.Messages[0].To != 2 {
+				t.Fatalf("recovery-tick messages=%#v, want one checkpoint vote to replica 2", ready.Messages)
+			}
+			wire, decodeErr := decodeCheckpointControl(ready.Messages[0].ProtocolControl)
+			if decodeErr != nil || wire.Type != checkpointControlVote ||
+				!checkpointDescriptorEqual(wire.Descriptor, prepared.Descriptor) || wire.Vote != vote {
+				t.Fatalf("retried vote wire=%#v err=%v", wire, decodeErr)
+			}
+		}
+		advanceCheckpointReady(t, node, storage, ready)
+	}
+}
+
+func TestCheckpointPartitionHealRetriesVoteAndConverges(t *testing.T) {
+	cluster := newSimCluster(t, 3, false)
+	var applicationDigest StateDigest
+	applicationDigest[0] = 1
+	cluster.checkpointResult = &CheckpointResult{
+		ApplicationSnapshot: []byte("partition-heal-snapshot"),
+		ApplicationDigest:   applicationDigest,
+	}
+	for _, node := range cluster.nodes {
+		node.retainExecutedPerLane = 1
+	}
+	cluster.drain()
+
+	command := Command{
+		ID: CommandID{Client: 71, Sequence: 1}, Payload: []byte("before-partition"),
+		Footprint: Footprint{Points: [][]byte{[]byte("partition-key")}},
+	}
+	if _, err := cluster.nodes[1].Propose(command); err != nil {
+		t.Fatal(err)
+	}
+	cluster.drain()
+	for _, id := range cluster.ids() {
+		if len(cluster.apps[id]) != 1 {
+			t.Fatalf("replica %d applied %d commands before partition, want 1", id, len(cluster.apps[id]))
+		}
+	}
+
+	cluster.omit(3)
+	cluster.pause(3)
+	quorumCompacted := false
+	for range 100 {
+		cluster.tickOnly(1, 1)
+		quorumCompacted = true
+		for _, id := range []ReplicaID{1, 2} {
+			checkpoint := cluster.stores[id].Checkpoint
+			if !checkpointCertified(checkpoint) ||
+				!executionFrontierEqual(checkpoint.CompactedThrough, checkpoint.Descriptor.Through) {
+				quorumCompacted = false
+				break
+			}
+		}
+		if quorumCompacted {
+			break
+		}
+	}
+	if !quorumCompacted {
+		t.Fatal("connected quorum did not certify and compact while replica 3 was isolated")
+	}
+	if !cluster.stores[3].Checkpoint.Empty() {
+		t.Fatal("isolated replica unexpectedly installed the checkpoint")
+	}
+
+	cluster.heal(3)
+	cluster.resume(3)
+	for range 20 {
+		cluster.tickOnly(1, 5)
+		checkpoint := cluster.stores[3].Checkpoint
+		if checkpointCertified(checkpoint) &&
+			executionFrontierEqual(checkpoint.CompactedThrough, checkpoint.Descriptor.Through) &&
+			!cluster.nodes[3].executionPaused {
+			if !checkpointDescriptorEqual(checkpoint.Descriptor, cluster.stores[1].Checkpoint.Descriptor) {
+				t.Fatal("healed replica installed a different checkpoint descriptor")
+			}
+			return
+		}
+	}
+	barrier := cluster.stores[1].Checkpoint.Descriptor.Barrier
+	t.Fatalf("healed replica remained stalled: round=%#v paused=%t checkpoint=%#v barrier=%s local-barrier=%#v source-barrier=%#v",
+		cluster.nodes[3].checkpointRound, cluster.nodes[3].executionPaused, cluster.stores[3].Checkpoint,
+		barrier, cluster.nodes[3].instances[barrier], cluster.nodes[1].instances[barrier])
+}
+
 func testCertifiedCheckpointWithFloor(
 	t *testing.T,
 	conf ConfState,

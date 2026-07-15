@@ -33,7 +33,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 - `RawNode` owns deterministic protocol state only. Opaque commands expose canonical point/span/all footprints and replicated cycle keys; protocol controls are separate entry kinds.
 - `Ready` enforces ordered persistence, transport, snapshot install, application `Apply`, checkpoint, compaction, and exact-prefix `Advance` phases. Application effects and full `CommandID` results commit atomically in the KV example.
 - The core supports voters 1 through 7, caller-owned storage/transport/time sampling, `MEP3` incarnation-authenticated messages, Pebble v9 migration, and safe-copy/zero-copy ownership.
-- Certified checkpoint descriptors bind exact frontiers, voter incarnations, barrier/protocol state, allocator fences, and application digests. Durable quorum certification precedes atomic tombstone/deletion.
+- Certified checkpoint descriptors bind exact frontiers, voter incarnations, barrier/protocol state, allocator fences, and application digests. Durable quorum certification precedes atomic tombstone/deletion; prepared replicas retry votes, and certified replicas answer covered stale votes with the latest certificate and offer.
 - The three-replica KV smoke covers empty-span ordered read, phantom conflict, certification, physical row deletion, snapshot-plus-delta restart, durable result replay, late compacted reference offer, and wrong-incarnation rejection.
 - Local Jepsen profiles cover restart, transport partition, storage-unavailable, destructive-storage, scan semantics, and checker behavior. These histories are loopback-only.
 
