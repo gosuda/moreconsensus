@@ -54,18 +54,15 @@ Why this matters:
 
 Source anchors: `epaxos/types.go` (`InstanceRef`, `ConfState`, `InstanceRecord`), `epaxos/node.go` (`NewRawNode`, `confFor`, `depsForConf`, `applyConfChange`).
 
-### 3.2 Commands and conflict relation
+### 3.2 Commands, entry kinds, and conflict relation
 
-A `Command` is opaque payload plus exact-byte `ConflictKeys`. Two user commands conflict if any conflict key is byte-identical. `CommandNoop` conflicts with nothing. `CommandConfChange` conflicts with every non-noop command.
+`Command` is opaque `ID`/`Payload` plus canonical `Footprint` and replicated `CycleKey`. Protocol no-op, configuration, membership, and checkpoint values are separate `EntryKind` unions; only `EntryCommand` carries an application command or produces `Ready.Apply`.
 
-Why this matters:
+Point equality, point-in-half-open-span, span overlap, and explicit group-wide `All` define the deterministic conflict relation. Canonicalization sorts/deduplicates points, merges overlapping or adjacent spans, and removes covered points. A hash-plus-augmented-interval index implements the same relation checked against a brute-force oracle.
 
-- EPaxos only needs to order interfering commands consistently. Non-conflicting commands may execute in different relative positions without changing the replicated state.
-- Exact-byte keys make the conflict relation deterministic and testable.
-- Applications that need range, prefix, predicate, or transaction-wide conflict semantics must encode sentinel keys themselves; the core does not infer application predicates.
+This is sufficient only if omitted conflicts strongly commute: final state, every response, command-result dedup state, and deterministic side effects must be order-independent. Logical sentinels express cross-resource invariants; range predicates are spans rather than enumerated physical keys.
 
-Source anchors: `epaxos/types.go` (`Command`, `ConflictsWith`), `epaxos/node.go` (`computeAttrsAt`, `indexConflicts`).
-
+Source anchors: `epaxos/types.go`, `epaxos/footprint.go`, `epaxos/conflict_engine.go`, and their differential tests.
 ### 3.3 Durable statuses
 
 `InstanceRecord.Status` progresses through:
@@ -222,22 +219,11 @@ Additional source anchors for finite AcceptEvidence sender-merge coverage: `tla/
 
 ## 9. Execution path
 
-Committed records are not emitted to the application immediately. `tryExecute` builds dependency components over committed but unexecuted instances, waits for missing dependencies to commit or recover, rejects execution while known conflicting preaccepted/accepted commands are unresolved, and emits ready components in deterministic `(Seq, ReplicaID, InstanceNum)` order.
+`tryExecute` builds dependency components over committed, unexecuted instances, waits for real dependency holes to execute or recover, and blocks on unresolved conflicting preaccepted/accepted entries. Every ready SCC is emitted in deterministic `(Seq, CycleKey, InstanceRef)` order. Sequence remains primary; empty/equal cycle keys fall through to the instance reference.
 
-Why this matches EPaxos:
+For committed conflicting commands, quorum processing makes at least one depend on the other. A one-way relation executes topologically. A cycle is sorted identically from the replicated tuple at every replica. Checkpoint-to-checkpoint reverse edges are retained so concurrent barriers in one dependency cycle execute completely before a single deterministic barrier cut pauses successor components.
 
-- SOSP 2013 Section 4.3.2 and EPaxos Revisited Section 2.2 require dependency graph construction, SCC condensation, reverse topological order, and deterministic order inside an SCC.
-- Dependency vectors represent per-replica prefixes, so `dependencyRefs` expands slot `k` into instances `1..k` for that replica.
-- `componentReady` requires every outside dependency to be executed, committed, or recoverable before emission.
-
-Why conflicting commands execute consistently:
-
-1. For any two committed conflicting commands, at least one must depend on the other after PreAccept/Accept/recovery quorum processing.
-2. If each depends on the other, every replica places them in the same SCC and sorts them deterministically by sequence and reference.
-3. If only one depends on the other, topological execution puts the dependency first.
-4. Stable committed attributes mean every replica sees the same dependency relation once it has the relevant committed records.
-
-Source anchors: `epaxos/node.go` (`tryExecute`, `executionComponents`, `componentReady`, `dependencyRefs`, `hasUnresolvedKnownConflict`), `tla/EPaxos.tla`.
+Source anchors: `epaxos/sparse_progress.go`, `epaxos/checkpoint_node.go`, cycle/checkpoint regressions, and `tla/EPaxos.tla`.
 
 ## 10. EPaxos Revisited chain pruning
 
@@ -253,60 +239,19 @@ Source anchors: `epaxos/node.go` (`dependencyKnownAfter`, `executionComponents`,
 
 ## 11. EPaxos Revisited TOQ core
 
-`Config.TOQ` is an explicit mode separate from the older deterministic `TimeOptimization` heuristic. In TOQ mode:
+`Config.TOQ` is explicit and separate from `TimeOptimization`. The embedding supplies conservative one-way-delay bounds and an optional sync group, samples its clock outside the core, and passes `now` to `ProcessTOQ`. The owner derives `ProcessAt`, persists `TOQPending`, sends the zero-attribute TOQ PreAccept envelope, and delays local dependency assignment until the cut. Receivers process at the replicated `ProcessAt`; finalization remains blocked while pending.
 
-1. the embedder supplies `TOQClock`, `TOQOneWayDelay`, and optionally `TOQSyncGroup`;
-2. each `TOQOneWayDelay[id]` is a conservative delivery bound that includes measured one-way network delay plus maximum clock-skew/synchronization uncertainty for that receiver and sync group;
-3. the owner computes `ProcessAt = TOQClock() + max(conservative delay bound over sync group)`;
-4. the owner persists a `StatusNone` record with `TOQPending=true`, command bytes, and `ProcessAt`;
-5. outbound PreAccept messages are flagged `TOQ=true` and intentionally carry `Seq=0` and no dependencies;
-6. the owner also queues a local TOQ PreAccept and delays its own dependency assignment until `ProcessAt`;
-7. receivers queue future TOQ PreAccepts and compute local attributes at the message's `ProcessAt`;
-8. finalization is blocked while `TOQPending` is true;
-9. retries preserve the explicit TOQ envelope.
+TOQ changes sampling time, not quorum durability or slow-path fallback. The core does not synchronize or sample clocks, measure delays, construct operational sync groups, or enforce drift. `tla/TOQClockDiscipline.tla` checks only the finite supplied-bound contract.
 
-Why this preserves EPaxos safety:
+Source anchors: `epaxos/types.go`, `epaxos/node.go` (`ProcessTOQ` and TOQ handlers), `epaxos/message.go`, `epaxos/toq_test.go`, `tla/EPaxosRevisited.tla`, and `tla/TOQClockDiscipline.tla`.
 
-- TOQ changes when dependency information is sampled; it does not remove quorum persistence or the slow path.
-- The owner cannot commit until its delayed local assignment is durably cleared.
-- A receiver computes attributes at `ProcessAt` and persists them before replying.
-- If TOQ fails to align processing order, divergent attributes still fall back to slow accept.
-- Message validation rejects TOQ PreAccepts that carry nonzero `Seq` or nonempty dependencies.
+## 12. Ready, durability, responses, and crash idempotence
 
-What TOQ does not prove:
+`Ready` is the only way protocol work leaves `RawNode`: hard/protocol state and snapshots, transport messages, ordered application `Apply`, deferred `RecordLoads`, application `Checkpoint` requests, and certified `Compact` ranges. The phase order is persist protocol metadata; send; install a received snapshot; apply; provide a requested checkpoint; atomically compact; then exact-prefix `Advance`.
 
-- The core does not synchronize clocks.
-- The core does not measure one-way delay.
-- The core does not construct operational sync groups.
-- `tla/TOQClockDiscipline.tla` checks only a finite contract: if skew and one-way delay are within configured bounds, the chosen `ProcessAt` is late enough for sync-group delivery before local processing.
-- The Go core treats `TOQOneWayDelay` as already containing the skew margin modeled by `TOQClockDiscipline`; there is no separate `TOQSkewBound` field.
+Every field may repeat before acknowledgement, and application work can replay after crash. The core does not preserve application responses. The KV embedding atomically stores each mutation/read result with `CommandID`, command digest, and applied marker. Exact duplicate delivery replays the durable result; ID reuse with different command bytes fails closed. This proves at-most-once effects only while result/dedup state is retained and does not remove timeout ambiguity.
 
-Source anchors: `epaxos/types.go` (`Config.TOQ`, `TOQClock`, `TOQOneWayDelay`, `TOQSyncGroup`, `TOQPending`, `ProcessAt`), `epaxos/node.go` (`configureTOQ`, `nextTOQProcessAt`, `localTOQPreAcceptMessage`, `propose`, `processDuePreAccepts`, `handleLocalTOQPreAccept`, `broadcastPreAccept`, `handlePreAccept`), `epaxos/message.go` (`TOQ` validation), `epaxos/toq_test.go`, `tla/EPaxosRevisited.tla`, `tla/TOQClockDiscipline.tla`.
-
-## 12. Ready, durability, and crash idempotence
-
-`Ready` is the only way protocol work leaves `RawNode`:
-
-- `Ready.Records` are durable consensus records.
-- `Ready.Messages` are transport messages.
-- `Ready.Committed` are application commands that have passed dependency execution.
-- `Ready.MustSync` is true when durable records are present.
-
-The required order is records first, then messages and application effects, then `Advance`. `Advance` accepts only an exact prefix of the outstanding `Ready`. If storage or application work fails before `Advance`, the same outstanding batch remains visible for retry.
-
-Why this prevents unsafe visibility:
-
-- A message that advertises a protocol fact is not acknowledged before the backing record is durably accepted by the embedder.
-- Application commands are not marked executed until the caller acknowledges them through `Advance`.
-- A partial record-only `Advance` is allowed, but messages or committed commands require all earlier records from the same batch.
-- Invalid `Advance` arguments leave the outstanding batch unchanged.
-
-Example KV idempotence:
-
-- The KV example writes an applied marker keyed by consensus instance in the same Pebble batch as the application mutation.
-- Replaying a committed command after crash observes the applied marker and does not create a second logical application effect.
-
-Source anchors: `epaxos/node.go` (`Ready`, `Advance`, `validateReadyAck`, `enqueueExecutedRecords`), `epaxos/storage.go` (`ApplyReady`), `examples/kv/epaxos_storage.go`, `tla/ReadyAdvance.tla`.
+Invalid or partial acknowledgements cannot expose later phases past an unacknowledged durable prefix. Source anchors: `epaxos/node.go`, `epaxos/storage.go`, `examples/kv/epaxos_storage.go`, Ready/dedup tests, and `tla/ReadyAdvance.tla`.
 
 ## 13. Storage failure and corruption behavior
 
@@ -441,7 +386,7 @@ Evidence: CMU-PDL-13-111 Theorem 5, `epaxos/node.go` (`computeAttrsAt`, `mergeAt
 
 Boundary:
 
-- If the application acknowledges clients at commit time before dependency execution, the paper's per-object linearizability assumptions apply. This library exposes executed commands through `Ready.Committed`; applications that acknowledge only after applying `Ready.Committed` use the execution result rather than an early commit notification.
+- If an application acknowledges at commit time before dependency execution, the paper's per-object assumptions apply. This library exposes executed application commands through `Ready.Apply`; acknowledging only after atomically applying that slice and its durable response uses the execution result rather than an early commit notification.
 
 ### 15.6 Liveness
 
@@ -472,21 +417,15 @@ Reason:
 
 Evidence: DST no-quorum tests, `tla/Quorum.tla`, `tla/ReadyAdvance.tla`, `epaxos/node.go` quorum checks.
 
-### 15.8 Latest-read semantics in the KV example
+### 15.8 Ordered read and MVCC semantics in the KV example
 
-Claim: the HTTP KV example's latest point reads and default latest scans use consensus barriers in the example's own write path.
+Claim: current point and range reads are ordinary opaque commands positioned by logical footprints. Point operations use logical points; scans and range operations use half-open spans. Ordered responses are stored in the same durable command-result namespace as mutation results.
 
-Reason:
+MVCC implementation details remain outside the core. Footprints use logical resources, not physical `key/timestamp` versions, with namespaces such as `row/`, `index/`, `unique/`, `txn/`, and `schema/` plus sentinel points. A write at timestamp 10 may be observed by a later read at 10; only a read that already observed the old value at 10 forces an overlapping later write above 10 or a retry.
 
-- Point reads wait for a key conflict barrier.
-- Latest scans propose a scan-wide barrier conflict key shared by the HTTP write/transaction/delete path.
-- Historical timestamp selectors intentionally avoid consensus progress and are documented as bounded/historical reads.
+Boundary: historical reads may remain outside consensus only with an application-defined safe snapshot/closed-timestamp token. `All` covers one EPaxos group, not an entire database.
 
-Boundary:
-
-- This is an example-service contract, not a protocol-native range/prefix conflict predicate for arbitrary EPaxos applications.
-
-Evidence: `examples/kv/cmd/kvnode/main.go`, `examples/kv/cmd/kvnode/main_test.go`, `jepsen/src/moreconsensus/epaxos_test.clj`, `tla/KVTimestampStaleness.tla`, `tla/KVOmissionRecovery.tla`.
+Evidence: KV footprint, ordered-read, dedup, snapshot-install, and three-replica checkpoint/restart tests plus finite KV models.
 
 ## 16. Verification map
 
@@ -529,6 +468,7 @@ Evidence: `examples/kv/cmd/kvnode/main.go`, `examples/kv/cmd/kvnode/main_test.go
 | `tla/EPaxosRevisited.tla` | TOQ envelope, delayed assignment, pending-decision blocking, receiver processing, fast-wait behavior, and chain pruning. | Real clock synchronization and OWD measurement. |
 | `tla/TOQClockDiscipline.tla` | Finite bounded-skew/bounded-delay `ProcessAt` contract; in Go this maps to `TOQOneWayDelay` values that already include skew margin. | Operational clock-sync implementation or delay measurement. |
 | `tla/ReadyAdvance.tla` | Durable Ready/Advance prefix acknowledgement and retry. | Concrete storage engine behavior. |
+| `tla/EPaxosCertifiedCompaction.tla` | Finite barrier closure, applied snapshot cut, durable voting/certification, atomic tombstone/delete, restart/replay, summary dependencies, and stale traffic rejection. | Arbitrary Go execution refinement, arbitrary crash/network histories, Byzantine certificates, or an unbounded theorem. |
 | `tla/Quorum.tla` | Supported quorum table and intersections. | Byzantine or dynamic quorum systems. |
 | `tla/KVTimestampStaleness.tla`, `tla/KVOmissionRecovery.tla` | KV timestamp and omission/recovery semantics. | General arbitrary application semantics. |
 
@@ -566,7 +506,7 @@ The repository scripts wire focused verification:
 
 ## 17. Current no-go blockers
 
-The implementation and evidence currently support a bounded library/example claim, not a mission-critical production-ready claim. The release remains no-go for the sole canonical item in `RELEASE_SCOPE.md`:
+The implementation and evidence support a bounded library/example claim, not mission-critical production readiness. Certified compaction, checkpoint-plus-delta restart, late-message fencing, and voter-incarnation rejection now have focused Go, three-replica smoke, and finite TLC evidence. The release remains no-go for the sole canonical item in `RELEASE_SCOPE.md`: an unbounded Go/TLA refinement argument and checked action correspondence are still absent.
 
 - broader formal model coverage remains open for local reasons—the nine unchecked TLAPS obligations and the trace replay's five residual classes—and external reasons—independent producer/reviewer signatures and native-Darwin target attestation.
 
@@ -578,10 +518,11 @@ Other target-environment, real-network, and operational properties remain explic
 
 Observable evidence: focused Ready ownership/durability/capped-tail tests, 1..7 quorum and historical-configuration tests, malformed-message and pool-alias tests, warmed zero-allocation Ready retry benchmarks, and same-workstation regression comparison. These checks establish implementation equivalence for the exercised finite cases; they do not constitute unbounded proof.
 
-## 19. Bounded service and retention claim
+## 19. Bounded certified-compaction and service claim
 
-The KV embedding has one lifecycle-owned logical-tick loop, proposal waiters, terminal error publication, atomic durable Ready application, capped-prefix frame admission, separate queue/retry capacities, and joined shutdown. Production mode requires mutual TLS 1.3 on peer, client, and admin planes. Peer certificates carry one replica URI SAN and inbound `Message.From` must match the authenticated replica. Client/admin CA membership is single-tenant authorization; per-user and multi-tenant RBAC are not implemented.
+The KV embedding has lifecycle-owned ticks, atomic Ready application and command results, separate authenticated service planes, content-addressed application snapshot transfer, and atomic protocol checkpoint/tombstone/deletion storage. A checkpoint descriptor binds an exact execution frontier, pinned voter incarnations, barrier tuple, allocator fences, protocol projection, and application digest. Prepared durability precedes votes; a slow-quorum certificate must be durable before deletion. Restart installs the snapshot and loads only retained delta; compacted late references return an offer without a record load.
 
 Pebble resource options and storage counters are explicit. Retention and compaction may fold a contiguous durably executed prefix, remove folded records from resident state while retaining durable authority, and drop executed payload capacity while preserving checksum and decided-tuple authority. `tla/EPaxosCompactionFencing.tla` certifies six named requirements only in its ordered 11-state scope, including singular decision-preserving late-message reload and stale-incarnation/closed-configuration fencing. This is not a proof of arbitrary compaction histories or unbounded uptime.
 
 - Evidence consists of tagged KV behavior and race tests, deterministic fault simulation, bounded finite model checking, the five-control sampled Go-to-TLC replay, and partial TLAPS checking with nine failed obligations. Deployment/service evidence is limited to Darwin arm64, three-node same-host loopback exercises, and simulated network faults. It does not provide an arbitrary-Go refinement theorem, production storage-engine compaction certification, real-network fault evidence, independent producer/reviewer signatures, native-Darwin target attestation, or a mission-critical production-readiness claim.
+Evidence consists of focused checkpoint crash/certificate/restart tests, a three-replica Pebble smoke, tagged KV transport tests, deterministic simulation, and `EPaxosCertifiedCompaction` finite TLC configurations. These are bounded observations on the recorded workstation. They do not prove unbounded Go/TLA refinement, arbitrary crash/network histories, target operation, or mission-critical readiness.

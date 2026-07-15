@@ -1,12 +1,16 @@
 # moreconsensus
 
-`moreconsensus` is a Go library for building replicated services with Egalitarian Paxos (EPaxos). Applications drive a deterministic `RawNode`, persist `Ready` records, send transport messages, apply committed commands, and acknowledge the exact `Ready` prefix with `Advance`.
+`moreconsensus` is a Go library for building replicated services with Egalitarian Paxos (EPaxos). Applications drive a deterministic `RawNode`; the embedding owns transport, durable and application state, response deduplication, snapshots, and any wall-clock sampling. Opaque commands carry only canonical logical point/span/all footprints and replicated cycle-order bytes for the core to interpret.
 
 ## Core features
 
 - EPaxos fast path, slow accept path, commit broadcast, and owner-independent recovery.
 - Deterministic logical ticks for protocol timing.
 - Caller-owned storage and transport virtualization.
+- Opaque application commands separated from protocol controls; only application entries produce ordered `Ready.Apply` work.
+- Canonical byte-lexicographic point, half-open span, and explicit group-wide `All` conflict scopes backed by an overlap index.
+- Deterministic SCC ordering by `Seq`, `CycleKey`, then instance reference.
+- Certified exact-frontier checkpoints, content-addressed application snapshots, durable protocol compaction, and checkpoint-plus-delta restart.
 - Safe-copy and explicit zero-copy ownership paths.
 - Pool-aware message and command helpers.
 - Canonical BLAKE3 checksums for records and messages.
@@ -14,6 +18,8 @@
 - A Pebble-backed distributed key-value example in its own Go module.
 - Separate client, peer, and administrative service planes with TLS 1.3 mutual-authentication support.
 - Repository gates for Go behavior, race testing, bounded finite model checking, fault simulation, and release-scope audits.
+
+`Ready` is an exact-prefix retry contract. The embedding persists protocol state, sends messages, installs received snapshots, applies `Ready.Apply` in order, services checkpoint requests, performs compaction, and then calls `Advance`. Apply work may repeat before acknowledgement or after crash; command effects and the full `CommandID` response/digest record must therefore commit atomically. Footprints may omit only truly strongly commutative work: final state, responses, dedup state, and deterministic side effects must all be order-independent.
 
 ## Documentation
 
@@ -30,9 +36,10 @@
 ## Support boundary
 
 - The production library surface is `gosuda.org/moreconsensus/epaxos`; the key-value service is an integration example and validation harness, not a multi-tenant product.
-- Voter sets support one through seven replicas. The core uses deterministic logical time; explicit TOQ inputs and operational clock discipline remain embedder responsibilities.
-- Formal evidence is finite model checking plus focused executable tests. It is not an exhaustive or unbounded proof, and it does not establish real-network production readiness.
-- Retention and checkpoint features provide bounded operational behavior; certified protocol-state compaction remains governed by [RELEASE_SCOPE.md](RELEASE_SCOPE.md).
+- Voter sets support one through seven replicas. The core uses deterministic logical time; explicit TOQ samples and operational clock discipline remain embedder responsibilities.
+- The example KV uses logical MVCC resources rather than physical version keys: point reads/writes use logical points; scans and range operations use half-open spans; cross-resource invariants use namespaced sentinels; `All` covers one EPaxos group, not an entire database.
+- Formal and executable evidence is bounded finite model checking plus focused tests, including certified compaction and three-replica checkpoint/restart. It is not an exhaustive or unbounded Go/TLA refinement proof and does not establish real-network production readiness.
+- Certified protocol-state compaction is implemented and boundedly exercised; the release decision remains **no-go** under [RELEASE_SCOPE.md](RELEASE_SCOPE.md) while unbounded Go/TLA action correspondence remains open.
 
 ## Module layout
 
