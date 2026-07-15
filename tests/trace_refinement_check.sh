@@ -29,6 +29,11 @@ fi
 echo "${tla_sha256:?missing TLA_TOOLS_SHA256}  ${JAR}" | sha256sum --check --quiet -
 
 JAVA_BIN="${JAVA_BIN:-java}"
+if ! "${JAVA_BIN}" -version >/dev/null 2>&1; then
+  if [[ -x /opt/homebrew/opt/openjdk/bin/java ]]; then
+    JAVA_BIN=/opt/homebrew/opt/openjdk/bin/java
+  fi
+fi
 REVISION="$(git -C "${ROOT}" rev-parse HEAD)"
 
 rm -f -- "${TRACES_DIR}"/Trace_*.tla "${TRACES_DIR}"/Trace_*.cfg "${TRACES_DIR}"/manifest.tsv \
