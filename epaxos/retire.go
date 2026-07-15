@@ -71,7 +71,7 @@ func (n *RawNode) retireExecuted() {
 				n.dropPayload(inst)
 				continue
 			}
-			// High-cap empty payload: nil without stubbing.
+			// Release capacity from an empty payload without marking it absent.
 			if cap(inst.rec.Command.Payload) > 0 {
 				next := inst.rec.Clone()
 				next.Command.Payload = nil

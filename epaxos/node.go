@@ -300,7 +300,7 @@ func messageCarriesValue(message Message) bool {
 }
 
 // messageNeedsPayload reports value-carrying inbound types that may compare
-// against a resident stub via commandEqual / phaseMessage* helpers.
+// against a resident with an elided payload via commandEqual / phaseMessage* helpers.
 func messageNeedsPayload(message Message) bool {
 	switch message.Type {
 	case MsgPreAccept, MsgAccept, MsgTryPreAccept:
@@ -4756,7 +4756,7 @@ func (n *RawNode) ProvideRecordLoad(res RecordLoadResult) error {
 			return err
 		}
 	}
-	// Execute deferred exports while payload is restored, before maybeRefoldLoaded re-stubs.
+	// Execute deferred exports while payload is restored, before clearing it again.
 	if needReadyRecord {
 		n.enqueueRecord(inst.rec)
 	}
@@ -4779,7 +4779,7 @@ func (n *RawNode) dropPayload(inst *instance) {
 		return
 	}
 	if len(inst.rec.Command.Payload) == 0 {
-		// nil high-cap empty slice only; not a stub
+		// Release capacity from an already-empty payload without marking it absent.
 		if cap(inst.rec.Command.Payload) > 0 {
 			next := inst.rec.Clone()
 			next.Command.Payload = nil
