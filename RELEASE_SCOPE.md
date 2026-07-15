@@ -10,7 +10,7 @@ A release claim is allowed only when the item is listed in **Closed release item
 
 No-go.
 
-The repository provides bounded protocol, storage, service, deterministic-simulation, and degraded-performance evidence on Darwin arm64. It is not mission-critical production-ready. The remaining release blocker is unbounded Go/TLA refinement and certified protocol-state compaction with late-message and incarnation fencing.
+The repository provides bounded protocol, storage, service, deterministic-simulation, and degraded-performance evidence on Darwin arm64. It is not mission-critical production-ready. The broader-formal row remains open for local reasons—nine unchecked TLAPS obligations and the bounded trace-replay residual classes—and external reasons—independent producer/reviewer signatures and native-Darwin target attestation.
 
 ## Evidence identity
 
@@ -58,7 +58,7 @@ The following items are closed only for the bounded evidence classes stated here
 | KV checkpoint verification and repair boundaries | `examples/kv/backup.go`, `examples/kv/cluster.go`, `examples/kv/epaxos_storage.go`, and KV checkpoint tests. |
 | Service API, TLS, request, scan, and binary-value boundaries | `examples/kv/cmd/kvnode/main.go`, tagged KV tests, and `EPAXOS.MD`. |
 | Local fault and Jepsen harnesses | `tests/chaos_fault_campaign.sh`, `tests/jepsen_local.sh`, and the Jepsen checker tests. |
-| Finite formal model gate | `tests/tla_model_check_fast.sh` runs 23 finite jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
+| Finite formal model gate | `tests/tla_model_check_fast.sh` runs 31 finite jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, fairness, and the positive plus six negative compaction/fencing configurations; `tests/tla_model_check.sh` is the larger manual suite. Correspondence limits remain explicit in `MODEL_EQ_REPORT.MD`. |
 | Operations artifact checks | `tests/operations_readiness_audit.sh` and the local lifecycle helpers validate bounded operator mechanics only. |
 | DST data lifecycle and transient fault behavior | `TestDSTDataLifecycleCheckpointRestoreAndCorruptionRejection`, `TestDSTTransientFaultCasesRemainAvailableAndRecover`, and `TestDSTDegradedPerformanceTransientNegligibleFaultStaysAlive` cover durable checkpoint restore, corruption rejection, transient faults, exactly-once application, linearizable replay, and deterministic work degradation. |
 
@@ -67,9 +67,9 @@ The following items are closed only for the bounded evidence classes stated here
 
 | Item | Current state |
 | --- | --- |
-| Broader formal model coverage | The finite TLC suite and executable `RawNode` trace cover bounded workflows. Exit requires an unbounded Go/TLA refinement argument, a checked action correspondence, and certified protocol-state compaction requirements including late-message and incarnation fencing. |
+| Broader formal model coverage | TLAPS 1.6.0-pre at version `763bf3c` machine-checks `tla/EPaxosInductiveProofs.tla`: 876 obligations, 867 proved, 9 failed, and 0 omitted. The proved anchor families are `InitEstablishesInvariant`, `NormalProposePreserves`, `BeginRecoveryPreserves`, `CollectEvidencePreserves`, `RecoveryProposePreserves`, `QuorumIntersection`, and `RecoverySelectionPreservesChosenValue`. The four unchecked helper obligations are `CollectEvidenceArchivePreservationObligation`, `CollectAcceptedHistoryPreservationObligation`, `AcceptHistoryPreservationObligation`, and `AcceptEvidenceArchivePreservationObligation`; the five unchanged original preservation lemmas with undischarged proofs are `CertifyChosenPreserves`, `RecordConfigurationPreserves`, `RetryStepsPreserve`, `StutterPreserves`, and `WaitingPersistsOrCompletes`. `tests/tlaps_check.sh` is fail-closed and currently exits 10. The checked Go-trace-to-TLC replay in `tests/trace_refinement_check.sh`, wired into `tests/ci.sh`, projects four captured scenarios through a snapshot-only abstraction onto 12 `EPaxosRawNodeRefinement` variables; every consecutive pair is dispatched by its audited raw `(action, kind)` entry in the 96-pair permission table to the model action predicates or exact 12-variable stutter, the atomic commit-plus-execute pair uses a TLC-evaluated `PaperChoose`/`PaperExecute` relational composition without changing `PaperNext` or `RefinementProperty`, and all five negative controls reject. The replay proves sampled admission, while the exhaustive AST dispatch inventory proves coverage of internal mutation/dispatch sites through exclusive `TraceActions`/`Stutter`/`Gap` classification. Replay residuals are unexercised `PaperObserveRecovery`, audited-but-unexercised `NormalValidationDrop/message-step`, 13 bookkeeping variables frozen at `Init`, coordinator-and-designated-instance scope, and `wire` abstracted to a constant. `tla/EPaxosCompactionFencing.tla` and `tla/EPaxosCompactionFencing.cfg` certify six compaction/fencing requirements over an ordered 11-state positive model with both lanes, both incarnations, and one fenced-configuration transition; six named negative-mutant configurations each trigger their designated invariant violation, and the layered Go witness is `TestFencingLayersRejectFoldedLoadAndStaleBootstrapAuth`. `tests/formal_closure_collect.sh` stages unsigned-local `rawArtifact` records fail-closed, verifier enums cover compaction/fencing, and the synthetic self-test covers 82 cases. The row remains open because the nine TLAPS obligations and trace residual classes are local gaps and because no independent producer/reviewer signatures or native-Darwin target attestation bind a release bundle. |
 
-Exactly one canonical item remains open. Closing it requires direct unbounded formal evidence; bounded simulation or rerunning a local sample is insufficient.
+Exactly one canonical item remains open. Closure requires discharge of the named local formal gaps and a valid externally signed, native-Darwin-attested evidence bundle; bounded simulation or rerunning a local sample is insufficient.
 
 ## Review baseline
 
@@ -85,12 +85,12 @@ Reviewers should start with the following authority and gates:
 ## Non-claims
 
 - Finite TLC is bounded evidence, not an unbounded theorem over arbitrary Go executions.
-- `tla/EPaxosInductiveProofs.tla` proves only its restricted semantic `ConcreteNext`; it does not cover codec, allocation, `Ready` ownership, SCC execution, TOQ timing, or arbitrary `RawNode` executions.
-- `tla/EPaxosRawNodeRefinement.tla` is an implementation-shaped bounded workflow model. `tests/refinementtrace` adds executable pre/post contracts and exported-method inventory checks, not a TLC/TLAPS action replay.
-- `tla/EPaxosVoterBootstrap.tla` is a finite bootstrap contract now executed by the 23-job TLC fast gate for base sizes 1–6 (successor sizes 2–7); bootstrap state is still not part of the `RawNode` semantic action trace.
+- `tla/EPaxosInductiveProofs.tla` has 867 proved, 9 failed, and 0 omitted obligations for its restricted semantic `ConcreteNext`; it does not cover codec, allocation, `Ready` ownership, SCC execution, TOQ timing, or arbitrary `RawNode` executions.
+- `tla/EPaxosRawNodeRefinement.tla` is an implementation-shaped bounded workflow model. The checked four-scenario action replay covers the 12-variable snapshot abstraction described above, not arbitrary Go execution refinement; `PaperObserveRecovery`, `NormalValidationDrop/message-step`, 13 frozen bookkeeping variables, coordinator-and-designated-instance scope, and constant-abstracted `wire` remain outside that checked correspondence.
+- `tla/EPaxosVoterBootstrap.tla` is a finite bootstrap contract executed by the 31-job TLC fast gate for base sizes 1–6 (successor sizes 2–7); bootstrap state is still outside the sampled Go-to-TLC replay.
 - The core does not synchronize clocks, measure one-way delay, prove operational TOQ discipline, or provide a production sync-group service.
 - Deterministic simulation and local Jepsen loopback are bounded fault evidence; they do not establish target deployment behavior.
-- Retention thresholds limit admission without deleting protocol history; certified compaction and unbounded uptime remain open.
-- KV checkpoint recovery requires semantic verification and whole-directory replacement; certified protocol-state compaction remains part of the broader formal blocker.
+- The finite compaction/fencing model provides certified protocol-state compaction evidence for six named requirements in its ordered 11-state scope, with six rejecting mutants and mapped Go witnesses; it does not prove arbitrary compaction histories or unbounded uptime.
+- KV checkpoint recovery requires semantic verification and whole-directory replacement; the finite compaction/fencing certification does not establish production storage-engine compaction for arbitrary histories.
 - Local mixed-version rollback validates the harness for its exercised binary pair; it does not prove broad compatibility across substantive protocol or storage changes.
 - Example/operator reports are bounded observations and are not release closure evidence.

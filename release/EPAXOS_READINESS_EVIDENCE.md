@@ -22,7 +22,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 | Root Go tests | Pass: `go test ./... -count=1` | Deterministic repository tests. |
 | Lifecycle race tests | Pass: `go test -race ./tests/lifecyclecollector -count=1` | Collector behavior under the race detector. |
 | Refinement-trace race tests | Pass: `go test -race ./tests/refinementtrace -count=1` | Executable bounded RawNode contracts under the race detector. |
-| Required fast TLA suite | Pass: `bash tests/tla_model_check_fast.sh` with 23 finite jobs | Bounded TLC state spaces; not an unbounded proof. |
+| Required fast TLA suite | Pass: `bash tests/tla_model_check_fast.sh` with 31 finite jobs | Includes the ordered compaction/fencing model and six exact-marker negative mutants; bounded TLC state spaces are not an unbounded proof. |
 | Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, one open row, links, model paths, and tracked-text guards. |
 | Repository text audit | Pass when `bash tests/audit_repo.sh` is run | Static forbidden-text and deterministic-core checks. |
 | Operations artifact audit | Pass in the recorded local verification | Example/operator reports and local lifecycle evidence; not target-environment closure evidence. |
@@ -41,10 +41,11 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 
 The TLA+ and executable evidence are deliberately layered:
 
-- `tla/EPaxos.tla`, `tla/EPaxosResponses.tla`, `tla/EPaxosRecovery.tla`, and `tla/Quorum.tla` cover normal protocol, response evidence, finite recovery, and quorum arithmetic.
-- `tla/EPaxosOptimizedRecovery.tla`, `tla/EPaxosOptimizedRecoveryDecisionTree.tla`, `tla/EPaxosEvidenceQuery.tla`, `tla/EPaxosEvidenceStaleness.tla`, `tla/EPaxosTryPreAcceptRetry.tla`, and the configured TryPreAccept and configuration-transition modules cover finite branch and message slices.
-- `tla/EPaxosRevisited.tla`, `tla/TOQClockDiscipline.tla`, `tla/ReadyAdvance.tla`, `tla/EPaxosRawNodeRefinement.tla`, and `tla/EPaxosInductiveProofs.tla` cover finite TOQ/Ready/refinement workflows and a restricted abstract-history safety module.
-- `tests/refinementtrace` executes real `RawNode` normal, recovery, TOQ, and configuration scenarios. Its semantic validator checks pre/post well-formedness, fail/drop stuttering, persistence of final Ready writes, exact-prefix Advance behavior, execution monotonicity, and observation stuttering. Its exported-method inventory prevents unreviewed `RawNode` transitions from silently entering the trace.
+- `tla/EPaxosInductiveProofs.tla` is checked by TLAPS 1.6.0-pre at version `763bf3c`: 876 obligations, 867 proved, 9 failed, and 0 omitted. All anchor families prove. Four newly isolated helper obligations and five unchanged original preservation lemmas remain unchecked, so `tests/tlaps_check.sh` is fail-closed and exits 10.
+- The 31-job TLC fast gate includes `tla/EPaxosCompactionFencing.tla` with `tla/EPaxosCompactionFencing.cfg`: an ordered 11-state positive model containing both lanes, both incarnations, and one fenced-configuration transition. It certifies six named requirements in that finite scope; six negative mutant configurations each produce their exact invariant violation, and `TestFencingLayersRejectFoldedLoadAndStaleBootstrapAuth` is the layered Go witness.
+- `tests/refinementtrace` captures four real `RawNode` normal, recovery, TOQ, and configuration scenarios. `tests/trace_refinement_check.sh`, wired into `tests/ci.sh`, projects semantic snapshots onto 12 `tla/EPaxosRawNodeRefinement.tla` variables. Every consecutive pair is dispatched by its audited raw `(action, kind)` entry in a 96-pair permission table to the model action predicates or exact 12-variable equality; atomic commit-plus-execute uses a TLC-evaluated `PaperChoose`/`PaperExecute` relational composition without changing `PaperNext` or `RefinementProperty`, and all five negative controls reject.
+- The trace replay proves sampled admission. The exhaustive AST inventory separately proves coverage of internal mutation/dispatch sites through exclusive `TraceActions`/`Stutter`/`Gap` classification. Their combined residuals are unexercised `PaperObserveRecovery`, audited-but-unexercised `NormalValidationDrop/message-step`, 13 bookkeeping variables frozen at `Init`, coordinator-and-designated-instance scope, and `wire` abstracted to a constant.
+- `tests/formal_closure_collect.sh` stages unsigned-local `rawArtifact` records fail-closed. Verifier enums cover the compaction/fencing area, and `tests/formal_closure_evidence_selftest.py` covers 82 synthetic cases. These local artifacts do not supply producer/reviewer signatures or native-Darwin target attestation.
 - `MODEL_EQ_REPORT.MD` is the direct mapping authority. It names implementation anchors, model actions, executable test anchors, and every correspondence boundary.
 
 ## Operational artifact evidence
@@ -53,13 +54,13 @@ The repository contains example/operator artifacts and audits:
 
 - `tests/kvnode_local_runner.go`, the local lifecycle helpers, and `epaxos/dst_test.go` produce bounded checkpoint, restore, corruption, fault, and deterministic-work evidence.
 - `examples/kv/cmd/kvcheckpoint` and its tests exercise checkpoint and rollback procedures.
-- These artifacts do not prove unbounded formal safety or certified protocol-state compaction.
+- These artifacts do not prove arbitrary-Go refinement or arbitrary production compaction histories.
 
 ## Current open blockers preserving no-go
 
 | Item | Required closure evidence |
 | --- | --- |
-| Broader formal model coverage | Unbounded Go/TLA refinement with a checked action correspondence, plus certified protocol-state compaction and late-message/incarnation fencing requirements. |
+| Broader formal model coverage | Local gaps: discharge the four named helper obligations and five unchanged original preservation lemmas still failing under TLAPS, and close the replay residual classes (`PaperObserveRecovery`, `NormalValidationDrop/message-step`, 13 frozen bookkeeping variables, coordinator-and-designated-instance scope, and constant-abstracted `wire`). External gaps: independent producer and reviewer signatures over the canonical bundle plus native-Darwin attestation for target `mc-kv-darwin24-arm64-launchd-3n-r1`. The finite compaction/fencing certification and sampled action replay are landed evidence, not row closure. |
 
 ### Closing broader-formal
 
@@ -97,4 +98,4 @@ bash tests/go_no_go_workflow.sh
 
 ## Release boundary
 
-- This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation, checkpoint recovery, and three-node same-host loopback exercises. It does not support unbounded formal safety, certified protocol-state compaction, operational TOQ clock synchronization, or target deployment guarantees. The release decision remains no-go while the formal row is open.
+- This evidence supports a bounded library and example-service claim on Darwin arm64, with deterministic simulation, checkpoint recovery, three-node same-host loopback exercises, sampled Go-to-TLC replay, and six finite compaction/fencing invariants. It does not support arbitrary-Go refinement, arbitrary compaction histories, operational TOQ clock synchronization, or target deployment guarantees. The release decision remains no-go for both the named local formal gaps and the missing independent signatures/native-Darwin target attestation.

@@ -8,10 +8,12 @@ The repository uses several deliberately different evidence layers:
 
 1. Paper-oriented TLA+ models describe protocol obligations and finite recovery slices.
 2. `EPaxosRawNodeRefinement.tla` models implementation-shaped bounded workflows.
-3. `tests/refinementtrace` executes real `RawNode` transitions and validates semantic pre/post contracts.
+3. `tests/refinementtrace` executes real `RawNode` transitions; `tla/EPaxosTraceCheck.tla` checks four captured scenario projections against the model action predicates.
 4. Go, race, simulation, service, and storage tests exercise behavior outside the TLA state space.
 
-No checked theorem currently connects arbitrary Go executions to `EPaxosInductiveProofs.tla`, and no checked action replay connects TLC transitions to every `RawNode` transition. Those are release-blocking correspondence gaps.
+TLAPS 1.6.0-pre at version `763bf3c` checks `tla/EPaxosInductiveProofs.tla` with 876 obligations: 867 proved, 9 failed, and 0 omitted. Its proved anchor families are `InitEstablishesInvariant`, `NormalProposePreserves`, `BeginRecoveryPreserves`, `CollectEvidencePreserves`, `RecoveryProposePreserves`, `QuorumIntersection`, and `RecoverySelectionPreservesChosenValue`. Four newly isolated helper obligations remain unchecked: `CollectEvidenceArchivePreservationObligation`, `CollectAcceptedHistoryPreservationObligation`, `AcceptHistoryPreservationObligation`, and `AcceptEvidenceArchivePreservationObligation`. Five original preservation lemmas retain their statements but have undischarged proofs: `CertifyChosenPreserves`, `RecordConfigurationPreserves`, `RetryStepsPreserve`, `StutterPreserves`, and `WaitingPersistsOrCompletes`. `tests/tlaps_check.sh` is fail-closed and currently exits 10.
+
+The checked Go-trace-to-TLC replay proves sampled admission for four captured scenarios through a snapshot-only 12-variable abstraction, and the exhaustive AST dispatch inventory proves coverage of internal mutation/dispatch sites through exclusive `TraceActions`/`Stutter`/`Gap` classification. This sum is not an arbitrary-Go refinement theorem. Replay residuals are unexercised `PaperObserveRecovery`, audited-but-unexercised `NormalValidationDrop/message-step`, 13 model bookkeeping variables frozen at `Init`, coordinator-and-designated-instance scope, and `wire` abstracted to a constant. The release row also remains open for external producer/reviewer signatures and native-Darwin target attestation.
 
 ## Model inventory
 
@@ -50,12 +52,14 @@ No checked theorem currently connects arbitrary Go executions to `EPaxosInductiv
 | `tla/EPaxosConfigTransitionLostResponseRetry.tla` | Normal local-owner lost-response retry before old-quorum completion. | Configuration transition lost-response tests. |
 | `tla/EPaxosConfigTransitionDedup.tla` | Owner vote separation and remote response de-duplication. | Configuration transition de-duplication tests. |
 | `tla/EPaxosTimingDomain.tla` | Separation of untimed, logical, and TOQ timing domains at Ready/restart boundaries. | `epaxos/toq_test.go`, `tests/refinementtrace`. |
-| `tla/EPaxosRawNodeRefinement.tla` | Bounded normal, recovery, TOQ, and configuration workflows with durability, Ready, evidence, execution, and branch invariants. | `tests/refinementtrace`, exported-method inventory. |
-| `tla/EPaxosInductiveProofs.tla` | Parametric safety and `AbstractHistoryRefinement` for its restricted `ConcreteNext`. | Formal source only; no Go action bridge is checked. |
-| `tla/EPaxosVoterBootstrap.tla` | Finite bootstrap fencing, target readiness, activation, abort, crash-prefix, race, and fairness obligations. | `tests/tla_model_check_fast.sh` runs base sizes 1–6 (successor sizes 2–7) plus crash-prefix, race, and fairness configurations; no corresponding `RawNode` semantic action trace or unbounded theorem is claimed. |
+| `tla/EPaxosRawNodeRefinement.tla` | Bounded normal, recovery, TOQ, and configuration workflows with durability, Ready, evidence, execution, and branch invariants; its action predicates are reused by the trace checker. | `tests/refinementtrace`, exhaustive AST dispatch inventory. |
+| `tla/EPaxosTraceCheck.tla` | Four captured Go scenarios projected by a snapshot-only abstraction onto 12 refinement variables; every consecutive pair is selected by its audited raw `(action, kind)` entry in the 96-pair table and satisfies the corresponding model action predicate or exact 12-variable stutter. Atomic commit-plus-execute is a TLC-evaluated relational composition of `PaperChoose` and `PaperExecute`; `PaperNext` and `RefinementProperty` are unchanged. | `tests/trace_refinement_check.sh` is wired into `tests/ci.sh`; all five negative controls reject. |
+| `tla/EPaxosCompactionFencing.tla` | Six compaction/fencing invariants over an ordered 11-state positive model containing both lanes, both incarnations, and one fenced-configuration transition. | `tla/EPaxosCompactionFencing.cfg`; six negative mutant configurations; mapped Go witnesses in the certification table below. |
+| `tla/EPaxosInductiveProofs.tla` | Parametric safety and `AbstractHistoryRefinement` statements for its restricted `ConcreteNext`; TLAPS proves 867 of 876 obligations, with 9 failed and 0 omitted. | `tests/tlaps_check.sh` is fail-closed and exits 10 while any obligation fails; no theorem connects arbitrary Go actions to this abstraction. |
+| `tla/EPaxosVoterBootstrap.tla` | Finite bootstrap fencing, target readiness, activation, abort, crash-prefix, race, and fairness obligations. | `tests/tla_model_check_fast.sh` runs base sizes 1–6 (successor sizes 2–7) plus crash-prefix, race, and fairness configurations; bootstrap is outside the sampled Go-to-TLC replay. |
 | `tla/KVTimestampStaleness.tla` and `tla/KVOmissionRecovery.tla` | Example KV timestamp and omission/recovery slices. | `examples/kv`, Jepsen checker tests. |
 
-The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 23 named finite jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
+The fast gate is executable through `bash tests/tla_model_check_fast.sh` and covers 31 named finite jobs, including the positive compaction/fencing configuration, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations. The larger `bash tests/tla_model_check.sh` profile is a manual finite suite. Neither is exhaustive.
 
 ## Paper-grounded claim map
 
@@ -101,37 +105,32 @@ References: [EPaxos SOSP 2013](https://sigops.org/s/conferences/sosp/2013/papers
 
 ## Executable trace boundary
 
-`tests/refinementtrace` is an executable bounded contract over real `RawNode` values. It covers normal proposal/commit, recovery, TOQ, and configuration workflows. The validator checks:
+`tests/refinementtrace` captures real `RawNode` normal, recovery, TOQ, and configuration workflows. `tests/trace_refinement_check.sh`, wired into `tests/ci.sh`, projects the four scenarios from pre-hash semantic snapshots onto exactly 12 variables of `tla/EPaxosRawNodeRefinement.tla`. For every consecutive pair, TLC dispatches solely by the audited raw `(action, kind)` pair over a 96-pair permission table and requires the model's corresponding action predicate or exact equality of all 12 variables. The atomic commit-plus-execute observation is checked through a TLC-evaluated relational composition of `PaperChoose` and `PaperExecute`; `PaperNext` and `RefinementProperty` remain unchanged. Five controls—action-label swap, paper-state corruption, non-paper-state corruption, recovery-evidence rewrite, and choose-execute midpoint corruption—are rejected.
 
-- state snapshots are well formed before and after each transition;
-- fail and drop transitions stutter without durable or application effects;
-- every final Ready write is persisted before its acknowledgement;
-- `Advance` accepts only the exact outstanding prefix and does not regress durability;
-- execution and observations are monotonic and stutter when no protocol transition commits work; and
-- every exported `RawNode` method is present in the explicit trace inventory.
-
-The inventory and contracts prevent silent API drift. They do not replay TLC actions, prove all possible method sequences, or prove arbitrary Go refinement.
+This replay proves sampled admission. Separately, the AST-checked inventory covers internal mutation and dispatch sites and requires each mutating entry to select exactly one of `TraceActions`, `Stutter`, or a named `Gap`; this proves dispatch-site classification, not action correspondence for arbitrary executions. Their combined checked scope does not include `PaperObserveRecovery`, the audited-but-unexercised `NormalValidationDrop/message-step`, 13 model bookkeeping variables frozen at `Init`, non-coordinator or non-designated-instance state, or information erased when `wire` is mapped to a constant.
 
 ## Verification snapshot
 
 - `go test ./... -count=1` passes.
 - `go test -race ./tests/lifecyclecollector -count=1` passes.
 - `go test -race ./tests/refinementtrace -count=1` passes.
-- `bash tests/tla_model_check_fast.sh` passes all 23 configured jobs, including bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
+- `bash tests/tla_model_check_fast.sh` passes all 31 configured jobs, including the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
+- `tests/trace_refinement_check.sh` accepts all four scenario traces and rejects all five negative controls.
 - `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 89.7% against 85.0% minimum and `examples/kv` 92.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
-- `tlapm` is not installed in the local environment, and no TLAPS proof artifact is part of the checked gate.
+- TLAPS 1.6.0-pre at version `763bf3c`, from the newest prebuilt x86_64-linux release asset (no 1.6.0 final exists), reports 876 obligations for `tla/EPaxosInductiveProofs.tla`: 867 proved, 9 failed, and 0 omitted. `tests/tlaps_check.sh` exits 10, preserving that failure.
+- `tests/formal_closure_collect.sh` stages unsigned-local `rawArtifact` records and fails closed on component or bookkeeping errors; verifier enums cover the compaction/fencing area, and `tests/formal_closure_evidence_selftest.py` passes 82 synthetic cases.
 
 ## Formal and release boundaries
 
-- `tla/EPaxosInductiveProofs.tla` is restricted to its module-level `ConcreteNext`; it excludes codec, allocation, Ready ownership, SCC execution, TOQ timing, the implementation-shaped RawNode model, and arbitrary Go executions.
-- `tla/EPaxosRawNodeRefinement.tla` is finite and implementation-shaped; its TLC property is not an unbounded theorem.
-- `tla/EPaxosVoterBootstrap.tla` is model-only and absent from the RawNode semantic trace.
+- `tla/EPaxosInductiveProofs.tla` is restricted to its module-level `ConcreteNext`; nine obligations remain unchecked, and the model excludes codec, allocation, Ready ownership, SCC execution, TOQ timing, the implementation-shaped RawNode model, and arbitrary Go executions.
+- The Go-to-TLC replay checks the four captured scenarios through the documented 12-variable abstraction. It does not cover the five named replay residual classes or prove arbitrary Go refinement; the dispatch inventory proves exhaustive site classification, not semantics for every possible execution.
+- `tla/EPaxosCompactionFencing.tla` certifies six requirements in its ordered 11-state scope with one exact rejecting mutant per invariant and layered Go witnesses. It is not an unbounded compaction theorem or a production storage-engine certification.
 - Deterministic simulation and loopback Jepsen histories do not represent real-network behavior.
-- Certified protocol-state compaction and late-message/incarnation fencing remain open in `RELEASE_SCOPE.md`.
+- The broader-formal release row remains open for both local gaps—the nine unchecked TLAPS obligations and the replay residual classes—and external evidence—independent producer/reviewer signatures and native-Darwin target attestation.
 
 ## Release decision
 
-The correspondence evidence supports bounded implementation claims only. The authoritative decision is **No-go.** while the single formal release row remains open and the aggregate verification gates are green.
+The correspondence evidence supports bounded implementation claims only. The authoritative decision is **No-go.** while the single formal release row remains open.
 
 ## Certified compaction and fencing requirements
 
