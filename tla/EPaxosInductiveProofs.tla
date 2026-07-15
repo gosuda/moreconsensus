@@ -1060,6 +1060,23 @@ PROOF
 <1> QED BY <1>1, <1>10, <1>11, <1>13, <1>14, <1>15, <1>16, <1>17
     DEF SafetyInvariant
 
+LEMMA CollectEvidenceArchivePreservationObligation ==
+    ASSUME NEW k, NEW r, NEW i, NEW b,
+           DomainAssumptions, SafetyInvariant, CollectEvidence(k, r, i, b)
+    PROVE EvidenceArchiveSound'
+BY IsaM("force")
+   DEF DomainAssumptions, SafetyInvariant, TypeOK, HistoryTypeOK,
+       EvidenceHistorySound, EvidenceArchiveSound, EvidenceWellFormed,
+       CollectEvidence, Evidence, SenderHistory, Update2
+
+LEMMA CollectAcceptedHistoryPreservationObligation ==
+    ASSUME NEW k, NEW r, NEW i, NEW b,
+           DomainAssumptions, SafetyInvariant, CollectEvidence(k, r, i, b)
+    PROVE AcceptedHistorySound'
+BY IsaM("force")
+   DEF SafetyInvariant, AcceptedHistorySound, CollectEvidence,
+       Acceptance, SenderHistory, Update2
+
 LEMMA CollectEvidencePreserves ==
     ASSUME NEW k, NEW r, NEW i, NEW b,
            DomainAssumptions, SafetyInvariant, CollectEvidence(k, r, i, b)
@@ -1101,48 +1118,10 @@ PROOF
        evidenceHistory \cup
          {Evidence(k, r, i, b, PinnedConfig[i], SenderHistory(r, i))}
     BY DEF CollectEvidence
-<1>4. \A e \in evidenceHistory : EvidenceWellFormed(e)'
-    PROOF
-    <2>1. TAKE e \in evidenceHistory
-    <2>2. EvidenceWellFormed(e)
-        BY <2>1 DEF SafetyInvariant, EvidenceHistorySound,
-                      EvidenceArchiveSound
-    <2>3. e.sender \in Replicas /\ e.instance \in Instances
-        BY <2>1, SMT
-           DEF SafetyInvariant, TypeOK, HistoryTypeOK, EvidenceRecords
-    <2>4. b >= promise[r][i] /\ promise'[r][i] = b
-        BY CollectPromiseAt, SMT DEF CollectEvidence, SafetyInvariant
-    <2>5. e.sender = r /\ e.instance = i =>
-           promise[e.sender][e.instance] <=
-             promise'[e.sender][e.instance]
-        BY <2>4, SMT
-    <2>6. ~(e.sender = r /\ e.instance = i) =>
-           promise[e.sender][e.instance] =
-             promise'[e.sender][e.instance]
-        BY CollectPromiseOff, <2>3, SMT DEF SafetyInvariant
-    <2>7. promise[e.sender][e.instance] <=
-           promise'[e.sender][e.instance]
-        BY <2>2, <2>4, CollectPromiseAt, CollectPromiseOff, <2>3, SMT
-           DEF EvidenceWellFormed
-    <2>8. SenderHistory(e.sender, e.instance)' =
-           SenderHistory(e.sender, e.instance)
-        BY DEF CollectEvidence, SenderHistory
-    <2> QED BY <2>2, <2>7, <2>8, SMT
-       DEF EvidenceWellFormed, CollectEvidence
-<1>5. \A e \in evidenceHistory' : EvidenceWellFormed(e)'
-    PROOF
-    <2>1. TAKE e \in evidenceHistory'
-    <2>2. e \in evidenceHistory \/
-           e = Evidence(k, r, i, b, PinnedConfig[i], SenderHistory(r, i))
-        BY <1>3, SMT
-    <2>3. e \in evidenceHistory => EvidenceWellFormed(e)'
-        BY <1>4
-    <2>4. e = Evidence(k, r, i, b, PinnedConfig[i], SenderHistory(r, i))
-           => EvidenceWellFormed(e)'
-        BY <1>2, SMT
-           DEF EvidenceWellFormed, Evidence, CollectEvidence, SenderHistory
-    <2> QED BY <2>2, <2>3, <2>4, SMT
-<1>6. EvidenceArchiveSound' BY <1>5 DEF EvidenceArchiveSound
+<1>4. EvidenceArchiveSound'
+    BY CollectEvidenceArchivePreservationObligation
+<1>5. EvidenceArchiveSound' BY <1>4
+<1>6. EvidenceArchiveSound' BY <1>4
 <1>7. countedEvidence' \subseteq evidenceHistory'
     BY <1>3, SMT DEF SafetyInvariant, EvidenceHistorySound, CollectEvidence,
                          Evidence
@@ -1175,49 +1154,7 @@ PROOF
            ProposalChosenSafe, ProposalWellFormed, ArchivedEvidenceFor,
            CollectEvidence
 <1>14. AcceptedHistorySound'
-    PROOF
-    <2>1. \A a \in acceptedHistory' :
-             /\ a.config = PinnedConfig[a.instance]
-             /\ \E p \in proposalHistory' :
-                   /\ p.instance = a.instance /\ p.ballot = a.ballot
-                   /\ p.value = a.value /\ p.config = a.config
-        BY <1>12, SMT DEF SafetyInvariant, AcceptedHistorySound
-    <2>2. \A a1, a2 \in acceptedHistory :
-             /\ a1.replica = a2.replica /\ a1.instance = a2.instance
-             /\ a1.ballot = a2.ballot => a1.value = a2.value
-        BY SMT DEF SafetyInvariant, AcceptedHistorySound
-    <2>3. \A a1, a2 \in acceptedHistory' :
-             /\ a1.replica = a2.replica /\ a1.instance = a2.instance
-             /\ a1.ballot = a2.ballot => a1.value = a2.value
-        BY <1>12, <2>2, SMT
-    <2>4. \A rr \in Replicas, ii \in Instances :
-             acceptedBallot'[rr][ii] <= promise'[rr][ii]
-        PROOF
-        <3>1. TAKE rr \in Replicas, ii \in Instances
-        <3>2. acceptedBallot'[rr][ii] = acceptedBallot[rr][ii] /\
-               acceptedBallot[rr][ii] <= promise[rr][ii]
-            BY SMT
-               DEF SafetyInvariant, AcceptedHistorySound, CollectEvidence
-        <3>3. b >= promise[r][i] /\ promise'[r][i] = b
-            BY CollectPromiseAt, SMT DEF CollectEvidence, SafetyInvariant
-        <3>4. rr = r /\ ii = i =>
-               acceptedBallot'[rr][ii] <= promise'[rr][ii]
-            BY <3>2, <3>3, SMT
-        <3>5. ~(rr = r /\ ii = i) =>
-               acceptedBallot'[rr][ii] <= promise'[rr][ii]
-            BY <3>2, CollectPromiseOff, SMT
-        <3> QED BY <3>4, <3>5, SMT
-    <2>5. \A rr \in Replicas, ii \in Instances :
-             acceptedValue'[rr][ii] # NoValue =>
-               /\ Acceptance(rr, ii, acceptedBallot'[rr][ii],
-                             acceptedValue'[rr][ii], PinnedConfig[ii])
-                    \in acceptedHistory'
-               /\ \A a \in SenderHistory(rr, ii)' :
-                     a.ballot <= acceptedBallot'[rr][ii]
-        BY <1>12, SMT
-           DEF SafetyInvariant, AcceptedHistorySound, CollectEvidence,
-               SenderHistory
-    <2> QED BY <2>1, <2>3, <2>4, <2>5 DEF AcceptedHistorySound
+    BY CollectAcceptedHistoryPreservationObligation
 <1>15. ChosenCertificateSound'
     BY <1>12, SMT
        DEF SafetyInvariant, ChosenCertificateSound, ProposalForChoice
@@ -1474,6 +1411,25 @@ PROOF
 <1> QED BY <1>1, <1>11, <1>12, <1>13, <1>14, <1>16, <1>17, <1>18
     DEF SafetyInvariant
 
+LEMMA AcceptHistoryPreservationObligation ==
+    ASSUME NEW r, NEW p, DomainAssumptions, SafetyInvariant,
+           AcceptProposal(r, p)
+    PROVE AcceptedHistorySound'
+BY IsaM("force")
+   DEF DomainAssumptions, SafetyInvariant, TypeOK, HistoryTypeOK,
+       ProposalHistorySound, ProposalShapeSound, ProposalWellFormed,
+       AcceptedHistorySound, AcceptProposal, Acceptance, SenderHistory,
+       Update2
+
+LEMMA AcceptEvidenceArchivePreservationObligation ==
+    ASSUME NEW r, NEW p, DomainAssumptions, SafetyInvariant,
+           AcceptProposal(r, p)
+    PROVE EvidenceArchiveSound'
+BY IsaM("force")
+   DEF DomainAssumptions, SafetyInvariant, TypeOK, HistoryTypeOK,
+       EvidenceHistorySound, EvidenceArchiveSound, EvidenceWellFormed,
+       AcceptProposal, Acceptance, SenderHistory, Update2
+
 LEMMA AcceptProposalPreserves ==
     ASSUME NEW r, NEW p, DomainAssumptions, SafetyInvariant,
            AcceptProposal(r, p)
@@ -1510,135 +1466,9 @@ PROOF
        DEF SafetyInvariant, TypeOK, AbstractTypeOK, AcceptProposal, Acceptance
 <1>10. TypeOK' BY <1>5, <1>7, <1>8, <1>9 DEF TypeOK
 <1>11. AcceptedHistorySound'
-    PROOF
-    <2>1. \A a \in acceptedHistory' :
-             /\ a.config = PinnedConfig[a.instance]
-             /\ \E prop \in proposalHistory' :
-                   /\ prop.instance = a.instance /\ prop.ballot = a.ballot
-                   /\ prop.value = a.value /\ prop.config = a.config
-        PROOF
-        <3>1. TAKE a \in acceptedHistory'
-        <3>2. a \in acceptedHistory \/
-               a = Acceptance(r, p.instance, p.ballot, p.value, p.config)
-            BY SMT DEF AcceptProposal, Acceptance
-        <3>3. a \in acceptedHistory =>
-               /\ a.config = PinnedConfig[a.instance]
-               /\ \E prop \in proposalHistory' :
-                     /\ prop.instance = a.instance /\ prop.ballot = a.ballot
-                     /\ prop.value = a.value /\ prop.config = a.config
-            BY SMT
-               DEF SafetyInvariant, AcceptedHistorySound, AcceptProposal
-        <3>4. a = Acceptance(r, p.instance, p.ballot, p.value, p.config) =>
-               /\ a.config = PinnedConfig[a.instance]
-               /\ \E prop \in proposalHistory' :
-                     /\ prop.instance = a.instance /\ prop.ballot = a.ballot
-                     /\ prop.value = a.value /\ prop.config = a.config
-            BY SMT
-               DEF SafetyInvariant, ProposalHistorySound,
-                   ProposalShapeSound, ProposalWellFormed, AcceptProposal,
-                   Acceptance
-        <3> QED BY <3>2, <3>3, <3>4, SMT
-    <2>2. \A a1, a2 \in acceptedHistory' :
-             /\ a1.replica = a2.replica /\ a1.instance = a2.instance
-             /\ a1.ballot = a2.ballot => a1.value = a2.value
-        PROOF
-        <3>1. TAKE a1, a2 \in acceptedHistory'
-        <3>2. a1 \in acceptedHistory \/
-               a1 = Acceptance(r, p.instance, p.ballot, p.value, p.config)
-            BY SMT DEF AcceptProposal, Acceptance
-        <3>3. a2 \in acceptedHistory \/
-               a2 = Acceptance(r, p.instance, p.ballot, p.value, p.config)
-            BY SMT DEF AcceptProposal, Acceptance
-        <3>4. a1 \in acceptedHistory /\ a2 \in acceptedHistory =>
-               (/\ a1.replica = a2.replica /\ a1.instance = a2.instance
-                   /\ a1.ballot = a2.ballot => a1.value = a2.value)
-            BY SMT DEF SafetyInvariant, AcceptedHistorySound
-        <3>5. a1 \in acceptedHistory /\
-               a2 = Acceptance(r, p.instance, p.ballot, p.value, p.config) =>
-               (/\ a1.replica = a2.replica /\ a1.instance = a2.instance
-                   /\ a1.ballot = a2.ballot => a1.value = a2.value)
-            BY SMT DEF AcceptProposal, Acceptance
-        <3>6. a2 \in acceptedHistory /\
-               a1 = Acceptance(r, p.instance, p.ballot, p.value, p.config) =>
-               (/\ a1.replica = a2.replica /\ a1.instance = a2.instance
-                   /\ a1.ballot = a2.ballot => a1.value = a2.value)
-            BY SMT DEF AcceptProposal, Acceptance
-        <3> QED BY <3>2, <3>3, <3>4, <3>5, <3>6, SMT
-    <2>3. \A rr \in Replicas, ii \in Instances :
-             acceptedBallot'[rr][ii] <= promise'[rr][ii]
-        PROOF
-        <3>1. TAKE rr \in Replicas, ii \in Instances
-        <3>2. acceptedBallot[rr][ii] <= promise[rr][ii]
-            BY DEF SafetyInvariant, AcceptedHistorySound
-        <3>3. rr = r /\ ii = p.instance =>
-               acceptedBallot'[rr][ii] <= promise'[rr][ii]
-            BY AcceptUpdatesAt, <1>1, SMT
-        <3>4. ~(rr = r /\ ii = p.instance) =>
-               acceptedBallot'[rr][ii] <= promise'[rr][ii]
-            BY AcceptUpdatesOff, <1>1, <3>2, SMT
-        <3> QED BY <3>3, <3>4, SMT
-    <2>4. \A rr \in Replicas, ii \in Instances :
-             acceptedValue'[rr][ii] # NoValue =>
-               /\ Acceptance(rr, ii, acceptedBallot'[rr][ii],
-                             acceptedValue'[rr][ii], PinnedConfig[ii])
-                    \in acceptedHistory'
-               /\ \A a \in SenderHistory(rr, ii)' :
-                     a.ballot <= acceptedBallot'[rr][ii]
-        PROOF
-        <3>1. TAKE rr \in Replicas, ii \in Instances
-        <3>2. rr = r /\ ii = p.instance =>
-               (acceptedValue'[rr][ii] # NoValue =>
-                 /\ Acceptance(rr, ii, acceptedBallot'[rr][ii],
-                               acceptedValue'[rr][ii], PinnedConfig[ii])
-                      \in acceptedHistory'
-                 /\ \A a \in SenderHistory(rr, ii)' :
-                       a.ballot <= acceptedBallot'[rr][ii])
-            BY AcceptUpdatesAt, <1>1, SMT
-               DEF SafetyInvariant, AcceptedHistorySound, AcceptProposal,
-                   Acceptance, SenderHistory, ProposalHistorySound,
-                   ProposalShapeSound, ProposalWellFormed
-        <3>3. ~(rr = r /\ ii = p.instance) =>
-               (acceptedValue'[rr][ii] # NoValue =>
-                 /\ Acceptance(rr, ii, acceptedBallot'[rr][ii],
-                               acceptedValue'[rr][ii], PinnedConfig[ii])
-                      \in acceptedHistory'
-                 /\ \A a \in SenderHistory(rr, ii)' :
-                       a.ballot <= acceptedBallot'[rr][ii])
-            BY AcceptUpdatesOff, <1>1, SMT
-               DEF SafetyInvariant, AcceptedHistorySound, AcceptProposal,
-                   Acceptance, SenderHistory
-        <3> QED BY <3>2, <3>3, SMT
-    <2> QED BY <2>1, <2>2, <2>3, <2>4 DEF AcceptedHistorySound
+    BY AcceptHistoryPreservationObligation
 <1>12. EvidenceArchiveSound'
-    PROOF
-    <2>1. \A e \in evidenceHistory' : EvidenceWellFormed(e)'
-        PROOF
-        <3>1. TAKE e \in evidenceHistory'
-        <3>2. e \in evidenceHistory /\ EvidenceWellFormed(e)
-            BY SMT
-               DEF SafetyInvariant, EvidenceHistorySound,
-                   EvidenceArchiveSound, AcceptProposal
-        <3>3. e.sender \in Replicas /\ e.instance \in Instances
-            BY <3>2, SMT
-               DEF SafetyInvariant, TypeOK, HistoryTypeOK, EvidenceRecords
-        <3>4. e.sender = r /\ e.instance = p.instance =>
-                 e.ballot <= promise'[e.sender][e.instance]
-            BY AcceptUpdatesAt, <1>1, <3>2, <3>3, SMT
-               DEF EvidenceWellFormed, AcceptProposal
-        <3>5. ~(e.sender = r /\ e.instance = p.instance) =>
-                 e.ballot <= promise'[e.sender][e.instance]
-            BY AcceptUpdatesOff, <1>1, <3>2, <3>3, SMT
-               DEF EvidenceWellFormed
-        <3>6. e.ballot <= promise'[e.sender][e.instance]
-            BY <3>4, <3>5, SMT
-        <3>7. \A a \in SenderHistory(e.sender, e.instance)' :
-                 a.ballot < e.ballot => a \in e.history
-            BY <3>2, <3>3, SMT
-               DEF EvidenceWellFormed, AcceptProposal, Acceptance,
-                   SenderHistory
-        <3> QED BY <3>2, <3>6, <3>7, SMT DEF EvidenceWellFormed,
-                                                     AcceptProposal
-    <2> QED BY <2>1 DEF EvidenceArchiveSound
+    BY AcceptEvidenceArchivePreservationObligation
 <1>13. countedEvidence' \subseteq evidenceHistory' /\
         CountedEvidenceCurrent' /\ CountedEvidenceUnique'
     BY SMT DEF SafetyInvariant, EvidenceHistorySound,
@@ -1669,21 +1499,20 @@ LEMMA CertifyChosenPreserves ==
     ASSUME NEW p, NEW q
     PROVE DomainAssumptions /\ SafetyInvariant /\ CertifyChosen(p, q)
           => SafetyInvariant'
-BY SMT DEF DomainAssumptions, SafetyInvariant, TypeOK, ProposalHistorySound,
-           ProposalShapeSound, ProposalEvidenceArchived,
-           ProposalBallotUnique, ProposalChosenSafe,
-           AcceptedHistorySound, EvidenceHistorySound,
-           CurrentRoundResponsesOnly, ChosenCertificateSound,
-           ChosenAgreement, ConfigHistorySafety, Nontriviality,
-           ValueProvenance, MappingInvariant, CertifyChosen, Choice,
-           ChoiceRecords, ProposalForChoice
+BY IsaM("force") DEF DomainAssumptions, SafetyInvariant, TypeOK,
+           ProposalHistorySound, ProposalShapeSound, ProposalEvidenceArchived,
+           ProposalBallotUnique, ProposalChosenSafe, AcceptedHistorySound,
+           EvidenceHistorySound, CurrentRoundResponsesOnly,
+           ChosenCertificateSound, ChosenAgreement, ConfigHistorySafety,
+           Nontriviality, ValueProvenance, MappingInvariant, CertifyChosen,
+           Choice, ChoiceRecords, ProposalForChoice
 
 LEMMA RecordConfigurationPreserves ==
     ASSUME NEW c, NEW outcome, NEW winner
     PROVE DomainAssumptions /\ SafetyInvariant /\
           RecordConfiguration(c, outcome, winner) => SafetyInvariant'
-BY SMT DEF DomainAssumptions, SafetyInvariant, TypeOK, ProposalHistorySound,
-           AcceptedHistorySound, EvidenceHistorySound,
+BY IsaM("force") DEF DomainAssumptions, SafetyInvariant, TypeOK,
+           ProposalHistorySound, AcceptedHistorySound, EvidenceHistorySound,
            CurrentRoundResponsesOnly, ChosenCertificateSound,
            ChosenAgreement, ConfigHistorySafety, ConfigHistoryWellFormed,
            SingleAppliedOutcome, EffectiveBacked, Nontriviality,
@@ -1696,7 +1525,7 @@ LEMMA RetryStepsPreserve ==
     DomainAssumptions /\ SafetyInvariant /\
     (StartRetry \/ IssueRetry \/ DropRequest \/ DeliverRequest \/
      CompleteRecovery \/ InternalWireStep) => SafetyInvariant'
-BY SMT DEF SafetyInvariant, TypeOK, ProposalHistorySound,
+BY IsaM("force") DEF SafetyInvariant, TypeOK, ProposalHistorySound,
            AcceptedHistorySound, EvidenceHistorySound,
            CurrentRoundResponsesOnly, ChosenCertificateSound,
            ChosenAgreement, ConfigHistorySafety, ConfigHistoryWellFormed,
@@ -1712,7 +1541,7 @@ BY NormalProposePreserves, BeginRecoveryPreserves, CollectEvidencePreserves,
    SMT DEF ConcreteNext
 
 LEMMA StutterPreserves == SafetyInvariant /\ Stutter => SafetyInvariant'
-BY SMT DEF Stutter
+BY IsaM("force") DEF Stutter
 
 LEMMA NextPreservesInvariant ==
     DomainAssumptions /\ SafetyInvariant /\ NextOrStutter => SafetyInvariant'
@@ -1782,16 +1611,16 @@ WaitingForCompletion == replyAvailable /\ ~recoveryComplete
 
 LEMMA CompletionEnabled ==
     WaitingForCompletion => ENABLED <<FinishRetry>>_CompletionVars
-BY DEF WaitingForCompletion, FinishRetry, CompletionVars
+BY ExpandENABLED, AutoUSE, SMT DEF WaitingForCompletion
 
 LEMMA WaitingPersistsOrCompletes ==
     WaitingForCompletion /\ NextOrStutter
     => WaitingForCompletion' \/ recoveryComplete'
-BY SMT DEF WaitingForCompletion, NextOrStutter, ConcreteNext, Stutter,
-           NormalPropose, BeginRecovery, CollectEvidence, RecoveryPropose,
-           AcceptProposal, CertifyChosen, RecordConfiguration,
-           ConfigExecutionGuard, StartRetry, IssueRetry, DropRequest,
-           DeliverRequest, CompleteRecovery, InternalWireStep
+BY IsaM("force") DEF WaitingForCompletion, NextOrStutter, ConcreteNext,
+           Stutter, NormalPropose, BeginRecovery, CollectEvidence,
+           RecoveryPropose, AcceptProposal, CertifyChosen,
+           RecordConfiguration, ConfigExecutionGuard, StartRetry, IssueRetry,
+           DropRequest, DeliverRequest, CompleteRecovery, InternalWireStep
 
 LEMMA CompletionActionCompletes ==
     WaitingForCompletion /\ NextOrStutter /\
