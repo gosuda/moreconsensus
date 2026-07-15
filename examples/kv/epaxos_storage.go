@@ -423,7 +423,12 @@ func digestEPaxosCommand(command epaxos.Command) (epaxos.StateDigest, error) {
 }
 
 func encodeEPaxosCommandResult(digest epaxos.StateDigest, response []byte) []byte {
-	out := make([]byte, 1, 1+len(digest)+binary.MaxVarintLen64+len(response))
+	capacity := 1 + len(digest) + binary.MaxVarintLen64
+	if len(response) > int(^uint(0)>>1)-capacity {
+		panic("kv: command result exceeds addressable memory")
+	}
+	capacity += len(response)
+	out := make([]byte, 1, capacity)
 	out[0] = epaxosCommandResultCodec
 	out = append(out, digest[:]...)
 	out = binary.AppendUvarint(out, uint64(len(response)))
