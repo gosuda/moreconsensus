@@ -58,9 +58,19 @@ func TestCheckpointCertifiedCompactionLifecycle(t *testing.T) {
 	}
 	var applicationDigest StateDigest
 	applicationDigest[0] = 1
+	emptyResult := CheckpointResult{ID: request.ID, ApplicationDigest: applicationDigest}
+	if err := node.ProvideCheckpoint(emptyResult); !errors.Is(err, ErrInvalidCheckpoint) {
+		t.Fatalf("empty application snapshot handle err=%v, want invalid checkpoint", err)
+	}
 	result := CheckpointResult{ID: request.ID, ApplicationSnapshot: []byte("snapshot-handle"), ApplicationDigest: applicationDigest}
 	if err := node.ProvideCheckpoint(result); err != nil {
 		t.Fatal(err)
+	}
+	emptyCheckpoint := node.checkpointRound.checkpoint.Clone()
+	emptyCheckpoint.ApplicationSnapshot = nil
+	emptyCheckpoint.Checksum = DigestCheckpoint(emptyCheckpoint)
+	if err := validateCheckpoint(emptyCheckpoint, node.confHistory); !errors.Is(err, ErrInvalidCheckpoint) {
+		t.Fatalf("empty durable snapshot handle err=%v, want invalid checkpoint", err)
 	}
 	if err := node.ProvideCheckpoint(result); err != nil {
 		t.Fatalf("exact duplicate checkpoint result: %v", err)

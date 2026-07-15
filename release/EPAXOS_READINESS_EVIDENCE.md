@@ -12,7 +12,7 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 ## Evidence identity
 
 - This snapshot describes the checked repository tree and the commands listed below. A production release must bind evidence to an exact source revision, release binary digest, target identity, immutable evidence root, and independent reviewer signature.
-- The coverage gate measures production packages separately: `epaxos` reached 87.3% against an 85.0% minimum and `examples/kv` reached 90.5% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
+- The coverage gate measures production packages separately: `epaxos` reached 87.6% against an 85.0% minimum and `examples/kv` reached 90.5% against a 90.0% minimum. Verification collectors are exercised by root behavior and race suites.
 - No external target-environment closure bundle is present. Repository evidence therefore remains bounded, local, and non-release-approving.
 
 ## Gate status
@@ -26,14 +26,14 @@ Status: no-go evidence bundle for the active EPaxos production-readiness goal. T
 | Release scope structure | Pass when `bash tests/release_scope_audit.sh` is run | Canonical decision, one open row, links, model paths, and tracked-text guards. |
 | Repository text audit | Pass when `bash tests/audit_repo.sh` is run | Static forbidden-text and deterministic-core checks. |
 | Operations artifact audit | Pass in the recorded local verification | Example/operator reports and local lifecycle evidence; not target-environment closure evidence. |
-| Aggregate Go coverage | Pass: `epaxos` 87.3% >= 85.0%; `examples/kv` 90.5% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
+| Aggregate Go coverage | Pass: `epaxos` 87.6% >= 85.0%; `examples/kv` 90.5% >= 90.0% | Verification collectors remain covered by root behavior and race suites; optional platform/process branches are outside production-package coverage. |
 
 ## Bounded protocol and service evidence
 
 - `RawNode` owns deterministic protocol state only. Opaque commands expose canonical point/span/all footprints and replicated cycle keys; protocol controls are separate entry kinds.
 - `Ready` enforces ordered persistence, transport, snapshot install, application `Apply`, checkpoint, compaction, and exact-prefix `Advance` phases. Application effects and full `CommandID` results commit atomically in the KV example.
 - The core supports voters 1 through 7, caller-owned storage/transport/time sampling, `MEP3` incarnation-authenticated messages, Pebble v9 migration, and safe-copy/zero-copy ownership.
-- Certified checkpoint descriptors bind exact frontiers, voter incarnations, barrier/protocol state, allocator fences, and application digests. Durable quorum certification precedes atomic tombstone/deletion; prepared replicas retry votes, and certified replicas answer covered stale votes with the latest certificate and offer.
+- Certified checkpoint descriptors bind exact frontiers, voter incarnations, barrier/protocol state, allocator fences, nonempty application snapshot handles, and application digests. Durable quorum certification precedes atomic tombstone/deletion; prepared replicas retry votes, and certified replicas answer covered stale votes with the latest certificate and offer.
 - The three-replica KV smoke covers empty-span ordered read, phantom conflict, certification, physical row deletion, snapshot-plus-delta restart, durable result replay, late compacted reference offer, and wrong-incarnation rejection.
 - Local Jepsen profiles cover restart, transport partition, storage-unavailable, destructive-storage, scan semantics, and checker behavior. These histories are loopback-only.
 

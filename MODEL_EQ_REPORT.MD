@@ -118,7 +118,7 @@ This replay proves sampled admission. Separately, the AST-checked inventory cove
 - `go test -race ./tests/refinementtrace -count=1` passes.
 - `bash tests/tla_model_check_fast.sh` passes all 32 configured jobs, including the certified-compaction configuration, the positive compaction/fencing model, six exact-marker negative mutants, bootstrap base sizes 1–6 (successor sizes 2–7), crash-prefix, race, and fairness configurations.
 - `tests/trace_refinement_check.sh` accepts all four scenario traces and rejects all five negative controls.
-- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 87.3% against 85.0% minimum and `examples/kv` 90.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
+- `tests/go_coverage.sh` passes the scoped production-package thresholds: `epaxos` 87.6% against 85.0% minimum and `examples/kv` 90.5% against 90.0% minimum. Root behavior and race suites exercise verification collectors.
 - TLAPS 1.6.0-pre at version `763bf3c`, from the newest prebuilt x86_64-linux release asset (no 1.6.0 final exists), reports 876 obligations for `tla/EPaxosInductiveProofs.tla`: 867 proved, 9 failed, and 0 omitted. `tests/tlaps_check.sh` exits 10, preserving that failure.
 - `tests/formal_closure_collect.sh` stages unsigned-local `rawArtifact` records and fails closed on component or bookkeeping errors; verifier enums cover the compaction/fencing area, and `tests/formal_closure_evidence_selftest.py` passes 82 synthetic cases.
 

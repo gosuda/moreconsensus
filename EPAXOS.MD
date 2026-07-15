@@ -137,7 +137,7 @@ When a retained reference is not resident, `Ready.RecordLoads` lists sorted, ded
 
 ## Certified checkpoints and durable compaction
 
-When executed history reaches the retention threshold, replicas may originate group-global checkpoint barriers. The executor recovers every real dependency hole, executes the complete barrier SCC, and emits one stable `Ready.Checkpoint{ID, Through}` after all represented application work. `ProvideCheckpoint` returns an opaque bounded snapshot handle and nonzero application digest.
+When executed history reaches the retention threshold, replicas may originate group-global checkpoint barriers. The executor recovers every real dependency hole, executes the complete barrier SCC, and emits one stable `Ready.Checkpoint{ID, Through}` after all represented application work. `ProvideCheckpoint` returns a nonempty opaque bounded snapshot handle and nonzero application digest.
 
 A descriptor binds cluster/config identities and incarnations, barrier tuple, exact multi-configuration execution frontier, protocol projection, allocator fences, and application digest. Voters attest only after prepared snapshot metadata is durable. A canonical slow-quorum certificate must itself become durable before `Ready.Compact` authorizes atomic tombstone advancement and record deletion. A late compacted reference never recreates protocol state.
 

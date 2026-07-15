@@ -502,7 +502,8 @@ func validateCheckpoint(checkpoint Checkpoint, history map[ConfID]ConfState) err
 	d := checkpoint.Descriptor
 	if d.ApplicationDigest == (StateDigest{}) || d.Barrier.IsZero() || d.BarrierTupleDigest == (StateDigest{}) ||
 		d.ProtocolStateDigest == (StateDigest{}) || deriveCheckpointID(d.BarrierTupleDigest, d.Through) != d.ID ||
-		len(checkpoint.ApplicationSnapshot) > maxApplicationSnapshotHandle || checkpoint.Checksum != DigestCheckpoint(checkpoint) {
+		len(checkpoint.ApplicationSnapshot) == 0 || len(checkpoint.ApplicationSnapshot) > maxApplicationSnapshotHandle ||
+		checkpoint.Checksum != DigestCheckpoint(checkpoint) {
 		return ErrInvalidCheckpoint
 	}
 	if err := validateExecutionFrontier(d.Through, history); err != nil {

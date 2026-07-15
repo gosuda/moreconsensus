@@ -160,7 +160,8 @@ func (n *RawNode) ProvideCheckpoint(result CheckpointResult) error {
 	if result.ID != round.request.ID {
 		return ErrCheckpointMismatch
 	}
-	if result.ApplicationDigest == (StateDigest{}) || len(result.ApplicationSnapshot) > maxApplicationSnapshotHandle {
+	if result.ApplicationDigest == (StateDigest{}) || len(result.ApplicationSnapshot) == 0 ||
+		len(result.ApplicationSnapshot) > maxApplicationSnapshotHandle {
 		return ErrInvalidCheckpoint
 	}
 	if round.result.ID != (CheckpointID{}) {
