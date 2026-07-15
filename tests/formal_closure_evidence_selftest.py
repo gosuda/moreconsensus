@@ -538,44 +538,99 @@ def build_fixture(root: Path, now: datetime) -> tuple[dict[str, Any], Path, Path
     )
 
     expected_subjects = sorted(
-        {
-            *(f"theorem:{name}" for name in verifier.THEOREM_BY_CLASS),
-            "config:complete-config",
-            *(f"property:{name}" for name in verifier.INVARIANT_IDS),
-            *(f"property:{name}" for name in verifier.TEMPORAL_IDS),
-        }
+        [f"theorem:{name}" for name in verifier.THEOREM_BY_CLASS]
+        + ["config:complete-config"]
+        + [f"property:{name}" for name in verifier.INVARIANT_IDS]
+        + [f"property:{name}" for name in verifier.TEMPORAL_IDS]
     )
     mutation_entries: list[dict[str, Any]] = []
     nonvacuity_entries: list[dict[str, Any]] = []
     mutation_subjects: list[dict[str, Any]] = []
     for subject_id in expected_subjects:
-        subject_kind = subject_id.partition(":")[0]
+        subject_kind, _, subject_name = subject_id.partition(":")
+        if subject_kind == "theorem":
+            authoritative_id = "formal-closure"
+            authoritative_path = "specs/FormalClosure.tla"
+            authoritative_file = model_path
+            mutation_operator = "remove-theorem-declaration"
+            detector_tool_id = "tlaps"
+            theorem_id = verifier.THEOREM_BY_CLASS[subject_name]
+            baseline_bytes = authoritative_file.read_bytes()
+            mutant_bytes = baseline_bytes.replace(
+                f"THEOREM {theorem_id} == TRUE\n".encode(), b"", 1
+            )
+        elif subject_kind == "config":
+            authoritative_id = "complete-config"
+            authoritative_path = "specs/FormalClosure.cfg"
+            authoritative_file = config_path
+            mutation_operator = "disable-deadlock-check"
+            detector_tool_id = "tlc"
+            theorem_id = None
+            baseline_bytes = authoritative_file.read_bytes()
+            mutant_bytes = baseline_bytes.replace(b"CHECK_DEADLOCK TRUE\n", b"CHECK_DEADLOCK FALSE\n", 1)
+        else:
+            authoritative_id = "complete-config"
+            authoritative_path = "specs/FormalClosure.cfg"
+            authoritative_file = config_path
+            mutation_operator = "remove-property-directive"
+            detector_tool_id = "tlc"
+            theorem_id = None
+            keyword = "INVARIANT" if subject_name in verifier.INVARIANT_IDS else "PROPERTY"
+            baseline_bytes = authoritative_file.read_bytes()
+            mutant_bytes = baseline_bytes.replace(f"{keyword} {subject_name}\n".encode(), b"", 1)
+        if mutant_bytes == baseline_bytes:
+            raise AssertionError(f"failed to construct semantic mutation for {subject_id}")
+        authoritative_hash = digest(authoritative_file)
         token = hashlib.sha256(subject_id.encode()).hexdigest()[:20]
         baseline_id, baseline_hash = add_artifact(
-            f"mutation-{token}-baseline.input",
-            "mutation-baseline",
-            f"baseline semantic input for {subject_id}\n".encode(),
+            f"mutation-{token}-baseline.input", "mutation-baseline", baseline_bytes
         )
         mutant_id, mutant_hash = add_artifact(
-            f"mutation-{token}-mutant.input",
-            "mutation-mutant",
-            f"mutated semantic input for {subject_id}\n".encode(),
+            f"mutation-{token}-mutant.input", "mutation-mutant", mutant_bytes
         )
-        detected_by = f"semantic-{subject_kind}-mutation-check"
+        if detector_tool_id == "tlaps":
+            baseline_command = ["tlapm", f"artifacts/{baseline_id}", "--theorem", theorem_id]
+            mutant_command = ["tlapm", f"artifacts/{mutant_id}", "--theorem", theorem_id]
+            java_binary_sha256 = None
+        else:
+            baseline_command = [
+                "java", "-jar", "tla2tools.jar", "-config", f"artifacts/{baseline_id}", "specs/FormalClosure.tla"
+            ]
+            mutant_command = [
+                "java", "-jar", "tla2tools.jar", "-config", f"artifacts/{mutant_id}", "specs/FormalClosure.tla"
+            ]
+            java_binary_sha256 = binary_hashes["java"]
+        baseline_command_hash = hashlib.sha256(
+            verifier.canonical_json_bytes(baseline_command)
+        ).hexdigest()
+        mutant_command_hash = hashlib.sha256(verifier.canonical_json_bytes(mutant_command)).hexdigest()
+        detected_by = f"native-{detector_tool_id}-semantic-mutation-detector-v1"
         detector = {
-            "record_kind": "formal-closure-subject-mutation-result",
+            "record_kind": "formal-closure-mutant-rejection",
             "subject_id": subject_id,
             "subject_kind": subject_kind,
+            "authoritative_id": authoritative_id,
+            "authoritative_path": authoritative_path,
+            "authoritative_sha256": authoritative_hash,
+            "mutation_operator": mutation_operator,
             "release_id": RELEASE_ID,
             "source_revision": SOURCE_REVISION,
             "source_tree_id": source_tree_id,
             "formal_spec_sha256": formal_spec_sha,
             "target_id": target_id,
-            "completed_at": event_text,
-            "result": "rejected",
             "baseline_sha256": baseline_hash,
             "mutated_sha256": mutant_hash,
             "detected_by": detected_by,
+            "command": mutant_command,
+            "command_sha256": mutant_command_hash,
+            "working_directory": ".",
+            "environment_sha256": verifier.EMPTY_ENVIRONMENT_SHA256,
+            "detector_tool_id": detector_tool_id,
+            "detector_tool_binary_sha256": binary_hashes[detector_tool_id],
+            "java_binary_sha256": java_binary_sha256,
+            "exit_code": 1,
+            "completed_at": event_text,
+            "result": "rejected",
         }
         detector_id, detector_hash = add_artifact(
             f"mutation-{token}-detector.json",
@@ -583,21 +638,33 @@ def build_fixture(root: Path, now: datetime) -> tuple[dict[str, Any], Path, Path
             (json.dumps(detector, indent=2, sort_keys=True) + "\n").encode(),
         )
         witness = {
-            "record_kind": "formal-closure-nonvacuity-witness",
+            "record_kind": "formal-closure-baseline-acceptance",
             "subject_id": subject_id,
             "subject_kind": subject_kind,
+            "authoritative_id": authoritative_id,
+            "authoritative_path": authoritative_path,
+            "authoritative_sha256": authoritative_hash,
+            "mutation_operator": mutation_operator,
             "release_id": RELEASE_ID,
             "source_revision": SOURCE_REVISION,
             "source_tree_id": source_tree_id,
             "formal_spec_sha256": formal_spec_sha,
             "target_id": target_id,
-            "observed_at": event_text,
-            "witness_count": 1,
-            "result": "pass",
             "baseline_sha256": baseline_hash,
             "mutated_sha256": mutant_hash,
-            "detector_output_sha256": detector_hash,
             "detected_by": detected_by,
+            "command": baseline_command,
+            "command_sha256": baseline_command_hash,
+            "working_directory": ".",
+            "environment_sha256": verifier.EMPTY_ENVIRONMENT_SHA256,
+            "detector_tool_id": detector_tool_id,
+            "detector_tool_binary_sha256": binary_hashes[detector_tool_id],
+            "java_binary_sha256": java_binary_sha256,
+            "exit_code": 0,
+            "completed_at": event_text,
+            "result": "accepted",
+            "mutant_output_sha256": detector_hash,
+            "witness_count": 1,
         }
         witness_id, witness_hash = add_artifact(
             f"nonvacuity-{token}-witness.json",
@@ -609,26 +676,56 @@ def build_fixture(root: Path, now: datetime) -> tuple[dict[str, Any], Path, Path
                 "mutation_id": subject_id,
                 "subject_id": subject_id,
                 "subject_kind": subject_kind,
+                "authoritative_id": authoritative_id,
+                "authoritative_path": authoritative_path,
+                "authoritative_sha256": authoritative_hash,
+                "mutation_operator": mutation_operator,
                 "baseline_path": f"inputs/{baseline_id}",
                 "baseline_sha256": baseline_hash,
                 "mutated_path": f"inputs/{mutant_id}",
                 "mutated_sha256": mutant_hash,
                 "detector_output_path": f"inputs/{detector_id}",
                 "detector_output_sha256": detector_hash,
-                "result": "rejected",
                 "detected_by": detected_by,
+                "detector_tool_id": detector_tool_id,
+                "detector_tool_binary_sha256": binary_hashes[detector_tool_id],
+                "java_binary_sha256": java_binary_sha256,
+                "baseline_command": baseline_command,
+                "baseline_command_sha256": baseline_command_hash,
+                "mutant_command": mutant_command,
+                "mutant_command_sha256": mutant_command_hash,
+                "working_directory": ".",
+                "environment_sha256": verifier.EMPTY_ENVIRONMENT_SHA256,
+                "baseline_exit_code": 0,
+                "mutant_exit_code": 1,
+                "baseline_completed_at": event_text,
+                "detector_completed_at": event_text,
+                "result": "rejected",
             }
         )
         nonvacuity_entries.append(
             {
                 "subject_id": subject_id,
                 "subject_kind": subject_kind,
+                "authoritative_id": authoritative_id,
+                "authoritative_path": authoritative_path,
+                "authoritative_sha256": authoritative_hash,
+                "mutation_operator": mutation_operator,
                 "baseline_sha256": baseline_hash,
                 "mutated_sha256": mutant_hash,
                 "detector_output_sha256": detector_hash,
                 "detected_by": detected_by,
+                "detector_tool_id": detector_tool_id,
+                "detector_tool_binary_sha256": binary_hashes[detector_tool_id],
+                "java_binary_sha256": java_binary_sha256,
+                "baseline_command": baseline_command,
+                "baseline_command_sha256": baseline_command_hash,
+                "working_directory": ".",
+                "environment_sha256": verifier.EMPTY_ENVIRONMENT_SHA256,
+                "baseline_exit_code": 0,
+                "baseline_completed_at": event_text,
                 "witness_count": 1,
-                "result": "pass",
+                "result": "accepted",
                 "witness_path": f"inputs/{witness_id}",
                 "witness_sha256": witness_hash,
             }
@@ -637,6 +734,10 @@ def build_fixture(root: Path, now: datetime) -> tuple[dict[str, Any], Path, Path
             {
                 "subject_id": subject_id,
                 "subject_kind": subject_kind,
+                "authoritative_id": authoritative_id,
+                "authoritative_path": authoritative_path,
+                "authoritative_sha256": authoritative_hash,
+                "mutation_operator": mutation_operator,
                 "baseline_artifact_id": baseline_id,
                 "baseline_sha256": baseline_hash,
                 "mutant_artifact_id": mutant_id,
@@ -644,8 +745,21 @@ def build_fixture(root: Path, now: datetime) -> tuple[dict[str, Any], Path, Path
                 "detector_artifact_id": detector_id,
                 "detector_sha256": detector_hash,
                 "detected_by": detected_by,
-                "detector_completed_at": event_text,
+                "detector_tool_id": detector_tool_id,
+                "detector_tool_binary_sha256": binary_hashes[detector_tool_id],
+                "java_binary_sha256": java_binary_sha256,
+                "baseline_command": baseline_command,
+                "baseline_command_sha256": baseline_command_hash,
+                "mutant_command": mutant_command,
+                "mutant_command_sha256": mutant_command_hash,
+                "working_directory": ".",
+                "environment_sha256": verifier.EMPTY_ENVIRONMENT_SHA256,
+                "baseline_exit_code": 0,
+                "baseline_result": "accepted",
+                "baseline_completed_at": event_text,
+                "mutant_exit_code": 1,
                 "mutation_result": "rejected",
+                "detector_completed_at": event_text,
                 "witness_artifact_id": witness_id,
                 "witness_sha256": witness_hash,
                 "witness_count": 1,
@@ -1178,7 +1292,7 @@ def main() -> int:
             ("unchecked-proof", lambda d: d["inductive_proofs"][0].update({"status": "unchecked"}), ".status must be 'checked'", None),
             ("unproved-obligation", lambda d: d["inductive_proofs"][0].update({"obligations_proved": 6}), "unchecked proof obligations", None),
             ("admitted-proof", lambda d: d["inductive_proofs"][0].update({"admitted_obligations": 1}), "admitted_obligations must be 0", None),
-            ("missing-invariant", lambda d: d["properties"]["invariants"].pop(), "at least 33", None),
+            ("missing-invariant", lambda d: d["properties"]["invariants"].pop(), "at least 39", None),
             ("duplicate-invariant", lambda d: d["properties"]["invariants"].__setitem__(-1, copy.deepcopy(d["properties"]["invariants"][0])), "duplicate property", None),
             ("missing-temporal", lambda d: d["properties"]["temporal_properties"].pop(), "at least 5", None),
             ("missing-finite-area", lambda d: d["finite_model_checks"][0]["area_ids"].pop(), "do not match the TLC raw log", None),
