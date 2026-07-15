@@ -385,6 +385,55 @@ func TestReadyProofQuorumReplicationSurvivesOriginalCoordinatorCrash(t *testing.
 	}
 }
 
+func TestFencingLayersRejectFoldedLoadAndStaleBootstrapAuth(t *testing.T) {
+	f := newBootstrapTestFixture(t, 1, 1)
+	current := VoterIdentity{Replica: 1, Incarnation: 2}
+	f.identities[0] = current
+	f.node.voterIdentities[1] = current
+	f.node.localIdentity = current
+	f.node.localVoter.Identity = current
+	f.node.durableLocalVoter.Identity = current
+	f.store.LocalVoterState.Identity = current
+	plan := prepareBootstrapPlan(t, f)
+	ref := InstanceRef{Conf: 1, Replica: 1, Instance: 5}
+	rec := checkedRecord(InstanceRecord{
+		Ref: ref, Status: StatusCommitted, Seq: 3, Ballot: Ballot{Replica: 1},
+		Deps: f.node.q.deps(), Command: Command{Payload: []byte("chosen"), ConflictKeys: [][]byte{[]byte("k")}},
+	})
+	foldTestRef(&f.node.engine, rec)
+	if err := f.node.BeginVoterFence(plan); err != nil {
+		t.Fatal(err)
+	}
+	before := f.node.Ready()
+	late := Message{Type: MsgPrepare, From: 1, To: 1, Ref: ref, Ballot: Ballot{Number: 1, Replica: 1}}
+	if err := f.node.Step(late); !errors.Is(err, ErrBootstrapFenced) {
+		t.Fatalf("fenced folded message err=%v", err)
+	}
+	// Ordinary messages carry no incarnation. This folded prepare has no
+	// resident payload-absent instance, so it does not defer a record load;
+	// closed-config admission then rejects it.
+	afterFoldedMessage := f.node.Ready()
+	if len(f.node.pendingRecordLoads) != 0 || len(afterFoldedMessage.RecordLoads) != len(before.RecordLoads) {
+		t.Fatalf("fenced folded message queued record load: pending=%#v before=%#v after=%#v", f.node.pendingRecordLoads, before.RecordLoads, afterFoldedMessage.RecordLoads)
+	}
+	// Bootstrap control traffic is the separate authenticated-incarnation path.
+	message, err := BuildBootstrapMessage(BootstrapMessage{
+		Type: BootstrapMsgReadyQuery, Cluster: f.cluster, Plan: plan.Request.Plan,
+		From: 1, FromIncarnation: 1, To: 1, BaseID: plan.Request.Base.ID,
+		BaseDigest: plan.RequestDigest, Payload: []byte("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.node.StepBootstrapAuthenticated(message, 1, 1); !errors.Is(err, ErrInvalidBootstrapMessage) {
+		t.Fatalf("stale authenticated incarnation err=%v", err)
+	}
+	after := f.node.Ready()
+	if len(f.node.pendingRecordLoads) != 0 || len(after.RecordLoads) != len(afterFoldedMessage.RecordLoads) {
+		t.Fatalf("stale bootstrap sender queued record load: pending=%#v before=%#v after=%#v", f.node.pendingRecordLoads, afterFoldedMessage.RecordLoads, after.RecordLoads)
+	}
+}
+
 func TestBootstrapEnvelopeAndChunkValidationIsCanonicalBoundedAndIdempotent(t *testing.T) {
 	f := newBootstrapTestFixture(t, 1, 1)
 	plan := prepareBootstrapPlan(t, f)

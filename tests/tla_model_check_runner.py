@@ -43,6 +43,13 @@ FAST_PROFILE = (
     ("tla/EPaxosRawNodeRefinement.tla", "tla/EPaxosRawNodeRefinementTOQ.cfg"),
     ("tla/EPaxosRawNodeRefinement.tla", "tla/EPaxosRawNodeRefinementRecovery.cfg"),
     ("tla/EPaxosSparsePrefix.tla", "tla/EPaxosSparsePrefixSafety.cfg"),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencing.cfg"),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativeFoldWithoutDurable.cfg", "Error: Invariant FoldRequiresDurableExecuted is violated."),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativeFoldNoncontiguous.cfg", "Error: Invariant FoldedAbsentResident is violated."),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativeDuplicateApplyAfterLoad.cfg", "Error: Invariant LateMessageRematerializes is violated."),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativeAcceptStaleIncarnation.cfg", "Error: Invariant StaleIncarnationFenced is violated."),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativeAcceptWhileFenced.cfg", "Error: Invariant ClosedConfigFenced is violated."),
+    ("tla/EPaxosCompactionFencing.tla", "tla/EPaxosCompactionFencingNegativePayloadDropRewritesTuple.cfg", "Error: Invariant PayloadDropPreservesAuthority is violated."),
     *BOOTSTRAP_PROFILE,
 )
 
@@ -77,7 +84,6 @@ FAILURE_TEXT = (
     "deadlock reached",
     "invariant invariant",
     "is violated",
-    "model checking completed. no error has been found"  # handled as success before failure scan
 )
 
 
@@ -85,6 +91,7 @@ FAILURE_TEXT = (
 class Job:
     module: str
     config: str
+    expected_failure_marker: str | None = None
 
     @property
     def label(self) -> str:
@@ -190,11 +197,18 @@ async def run_job(job: Job, root: pathlib.Path, java: str, jar: pathlib.Path, ti
                 raise
             await reader
             text = "\n".join(output)
-            lowered = text.lower()
+            lower = text.lower()
             if process.returncode != 0:
+                if job.expected_failure_marker is not None:
+                    if process.returncode == 12 and job.expected_failure_marker in text:
+                        print(f"[{job.label}] expected invariant violation observed", flush=True)
+                        return None
+                    return f"{job.label}: expected exit 12 with marker {job.expected_failure_marker!r}, got exit {process.returncode}"
                 return f"{job.label}: Java exited {process.returncode}"
-            if "deadlock reached" in lowered or "is violated" in lowered or "invariant invariant" in lowered:
-                return f"{job.label}: TLC reported deadlock or invariant failure"
+            if job.expected_failure_marker is not None:
+                return f"{job.label}: expected invariant violation but TLC exited successfully"
+            if any(marker in lower for marker in FAILURE_TEXT):
+                return f"{job.label}: reported deadlock or invariant failure"
             if SUCCESS_TEXT not in text:
                 return f"{job.label}: missing explicit TLC success result"
             print(f"[{job.label}] SUCCESS", flush=True)

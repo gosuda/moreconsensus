@@ -31,6 +31,9 @@ elif mode == "deadlock":
     print("Error: Deadlock reached.", flush=True)
 elif mode == "invariant":
     print("Error: Invariant InvariantSafety is violated.", flush=True)
+elif mode == "expected-failure":
+    print(os.environ["FAKE_JAVA_EXPECTED_MARKER"], flush=True)
+    raise SystemExit(12)
 else:
     print("Model checking completed. No error has been found.", flush=True)
 '''
@@ -57,10 +60,20 @@ class TLAModelCheckRunnerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FAKE_JAVA_MODE": mode}, clear=False):
             return asyncio.run(run_job(Job("tla/Module.tla", "tla/Config.cfg"), self.root, str(self.java), self.jar, timeout, asyncio.Semaphore(1)))
 
+    def run_expected_failure(self, marker, mode="expected-failure"):
+        environment = {"FAKE_JAVA_MODE": mode}
+        if mode == "expected-failure":
+            environment["FAKE_JAVA_EXPECTED_MARKER"] = marker
+        with mock.patch.dict(os.environ, environment, clear=False):
+            return asyncio.run(run_job(Job("tla/Module.tla", "tla/Config.cfg", marker), self.root, str(self.java), self.jar, 2, asyncio.Semaphore(1)))
+
     def test_fast_profile_is_exact_and_full_is_nonempty(self):
         fast = select_profile("fast")
-        self.assertEqual(len(fast), 23)
-        self.assertEqual(tuple((job.module, job.config) for job in fast), FAST_PROFILE)
+        self.assertEqual(len(fast), 31)
+        self.assertEqual(
+            tuple((job.module, job.config, job.expected_failure_marker) for job in fast),
+            tuple(entry if len(entry) == 3 else (*entry, None) for entry in FAST_PROFILE),
+        )
         self.assertGreater(len(select_profile("full")), len(fast))
         with self.assertRaises(ValueError):
             select_profile("empty")
@@ -85,6 +98,11 @@ class TLAModelCheckRunnerTest(unittest.TestCase):
         for mode in ("deadlock", "invariant"):
             with self.subTest(mode=mode):
                 self.assertIn("deadlock or invariant failure", self.run_one(mode))
+
+    def test_expected_mutant_requires_exit_12_and_exact_marker(self):
+        marker = "Error: Invariant MutantInvariant is violated."
+        self.assertIsNone(self.run_expected_failure(marker))
+        self.assertIn("expected invariant violation", self.run_expected_failure(marker, "success"))
 
     def test_overall_timeout_cancels_jobs_and_cleans_metadirs(self):
         with mock.patch.dict(os.environ, {"FAKE_JAVA_MODE": "sleep"}, clear=False):

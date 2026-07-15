@@ -132,3 +132,14 @@ The inventory and contracts prevent silent API drift. They do not replay TLC act
 ## Release decision
 
 The correspondence evidence supports bounded implementation claims only. The authoritative decision is **No-go.** while the single formal release row remains open and the aggregate verification gates are green.
+
+## Certified compaction and fencing requirements
+
+| Requirement | Model invariant | Negative mutant config | Go anchor | Go test |
+| --- | --- | --- | --- | --- |
+| Fold watermark advances only over a contiguous durably executed prefix | `FoldRequiresDurableExecuted` | `tla/EPaxosCompactionFencingNegativeFoldWithoutDurable.cfg` | `epaxos/retire.go:retireExecuted` | `TestRetireFoldsBeyondRetention` |
+| Folded instances are absent from resident state and remain durable | `FoldedAbsentResident` | `tla/EPaxosCompactionFencingNegativeFoldNoncontiguous.cfg` | `epaxos/conflict_engine.go:foldRecord`, `epaxos/conflict_engine.go:advanceFold` | `TestRetireFoldsBeyondRetention` |
+| A late message reloads its durable decision once before replay | `LateMessageRematerializes` | `tla/EPaxosCompactionFencingNegativeDuplicateApplyAfterLoad.cfg` | `epaxos/node.go:needsRecordLoad`, `epaxos/node.go:ProvideRecordLoad`, `epaxos/node.go:maybeRefoldLoaded` | `TestRecordLoadFoundReplaysDeferred` |
+| Dropping a payload preserves checksum authority and the decided tuple | `PayloadDropPreservesAuthority` | `tla/EPaxosCompactionFencingNegativePayloadDropRewritesTuple.cfg` | `epaxos/node.go:dropPayload` | `TestRetirePayloadDropPreservesChecksum` |
+| Layered admission: stale bootstrap identity is rejected (`bootstrap.go:2554-2556`); separately, a folded ordinary prepare does not defer a payload load (`node.go:2071-2074`) and closed-config admission rejects it (`bootstrap.go:2871-2874`) | `StaleIncarnationFenced` | `tla/EPaxosCompactionFencingNegativeAcceptStaleIncarnation.cfg` | `epaxos/bootstrap.go:StepBootstrapAuthenticated`, `epaxos/bootstrap.go:admitWhileFenced`, `epaxos/node.go:Step` | `TestFencingLayersRejectFoldedLoadAndStaleBootstrapAuth` |
+| Non-control traffic to a fenced configuration is rejected without loading folded state | `ClosedConfigFenced` | `tla/EPaxosCompactionFencingNegativeAcceptWhileFenced.cfg` | `epaxos/bootstrap.go:admitWhileFenced` | `TestFenceRejectsOrdinaryPreAcceptAcceptPrepareAboveEveryLaneFrontier` |
