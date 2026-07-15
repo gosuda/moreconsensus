@@ -215,10 +215,13 @@ var internalDispatchContracts = map[string]rawNodeMethodContract{
 	"advanceFold":    {Mutates: true, Models: []string{"EPaxosRetirePrefix.tla", "EPaxosCompactionFencing.tla"}, Gap: "conflict-engine fold watermark advance is resident-state only; certified by the compaction models"},
 
 	// Certified-checkpoint persistence and compaction paths.
-	"checkpointSnapshotAdvanced":   {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint durability acknowledgement is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
-	"compactCheckpointMetadata":    {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "certified checkpoint metadata compaction is below the current RawNode trace abstraction"},
-	"enqueueLatestCheckpointOffer": {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint handoff traffic is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
-	"handleCheckpointControl":      {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint vote, certificate, and handoff traffic is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"checkpointSnapshotAdvanced":         {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint durability acknowledgement is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"compactCheckpointMetadata":          {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "certified checkpoint metadata compaction is below the current RawNode trace abstraction"},
+	"retryCheckpointControl":             {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "periodic prepared-vote retry is covered by checkpoint partition-heal tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointCertificate": {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint certificate handoff is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointOffer":       {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint offer handoff is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
+	"enqueueLatestCheckpointControl":     {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint certificate and offer enqueueing is covered by checkpoint partition-heal tests; no RawNode refinement-trace action yet"},
+	"handleCheckpointControl":            {Mutates: true, Models: []string{"EPaxosCertifiedCompaction.tla"}, Gap: "checkpoint vote, certificate, and handoff traffic is covered by checkpoint lifecycle tests; no RawNode refinement-trace action yet"},
 
 	// Folded-record re-materialization path.
 	"needsRecordLoad":                       {},
