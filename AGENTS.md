@@ -1,14 +1,11 @@
 # Agent Instructions
 
-Run these commands before completing relevant changes:
+Before completing relevant changes, run these non-overlapping gates; `tests/ci.sh`
+covers race, integration, and formal checks, but not vet or lint:
 
 ```sh
-go test -race -count=1 ./...
 go vet ./...
 golangci-lint run ./...
 (cd examples/kv && golangci-lint run ./...)
 tests/ci.sh
 ```
-
-Per-task goals live in `.agent-tasks/<task-id>/GOALS.md`.
-Richer project conventions are init's job.
