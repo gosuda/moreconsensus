@@ -148,3 +148,262 @@ Restart validates the checkpoint and certificate, installs the application snaps
 Logical resources, not physical MVCC `key/timestamp` suffixes, belong in footprints. Point reads, writes, deletes, and intents use a logical point; scans, delete-ranges, and range tombstones use a half-open span. Cross-resource invariants use deterministic namespaces such as `row/`, `index/`, `unique/`, `txn/`, and `schema/` plus sentinel points. Group maintenance uses `All`, which covers one EPaxos group rather than an entire database.
 
 MVCC timestamps, intents, transaction records, timestamp caches, retries, GC thresholds, and closed timestamps remain application state. A write applied at timestamp 10 may be visible to a later read at timestamp 10; only a read that already observed the old value at 10 forces an overlapping later write above 10 or a retry.
+
+## Implementation blueprint
+
+This section is an embedding blueprint, not a second protocol specification. The protocol decisions remain inside `RawNode`; the embedding supplies durable effects, transport, application execution, clock samples, and lifecycle control. `examples/kv` is the executable reference for these boundaries.
+
+### 1. Separate the five ownership domains
+
+Build one single-threaded event loop per replica around these components:
+
+1. **Protocol core:** one `RawNode`. Only its event-loop goroutine calls `Tick`, `ProcessTOQ`, `Step`, `Propose`, `Ready`, `ProvideRecordLoad`, `ProvideCheckpoint`, and `Advance`.
+2. **Protocol storage:** implements `Storage` and atomically stores hard state, configuration history, bootstrap state, voter identity, frontier updates, allocator floors, instance records, checkpoint metadata, and compaction tombstones.
+3. **Application storage:** applies `Ready.Apply` in order and atomically stores the command result/dedup record with each application mutation.
+4. **Transport:** carries authenticated serialized protocol messages. It may retry, duplicate, delay, and reorder messages, but must not mutate them.
+5. **Clock and scheduler:** produces logical ticks and, only when TOQ is enabled, monotonic externally sampled time plus operational clock-health decisions.
+
+Do not let transport or application workers call the core concurrently. Feed their completions back into the replica event loop. This gives each input a deterministic before/after relationship and makes crash injection reproducible.
+
+### 2. Create durable schemas before constructing a node
+
+Use separate key namespaces or column families for:
+
+| Namespace | Key | Value and invariant |
+| --- | --- | --- |
+| Hard state | singleton | Complete `HardState`; never regress configuration id, tick, or voter history. |
+| Configuration history | `ConfID` | Canonical sorted voter set and associated history metadata. Old instances retain their original configuration. |
+| Instance record | `(ConfID, ReplicaID, InstanceNum)` | Current authenticated `InstanceRecord`. A replacement must obey ballot and status monotonicity. |
+| Bootstrap/voter state | protocol-defined id | `BootstrapRecord`, `LocalVoterState`, and voter incarnations, committed in the same durability phase as related protocol state. |
+| Frontier | `(ConfID, ReplicaID)` | Durable executed/committed frontier updates. A frontier only moves forward. |
+| Allocator | singleton | Highest acknowledged local allocator floor. Never reuse an instance number after restart. |
+| Checkpoint | checkpoint id | Descriptor, snapshot handle, application digest, quorum certificate, and compacted frontier. |
+| Application result | `CommandID` | Command digest plus full response or durable result handle. Reusing an id with different command bytes fails closed. |
+
+Implement `Storage.InitialState`, `LoadCheckpoint`, `LoadInstances`, and `LoadInstance` directly over these schemas. Startup must first validate the checkpoint and install its application snapshot, then construct `RawNode`, which loads authenticated protocol records strictly after the compacted frontier. Corruption, contradictory history, allocator regression, or missing data above the compacted frontier is a startup error, not an empty-state fallback.
+
+### 3. Configure and start a replica
+
+At minimum, configure a stable local `ReplicaID`, sorted voters, a stable cluster identity, voter incarnations, storage, retry ticks, and recovery ticks. Keep the same identity and durable store across an ordinary crash/restart. A process replacement with a new incarnation requires the repository's certified bootstrap flow; changing only the numeric id is unsafe.
+
+```go
+node, err := epaxos.NewRawNode(epaxos.Config{
+    ID:            localID,
+    Voters:        voters,
+    Cluster:       clusterID,
+    LocalIdentity: localIdentity,
+    VoterIdentities: identities,
+    Storage:       protocolStore,
+    RetryTicks:    retryTicks,
+    RecoveryTicks: recoveryTicks,
+})
+if err != nil {
+    return err // fail startup; do not silently initialize an empty node
+}
+```
+
+Drain the initial `Ready` before accepting client traffic. That first batch may contain complete hard state or bootstrap work that must be durable before messages are visible.
+
+### 4. Implement the Ready loop as the only effect boundary
+
+The following shape is intentionally serial. Production code may pipeline storage and transport internally, but it must preserve these phase barriers and acknowledge only completed prefixes.
+
+```go
+func drain(node *epaxos.RawNode) error {
+    for node.HasReady() {
+        rd := node.Ready() // frozen and byte-stable until Advance
+
+        // Phase 1: atomically persist every protocol mutation in rd.
+        if err := protocolStore.ApplyReady(rd); err != nil {
+            return err // keep rd frozen; retry the same batch
+        }
+
+        // Phase 2: only durable protocol decisions may leave the process.
+        if err := transport.Enqueue(rd.Messages, rd.BootstrapMessages); err != nil {
+            return err // transport enqueue must be idempotent
+        }
+
+        // Phase 3: materialize and verify an offered received snapshot.
+        if rd.Snapshot != nil {
+            if err := application.InstallAndVerify(*rd.Snapshot); err != nil {
+                return err
+            }
+        }
+
+        // Phase 4: preserve this exact order. ApplyOnce stores effect and result.
+        for _, command := range rd.Apply {
+            if err := application.ApplyOnce(command); err != nil {
+                return err
+            }
+        }
+
+        // Phase 5: answer explicit storage/application handshakes.
+        for _, ref := range rd.RecordLoads {
+            record, found, err := protocolStore.LoadInstance(ref)
+            if err != nil {
+                return err
+            }
+            if err := node.ProvideRecordLoad(epaxos.RecordLoadResult{
+                Ref: ref, Record: record, Found: found,
+            }); err != nil {
+                return err
+            }
+        }
+        if rd.Checkpoint != nil {
+            result, err := application.MaterializeCheckpoint(*rd.Checkpoint)
+            if err != nil {
+                return err
+            }
+            if err := node.ProvideCheckpoint(result); err != nil {
+                return err
+            }
+        }
+
+        // Phase 6: Compact has already been authorized by a durable certificate.
+        // Its metadata/tombstones and record deletion must be one atomic write.
+        if err := protocolStore.CompleteCompaction(rd.Compact); err != nil {
+            return err
+        }
+
+        if err := node.Advance(rd); err != nil {
+            return err // a mismatch is an embedding bug
+        }
+    }
+    return nil
+}
+```
+
+If one storage transaction already handles protocol persistence and authorized compaction, `CompleteCompaction` is part of phase 1 rather than a second write. The invariant is atomic tombstone advancement plus deletion, not the function split in the pseudocode. Never call `Advance` after a partial apply, failed snapshot install, unserviced required load, or failed checkpoint result.
+
+### 5. Make client commands deterministic and complete
+
+Encode a versioned payload containing every value needed to apply the command. Assign a nonzero `CommandID{Client, Sequence}` before retrying. Compute the canonical footprint from **logical resources**, not storage-engine keys. Compute `CycleKey` from stable business data when deterministic cycle order should be meaningful; otherwise use a stable command-derived value.
+
+For an atomic financial transfer, one command should contain source, destination, amount, currency, and business id. Its footprint should conservatively include:
+
+```text
+acct/<source>
+acct/<destination>
+dedup/<client>/<sequence>
+txn/<client>/<sequence>
+```
+
+The apply transaction validates the source balance, decides success or decline deterministically, mutates both balances or neither, writes the transaction/result row, and writes the dedup record atomically. Splitting debit and credit into separate EPaxos commands would expose an intermediate balance and would require an application transaction protocol outside EPaxos.
+
+Every state or response difference must be represented by a conflict resource. Include unique indexes, idempotency rows, inventory counters, result rows, secondary indexes, range sentinels, and schema/version guards when they affect outcomes. Under-declaration is a safety bug. Over-declaration is safe but reduces concurrency.
+
+### 6. Route clients for locality without changing voters
+
+Client routing and consensus membership are different layers. A five-node financial service can assign each account to an adjacent home pair and choose the least-loaded healthy home as the command owner. That reduces the client-to-coordinator path and balances owner lanes. The resulting `PreAccept`, `Accept`, recovery, and commit traffic still targets the instance's full pinned voter configuration; the home pair is not a two-node consensus group.
+
+On timeout, retry the same command id and bytes against either home. Never create a new id merely because the first coordinator reply was lost. The durable application-result table turns a repeated execution into the original response and rejects same-id/different-command reuse.
+
+### 7. Understand the normal proposal state machine
+
+The owner allocates `(local replica, next instance, current configuration)`, computes local attributes, persists `PRE-ACCEPTED`, and broadcasts `PreAccept`. A receiver:
+
+1. Validates cluster/configuration identity, sender incarnation, ballot, checksum, command encoding, timing domain, and canonical footprint.
+2. Finds locally known conflicting instances through the point/span/global conflict indexes.
+3. Builds the latest dependency per voter lane and sets `Seq` above the maximum dependency sequence.
+4. Persists the resulting pre-accepted tuple before sending `PreAcceptResp`.
+
+The optimized fast decision is not "no conflicts exist anywhere." Treat it as this predicate:
+
+```text
+candidate covers the owner's durable local attributes
+AND candidate is on the initial owner ballot
+AND every counted remote reply has the exact candidate (Seq, Deps)
+AND every counted vote carries the fast-path-eligible marker
+AND counted votes form the configured optimized fast quorum
+AND the union of their committed-prefix evidence covers every nonzero Deps slot
+```
+
+For odd `N = 2F + 1`, the optimized quorum is `F + floor((F + 1) / 2)`, including the owner. The quorum-intersection proof means a later recovery quorum cannot choose an incompatible history without intersecting the witnesses that persisted this candidate. Exact tuple agreement prevents the coordinator from mixing mutually incompatible reply fragments. Committed-prefix evidence proves that compact dependency entries do not hide an unresolved earlier instance in that lane.
+
+The owner may adopt a reply candidate that monotonically covers its local tuple; the other counted remote replies must match that candidate exactly before commit. If the predicate cannot become true, merge the observed attributes, persist `ACCEPTED`, send `Accept`, and commit after a slow majority accepts that exact value.
+
+### 8. Implement recovery as value selection, not reproposal
+
+Any deterministic recovery coordinator may recover a stalled owner lane. Raise and persist a promise ballot, collect a slow quorum of `PrepareResp`, and choose in this order:
+
+1. A committed value, if any response has one.
+2. The accepted tuple with the highest durable `RecordBallot`.
+3. A matching fast-path-eligible pre-accepted candidate with the required fast/slow intersection evidence, completed through `TryPreAccept`.
+4. A conservative merge of pre-accepted evidence, completed through slow `Accept`.
+5. A recovery no-op only when the quorum proves that no value exists.
+
+Do not compare the prepare promise ballot as if it were a value ballot; `RecordBallot` identifies the accepted value. Preserve sender-attributed `AcceptEvidence`. `TryPreAccept` must reject stale ballots, unordered conflicts, and stale dependencies. Ambiguous, incomplete, timed-out, or contradictory evidence falls back to slow `Accept`; it never becomes an optimistic commit.
+
+### 9. Execute the dependency graph deterministically
+
+Execution is a graph problem over committed, not-yet-executed instances. Define an edge `A -> B` when `A` depends on `B`, so `A` must wait for `B`. Resolve configuration slots with the configuration pinned in `A.Ref.Conf`.
+
+1. Start from committed, unexecuted resident records and follow dependency references.
+2. Ignore a dependency already covered by a durable executed frontier.
+3. Request folded records through `Ready.RecordLoads`; never fabricate a missing dependency.
+4. Keep a component blocked if a true external dependency is not committed/executed or a known conflicting pre-accepted/accepted instance can still determine its order.
+5. Apply chain pruning before SCC discovery: an edge from `A` to `B` can be pruned only under the implemented rule that `B` already depends on `A` and has the higher sequence number.
+6. Run Tarjan's algorithm over the remaining graph:
+   - assign `index[v] = lowlink[v] = nextIndex`;
+   - push `v` on the active stack;
+   - DFS each edge, propagating child lowlinks;
+   - for an edge to an active vertex, lower `lowlink[v]` to that vertex's index;
+   - when `lowlink[v] == index[v]`, pop through `v` to produce one SCC.
+7. Build the SCC condensation DAG. It is acyclic. An SCC is ready only when every outgoing dependency reaches an executed instance or an SCC already selected earlier in this execution pass.
+8. Within one ready SCC, sort by ascending `(Seq, CycleKey, InstanceRef)` and emit the whole component in that order.
+9. Mark the emitted prefix durable through `Ready`/`Advance`, then repeat until no component is ready.
+
+Tarjan discovery and condensation are `O(V + E)` before the deterministic per-SCC sorts. Never execute graph vertices in hash-map iteration order, sort by `CycleKey` before `Seq`, execute only part of a cycle, or parallelize one `Ready.Apply` slice.
+
+### 10. Integrate TOQ only with an operational clock contract
+
+Enable `Config.TOQ` only after the deployment provides:
+
+- monotonic external time samples passed to `ProcessTOQ(now)`;
+- clock synchronization monitoring and a policy that removes or quarantines unhealthy members;
+- a conservative per-receiver `TOQOneWayDelay` equal to network delay plus clock-skew/synchronization uncertainty;
+- a valid sync group for each live configuration;
+- safe handling of rollback, overflow, and unavailable runtime configuration errors.
+
+TOQ sends `PreAccept` with `Seq=0`, empty dependencies, `TOQ=true`, and a computed `ProcessAt`. The owner and receivers delay local dependency assignment until the relevant processing time. The owner's pending record is a hard barrier: early replies may be retained, but they cannot cause commit before local `ProcessAt` clears durably. Due work is ordered by `ProcessAt`, instance reference, then sender. The core consumes samples and bounds; it does not synchronize clocks or measure delay.
+
+### 11. Specify transport behavior explicitly
+
+Frame every message with protocol version, cluster identity, sender/receiver replica and incarnation, pinned configuration, message type, ballot, instance reference, authenticated value fields, and checksum. Enforce size limits before allocation. Use bounded queues and backpressure; dropping every retry indefinitely is a liveness failure.
+
+Delivery is at-least-once. Duplicate and reordered messages are expected. A stale or duplicate message may return `ErrMessageRejected`; treat that as a protocol-level drop, not process corruption. Other validation errors should be observable and fail closed. Never send a message from `Ready` before the records in the same batch are durable.
+
+### 12. Crash, restart, and compaction checklist
+
+Before declaring restart support complete, verify all of the following:
+
+- Restart reconstructs the same cluster identity, local voter incarnation, configuration history, allocator floor, checkpoint, and records.
+- A crash before persistence emits no message; a crash after persistence but before send can resend safely.
+- A crash after send but before `Advance` can replay the identical `Ready`.
+- A crash after application mutation but before `Advance` returns the stored result without applying the effect twice.
+- Folded records are loaded only through the `RecordLoads` handshake.
+- A compacted reference is answered by certified checkpoint/frontier evidence and is never recreated.
+- Snapshot bytes are materialized and digest-checked before the protocol consumes the snapshot.
+- Protocol tombstones and physical record deletion commit atomically.
+
+### 13. Verification matrix for a new embedding
+
+Run deterministic scenarios before load testing:
+
+| Area | Required scenario and assertion |
+| --- | --- |
+| Fast path | Independent commands commit after the configured matching fast quorum; all replicas apply the same bytes. |
+| Conflict | Concurrent overlapping commands converge through fast or slow paths and produce one deterministic order. |
+| Atomic command | Inject a crash at every persistence/apply boundary; debit and credit are both visible or both absent, and the response is stable. |
+| Duplicate client retry | Retry identical id/bytes at another coordinator; one effect and one durable response result. Different bytes with the same id fail closed. |
+| Recovery | Crash the owner after pre-accept, after accept, and after commit send; a non-owner recovers the same value. |
+| Message faults | Duplicate, drop, delay, and reorder each message class; safety holds and a healthy quorum eventually progresses. |
+| Quorum boundary | For five voters, zero, one, and two unavailable nodes retain quorum progress; three unavailable nodes do not commit. |
+| Restart | Restart every replica from durable storage at every Ready boundary and compare final records, apply order, and application digest. |
+| Graph | Cover chains, diamonds, cycles, blocked external dependencies, chain pruning, and deterministic SCC order. |
+| Record folding | Force resident limits, service loads, restart, and compare behavior with an unbounded-resident run. |
+| Membership | Add/remove voters with old in-flight instances; old refs use old pinned quorums and new refs use the successor configuration. |
+| Checkpoint | Crash before preparation, after certification, and during atomic compaction; no represented command is lost or applied twice. |
+| TOQ | Exercise early replies, equal timestamps, conservative delays, clock rollback, configuration refresh, and missing sync-group data. |
+
+Then run race detection, randomized fault campaigns, formal/refinement checks, and long-running resource tests. Measure command latency by path, coordinator distribution, retries, recovery starts, resident/folded records, Ready queue depth, and application-result retention. Throughput degradation under faults should be explained by remaining coordinators, quorum availability, and link delay; a graph alone is not correctness evidence.

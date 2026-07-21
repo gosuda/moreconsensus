@@ -464,7 +464,7 @@ select:disabled {
 .protocol-grid {
   display: grid;
   min-height: calc(100vh - 175px);
-  grid-template-columns: 280px minmax(460px, 1fr) 340px;
+  grid-template-columns: minmax(360px, 420px) minmax(560px, 1fr) 340px;
   align-items: stretch;
 }
 
@@ -498,6 +498,138 @@ select:disabled {
   color: #bbc7cf;
   font-size: 14px;
   line-height: 1.55;
+}
+
+.learning-content > h2 {
+  margin-top: 8px;
+  font-size: clamp(22px, 2vw, 31px);
+  line-height: 1.08;
+}
+
+.learning-summary {
+  margin: 14px 0 18px;
+  color: #d4dde3;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.current-transition,
+.learning-section,
+.bootstrap-panel,
+.route-preview,
+.throughput-chart {
+  margin: 12px 0;
+  padding: 13px;
+  border: 1px solid var(--border);
+  background: rgba(6, 8, 13, 0.48);
+}
+
+.current-transition {
+  border-color: rgba(98, 223, 243, 0.35);
+}
+
+.current-transition strong,
+.route-preview strong,
+.bootstrap-panel strong,
+.throughput-chart figcaption strong {
+  display: block;
+  margin-top: 7px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.current-transition p,
+.learning-section p,
+.route-preview p,
+.bootstrap-panel p,
+.chart-note {
+  margin: 8px 0 0;
+  color: #b8c5ce;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.learning-section h3 {
+  margin: 0;
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.09em;
+}
+
+.learning-section.invariant {
+  border-color: rgba(112, 233, 154, 0.32);
+}
+
+.learning-section.invariant h3 {
+  color: var(--green);
+}
+
+.algorithm-steps {
+  display: grid;
+  gap: 8px;
+  margin: 11px 0 0;
+  padding-left: 22px;
+  color: #c7d2d9;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.algorithm-steps li::marker {
+  color: var(--cyan);
+  font-family: var(--mono);
+}
+
+.throughput-chart {
+  margin-top: 18px;
+}
+
+.throughput-chart figcaption {
+  display: grid;
+  gap: 3px;
+}
+
+.throughput-chart figcaption span:last-child {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.throughput-bars {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.throughput-row {
+  display: grid;
+  grid-template-columns: 50px minmax(70px, 1fr) 70px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.throughput-row > strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.throughput-track {
+  height: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.throughput-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--cyan), var(--green));
+  box-shadow: 0 0 12px rgba(98, 223, 243, 0.22);
+}
+
+.chart-note {
+  font-size: 9px;
 }
 
 .chapter-list {
@@ -650,6 +782,29 @@ select:disabled {
   background: rgba(28, 14, 19, 0.96);
 }
 
+.replica-card.crashed {
+  border-color: var(--red);
+  background: repeating-linear-gradient(-45deg, rgba(255, 99, 112, 0.08) 0 6px, rgba(28, 14, 19, 0.96) 6px 12px);
+}
+
+.replica-card.offline {
+  border-color: #3a4651;
+  opacity: 0.72;
+  filter: saturate(0.45);
+}
+
+.replica-identity {
+  display: grid;
+  gap: 1px;
+}
+
+.replica-region {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 7px;
+  letter-spacing: 0.04em;
+}
+
 .replica-card-header,
 .instance-summary,
 .kv-summary {
@@ -673,6 +828,11 @@ select:disabled {
 }
 
 .replica-status.paused {
+  color: var(--red);
+}
+
+.replica-status.crashed,
+.replica-status.offline {
   color: var(--red);
 }
 
@@ -721,6 +881,23 @@ select:disabled {
   color: var(--green);
   font-family: var(--mono);
   font-size: 9px;
+}
+
+.hammer-button {
+  position: relative;
+  padding-left: 24px;
+}
+
+.hammer-button::before {
+  position: absolute;
+  top: 50%;
+  left: 9px;
+  width: 9px;
+  height: 4px;
+  transform: translateY(-50%) rotate(-38deg);
+  background: var(--red);
+  box-shadow: -4px -2px 0 -1px var(--red), 6px 4px 0 -1px var(--red);
+  content: "";
 }
 
 .packet {
@@ -779,7 +956,7 @@ select:disabled {
 
 .message-row {
   display: grid;
-  grid-template-columns: 64px minmax(110px, 1fr) 74px minmax(90px, 1fr) auto;
+  grid-template-columns: 54px minmax(92px, 1fr) 70px minmax(82px, 1fr) minmax(85px, auto) minmax(110px, auto) auto;
   align-items: center;
   gap: 8px;
   padding: 7px 8px;
@@ -808,6 +985,14 @@ select:disabled {
 .message-type.try-pre-accept,
 .message-type.try-pre-accept-resp { color: var(--violet); }
 .message-type.commit { color: var(--green); }
+
+.message-timing,
+.link-rtt,
+.network-location {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 9px;
+}
 
 .message-actions,
 .inline-actions,
@@ -1036,10 +1221,30 @@ select:disabled {
 .event-kind.prepare,
 .event-kind.recovery { color: var(--violet); }
 
+.event-kind.crashed,
+.event-kind.bootstrapped,
+.event-kind.restarted,
+.event-kind.network-advanced {
+  color: var(--violet);
+}
+
 .lab-form {
   display: grid;
   gap: 11px;
   margin-top: 16px;
+}
+
+.finance-form {
+  padding-bottom: 4px;
+}
+
+.bootstrap-panel .button {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.route-preview strong {
+  color: var(--cyan);
 }
 
 .field {
@@ -1218,7 +1423,7 @@ select:disabled {
 
 @media (max-width: 1099px) {
   .protocol-grid {
-    grid-template-columns: 260px minmax(0, 1fr);
+    grid-template-columns: minmax(330px, 390px) minmax(0, 1fr);
   }
 
   .inspector {
@@ -1359,19 +1564,30 @@ select:disabled {
   }
 
   .topology {
-    min-height: 390px;
+    min-height: 480px;
   }
 
   .replica-card {
     width: 116px;
-    min-height: 74px;
+    min-height: 92px;
     padding: 8px;
   }
 
   .replica-card .replica-tick,
   .replica-card .instance-list,
-  .replica-card .kv-summary {
+  .replica-card .kv-summary > span:first-child {
     display: none;
+  }
+
+  .replica-card .kv-summary {
+    margin-top: 5px;
+  }
+
+  .replica-card .kv-summary .button {
+    width: 100%;
+    min-height: 26px;
+    padding-block: 4px;
+    font-size: 8px;
   }
 
   .replica-card::after {
@@ -1393,7 +1609,8 @@ select:disabled {
   }
 
   .message-row .message-ref,
-  .message-row .message-deps {
+  .message-row .message-deps,
+  .message-row .message-timing {
     display: none;
   }
 

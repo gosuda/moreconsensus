@@ -4,6 +4,7 @@ import { animateAfterFrame, animateBeforeFrame, render, setCoreReady } from "./v
 const state = {
   dispatch: null,
   catalog: [],
+  throughput: [],
   mode: "landing",
   trace: null,
   frame: null,
@@ -22,6 +23,7 @@ const state = {
   eventLog: [],
   labFrames: new Map(),
   labDraft: { coordinator: "1", key: "cart", value: "reserved" },
+  financeDraft: { from: "northwind", to: "contoso", amount: "2500.00" },
   chain: Promise.resolve(),
   timer: 0,
 };
@@ -38,6 +40,7 @@ async function initialize() {
   try {
     state.dispatch = await startCore(showBlockingError);
     state.catalog = state.dispatch({ op: "catalog" }).scenarios;
+    state.throughput = state.dispatch({ op: "performance" }).throughput;
     setCoreReady();
     await openRoute({ replaceInvalid: true });
   } catch {
@@ -58,6 +61,9 @@ function installEvents() {
     if (event.target.matches('[data-role="lab-form"]')) {
       event.preventDefault();
       void propose();
+    } else if (event.target.matches('[data-role="finance-form"]')) {
+      event.preventDefault();
+      void transfer();
     }
   });
 
@@ -65,12 +71,17 @@ function installEvents() {
     const field = event.target.dataset.field;
     if (field === "key" || field === "value" || field === "coordinator") {
       state.labDraft[field] = event.target.value;
+    } else if (field === "from" || field === "to" || field === "amount") {
+      state.financeDraft[field] = event.target.value;
     }
   });
 
   document.addEventListener("change", (event) => {
-    if (event.target.dataset.field === "coordinator") {
+    const field = event.target.dataset.field;
+    if (field === "coordinator") {
       state.labDraft.coordinator = event.target.value;
+    } else if (field === "from" || field === "to") {
+      state.financeDraft[field] = event.target.value;
     }
   });
 
@@ -88,21 +99,21 @@ function installEvents() {
       event.preventDefault();
       if (state.mode === "tour") {
         toggleTourPlayback();
-      } else if (state.mode === "lab") {
+      } else if (isSessionMode()) {
         toggleLabRun();
       }
     } else if (key === "n") {
       event.preventDefault();
       if (state.mode === "tour") {
         void goToTourFrame(state.frameIndex + 1);
-      } else if (state.mode === "lab") {
+      } else if (isSessionMode()) {
         void seekLab(state.frame.index + 1);
       }
     } else if (key === "b") {
       event.preventDefault();
       if (state.mode === "tour") {
         void goToTourFrame(state.frameIndex - 1);
-      } else if (state.mode === "lab") {
+      } else if (isSessionMode()) {
         void seekLab(state.frame.index - 1);
       }
     } else if (key === "r") {
@@ -111,6 +122,8 @@ function installEvents() {
         void goToTourFrame(0);
       } else if (state.mode === "lab") {
         void resetLab(state.frame.snapshot.cluster.size, true);
+      } else if (state.mode === "finance") {
+        void resetFinance(true);
       }
     }
   });
@@ -136,14 +149,15 @@ async function handleAction(action, control) {
       goHome();
       break;
     case "start-tour":
-      await openTour("parallel", { autoplay: true, updateURL: true });
+      await openTour("parallel", { autoplay: false, updateURL: true });
       break;
     case "open-lab":
       await resetLab(3, false);
       break;
-    case "open-scenario":
-      await openTour(control.dataset.scenario, { autoplay: false, updateURL: true });
+    case "open-finance":
+      await resetFinance(false);
       break;
+    case "open-scenario":
     case "next-chapter":
       await openTour(control.dataset.scenario, { autoplay: false, updateURL: true });
       break;
@@ -184,6 +198,26 @@ async function handleAction(action, control) {
     case "propose":
       await propose();
       break;
+    case "transfer":
+      await transfer();
+      break;
+    case "bootstrap-node":
+      await dispatchLab({ kind: "bootstrap", replica: Number(control.dataset.replica) });
+      break;
+    case "bootstrap-all":
+      for (const replica of state.frame.snapshot.replicas.filter((item) => !item.booted)) {
+        await dispatchLab({ kind: "bootstrap", replica: replica.id });
+      }
+      break;
+    case "crash-node":
+      await dispatchLab({ kind: "crash", replica: Number(control.dataset.replica) });
+      break;
+    case "restart-node":
+      await dispatchLab({ kind: "restart", replica: Number(control.dataset.replica) });
+      break;
+    case "advance-network":
+      await dispatchLab({ kind: "advance-network", milliseconds: Number(control.dataset.milliseconds || 1) });
+      break;
     case "deliver-next":
       await dispatchLab({ kind: "deliver-next" });
       break;
@@ -218,7 +252,11 @@ async function handleAction(action, control) {
       await seekLab(state.frame.index + 1);
       break;
     case "reset-lab":
-      await resetLab(state.frame.snapshot.cluster.size, true);
+      if (state.mode === "finance") {
+        await resetFinance(true);
+      } else {
+        await resetLab(state.frame.snapshot.cluster.size, true);
+      }
       break;
     case "share":
       await shareCurrentURL();
@@ -238,7 +276,7 @@ async function openRoute({ replaceInvalid }) {
     goHome(false);
     return;
   }
-  if (mode === "tour") {
+  if (mode === "learn") {
     const scenario = params.get("scenario");
     if (state.catalog.some((item) => item.id === scenario) && params.size === 2) {
       await openTour(scenario, { autoplay: false, updateURL: false });
@@ -251,6 +289,10 @@ async function openRoute({ replaceInvalid }) {
       await resetLab(size, false, false);
       return;
     }
+  }
+  if (mode === "finance" && params.size === 1) {
+    await resetFinance(false, false);
+    return;
   }
   goHome(replaceInvalid);
 }
@@ -269,7 +311,7 @@ async function openTour(scenario, { autoplay, updateURL }) {
     state.error = "";
     state.inspectorOpen = false;
     if (updateURL) {
-      setURL({ mode: "tour", scenario });
+      setURL({ mode: "learn", scenario });
     }
     render(state);
   });
@@ -362,6 +404,37 @@ async function resetLab(size, confirmIfNeeded, updateURL = true) {
   });
 }
 
+async function resetFinance(confirmIfNeeded, updateURL = true) {
+  if (state.busy) {
+    return;
+  }
+  const nonempty = state.mode === "finance" && state.frame?.index > 0;
+  if (confirmIfNeeded && nonempty && !window.confirm("Start a new financial simulation? This clears the current trace.")) {
+    return;
+  }
+  stopPlayback();
+  await runSerialized(async () => {
+    const result = state.dispatch({ op: "finance.reset" });
+    state.mode = "finance";
+    state.trace = null;
+    state.frame = result.frame;
+    state.frameIndex = 0;
+    state.selectedReplica = 1;
+    state.selectedInstanceRef = "";
+    state.canBack = result.canBack;
+    state.canForward = result.canForward;
+    state.eventLog = [];
+    state.labFrames = new Map([[0, result.frame]]);
+    state.financeDraft = { from: "northwind", to: "contoso", amount: "2500.00" };
+    state.error = "";
+    state.inspectorOpen = false;
+    if (updateURL) {
+      setURL({ mode: "finance" });
+    }
+    render(state);
+  });
+}
+
 async function propose() {
   if (state.mode !== "lab") {
     return;
@@ -374,14 +447,27 @@ async function propose() {
   });
 }
 
+async function transfer() {
+  if (state.mode !== "finance") {
+    return;
+  }
+  await dispatchLab({
+    kind: "transfer",
+    from: state.financeDraft.from,
+    to: state.financeDraft.to,
+    amount: centsFromInput(state.financeDraft.amount),
+  });
+}
+
 async function dispatchLab(action, { quietBlocked = false } = {}) {
-  if (state.mode !== "lab" || state.busy) {
+  if (!isSessionMode() || state.busy) {
     return false;
   }
   let succeeded = false;
   await runSerialized(async () => {
     try {
-      const result = state.dispatch({ op: "lab.action", action: completeAction(action) });
+      const prefix = state.mode === "finance" ? "finance" : "lab";
+      const result = state.dispatch({ op: `${prefix}.action`, action: completeAction(action) });
       for (const index of Array.from(state.labFrames.keys())) {
         if (index >= result.frame.index) {
           state.labFrames.delete(index);
@@ -391,7 +477,7 @@ async function dispatchLab(action, { quietBlocked = false } = {}) {
       state.canBack = result.canBack;
       state.canForward = result.canForward;
       state.error = "";
-      await transitionFrame(result.frame, "lab");
+      await transitionFrame(result.frame, state.mode);
       succeeded = true;
     } catch (error) {
       if (quietBlocked && error.code === "blocked") {
@@ -406,21 +492,22 @@ async function dispatchLab(action, { quietBlocked = false } = {}) {
 }
 
 async function seekLab(index) {
-  if (state.mode !== "lab" || state.busy || index < 0 || (index > state.frame.index && !state.canForward)) {
+  if (!isSessionMode() || state.busy || index < 0 || (index > state.frame.index && !state.canForward)) {
     return;
   }
   stopPlayback();
   await runSerialized(async () => {
-    const result = state.dispatch({ op: "lab.seek", index });
+    const prefix = state.mode === "finance" ? "finance" : "lab";
+    const result = state.dispatch({ op: `${prefix}.seek`, index });
     state.canBack = result.canBack;
     state.canForward = result.canForward;
     state.error = "";
-    await transitionFrame(result.frame, "lab");
+    await transitionFrame(result.frame, state.mode);
   });
 }
 
 function toggleLabRun() {
-  if (state.mode !== "lab") {
+  if (!isSessionMode()) {
     return;
   }
   if (state.labRunning) {
@@ -429,8 +516,7 @@ function toggleLabRun() {
     render(state);
     return;
   }
-  const deliverable = state.frame.snapshot.messages.some((message) => !message.blocked);
-  if (!deliverable || state.busy) {
+  if (!sessionCanAdvance() || state.busy) {
     return;
   }
   state.labRunning = true;
@@ -448,7 +534,16 @@ function scheduleLabStep() {
       return;
     }
     const beforeTicks = state.frame.snapshot.replicas.map((replica) => replica.tick);
-    const moved = await dispatchLab({ kind: "deliver-next" }, { quietBlocked: true });
+    const deliverable = state.frame.snapshot.messages.some((message) => !message.blocked);
+    let moved = false;
+    if (deliverable) {
+      moved = await dispatchLab({ kind: "deliver-next" }, { quietBlocked: true });
+    } else if (state.mode === "finance") {
+      const wait = nextNetworkWait();
+      if (wait > 0) {
+        moved = await dispatchLab({ kind: "advance-network", milliseconds: wait }, { quietBlocked: true });
+      }
+    }
     const afterTicks = state.frame.snapshot.replicas.map((replica) => replica.tick);
     if (beforeTicks.some((tick, index) => tick !== afterTicks[index])) {
       state.labRunning = false;
@@ -456,13 +551,13 @@ function scheduleLabStep() {
       render(state);
       return;
     }
-    if (!moved || !state.labRunning || !state.frame.snapshot.messages.some((message) => !message.blocked)) {
+    if (!moved || !state.labRunning || !sessionCanAdvance()) {
       state.labRunning = false;
       render(state);
       return;
     }
     scheduleLabStep();
-  }, 620 / state.speed);
+  }, (state.mode === "finance" ? 260 : 620) / state.speed);
 }
 
 async function transitionFrame(frame, mode) {
@@ -516,6 +611,10 @@ function completeAction(action) {
     envelope: action.envelope || "",
     key: action.key || "",
     value: action.value || "",
+    from: action.from || "",
+    to: action.to || "",
+    amount: action.amount || 0,
+    milliseconds: action.milliseconds || 0,
   };
 }
 
@@ -553,6 +652,35 @@ async function shareCurrentURL() {
     shareURL.select();
     announce("Copy this link:");
   }
+}
+
+function isSessionMode() {
+  return state.mode === "lab" || state.mode === "finance";
+}
+
+function nextNetworkWait() {
+  let wait = 0;
+  for (const message of state.frame?.snapshot.messages || []) {
+    if (message.remainingMs > 0 && (wait === 0 || message.remainingMs < wait)) {
+      wait = message.remainingMs;
+    }
+  }
+  return wait;
+}
+
+function sessionCanAdvance() {
+  if (state.frame?.snapshot.messages.some((message) => !message.blocked)) {
+    return true;
+  }
+  return state.mode === "finance" && nextNetworkWait() > 0;
+}
+
+function centsFromInput(value) {
+  const match = String(value).trim().match(/^(\d{1,7})(?:\.(\d{1,2}))?$/);
+  if (!match) {
+    return 0;
+  }
+  return Number(match[1]) * 100 + Number((match[2] || "").padEnd(2, "0"));
 }
 
 function goHome(replace = false) {

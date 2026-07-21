@@ -30,6 +30,12 @@ var scenarioCatalog = []ScenarioMeta{
 		Lede:       "When an instance owner stops, another replica gathers evidence and finishes the chosen value.",
 		Completion: "CHECKED · owner paused · value recovered",
 	},
+	{
+		ID:         "optimization",
+		Title:      "Optimization",
+		Lede:       "Compare base EPaxos with TOQ, locality-aware routing, RTT scheduling, and measured graceful degradation.",
+		Completion: "MEASURED · actual core · fixed 120-round load",
+	},
 }
 
 // Catalog returns the stable guided-scenario catalog in presentation order.
@@ -52,12 +58,15 @@ func BuildScenario(id string) (ScenarioTrace, error) {
 		trace, err = buildConflictCycle()
 	case "recovery":
 		trace, err = buildRecovery()
+	case "optimization":
+		trace, err = buildOptimization()
 	default:
 		return ScenarioTrace{}, actionError(CodeNotFound, "That guided scenario does not exist.")
 	}
 	if err != nil {
 		return ScenarioTrace{}, internalError("The guided scenario could not be generated.", err)
 	}
+	applyLearning(&trace)
 	return trace, nil
 }
 
@@ -70,6 +79,19 @@ type scenarioBuilder struct {
 
 func newScenarioBuilder(meta ScenarioMeta) (*scenarioBuilder, error) {
 	session, err := NewSession(3)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := session.Seek(0)
+	if err != nil {
+		return nil, err
+	}
+	frame.Focus = &Focus{Replica: 1}
+	return &scenarioBuilder{meta: meta, session: session, frames: []Frame{frame}, current: frame}, nil
+}
+
+func newFinancialScenarioBuilder(meta ScenarioMeta) (*scenarioBuilder, error) {
+	session, err := NewFinancialSession()
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +161,40 @@ func (b *scenarioBuilder) drainUntil(done func(Frame) bool) error {
 		}
 		if _, err := b.dispatch(Action{Kind: "deliver", Envelope: next.ID}); err != nil {
 			return fmt.Errorf("drain %s R%d->R%d %s envelope %s: %w", next.Type, next.From, next.To, next.Ref, next.ID, err)
+		}
+	}
+	return fmt.Errorf("scenario exceeded %d frames", maxHistoryActions)
+}
+
+func (b *scenarioBuilder) drainTimed() error {
+	for len(b.frames) < maxHistoryActions {
+		if len(b.current.Snapshot.Messages) == 0 {
+			return nil
+		}
+		moved := false
+		for _, message := range b.current.Snapshot.Messages {
+			if !message.Blocked {
+				if _, err := b.dispatch(Action{Kind: "deliver", Envelope: message.ID}); err != nil {
+					return err
+				}
+				moved = true
+				break
+			}
+		}
+		if moved {
+			continue
+		}
+		wait := uint64(0)
+		for _, message := range b.current.Snapshot.Messages {
+			if message.RemainingMS > 0 && (wait == 0 || message.RemainingMS < wait) {
+				wait = message.RemainingMS
+			}
+		}
+		if wait == 0 {
+			return fmt.Errorf("financial scenario queue is blocked without an RTT deadline")
+		}
+		if _, err := b.dispatch(Action{Kind: "advance-network", Milliseconds: wait}); err != nil {
+			return err
 		}
 	}
 	return fmt.Errorf("scenario exceeded %d frames", maxHistoryActions)
@@ -414,6 +470,41 @@ func buildRecovery() (ScenarioTrace, error) {
 		{index: firstDependencyBlocked(b.frames, 2, secondRef, firstRef), headline: "A dependency blocks execution", explanation: "R2 cannot apply the conflicting successor first.", focus: Focus{Replica: 2, Ref: secondRef}},
 		{index: firstSentType(b.frames, "prepare", firstRef), headline: "R2 raises a recovery ballot", explanation: "A healthy replica gathers Prepare evidence for the stalled instance.", focus: Focus{Replica: 2, Ref: firstRef}},
 		{index: firstHealthyAppliedBoth(b.frames, beforeResume, firstRef, secondRef), headline: "The value survives its owner", explanation: "The quorum finishes both commands before R1 returns.", focus: Focus{Replica: 2, Ref: firstRef}},
+	}
+	if err = applyMilestones(b.frames, indices); err != nil {
+		return ScenarioTrace{}, err
+	}
+	return b.trace(), nil
+}
+func buildOptimization() (ScenarioTrace, error) {
+	b, err := newFinancialScenarioBuilder(scenarioCatalog[4])
+	if err != nil {
+		return ScenarioTrace{}, err
+	}
+	for replica := uint64(1); replica <= 5; replica++ {
+		if _, err = b.dispatch(Action{Kind: "bootstrap", Replica: replica}); err != nil {
+			return ScenarioTrace{}, err
+		}
+	}
+	if _, err = b.dispatch(Action{Kind: "transfer", From: "northwind", To: "contoso", Amount: 250_000}); err != nil {
+		return ScenarioTrace{}, err
+	}
+	ref, err := b.ref(1)
+	if err != nil {
+		return ScenarioTrace{}, err
+	}
+	if err = b.drainTimed(); err != nil {
+		return ScenarioTrace{}, err
+	}
+	if err = requireExecutedEverywhere(b.current, ref); err != nil {
+		return ScenarioTrace{}, err
+	}
+	indices := []milestone{
+		{index: 1, headline: "Bootstrap durable state", explanation: "Each node persists configuration before it can receive client traffic.", focus: Focus{Replica: 1}},
+		{index: 5, headline: "Five locality replicas are online", explanation: "Every account maps to an adjacent pair; routing remains separate from protocol replication.", focus: Focus{Replica: 5}},
+		{index: 6, headline: "Locality routes the debit", explanation: "Northwind is homed on R1 and R2; deterministic least-load routing selects R1.", focus: Focus{Replica: 1, Ref: ref}},
+		{index: firstDeliveredType(b.frames, "pre-accept-resp", ref), headline: "RTT shapes the fast quorum", explanation: "The first matching nearby replies satisfy the three-of-five optimized quorum.", focus: Focus{Replica: 1, Ref: ref}},
+		{index: firstFrameAllExecuted(b.frames, ref), headline: "TOQ moves work to ProcessAt", explanation: "This trace is the base control. TOQ can delay dependency assignment using explicit clock and delay bounds.", focus: Focus{Replica: 1, Ref: ref}},
 	}
 	if err = applyMilestones(b.frames, indices); err != nil {
 		return ScenarioTrace{}, err

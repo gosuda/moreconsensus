@@ -12,7 +12,7 @@ func TestScenarioCatalogContract(t *testing.T) {
 	for i := range catalog {
 		got[i] = catalog[i].ID
 	}
-	want := []string{"parallel", "fast-path", "conflict-cycle", "recovery"}
+	want := []string{"parallel", "fast-path", "conflict-cycle", "recovery", "optimization"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("catalog order = %#v, want %#v", got, want)
 	}
@@ -115,6 +115,71 @@ func TestRecoveryScenarioContract(t *testing.T) {
 		}
 	}
 	assertMilestones(t, trace, []string{"The owner disappears", "A dependency blocks execution", "R2 raises a recovery ballot", "The value survives its owner"})
+}
+
+func TestOptimizationScenarioContract(t *testing.T) {
+	t.Parallel()
+	trace := mustScenario(t, "optimization")
+	initial := trace.Frames[0]
+	if initial.Snapshot.Cluster.Size != 5 || !initial.Snapshot.Cluster.Financial {
+		t.Fatalf("optimization cluster = %#v", initial.Snapshot.Cluster)
+	}
+	if len(initial.Snapshot.Accounts) != 10 || len(initial.Snapshot.Links) != 10 {
+		t.Fatalf("optimization topology has %d accounts and %d links", len(initial.Snapshot.Accounts), len(initial.Snapshot.Links))
+	}
+	for _, replica := range initial.Snapshot.Replicas {
+		if replica.Booted {
+			t.Fatalf("R%d booted before the bootstrap trace", replica.ID)
+		}
+	}
+
+	sawRTT := false
+	for index, frame := range trace.Frames {
+		if frame.Learning == nil || frame.Learning.Phase == "" || frame.Learning.Title == "" ||
+			frame.Learning.Summary == "" || frame.Learning.Why == "" ||
+			frame.Learning.Invariant == "" || len(frame.Learning.Algorithm) == 0 {
+			t.Fatalf("frame %d learning content = %#v", index, frame.Learning)
+		}
+		for _, message := range frame.Snapshot.Messages {
+			if message.RTTMS > 0 {
+				sawRTT = true
+			}
+		}
+	}
+	if !sawRTT {
+		t.Fatal("optimization trace contains no RTT-scheduled message")
+	}
+
+	final := trace.Frames[len(trace.Frames)-1]
+	if len(final.Snapshot.Commands) != 1 {
+		t.Fatalf("optimization commands = %#v", final.Snapshot.Commands)
+	}
+	command := final.Snapshot.Commands[0]
+	if command.Operation != "TRANSFER" || len(command.Resources) != 4 ||
+		!contains(command.Resources, "acct/northwind") ||
+		!contains(command.Resources, "acct/contoso") ||
+		!contains(command.Resources, "dedup/1/1") ||
+		!contains(command.Resources, "txn/1/1") {
+		t.Fatalf("optimization transfer = %#v", command)
+	}
+	for _, replica := range final.Snapshot.Replicas {
+		if !replica.Booted || replica.Crashed || countApplied(replica, command.Ref) != 1 {
+			t.Fatalf("R%d final protocol state = %#v", replica.ID, replica)
+		}
+		if got := stateInt(t, replica, accountStateKey("northwind")); got != 24_750_000 {
+			t.Fatalf("R%d northwind balance = %d", replica.ID, got)
+		}
+		if got := stateInt(t, replica, accountStateKey("contoso")); got != 12_250_000 {
+			t.Fatalf("R%d contoso balance = %d", replica.ID, got)
+		}
+	}
+	assertMilestones(t, trace, []string{
+		"Bootstrap durable state",
+		"Five locality replicas are online",
+		"Locality routes the debit",
+		"RTT shapes the fast quorum",
+		"TOQ moves work to ProcessAt",
+	})
 }
 
 func mustScenario(t *testing.T, id string) ScenarioTrace {

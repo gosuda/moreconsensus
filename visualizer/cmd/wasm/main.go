@@ -21,13 +21,14 @@ type request struct {
 }
 
 type response struct {
-	OK         bool               `json:"ok"`
-	Scenarios  []sim.ScenarioMeta `json:"scenarios,omitempty"`
-	Trace      *sim.ScenarioTrace `json:"trace,omitempty"`
-	Frame      *sim.Frame         `json:"frame,omitempty"`
-	CanBack    *bool              `json:"canBack,omitempty"`
-	CanForward *bool              `json:"canForward,omitempty"`
-	Error      *errorResponse     `json:"error,omitempty"`
+	OK         bool                  `json:"ok"`
+	Scenarios  []sim.ScenarioMeta    `json:"scenarios,omitempty"`
+	Throughput []sim.ThroughputPoint `json:"throughput,omitempty"`
+	Trace      *sim.ScenarioTrace    `json:"trace,omitempty"`
+	Frame      *sim.Frame            `json:"frame,omitempty"`
+	CanBack    *bool                 `json:"canBack,omitempty"`
+	CanForward *bool                 `json:"canForward,omitempty"`
+	Error      *errorResponse        `json:"error,omitempty"`
 }
 
 type errorResponse struct {
@@ -36,9 +37,13 @@ type errorResponse struct {
 }
 
 type bridge struct {
-	lab       *sim.Session
-	labCursor int
-	labLength int
+	lab           *sim.Session
+	labCursor     int
+	labLength     int
+	finance       *sim.Session
+	financeCursor int
+	financeLength int
+	throughput    []sim.ThroughputPoint
 }
 
 var dispatchFunction js.Func
@@ -89,6 +94,18 @@ func (b *bridge) handle(req request) response {
 			return failure(sim.CodeInvalidRequest, "Catalog does not accept additional fields.")
 		}
 		return response{OK: true, Scenarios: sim.Catalog()}
+	case "performance":
+		if req.Scenario != "" || req.Size != 0 || req.Index != 0 || req.Action != (sim.Action{}) {
+			return failure(sim.CodeInvalidRequest, "Performance does not accept additional fields.")
+		}
+		if b.throughput == nil {
+			profile, err := sim.FaultThroughputProfile()
+			if err != nil {
+				return fromError(err)
+			}
+			b.throughput = profile
+		}
+		return response{OK: true, Throughput: b.throughput}
 	case "scenario":
 		if req.Scenario == "" || req.Size != 0 || req.Index != 0 || req.Action != (sim.Action{}) {
 			return failure(sim.CodeInvalidRequest, "Choose one guided scenario.")
@@ -135,6 +152,43 @@ func (b *bridge) handle(req request) response {
 		}
 		b.labCursor = frame.Index
 		return frameResponse(frame, b.labCursor > 0, b.labCursor < b.labLength)
+	case "finance.reset":
+		if req.Scenario != "" || req.Size != 0 || req.Index != 0 || req.Action != (sim.Action{}) {
+			return failure(sim.CodeInvalidRequest, "Financial reset does not accept additional fields.")
+		}
+		session, err := sim.NewFinancialSession()
+		if err != nil {
+			return fromError(err)
+		}
+		frame, err := session.Seek(0)
+		if err != nil {
+			return fromError(err)
+		}
+		b.finance = session
+		b.financeCursor = 0
+		b.financeLength = 0
+		return frameResponse(frame, false, false)
+	case "finance.action":
+		if req.Scenario != "" || req.Size != 0 || req.Index != 0 || b.finance == nil {
+			return failure(sim.CodeInvalidRequest, "Reset the financial simulation before dispatching an action.")
+		}
+		frame, err := b.finance.Dispatch(req.Action)
+		if err != nil {
+			return fromError(err)
+		}
+		b.financeCursor = frame.Index
+		b.financeLength = frame.Index
+		return frameResponse(frame, b.financeCursor > 0, false)
+	case "finance.seek":
+		if req.Scenario != "" || req.Size != 0 || req.Action != (sim.Action{}) || b.finance == nil {
+			return failure(sim.CodeInvalidRequest, "Reset the financial simulation before seeking its history.")
+		}
+		frame, err := b.finance.Seek(req.Index)
+		if err != nil {
+			return fromError(err)
+		}
+		b.financeCursor = frame.Index
+		return frameResponse(frame, b.financeCursor > 0, b.financeCursor < b.financeLength)
 	default:
 		return failure(sim.CodeInvalidRequest, "That operation is not supported.")
 	}

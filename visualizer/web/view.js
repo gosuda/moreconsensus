@@ -1,4 +1,5 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
+const currencyFormatter = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
 const dom = {
   landing: document.querySelector("#landing"),
@@ -38,11 +39,12 @@ export function setCoreReady() {
   dom.coreStatus.textContent = "CORE READY";
   dom.coreStatus.classList.add("ready");
   document.querySelector("#tour-cta").disabled = false;
+  document.querySelector("#finance-cta").disabled = false;
   document.querySelector("#lab-cta").disabled = false;
 }
 
 export function render(state) {
-  const inWorkspace = state.mode === "tour" || state.mode === "lab";
+  const inWorkspace = state.mode === "tour" || state.mode === "lab" || state.mode === "finance";
   dom.landing.hidden = inWorkspace;
   dom.workspace.hidden = !inWorkspace;
   dom.share.hidden = !inWorkspace;
@@ -55,8 +57,8 @@ export function render(state) {
 
   const snapshot = state.frame.snapshot;
   const selectedReplica = snapshot.replicas.find((replica) => replica.id === state.selectedReplica) || snapshot.replicas[0];
-  dom.modeLabel.textContent = state.mode === "tour" ? "GUIDED TOUR" : "PROTOCOL LAB";
-  dom.title.textContent = state.mode === "tour" ? state.trace.scenario.title : `${snapshot.cluster.size}-replica lab`;
+  dom.modeLabel.textContent = state.mode === "tour" ? "LEARNING EPAXOS" : state.mode === "finance" ? "FINANCIAL K/V SYSTEM" : "PROTOCOL LAB";
+  dom.title.textContent = state.mode === "tour" ? state.trace.scenario.title : state.mode === "finance" ? "Five-node transaction network" : `${snapshot.cluster.size}-replica lab`;
   dom.quorum.textContent = `FAST ${snapshot.cluster.fastQuorum} · SLOW ${snapshot.cluster.slowQuorum}`;
   dom.frameCounter.textContent = `FRAME ${state.frame.index}`;
   dom.stageFocus.textContent = `R${selectedReplica.id} SELECTED`;
@@ -71,38 +73,18 @@ export function render(state) {
 
 function renderLeftRail(state, selectedReplica) {
   const content = document.createDocumentFragment();
-  content.append(kicker(state.mode === "tour" ? "GUIDED CHAPTER" : "LAB INPUT"));
-
   if (state.mode === "tour") {
-    const headline = el("h2", "", state.frame.headline || state.trace.scenario.title);
-    const explanation = el("p", "rail-copy", state.frame.explanation || state.trace.scenario.lede);
-    content.append(headline, explanation);
-
-    const chapters = el("div", "chapter-list");
-    state.catalog.forEach((scenario, index) => {
-      const chapter = actionButton("", "open-scenario", "chapter-button");
-      chapter.dataset.scenario = scenario.id;
-      chapter.classList.toggle("active", scenario.id === state.trace.scenario.id);
-      chapter.append(el("span", "chapter-number", String(index + 1).padStart(2, "0")), el("span", "", scenario.title));
-      chapter.setAttribute("aria-current", scenario.id === state.trace.scenario.id ? "step" : "false");
-      chapters.append(chapter);
-    });
-    content.append(chapters);
-
-    if (state.frameIndex === state.trace.frames.length - 1) {
-      content.append(el("div", "completion-card", state.trace.scenario.completion));
-      const next = nextScenario(state);
-      const action = next ? actionButton("Next chapter", "next-chapter", "button primary") : actionButton("Open the lab", "open-lab", "button primary");
-      action.dataset.scenario = next?.id || "";
-      if (!next) {
-        content.append(el("p", "rail-copy", "Now break it yourself."));
-      }
-      content.append(action);
-    }
+    content.append(renderLearning(state));
+  } else if (state.mode === "finance") {
+    content.append(kicker("FINANCIAL K/V WORKLOAD"));
+    content.append(el("h2", "", "Atomic account transfer"));
+    content.append(el("p", "rail-copy", "The source account selects an adjacent home pair. The least-loaded running home coordinates one atomic debit-and-credit command."));
+    content.append(renderFinanceForm(state));
+    content.append(renderThroughputChart(state.throughput));
   } else {
-    const heading = el("h2", "", "Send one point command");
-    const copy = el("p", "rail-copy", "Choose any running coordinator. Messages move only when you deliver them or start Run.");
-    content.append(heading, copy);
+    content.append(kicker("LAB INPUT"));
+    content.append(el("h2", "", "Send one point command"));
+    content.append(el("p", "rail-copy", "Choose any running coordinator. Messages move only when you deliver them or start Run."));
     content.append(renderLabForm(state, selectedReplica));
   }
 
@@ -112,6 +94,122 @@ function renderLeftRail(state, selectedReplica) {
     content.append(error);
   }
   dom.leftRail.replaceChildren(content);
+}
+
+function renderLearning(state) {
+  const content = el("div", "learning-content");
+  const learning = state.frame.learning;
+  content.append(kicker(learning?.phase || "LEARNING EPAXOS"));
+  content.append(el("h2", "", learning?.title || state.trace.scenario.title));
+  content.append(el("p", "learning-summary", learning?.summary || state.trace.scenario.lede));
+
+  if (state.frame.headline) {
+    const current = el("div", "current-transition");
+    current.append(kicker(`FRAME ${state.frame.index} · CURRENT TRANSITION`), el("strong", "", state.frame.headline), el("p", "", state.frame.explanation));
+    content.append(current);
+  }
+  if (learning) {
+    const why = el("section", "learning-section");
+    why.append(el("h3", "", "WHY THIS IS SAFE"), el("p", "", learning.why));
+    const invariant = el("section", "learning-section invariant");
+    invariant.append(el("h3", "", "INVARIANT"), el("p", "", learning.invariant));
+    const algorithm = el("section", "learning-section");
+    algorithm.append(el("h3", "", "ALGORITHM · STEP BY STEP"));
+    const steps = el("ol", "algorithm-steps");
+    learning.algorithm.forEach((step) => steps.append(el("li", "", step)));
+    algorithm.append(steps);
+    content.append(why, invariant, algorithm);
+  }
+  if (state.trace.scenario.id === "optimization") {
+    content.append(renderThroughputChart(state.throughput));
+  }
+
+  const chapters = el("nav", "chapter-list");
+  chapters.setAttribute("aria-label", "Learning EPaxos chapters");
+  state.catalog.forEach((scenario, index) => {
+    const chapter = actionButton("", "open-scenario", "chapter-button");
+    chapter.dataset.scenario = scenario.id;
+    chapter.classList.toggle("active", scenario.id === state.trace.scenario.id);
+    chapter.append(el("span", "chapter-number", String(index + 1).padStart(2, "0")), el("span", "", scenario.title));
+    chapter.setAttribute("aria-current", scenario.id === state.trace.scenario.id ? "step" : "false");
+    chapters.append(chapter);
+  });
+  content.append(chapters);
+
+  if (state.frameIndex === state.trace.frames.length - 1) {
+    content.append(el("div", "completion-card", state.trace.scenario.completion));
+    const next = nextScenario(state);
+    const action = next ? actionButton("Next chapter", "next-chapter", "button primary") : actionButton("Open financial system", "open-finance", "button primary");
+    action.dataset.scenario = next?.id || "";
+    content.append(action);
+  }
+  return content;
+}
+
+function renderFinanceForm(state) {
+  const snapshot = state.frame.snapshot;
+  const form = el("form", "lab-form finance-form");
+  form.dataset.role = "finance-form";
+  const allBooted = snapshot.replicas.every((replica) => replica.booted);
+  if (!allBooted) {
+    const bootstrap = el("div", "bootstrap-panel");
+    bootstrap.append(el("strong", "", "CLUSTER BOOTSTRAP REQUIRED"), el("p", "", "Bring each replica online, persist configuration, and install the opening account snapshot."));
+    const bootAll = actionButton("Bootstrap all five nodes", "bootstrap-all", "button primary");
+    bootAll.disabled = state.busy;
+    bootstrap.append(bootAll);
+    form.append(bootstrap);
+  }
+
+  const from = accountField("from", "Debit account", state.financeDraft.from, snapshot.accounts, state.busy || !allBooted);
+  const to = accountField("to", "Credit account", state.financeDraft.to, snapshot.accounts, state.busy || !allBooted);
+  const amount = textField("amount", "Amount · USD", state.financeDraft.amount, 10, state.busy || !allBooted);
+  amount.querySelector("input").inputMode = "decimal";
+  const selected = snapshot.accounts.find((account) => account.id === state.financeDraft.from);
+  const route = el("div", "route-preview");
+  route.append(kicker("LOCALITY ROUTER"), el("strong", "", selected ? `${selected.name} → R${selected.home[0]} / R${selected.home[1]}` : "Choose an account"), el("p", "", "Least coordinated running home wins. Consensus messages still use all five voters."));
+  const submit = actionButton("Route atomic transfer", "transfer", "button primary");
+  submit.type = "submit";
+  submit.disabled = state.busy || !allBooted;
+  form.append(from, to, amount, route, submit);
+  return form;
+}
+
+function accountField(name, labelText, value, accounts, disabled) {
+  const field = el("div", "field");
+  const label = el("label", "", labelText);
+  label.htmlFor = `finance-${name}`;
+  const select = el("select");
+  select.id = `finance-${name}`;
+  select.dataset.field = name;
+  for (const account of accounts) {
+    const option = el("option", "", `${account.name} · R${account.home[0]}/R${account.home[1]}`);
+    option.value = account.id;
+    option.selected = account.id === value;
+    select.append(option);
+  }
+  select.disabled = disabled;
+  field.append(label, select);
+  return field;
+}
+
+function renderThroughputChart(points) {
+  const figure = el("figure", "throughput-chart");
+  const caption = el("figcaption");
+  caption.append(kicker("ACTUAL CORE LOAD TRIAL"), el("strong", "", "Graceful degradation"), el("span", "", "Completed transfers in 120 deterministic RTT rounds."));
+  figure.append(caption);
+  const bars = el("div", "throughput-bars");
+  for (const point of points || []) {
+    const row = el("div", "throughput-row");
+    const label = el("span", "", `${point.faults} fault${point.faults === 1 ? "" : "s"}`);
+    const track = el("div", "throughput-track");
+    const bar = el("div", "throughput-bar");
+    bar.style.width = `${point.normalized}%`;
+    track.append(bar);
+    row.append(label, track, el("strong", "", `${point.normalized}% · ${point.committed}`));
+    bars.append(row);
+  }
+  figure.append(bars, el("p", "chart-note", "Five independent account streams use the real core and link scheduler. At three faults, two voters cannot form the 3-of-5 quorum."));
+  return figure;
 }
 
 function renderLabForm(state, selectedReplica) {
@@ -177,26 +275,35 @@ function renderTopology(state, snapshot, selectedReplica) {
   const fragment = document.createDocumentFragment();
   const layout = positions[snapshot.cluster.size];
   snapshot.replicas.forEach((replica, index) => {
+    const statusText = replicaStatus(replica);
     const card = el("div", "replica-card");
     card.dataset.replica = String(replica.id);
     card.dataset.action = "select-replica";
     card.tabIndex = 0;
     card.setAttribute("role", "button");
     card.setAttribute("aria-pressed", String(replica.id === selectedReplica.id));
-    card.setAttribute("aria-label", `Select replica ${replica.id}, ${replica.paused ? "paused" : "running"}`);
+    card.setAttribute("aria-label", `Select replica ${replica.id}, ${statusText.toLowerCase()}`);
     card.style.left = `${layout[index][0]}%`;
     card.style.top = `${layout[index][1]}%`;
     card.classList.toggle("selected", replica.id === selectedReplica.id);
     card.classList.toggle("focused", state.mode === "tour" && state.frame.focus?.replica === replica.id);
     card.classList.toggle("paused", replica.paused);
+    card.classList.toggle("crashed", replica.crashed);
+    card.classList.toggle("offline", !replica.booted);
     const latest = replica.instances.at(-1);
     card.dataset.latestStatus = latest ? `${latest.ref} · ${latest.status}` : "NO INSTANCES";
 
     const header = el("div", "replica-card-header");
-    const id = el("span", "replica-id", `R${replica.id}`);
-    const status = el("span", `replica-status ${replica.paused ? "paused" : ""}`, replica.paused ? "PAUSED" : "RUNNING");
-    header.append(id, status);
-    card.append(header, el("div", "replica-tick", `LOGICAL TICK ${replica.tick}`));
+    const identity = el("div", "replica-identity");
+    identity.append(el("span", "replica-id", `R${replica.id}`));
+    if (replica.region) {
+      identity.append(el("span", "replica-region", replica.region));
+    }
+    const status = el("span", `replica-status ${statusText.toLowerCase()}`, statusText);
+    header.append(identity, status);
+    card.append(header);
+    const telemetry = el("div", "replica-tick", `LOGICAL ${replica.tick}${snapshot.cluster.financial ? ` · COORD ${replica.coordinated}` : ""}`);
+    card.append(telemetry);
 
     const instances = el("div", "instance-list");
     for (const instance of replica.instances.slice(-4)) {
@@ -206,18 +313,21 @@ function renderTopology(state, snapshot, selectedReplica) {
       instances.append(row);
     }
     if (replica.instances.length === 0) {
-      instances.append(el("div", "instance-summary", "NO LOCAL INSTANCES"));
+      instances.append(el("div", "instance-summary", replica.booted ? "NO LOCAL INSTANCES" : "AWAITING BOOTSTRAP"));
     }
     card.append(instances);
 
     const stateSummary = el("div", "kv-summary");
-    const latestState = replica.state.at(-1);
-    stateSummary.append(el("span", "", latestState ? `${latestState.key}=${latestState.value}` : "STATE ∅"));
-    const nodeControl = actionButton(replica.paused ? "Resume" : "Pause", replica.paused ? "resume-node" : "pause-node", `button ${replica.paused ? "" : "danger"}`);
-    nodeControl.dataset.replica = String(replica.id);
-    nodeControl.disabled = state.mode !== "lab" || state.busy;
-    nodeControl.title = replica.paused ? `Resume R${replica.id}` : `Pause R${replica.id}`;
-    stateSummary.append(nodeControl);
+    if (snapshot.cluster.financial) {
+      stateSummary.append(el("span", "", replica.booted ? `${replica.state.length} ACCOUNT KEYS` : "STATE OFFLINE"));
+    } else {
+      const latestState = replica.state.at(-1);
+      stateSummary.append(el("span", "", latestState ? `${latestState.key}=${latestState.value}` : "STATE ∅"));
+    }
+    const nodeControl = nodeAction(state, replica);
+    if (nodeControl) {
+      stateSummary.append(nodeControl);
+    }
     card.append(stateSummary);
     fragment.append(card);
   });
@@ -230,10 +340,54 @@ function renderTopology(state, snapshot, selectedReplica) {
     line.classList.toggle("delayed", link.delayed);
     line.dataset.from = String(link.from);
     line.dataset.to = String(link.to);
+    line.dataset.rtt = String(link.rttMs);
     lines.append(line);
   }
   dom.network.replaceChildren(lines);
   requestAnimationFrame(drawNetwork);
+}
+
+function replicaStatus(replica) {
+  if (!replica.booted) {
+    return "OFFLINE";
+  }
+  if (replica.crashed) {
+    return "CRASHED";
+  }
+  if (replica.paused) {
+    return "PAUSED";
+  }
+  return "RUNNING";
+}
+
+function nodeAction(state, replica) {
+  if (state.mode === "finance") {
+    let label = "Hammer crash";
+    let action = "crash-node";
+    let className = "button danger hammer-button";
+    if (!replica.booted) {
+      label = "Boot";
+      action = "bootstrap-node";
+      className = "button";
+    } else if (replica.crashed) {
+      label = "Restart";
+      action = "restart-node";
+      className = "button";
+    }
+    const control = actionButton(label, action, className);
+    control.dataset.replica = String(replica.id);
+    control.disabled = state.busy;
+    control.title = replica.crashed ? `Restart R${replica.id} from durable storage` : !replica.booted ? `Bootstrap R${replica.id}` : `Crash R${replica.id} with the failure hammer`;
+    return control;
+  }
+  if (state.mode === "lab") {
+    const control = actionButton(replica.paused ? "Resume" : "Pause", replica.paused ? "resume-node" : "pause-node", `button ${replica.paused ? "" : "danger"}`);
+    control.dataset.replica = String(replica.id);
+    control.disabled = state.busy;
+    control.title = replica.paused ? `Resume R${replica.id}` : `Pause R${replica.id}`;
+    return control;
+  }
+  return null;
 }
 
 function drawNetwork() {
@@ -258,9 +412,15 @@ function drawNetwork() {
 }
 
 function renderTransport(state, snapshot) {
-  dom.queueCount.textContent = `${snapshot.messages.length} ${snapshot.messages.length === 1 ? "ENVELOPE" : "ENVELOPES"}`;
+  const clock = snapshot.cluster.financial ? ` · T+${snapshot.cluster.networkMs}MS` : "";
+  dom.queueCount.textContent = `${snapshot.messages.length} ${snapshot.messages.length === 1 ? "ENVELOPE" : "ENVELOPES"}${clock}`;
   const allBlocked = snapshot.messages.length > 0 && snapshot.messages.every((message) => message.blocked);
   dom.blockedHint.hidden = !allBlocked;
+  if (allBlocked && snapshot.cluster.financial && snapshot.messages.some((message) => message.remainingMs > 0)) {
+    dom.blockedHint.textContent = "Packets are in flight. Advance simulated RTT time, or press Run to follow the next deadline.";
+  } else {
+    dom.blockedHint.textContent = "No message can move. Heal a link, resume or restart a replica, drop a packet, or tick recovery.";
+  }
   const fragment = document.createDocumentFragment();
   if (snapshot.messages.length === 0) {
     fragment.append(el("div", "empty-state", "NETWORK QUIET · NO QUEUED ENVELOPES"));
@@ -268,14 +428,16 @@ function renderTransport(state, snapshot) {
   for (const message of snapshot.messages) {
     const row = el("div", `message-row ${message.blocked ? "blocked" : ""}`);
     row.dataset.envelope = message.id;
+    const timing = message.rttMs > 0 ? `RTT ${message.rttMs}MS${message.remainingMs > 0 ? ` · ${message.remainingMs}MS LEFT` : " · READY"}` : "";
     row.append(
       el("span", "", `#${message.id}`),
       el("span", `message-type ${message.type}`, message.type.toUpperCase()),
       el("span", "", `R${message.from} → R${message.to}`),
       el("span", "message-ref", message.ref),
       el("span", "message-deps", message.deps.length ? `deps ${message.deps.join(", ")}` : "deps ∅"),
+      el("span", "message-timing", timing),
     );
-    if (state.mode === "lab") {
+    if (state.mode === "lab" || state.mode === "finance") {
       const actions = el("div", "message-actions");
       const deliver = actionButton("Deliver", "deliver-envelope", "button");
       deliver.dataset.envelope = message.id;
@@ -309,7 +471,10 @@ function renderInspector(state, replica) {
 function renderInstanceInspector(state, replica) {
   const fragment = document.createDocumentFragment();
   if (replica.instances.length === 0) {
-    fragment.append(el("div", "empty-state", `Replica ${replica.id} has no local instances yet.`));
+    const reason = !replica.booted ? `Replica ${replica.id} is offline. Bootstrap it to persist the initial configuration.` :
+      replica.crashed ? `Replica ${replica.id} is crashed. Restart it from durable storage.` :
+        `Replica ${replica.id} has no local instances yet.`;
+    fragment.append(el("div", "empty-state", reason));
     fragment.append(renderApplication(replica));
     dom.inspectorContent.replaceChildren(fragment);
     return;
@@ -332,7 +497,10 @@ function renderInstanceInspector(state, replica) {
 
   const details = el("dl", "detail-grid");
   detail(details, "Ref", selected.ref);
-  detail(details, "Command", selected.command ? `SET ${selected.command.key}=${selected.command.value}` : "protocol-only");
+  detail(details, "Command", selected.command?.summary || "protocol-only");
+  if (selected.command?.resources?.length) {
+    detail(details, "Footprint", selected.command.resources.join(" · "));
+  }
   detail(details, "Status", selected.status.toUpperCase());
   detail(details, "Seq", String(selected.seq));
   detail(details, "Deps", selected.depVector.length ? `[${selected.depVector.join(", ")}]` : "[]");
@@ -402,11 +570,14 @@ function renderApplication(replica) {
   const panel = el("section", "application-panel");
   panel.append(el("h3", "", "APPLICATION STATE"));
   if (replica.state.length === 0) {
-    panel.append(el("div", "empty-state", "STATE ∅"));
+    panel.append(el("div", "empty-state", replica.booted ? "STATE ∅" : "STATE OFFLINE"));
   }
   for (const item of replica.state) {
     const row = el("div", "state-row");
-    row.append(el("span", "", item.key), el("strong", "", item.value));
+    const financial = item.key.startsWith("acct_");
+    const label = financial ? item.key.slice(5).replaceAll("_", " ").toUpperCase() : item.key;
+    const value = financial ? formatCents(Number(item.value)) : item.value;
+    row.append(el("span", "", label), el("strong", "", value));
     panel.append(row);
   }
   panel.append(el("h3", "", "APPLY ORDER"));
@@ -415,7 +586,7 @@ function renderApplication(replica) {
   }
   replica.applied.forEach((applied, index) => {
     const row = el("div", "applied-row");
-    row.append(el("span", "", String(index + 1).padStart(2, "0")), el("span", "", `${applied.ref} · SET ${applied.key}=${applied.value}`));
+    row.append(el("span", "", String(index + 1).padStart(2, "0")), el("span", "", `${applied.ref} · ${applied.summary}`));
     panel.append(row);
   });
   return panel;
@@ -424,11 +595,15 @@ function renderApplication(replica) {
 function renderNetworkInspector(state, replica) {
   const panel = el("section", "network-panel");
   panel.append(el("h3", "", `LINKS FROM R${replica.id}`));
+  if (replica.region) {
+    panel.append(el("p", "network-location", replica.region));
+  }
   const links = state.frame.snapshot.links.filter((link) => link.from === replica.id || link.to === replica.id);
   for (const link of links) {
     const row = el("div", `network-link-row ${link.delayed ? "delayed" : ""}`);
-    row.append(el("span", "", `R${link.from} ↔ R${link.to}`), el("span", "", link.delayed ? "DELAYED" : "HEALTHY"));
-    if (state.mode === "lab") {
+    const stateText = link.delayed ? "DELAYED" : "HEALTHY";
+    row.append(el("span", "", `R${link.from} ↔ R${link.to}`), el("span", "link-rtt", link.rttMs ? `RTT ${link.rttMs}MS · ${stateText}` : stateText));
+    if (state.mode === "lab" || state.mode === "finance") {
       const control = actionButton(link.delayed ? "Heal" : "Delay", link.delayed ? "heal-link" : "delay-link", `button ${link.delayed ? "" : "danger"}`);
       control.dataset.from = String(link.from);
       control.dataset.to = String(link.to);
@@ -468,13 +643,22 @@ function renderPlayback(state, snapshot) {
     );
   } else {
     const deliverable = snapshot.messages.some((message) => !message.blocked);
-    const allPaused = snapshot.replicas.every((replica) => replica.paused);
+    const wait = nextRTTWait(snapshot);
+    const runnable = deliverable || (state.mode === "finance" && wait > 0);
+    const allUnavailable = snapshot.replicas.every((replica) => !replica.booted || replica.paused || replica.crashed);
     left.append(
       playbackButton("Back", "lab-back", state.busy || !state.canBack, "B"),
       playbackButton("Forward", "lab-forward", state.busy || !state.canForward, "N"),
       playbackButton("Deliver next", "deliver-next", state.busy || !deliverable, ""),
-      playbackButton(state.labRunning ? "Pause" : "Run", "toggle-run", !state.labRunning && (state.busy || !deliverable), "Space"),
-      playbackButton("Tick", "tick", state.busy || allPaused, ""),
+    );
+    if (state.mode === "finance") {
+      const advance = playbackButton(wait > 0 ? `Advance ${wait}ms` : "Advance RTT", "advance-network", state.busy || wait === 0, "");
+      advance.dataset.milliseconds = String(wait);
+      left.append(advance);
+    }
+    left.append(
+      playbackButton(state.labRunning ? "Pause" : "Run", "toggle-run", !state.labRunning && (state.busy || !runnable), "Space"),
+      playbackButton("Tick", "tick", state.busy || allUnavailable, ""),
       playbackButton("Reset", "reset-lab", state.busy, "R"),
     );
   }
@@ -484,8 +668,23 @@ function renderPlayback(state, snapshot) {
     control.disabled = state.busy;
     right.append(control);
   }
-  const status = el("div", "playback-status", state.mode === "tour" ? `${state.frameIndex + 1} / ${state.trace.frames.length}` : `History ${state.frame.index}`);
+  const sessionStatus = state.mode === "finance" ? `T+${snapshot.cluster.networkMs}MS · HISTORY ${state.frame.index}` : `History ${state.frame.index}`;
+  const status = el("div", "playback-status", state.mode === "tour" ? `${state.frameIndex + 1} / ${state.trace.frames.length}` : sessionStatus);
   dom.playback.replaceChildren(left, status, right);
+}
+
+function nextRTTWait(snapshot) {
+  let wait = 0;
+  for (const message of snapshot.messages) {
+    if (message.remainingMs > 0 && (wait === 0 || message.remainingMs < wait)) {
+      wait = message.remainingMs;
+    }
+  }
+  return wait;
+}
+
+function formatCents(cents) {
+  return currencyFormatter.format(cents / 100);
 }
 
 function playbackButton(label, action, disabled, shortcut) {
