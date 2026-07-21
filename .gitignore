@@ -41,3 +41,4 @@ kvnode-data/
 # .idea/
 # .vscode/
 .formal-closure-evidence/
+visualizer/dist/

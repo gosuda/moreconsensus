@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EPaxos Lab — Leaderless consensus, visualized</title>
+  <meta name="description" content="Send commands to any replica and watch EPaxos turn conflicts into a deterministic execution order.">
+  <meta property="og:title" content="EPaxos Lab — Leaderless consensus, visualized">
+  <meta property="og:description" content="Send commands to any replica and watch EPaxos turn conflicts into a deterministic execution order.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./wasm_exec.js"></script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to simulation</a>
+  <div class="site-shell">
+    <header class="site-header">
+      <button class="brand" type="button" data-action="home" aria-label="EPaxos Lab home">
+        <img src="./favicon.svg" width="34" height="34" alt="">
+        <span class="brand-name">EPAXOS LAB</span>
+        <span class="brand-expansion">EGALITARIAN PAXOS</span>
+      </button>
+      <div class="header-status">
+        <span id="core-status" class="core-status" role="status">CORE STARTING</span>
+        <button id="share-button" class="button ghost" type="button" data-action="share" hidden>Share</button>
+        <button id="inspector-toggle" class="button ghost inspector-toggle" type="button" data-action="toggle-inspector" aria-controls="inspector" aria-expanded="false" hidden>Inspector</button>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section id="landing" class="landing" aria-labelledby="landing-title">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <p class="eyebrow">A LEADERLESS CONSENSUS PROTOCOL, IN MOTION</p>
+          <h1 id="landing-title">EPaxos, made visible.</h1>
+          <p class="hero-body">Send commands to any replica. Watch independent work commit fast—and conflicts become dependencies.</p>
+          <div class="hero-actions">
+            <button id="tour-cta" class="button primary" type="button" data-action="start-tour" disabled>Start the guided tour</button>
+            <button id="lab-cta" class="button secondary" type="button" data-action="open-lab" disabled>Open the lab</button>
+          </div>
+          <p class="proof-badge"><span aria-hidden="true"></span>RUNNING THE REAL MORECONSENSUS CORE</p>
+        </div>
+        <div class="hero-diagram" aria-hidden="true">
+          <div class="hero-node hero-node-a">R1</div>
+          <div class="hero-node hero-node-b">R2</div>
+          <div class="hero-node hero-node-c">R3</div>
+          <div class="hero-command command-a">SET east=7</div>
+          <div class="hero-command command-b">SET west=9</div>
+          <svg viewBox="0 0 520 420" focusable="false">
+            <path d="M110 90 L410 215 L110 340" class="hero-link cyan"></path>
+            <path d="M410 90 L110 215 L410 340" class="hero-link green"></path>
+          </svg>
+        </div>
+      </section>
+
+      <section id="workspace" class="workspace" aria-label="EPaxos protocol visualizer" hidden>
+        <div id="command-bar" class="command-bar">
+          <div>
+            <span id="mode-label" class="mode-label">GUIDED TOUR</span>
+            <strong id="workspace-title">Coordinate anywhere</strong>
+          </div>
+          <div id="quorum-label" class="quorum-label">FAST 2 · SLOW 2</div>
+          <div id="frame-counter" class="frame-counter">FRAME 0</div>
+        </div>
+
+        <div class="protocol-grid">
+          <aside id="left-rail" class="left-rail" aria-label="Controls and chapter notes"></aside>
+
+          <section id="stage" class="stage" aria-label="Replica topology">
+            <div class="stage-heading">
+              <div>
+                <span class="panel-kicker">CLUSTER TOPOLOGY</span>
+                <h2 id="stage-title">Replica-local views</h2>
+              </div>
+              <span id="stage-focus" class="stage-focus">R1 SELECTED</span>
+            </div>
+            <div id="topology" class="topology">
+              <svg id="network-svg" class="network-svg" aria-hidden="true"></svg>
+              <div id="replica-layer" class="replica-layer"></div>
+              <div id="packet-layer" class="packet-layer" aria-hidden="true"></div>
+            </div>
+            <section id="transport" class="transport" aria-labelledby="transport-title">
+              <div class="transport-heading">
+                <div>
+                  <span class="panel-kicker">EVENT TRANSPORT</span>
+                  <h3 id="transport-title">Message queue</h3>
+                </div>
+                <span id="queue-count" class="queue-count">0 ENVELOPES</span>
+              </div>
+              <p id="blocked-hint" class="blocked-hint" hidden>No message can move. Heal a link, resume a replica, drop a packet, or tick recovery.</p>
+              <div id="message-queue" class="message-queue"></div>
+            </section>
+          </section>
+
+          <aside id="inspector" class="inspector" aria-label="Replica inspector">
+            <div class="inspector-heading">
+              <div>
+                <span class="panel-kicker">LOCAL INSPECTOR</span>
+                <h2 id="inspector-title">Replica 1 · local view</h2>
+              </div>
+              <button class="icon-button inspector-close" type="button" data-action="close-inspector" aria-label="Close inspector">×</button>
+            </div>
+            <div class="tabs" role="tablist" aria-label="Inspector views">
+              <button type="button" role="tab" data-tab="INSTANCE" aria-selected="true">INSTANCE</button>
+              <button type="button" role="tab" data-tab="NETWORK" aria-selected="false">NETWORK</button>
+              <button type="button" role="tab" data-tab="EVENT LOG" aria-selected="false">EVENT LOG</button>
+            </div>
+            <div id="inspector-content" class="inspector-content"></div>
+          </aside>
+        </div>
+
+        <nav id="playback" class="playback" aria-label="Trace playback controls"></nav>
+      </section>
+
+      <section id="blocking-error" class="blocking-error" role="alert" hidden></section>
+    </main>
+
+    <footer class="about-panel">
+      <div>
+        <span class="panel-kicker">ABOUT THIS SURFACE</span>
+        <p>Educational simulator. The repository’s formal evidence is bounded; this is not a production-readiness claim.</p>
+      </div>
+      <nav aria-label="Project resources">
+        <a href="https://sigops.org/s/conferences/sosp/2013/papers/p358-moraru.pdf" target="_blank" rel="noopener noreferrer">Read the paper</a>
+        <a href="https://github.com/gosuda/moreconsensus/blob/main/EPAXOS.MD" target="_blank" rel="noopener noreferrer">Implementation guide</a>
+        <a href="https://github.com/gosuda/moreconsensus" target="_blank" rel="noopener noreferrer">View source</a>
+        <a href="https://github.com/gosuda/moreconsensus/blob/main/RELEASE_SCOPE.md" target="_blank" rel="noopener noreferrer">Release scope</a>
+      </nav>
+    </footer>
+  </div>
+
+  <dialog id="share-dialog" class="share-dialog">
+    <form method="dialog">
+      <label for="share-url">Copy this link:</label>
+      <input id="share-url" type="url" readonly>
+      <div class="dialog-actions">
+        <button class="button secondary" value="cancel">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="live-region" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>
