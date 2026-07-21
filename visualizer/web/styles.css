@@ -1238,6 +1238,53 @@ select:disabled {
   padding-bottom: 4px;
 }
 
+.auto-mode-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  background: rgba(98, 223, 243, 0.035);
+}
+
+.auto-mode-panel.running {
+  border-color: var(--cyan);
+  box-shadow: inset 3px 0 0 var(--cyan);
+}
+
+.auto-mode-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.auto-mode-heading .kicker {
+  margin: 0;
+}
+
+.auto-mode-heading strong {
+  color: var(--green);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.auto-mode-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.auto-mode-panel .auto-mode-note {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.auto-mode-panel .button {
+  width: 100%;
+}
+
 .bootstrap-panel .button {
   width: 100%;
   margin-top: 12px;
