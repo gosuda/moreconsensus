@@ -55,6 +55,8 @@ jobs:
           printf '#!/usr/bin/env bash\nexec java -cp "%s" clojure.main -m leiningen.core.main "$@"\n' "$jar" > /tmp/lein
           chmod +x /tmp/lein
           echo /tmp >> "$GITHUB_PATH"
+      - name: Run go vet
+        run: go vet ./...
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9
